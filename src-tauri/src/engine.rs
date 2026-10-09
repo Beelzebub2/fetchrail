@@ -1656,6 +1656,17 @@ impl DownloadManager {
             .connections
             .min(settings.max_requests_per_origin)
             .max(1);
+        // Cloned clients share an HTTP/2 transport; keep a reusable pool for each worker instead.
+        let mut clients = if maximum == 1 {
+            vec![client.clone()]
+        } else {
+            let headers = task.headers.read().await.clone();
+            (0..maximum)
+                .map(|_| Self::new_session_client(headers.clone()))
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(EngineError::Message)?
+        };
+        let mut slots = (0..maximum).collect::<std::collections::VecDeque<_>>();
         let mut auto = Adaptive::new(
             maximum,
             settings.adaptive_connections && probe.accepts_ranges,
@@ -1663,6 +1674,7 @@ impl DownloadManager {
         task.record.write().await.connections = auto.target;
         let origin = self.origin(url).await;
         let mut last_throttles = origin.throttles();
+        let mut last_waits = origin.waits();
         let mut pending = (0..segments.len()).collect::<std::collections::VecDeque<_>>();
         let batch = cancel.child_token();
         let mut active = FuturesUnordered::new();
@@ -1681,24 +1693,39 @@ impl DownloadManager {
                 let Some(index) = pending.pop_front() else {
                     break;
                 };
+                let slot = slots.pop_front().expect("A worker slot is available");
+                let mut client = clients[slot].clone();
                 let segment = &segments[index];
                 let batch = &batch;
                 active.push(async move {
-                    self.download_with_retries(
-                        task, batch, client, url, part_dir, index, segment, probe,
-                    )
-                    .await
+                    let result = self
+                        .download_with_retries(
+                            task,
+                            batch,
+                            &mut client,
+                            url,
+                            part_dir,
+                            index,
+                            segment,
+                            probe,
+                        )
+                        .await;
+                    (slot, client, result)
                 });
             }
             if active.is_empty() {
                 break;
             }
             // Lower targets drain existing requests before their throughput can be compared.
-            sample_ready &= active.len() == auto.target;
+            sample_ready &= active.len() == auto.target && !origin.is_waiting();
             tokio::select! {
                 result = active.next() => {
-                    if let Some(Err(error)) = result {
-                        if failure.is_none() { failure = Some(error); batch.cancel(); }
+                    if let Some((slot, client, result)) = result {
+                        clients[slot] = client;
+                        slots.push_front(slot);
+                        if let Err(error) = result {
+                            if failure.is_none() { failure = Some(error); batch.cancel(); }
+                        }
                     }
                 },
                 _ = sample.tick(), if failure.is_none() => {
@@ -1707,11 +1734,14 @@ impl DownloadManager {
                     let rate = bytes.saturating_sub(last_bytes) as f64 / now.duration_since(last_sample).as_secs_f64().max(0.001);
                     let throttles = origin.throttles();
                     let throttled = throttles != last_throttles;
-                    if !pending.is_empty() && (throttled || sample_ready) { auto.sample(rate, throttled); }
+                    let waits = origin.waits();
+                    // Shared-budget waits must not look like a slower connection-count trial.
+                    if !pending.is_empty() && (throttled || (sample_ready && waits == last_waits && !origin.is_waiting())) { auto.sample(rate, throttled); }
                     task.record.write().await.connections = auto.target;
                     last_bytes = bytes;
                     last_sample = now;
                     last_throttles = throttles;
+                    last_waits = waits;
                     sample_ready = true;
                 }
             }
@@ -1727,7 +1757,7 @@ impl DownloadManager {
         &self,
         task: &Arc<DownloadTask>,
         cancel: &CancellationToken,
-        client: &Client,
+        client: &mut Client,
         url: &Url,
         part_dir: &Path,
         index: usize,
@@ -1743,6 +1773,11 @@ impl DownloadManager {
             match result {
                 Ok(()) => return Ok(()),
                 Err(error) if is_transient(&error) && attempt + 1 < attempts => {
+                    if matches!(&error, EngineError::Slow) {
+                        // A new stream on the same HTTP/2 transport can inherit its stalled TCP state.
+                        *client = Self::new_session_client(task.headers.read().await.clone())
+                            .map_err(EngineError::Message)?;
+                    }
                     let delay = crate::network::backoff(attempt);
                     task.record.write().await.status_detail =
                         Some(format!("Retry {}/{}: {}", attempt + 1, attempts, error));
@@ -1843,7 +1878,7 @@ impl DownloadManager {
         task.check_stopped(cancel)?;
         let gate = self.origin(url).await;
         let settings = self.settings.read().await.clone();
-        let _permit = gate
+        let permit = gate
             .acquire(settings.max_requests_per_origin, cancel)
             .await
             .ok_or(EngineError::Cancelled)?;
@@ -1924,6 +1959,9 @@ impl DownloadManager {
         let mut written = existing;
         let mut checkpoint_at = Instant::now();
         let started = Instant::now();
+        let mut progress_at = started;
+        let mut progress_bytes = written;
+        let mut best_rate = 0.0;
         let transfer = async {
             loop {
                 task.check_stopped(cancel)?;
@@ -1946,16 +1984,24 @@ impl DownloadManager {
                 segment.downloaded.store(written, Ordering::Relaxed);
                 if checkpoint_at.elapsed().as_secs() >= 5 {
                     output.flush().await?; if !direct { output.get_ref().sync_all().await?; }
-                    self.checkpoint(task, part_dir, index, written, format!("{:x}", hasher.clone().finalize()),true).await?;
+                    self.checkpoint(task, part_dir, index, written, format!("{:x}", hasher.clone().finalize()),false).await?;
                     checkpoint_at = Instant::now();
                 }
-                if limit == 0 && started.elapsed().as_secs() >= 30 && self.settings.read().await.speed_limit_bps == 0 && task.record.read().await.speed_limit_bps == 0 && (written - existing) as f64 / started.elapsed().as_secs_f64() < 2048.0 {
-                    return Err(EngineError::Slow);
+                if progress_at.elapsed().as_secs() >= 10 {
+                    if limit == 0 && self.settings.read().await.speed_limit_bps == 0 && task.record.read().await.speed_limit_bps == 0 {
+                        let slow = crate::network::slow_progress(written - progress_bytes, progress_at.elapsed(), &mut best_rate);
+                        // Initial fast bytes must not hide a trickling tail indefinitely.
+                        if slow && started.elapsed().as_secs() >= 30 { return Err(EngineError::Slow); }
+                    } else { best_rate = 0.0; }
+                    progress_at = Instant::now();
+                    progress_bytes = written;
                 }
             }
             Ok::<(),EngineError>(())
         }.await;
         segment.active.store(false, Ordering::Relaxed);
+        drop(stream);
+        drop(permit);
         output.flush().await?;
         if !direct {
             output.get_ref().sync_all().await?;
@@ -2107,17 +2153,19 @@ impl DownloadManager {
         if headers.is_empty() {
             return Ok(self.client.clone());
         }
-        let mut builder = Client::builder();
-        if !headers.contains_key(header::USER_AGENT) {
-            builder = builder.user_agent(concat!("Fetchrail/", env!("CARGO_PKG_VERSION")));
-        }
+        Self::new_session_client(headers)
+    }
+
+    fn new_session_client(headers: HeaderMap) -> Result<Client, String> {
+        let session = !headers.is_empty();
+        let builder = download_client_builder();
         builder.default_headers(headers)
-            .redirect(reqwest::redirect::Policy::custom(|attempt| {
+            .redirect(reqwest::redirect::Policy::custom(move |attempt| {
                 if attempt.previous().len() >= 10 { return attempt.error("Too many redirects"); }
-                if attempt.previous().first().is_some_and(|first| first.origin() != attempt.url().origin()) {
+                if session && attempt.previous().first().is_some_and(|first| first.origin() != attempt.url().origin()) {
                     attempt.error("Browser credentials cannot follow a cross-origin redirect; continue in the browser.")
                 } else { attempt.follow() }
-            })).connect_timeout(Duration::from_secs(15)).read_timeout(Duration::from_secs(30))
+            }))
             .build().map_err(|_| "Could not initialize browser session.".into())
     }
 

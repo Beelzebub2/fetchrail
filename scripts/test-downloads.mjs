@@ -58,7 +58,7 @@ const otherOrigin = createServer((request,response) => { leakedCredentials ||= B
 await new Promise((done) => otherOrigin.listen(0,"127.0.0.1",done));
 const server = createServer((request, response) => {
   const name = request.url.slice(1);
-  const payload=name === "adaptive-large.bin" ? adaptiveData : name.startsWith("benchmark-") ? benchmarkData : data;
+  const payload=name.startsWith("adaptive-large") ? adaptiveData : name.startsWith("benchmark-") ? benchmarkData : data;
   if (name==="empty.bin") { response.writeHead(416,{"Content-Range":"bytes */0"}).end(); return; }
   if (name === "auth.bin") { response.writeHead(403).end(); return; }
   if (name === "landing.html") { response.writeHead(200, { "Content-Type": "text/html" }).end("<button>Download</button>"); return; }
@@ -96,12 +96,13 @@ const server = createServer((request, response) => {
   entry.active++; entry.peak = Math.max(entry.peak, entry.active);
   globalActive++; globalPeak=Math.max(globalPeak,globalActive);
   const disconnect = name === "disconnect.bin" && !dropped && end-start > 1;
-  const tick=name === "adaptive-large.bin" ? 50 : name.startsWith("benchmark-tail-") ? (start===0 && end>0 ? 25 : 1) : name.startsWith("benchmark-disk-") ? 1 : 15;
+  const tick=name.startsWith("adaptive-large") ? 50 : name.startsWith("benchmark-tail-") ? (start===0 && end>0 ? 25 : 1) : name.startsWith("benchmark-disk-") ? 1 : 15;
   const block=name.startsWith("benchmark-") ? 256*1024 : 65536;
   if (disconnect) dropped=true;
   let sent = 0;
+  const trickle = name === "slow-tail.bin" && start === 0 && end > 0;
   const timer = setInterval(() => {
-    const next = Math.min(start + block, end + 1);
+    const next = Math.min(start + (trickle && sent >= 786432 ? 48 : block), end + 1);
     response.write(payload.subarray(start, next)); sent+=next-start; start = next;
     if (disconnect && sent >= 131072) { clearInterval(timer); response.destroy(); return; }
     if (start > end) { clearInterval(timer); response.end(); }
@@ -124,6 +125,7 @@ async function launch() {
   app.once("error", (error) => { startupError = error; });
   await waitFor(async () => {
     if (startupError) throw startupError;
+    if (app.exitCode!==null || app.signalCode!==null) throw new Error(`App exited during startup: ${app.exitCode ?? app.signalCode}`);
     try {
       const config = JSON.parse(await read("browser-bridge.json"));
       if (config.token === previousToken) return false;
@@ -141,7 +143,7 @@ async function launch() {
         socket.once("error", () => done(false));
       });
     } catch { return false; }
-  }, "app startup");
+  }, "app startup",60000);
 }
 const native = (method, params = {}, id = randomUUID()) => new Promise((done, reject) => {
   const payload = Buffer.from(JSON.stringify({ v: 1, id, method, params }));
@@ -154,7 +156,7 @@ const list = async () => (await native("getDownloads")).downloads;
 const record = async (id) => (await list()).find((item) => item.id === id);
 async function add(name, options = {}) {
   const result = await native("addDownloads", { source: "popup", items: [{ url: base + name }], connections: 4, ...options });
-  assert.equal(result.accepted, 1); ids.push(result.ids[0]); return result.ids[0];
+  assert.equal(result.accepted, 1,JSON.stringify(result.errors)); ids.push(result.ids[0]); return result.ids[0];
 }
 async function complete(id, connections, payload = data) {
   const item = await waitFor(async () => {
@@ -163,7 +165,11 @@ async function complete(id, connections, payload = data) {
     return item?.status === "completed" && item;
   }, "download completion");
   assert.equal(item.connections, connections);
-  const full = await waitFor(async () => { const saved=JSON.parse(await read("downloads.json")).find((item)=>item.id===id); return saved?.status === "completed" && saved; },"completion persisted");
+  const full = await waitFor(async () => {
+    const saved=JSON.parse(await read("downloads.json")).find((item)=>item.id===id);
+    if(saved?.status==="failed") throw new Error(`Durable completion failed: ${saved.error}`);
+    return saved?.status === "completed" && saved;
+  },"completion persisted");
   assert.equal(digest(await readFile(full.destination)), payload === data ? expectedHash : digest(payload), "Downloaded bytes must match the original.");
   const zone=await readFile(full.destination+":Zone.Identifier","utf8");
   assert.match(zone,/ZoneId=3/); assert.ok(!zone.includes("session=fixture"));
@@ -238,7 +244,7 @@ try {
     url: base + "session-context.bin", expectedBytes: data.length, expectedMime: "application/octet-stream",
     requestContext: { cookie: "session=fetchrail-test", referer: base + "step/5", userAgent: "Fetchrail browser fixture" },
   }] });
-  assert.equal(browserSession.accepted, 1);
+  assert.equal(browserSession.accepted, 1,JSON.stringify(browserSession.errors));
   ids.push(browserSession.ids[0]);
   assert.equal((await record(browserSession.ids[0])).requestContext, undefined, "Browser session headers must never be exposed in the bridge response.");
   app.kill(); await new Promise((done) => app.once("exit", done));
@@ -481,6 +487,39 @@ try {
   assert.ok(samples.every((item) => !item || item.activeConnections <= 16));
   assert.equal(observed.get("adaptive-large.bin").peak, 16);
   console.log("PASS: adaptive workers grow from four to eight to sixteen, report real receiving counts and publish identical 192 MiB output");
+  app.kill(); await new Promise((done)=>app.once("exit",done));
+  await writeFile(join(stateDir,"settings.json"),JSON.stringify({...settings,adaptiveConnections:true,speedLimitBps:0,maxRequestsPerOrigin:8}));
+  await launch();
+  globalPeak=0;
+  const sharedIds=await Promise.all([add("adaptive-large-a.bin",{connections:16}),add("adaptive-large-b.bin",{connections:16})]);
+  const sharedTargets=new Map(sharedIds.map(id=>[id,4]));
+  let sharedBudgetObserved=false;
+  await waitFor(async()=>{
+    const jobs=(await list()).filter(item=>sharedIds.includes(item.id));
+    for(const item of jobs) { if(item.status==="failed") throw new Error(item.error); }
+    for(const item of jobs) {
+      if(item.status==="downloading" && item.downloadedBytes>0) sharedTargets.set(item.id,Math.max(sharedTargets.get(item.id),item.connections));
+    }
+    if(jobs.every(item=>item.status==="downloading" && item.downloadedBytes>=96*1024*1024)) {
+      assert.ok(jobs.every(item=>item.connections>=sharedTargets.get(item.id)),`Shared-budget waits must not reduce an established worker target: ${JSON.stringify(jobs.map(({id,connections,activeConnections,downloadedBytes})=>({connections,activeConnections,downloadedBytes,previous:sharedTargets.get(id)})))}`);
+      sharedBudgetObserved ||= jobs.some(item=>item.connections>item.activeConnections && item.connections>=8);
+    }
+    assert.ok(globalActive<=8,"The server must observe the shared host request limit.");
+    return jobs.every(item=>item.status==="completed");
+  },"adaptive downloads sharing one host budget",60000);
+  assert.ok(sharedBudgetObserved,"Both adaptive jobs must make concurrent progress under the shared host limit.");
+  assert.ok(globalPeak<=8);
+  await Promise.all(sharedIds.map(async id=>complete(id,(await record(id)).connections,adaptiveData)));
+  console.log("PASS: two adaptive downloads share eight host requests fairly without false connection-count reductions or changed output");
+  const slowTail = await add("slow-tail.bin",{connections:1});
+  await waitFor(async()=>{
+    const item=await record(slowTail);
+    if(item?.status==="failed")throw new Error(item.error);
+    return item?.status==="completed";
+  },"fast prefix followed by a trickling tail",45000);
+  await complete(slowTail,1);
+  assert.ok(observed.get("slow-tail.bin").ranges.some(range=>range.start>0&&range.start<1024*1024),"The trickling request must resume only its missing suffix.");
+  console.log("PASS: a fast prefix cannot hide a trickling tail; its missing suffix retries promptly and publishes identical bytes");
   app.kill(); await new Promise((done)=>app.once("exit",done));
   if (benchmarkData) settings.speedLimitBps = 0;
   await writeFile(join(stateDir,"settings.json"),JSON.stringify(settings)); await launch();
