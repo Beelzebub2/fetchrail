@@ -16,4 +16,4 @@ foreach ($key in $keys) {
         }
     }
 }
-Write-Host "Braid native-host registrations removed."
+Write-Host "Fetchrail native-host registrations removed."

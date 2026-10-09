@@ -17,9 +17,9 @@ document.documentElement.dataset.theme = localStorage.getItem("theme") ?? "dark"
 document.documentElement.dataset.accent = localStorage.getItem("accent") ?? "ember";
 
 async function request(type, params = {}) {
-  if (!api?.runtime?.sendMessage) throw new Error("Open this panel from the installed Braid browser extension.");
+  if (!api?.runtime?.sendMessage) throw new Error("Open this panel from the installed Fetchrail browser extension.");
   const response = await api.runtime.sendMessage({ type, ...params });
-  if (!response?.ok) throw new Error(response?.error ?? "Braid did not respond.");
+  if (!response?.ok) throw new Error(response?.error ?? "Fetchrail did not respond.");
   return response.result;
 }
 
@@ -215,14 +215,14 @@ async function connect() {
   $("#connection").disabled = true;
   try {
     const result = await request("ping");
-    if (!result.capabilities.includes("getDownloads")) throw new Error("Update the Braid app and native host to use this companion.");
+    if (!result.capabilities.includes("getDownloads")) throw new Error("Update the Fetchrail app and native host to use this companion.");
     connection(true);
     for (const key of ["theme", "accent"]) {
       if (!result[key]) continue;
       document.documentElement.dataset[key] = result[key];
       localStorage.setItem(key, result[key]);
     }
-    $("#version").textContent = "Braid " + result.appVersion;
+    $("#version").textContent = "Fetchrail " + result.appVersion;
     $("#connections option[value='0']").textContent = "App default (" + result.connectionsPerDownload + ")";
     $("#engine-hint").textContent = `Up to ${result.maxConcurrentDownloads} simultaneous downloads · ${result.minSegmentSizeMb} MB minimum segment. Servers without ranges use one connection.`;
     const currentQueue = preferredQueue;
@@ -232,7 +232,7 @@ async function connect() {
     notice("");
     await refresh();
     if (!polling) { polling = true; void poll(); }
-  } catch (error) { connection(false); notice(error.message + " Open Braid and check your browser integration setup.", true); }
+  } catch (error) { connection(false); notice(error.message + " Open Fetchrail and check your browser integration setup.", true); }
   finally { $("#connection").disabled = false; }
 }
 
@@ -324,7 +324,7 @@ async function add(items, fromSelection = false) {
   updateSelection();
   try {
     const result = await request("addDownloads", { items, ...transferOptions() });
-    notice(`${result.accepted} download${result.accepted === 1 ? "" : "s"} added to Braid.` + (result.rejected ? ` ${result.rejected} rejected: ${result.errors[0]?.message}` : ""), !!result.rejected);
+    notice(`${result.accepted} download${result.accepted === 1 ? "" : "s"} added to Fetchrail.` + (result.rejected ? ` ${result.rejected} rejected: ${result.errors[0]?.message}` : ""), !!result.rejected);
     if (fromSelection) {
       const rejected = new Set(result.errors.map((error) => error.url));
       for (const item of items) if (!rejected.has(item.url)) selected.delete(item.url);

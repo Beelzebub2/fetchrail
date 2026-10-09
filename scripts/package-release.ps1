@@ -8,14 +8,14 @@ node (Join-Path $PSScriptRoot "check-release.mjs") $Tag
 if ($LASTEXITCODE -ne 0) { throw "Release version validation failed." }
 
 $releaseDir = Join-Path $projectRoot "src-tauri\target\release"
-$releaseExe = Join-Path $releaseDir "braid.exe"
+$releaseExe = Join-Path $releaseDir "fetchrail.exe"
 if (-not (Test-Path -LiteralPath $releaseExe -PathType Leaf)) {
-    throw "Build the release executable before packaging: braid.exe is missing."
+    throw "Build the release executable before packaging: fetchrail.exe is missing."
 }
 
 $outputDir = [System.IO.Path]::GetFullPath((Join-Path $projectRoot "release-artifacts"))
 # The word "Setup" in the file name is what makes the executable start as the installer.
-$artifactName = "Braid-Setup-$Tag-windows-x64.exe"
+$artifactName = "Fetchrail-Setup-$Tag-windows-x64.exe"
 $artifact = Join-Path $outputDir $artifactName
 # OneDrive placeholders have ReparsePoint attributes without redirecting the path.
 if ((Test-Path -LiteralPath $outputDir) -and (Get-Item -LiteralPath $outputDir).LinkType) {
@@ -34,7 +34,7 @@ try {
     $artifactStream.Dispose()
     $sha256.Dispose()
 }
-"$hash  $artifactName" | Set-Content -LiteralPath (Join-Path $outputDir "Braid-Setup-$Tag-windows-x64.sha256") -Encoding ASCII
+"$hash  $artifactName" | Set-Content -LiteralPath (Join-Path $outputDir "Fetchrail-Setup-$Tag-windows-x64.sha256") -Encoding ASCII
 Write-Host "Setup executable: $artifact"
 
 # Installed copies read latest.json and accept the download only if it matches this signature.
@@ -46,7 +46,7 @@ if (-not ($env:TAURI_SIGNING_PRIVATE_KEY -or $env:TAURI_SIGNING_PRIVATE_KEY_PATH
 }
 npx tauri signer sign --app-version $version $artifact | Out-Null
 if ($LASTEXITCODE -ne 0) { throw "Signing the release failed." }
-$repository = if ($env:GITHUB_REPOSITORY) { $env:GITHUB_REPOSITORY } else { "Beelzebub2/braid" }
+$repository = if ($env:GITHUB_REPOSITORY) { $env:GITHUB_REPOSITORY } else { "Beelzebub2/fetchrail" }
 $json = [ordered]@{
     version = $version
     pub_date = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")

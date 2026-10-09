@@ -28,7 +28,7 @@ for (const browser of ["chromium", "firefox"]) {
     cpSync(source(file), join(target, file));
   }
   // Embed the running build in code: fetching a stamp at startup could read a newer build.
-  writeFileSync(join(target, "background.js"), `const BRAID_BUILD = ${JSON.stringify(build)};\n` + readFileSync(join(root, "src", "background.js"), "utf8"));
+  writeFileSync(join(target, "background.js"), `const FETCHRAIL_BUILD = ${JSON.stringify(build)};\n` + readFileSync(join(root, "src", "background.js"), "utf8"));
   writeFileSync(join(target, "build-info.json"), JSON.stringify({ build }) + "\n");
 }
 

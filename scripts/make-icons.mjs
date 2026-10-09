@@ -9,7 +9,7 @@ import { fileURLToPath } from "node:url";
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
 const icons = join(root, "src-tauri", "icons");
 const extension = join(root, "browser-extension", "src");
-const temp = mkdtempSync(join(tmpdir(), "braid-icons-"));
+const temp = mkdtempSync(join(tmpdir(), "fetchrail-icons-"));
 const cli = join(root, "node_modules", "@tauri-apps", "cli", "tauri.js");
 const render = (source, ...args) => execFileSync(process.execPath, [cli, "icon", join(icons, source), ...args], { cwd: root, stdio: "ignore" });
 

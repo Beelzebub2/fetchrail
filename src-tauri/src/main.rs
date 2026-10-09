@@ -2,12 +2,12 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 fn main() {
-    if braid_lib::native_host::is_browser_invocation() {
-        return braid_lib::native_host::run();
+    if fetchrail_lib::native_host::is_browser_invocation() {
+        return fetchrail_lib::native_host::run();
     }
     #[cfg(windows)]
-    if let Some(mode) = braid_lib::install::setup_mode() {
-        return braid_lib::run_setup(mode);
+    if let Some(mode) = fetchrail_lib::install::setup_mode() {
+        return fetchrail_lib::run_setup(mode);
     }
-    braid_lib::run();
+    fetchrail_lib::run();
 }

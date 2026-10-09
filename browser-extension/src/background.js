@@ -1,8 +1,8 @@
 const api = globalThis.browser ?? globalThis.chrome;
 const HOST_NAME = "com.rrmtools.braid";
-const MENU_DOWNLOAD = "braid.download";
-const MENU_DOWNLOAD_ALL = "braid.downloadAll";
-const UPDATE_ALARM = "braid.extensionUpdate";
+const MENU_DOWNLOAD = "fetchrail.download";
+const MENU_DOWNLOAD_ALL = "fetchrail.downloadAll";
+const UPDATE_ALARM = "fetchrail.extensionUpdate";
 let activeActions = 0;
 let checkingUpdate = false;
 const routingDownloads = new Set();
@@ -24,13 +24,13 @@ async function checkForExtensionUpdate() {
     const response = await fetch(api.runtime.getURL("build-info.json"), { cache: "no-store" });
     if (!response.ok) return;
     const { build } = await response.json();
-    if (!/^[a-f0-9]{64}$/.test(build) || build === BRAID_BUILD) return;
-    const attempt = `${BRAID_BUILD}>${build}`;
-    if ((await api.storage.local.get("braidReloadAttempt")).braidReloadAttempt === attempt) return;
+    if (!/^[a-f0-9]{64}$/.test(build) || build === FETCHRAIL_BUILD) return;
+    const attempt = `${FETCHRAIL_BUILD}>${build}`;
+    if ((await api.storage.local.get("fetchrailReloadAttempt")).fetchrailReloadAttempt === attempt) return;
     if (await panelIsOpen() || activeActions) return;
-    await api.storage.local.set({ braidReloadAttempt: attempt });
+    await api.storage.local.set({ fetchrailReloadAttempt: attempt });
     if (activeActions || await panelIsOpen() || activeActions) {
-      await api.storage.local.remove("braidReloadAttempt");
+      await api.storage.local.remove("fetchrailReloadAttempt");
       return;
     }
     api.runtime.reload();
@@ -38,7 +38,7 @@ async function checkForExtensionUpdate() {
   finally { checkingUpdate = false; }
 }
 
-// Local file checks never launch Braid or contact an update server.
+// Local file checks never launch Fetchrail or contact an update server.
 void api.alarms.create(UPDATE_ALARM, { periodInMinutes: 1 });
 api.alarms.onAlarm.addListener((alarm) => {
   if (alarm.name === UPDATE_ALARM) void checkForExtensionUpdate();
@@ -55,8 +55,8 @@ async function nativeRequest(method, params = {}) {
           else resolve(result);
         });
       });
-  if (!response?.ok) throw new Error(response?.error?.message ?? "Braid did not accept the request.");
-  if (method === "getDownloads") await setBadge(response.result.overview.active ? String(response.result.overview.active) : "", "Braid Download Companion");
+  if (!response?.ok) throw new Error(response?.error?.message ?? "Fetchrail did not accept the request.");
+  if (method === "getDownloads") await setBadge(response.result.overview.active ? String(response.result.overview.active) : "", "Fetchrail Download Companion");
   return response.result;
 }
 
@@ -90,11 +90,11 @@ async function addItems(source, items, options = {}) {
       ids.push(...(result.ids ?? []));
       errors.push(...result.errors.map((error) => ({ ...error, index: error.index + offset, url: safeItems[offset + error.index].url })));
     } catch (error) {
-      await setBadge("!", "Braid: " + error.message);
+      await setBadge("!", "Fetchrail: " + error.message);
       throw new Error(`${accepted ? accepted + " downloads were already accepted. " : ""}${error.message}`);
     }
   }
-  await setBadge(errors.length ? "!" : String(accepted), `Braid: ${accepted} downloads accepted`);
+  await setBadge(errors.length ? "!" : String(accepted), `Fetchrail: ${accepted} downloads accepted`);
   return { accepted, rejected: errors.length, errors, ids };
 }
 
@@ -115,7 +115,7 @@ async function routeBrowserDownload(item) {
       expectedMime: current.mime,
     }]);
     engineId = result.ids[0];
-    if (result.accepted !== 1 || !engineId) throw new Error(result.errors[0]?.message ?? "Braid did not accept the download.");
+    if (result.accepted !== 1 || !engineId) throw new Error(result.errors[0]?.message ?? "Fetchrail did not accept the download.");
     const [latest] = await api.downloads.search({ id: item.id });
     paused = latest?.state === "in_progress" && latest.paused;
     // Verification can outlast a user action or the browser's safety verdict.
@@ -129,13 +129,13 @@ async function routeBrowserDownload(item) {
     await api.downloads.erase({ id: item.id }).catch(() => {});
   } catch (error) {
     if (engineId) await nativeRequest("controlDownload", { downloadId: engineId, action: "cancel" }).catch(() => {});
-    await setBadge("!", "Braid: continuing in your browser. " + error.message);
+    await setBadge("!", "Fetchrail: continuing in your browser. " + error.message);
   } finally {
-    if (paused) await api.downloads.resume(item.id).catch((error) => setBadge("!", "Braid: resume the browser download manually. " + error.message));
+    if (paused) await api.downloads.resume(item.id).catch((error) => setBadge("!", "Fetchrail: resume the browser download manually. " + error.message));
   }
 }
 
-if (!api.downloads?.onCreated) void setBadge("!", "Braid: reload the extension to enable browser download capture.");
+if (!api.downloads?.onCreated) void setBadge("!", "Fetchrail: reload the extension to enable browser download capture.");
 api.downloads?.onCreated?.addListener((item) => {
   if (item.state !== "in_progress" || item.paused || item.incognito
     || (item.danger && item.danger !== "safe")
@@ -178,8 +178,8 @@ async function collectLinks(tabId) {
 
 async function createMenus() {
   await api.contextMenus.removeAll();
-  api.contextMenus.create({ id: MENU_DOWNLOAD, title: "Download with Braid", contexts: ["link", "image", "audio", "video"], documentUrlPatterns: ["http://*/*", "https://*/*"] });
-  api.contextMenus.create({ id: MENU_DOWNLOAD_ALL, title: "Choose downloads with Braid…", contexts: ["page"], documentUrlPatterns: ["http://*/*", "https://*/*"] });
+  api.contextMenus.create({ id: MENU_DOWNLOAD, title: "Download with Fetchrail", contexts: ["link", "image", "audio", "video"], documentUrlPatterns: ["http://*/*", "https://*/*"] });
+  api.contextMenus.create({ id: MENU_DOWNLOAD_ALL, title: "Choose downloads with Fetchrail…", contexts: ["page"], documentUrlPatterns: ["http://*/*", "https://*/*"] });
 }
 
 api.runtime.onInstalled.addListener(() => void createMenus());
@@ -190,7 +190,7 @@ api.contextMenus.onClicked.addListener((info, tab) => {
     if (url) {
       activeActions++;
       void addItems("contextMenu", [{ url }])
-        .catch((error) => setBadge("!", "Braid: " + error.message))
+        .catch((error) => setBadge("!", "Fetchrail: " + error.message))
         .finally(() => activeActions--);
     }
   } else if (info.menuItemId === MENU_DOWNLOAD_ALL && tab?.id != null) {
@@ -209,7 +209,7 @@ api.runtime.onMessage.addListener((message, sender, sendResponse) => {
     });
     if (["ping", "getDownloads", "showApp"].includes(message.type)) return nativeRequest(message.type);
     if (message.type === "controlDownload") return nativeRequest("controlDownload", { downloadId: message.downloadId, action: message.action });
-    throw new Error("Unknown Braid action.");
+    throw new Error("Unknown Fetchrail action.");
   };
   activeActions++;
   run().then((result) => sendResponse({ ok: true, result }), (error) => sendResponse({ ok: false, error: error.message }))

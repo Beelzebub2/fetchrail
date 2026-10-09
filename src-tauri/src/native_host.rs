@@ -94,11 +94,11 @@ fn forward_request(request: NativeRequest) -> Result<NativeResponse, String> {
             }
         }
         if attempt == 0 {
-            launch_braid()?;
+            launch_fetchrail()?;
         }
         thread::sleep(Duration::from_millis(100));
     }
-    Err("Braid did not start its browser bridge in time.".into())
+    Err("Fetchrail did not start its browser bridge in time.".into())
 }
 
 fn send_to_bridge(
@@ -110,32 +110,32 @@ fn send_to_bridge(
     };
     stream
         .set_read_timeout(Some(Duration::from_secs(30)))
-        .map_err(|error| format!("Could not configure Braid connection: {error}"))?;
+        .map_err(|error| format!("Could not configure Fetchrail connection: {error}"))?;
     stream
         .set_write_timeout(Some(Duration::from_secs(5)))
-        .map_err(|error| format!("Could not configure Braid connection: {error}"))?;
+        .map_err(|error| format!("Could not configure Fetchrail connection: {error}"))?;
     let envelope = BrowserBridgeEnvelope {
         token: config.token.clone(),
         request: request.clone(),
     };
     let mut bytes = serde_json::to_vec(&envelope)
-        .map_err(|error| format!("Could not encode Braid browser request: {error}"))?;
+        .map_err(|error| format!("Could not encode Fetchrail browser request: {error}"))?;
     bytes.push(b'\n');
     stream
         .write_all(&bytes)
-        .map_err(|error| format!("Could not send request to Braid: {error}"))?;
+        .map_err(|error| format!("Could not send request to Fetchrail: {error}"))?;
 
     let mut reader = BufReader::new(stream).take((MAX_NATIVE_RESPONSE_BYTES + 1) as u64);
     let mut response = Vec::new();
     reader
         .read_until(b'\n', &mut response)
-        .map_err(|error| format!("Could not read Braid response: {error}"))?;
+        .map_err(|error| format!("Could not read Fetchrail response: {error}"))?;
     if response.len() > MAX_NATIVE_RESPONSE_BYTES {
-        return Err("Braid returned an oversized browser response.".into());
+        return Err("Fetchrail returned an oversized browser response.".into());
     }
     serde_json::from_slice(response.trim_ascii())
         .map(Some)
-        .map_err(|error| format!("Braid returned an invalid browser response: {error}"))
+        .map_err(|error| format!("Fetchrail returned an invalid browser response: {error}"))
 }
 
 fn read_bridge_config() -> Result<BrowserBridgeConfig, String> {
@@ -156,13 +156,13 @@ pub(crate) fn bridge_port() -> Option<u16> {
     read_bridge_config().ok().map(|config| config.port)
 }
 
-fn launch_braid() -> Result<(), String> {
+fn launch_fetchrail() -> Result<(), String> {
     let app =
-        std::env::current_exe().map_err(|error| format!("Could not locate Braid: {error}"))?;
+        std::env::current_exe().map_err(|error| format!("Could not locate Fetchrail: {error}"))?;
     Command::new(app)
         .arg("--background")
         .spawn()
-        .map_err(|error| format!("Could not launch Braid: {error}"))?;
+        .map_err(|error| format!("Could not launch Fetchrail: {error}"))?;
     Ok(())
 }
 

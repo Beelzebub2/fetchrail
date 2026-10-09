@@ -13,7 +13,7 @@ const versions = {
   "package-lock.json root package": lock.packages[""].version,
   "src-tauri/tauri.conf.json": (await json("src-tauri/tauri.conf.json")).version,
   "src-tauri/Cargo.toml": (await read("src-tauri/Cargo.toml")).match(/^\[package\][\s\S]*?^version = "([^"]+)"/m)?.[1],
-  "src-tauri/Cargo.lock": (await read("src-tauri/Cargo.lock")).match(/^name = "braid"\r?\nversion = "([^"]+)"/m)?.[1],
+  "src-tauri/Cargo.lock": (await read("src-tauri/Cargo.lock")).match(/^name = "fetchrail"\r?\nversion = "([^"]+)"/m)?.[1],
   "Chromium extension": (await json("browser-extension/manifests/chromium.json")).version,
   "Firefox extension": (await json("browser-extension/manifests/firefox.json")).version,
 };

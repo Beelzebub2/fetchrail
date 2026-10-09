@@ -11,7 +11,7 @@ use winreg::{enums::HKEY_CURRENT_USER, RegKey};
 #[cfg(windows)]
 use crate::native_host::{CHROMIUM_EXTENSION_ID, FIREFOX_EXTENSION_ID};
 
-// These files travel inside braid.exe, so the companion does not depend on a checkout.
+// These files travel inside fetchrail.exe, so the companion does not depend on a checkout.
 macro_rules! extension_files {
     ($($file:literal),+ $(,)?) => {
         const CHROMIUM_FILES: &[(&str, &[u8])] = &[$(
@@ -61,14 +61,14 @@ fn native_host_manifests(executable: &Path) -> [serde_json::Value; 2] {
     [
         json!({
             "name": NATIVE_HOST_NAME,
-            "description": "Braid browser integration",
+            "description": "Fetchrail browser integration",
             "path": executable,
             "type": "stdio",
             "allowed_origins": [format!("chrome-extension://{CHROMIUM_EXTENSION_ID}/")]
         }),
         json!({
             "name": NATIVE_HOST_NAME,
-            "description": "Braid browser integration",
+            "description": "Fetchrail browser integration",
             "path": executable,
             "type": "stdio",
             "allowed_extensions": [FIREFOX_EXTENSION_ID]
@@ -114,7 +114,7 @@ fn sync_folder(folder: &Path, files: &[(&str, &[u8])]) -> std::io::Result<()> {
     {
         let target = folder.join(name);
         fs::create_dir_all(target.parent().expect("extension asset parent"))?;
-        let temporary = target.with_extension("braid-update");
+        let temporary = target.with_extension("fetchrail-update");
         fs::write(&temporary, bytes)?;
         fs::rename(temporary, target)?;
     }
@@ -122,7 +122,7 @@ fn sync_folder(folder: &Path, files: &[(&str, &[u8])]) -> std::io::Result<()> {
         .iter()
         .find(|(name, _)| *name == "build-info.json")
         .expect("extension build marker");
-    let temporary = marker.with_extension("braid-update");
+    let temporary = marker.with_extension("fetchrail-update");
     fs::write(&temporary, bytes)?;
     fs::rename(temporary, marker)?;
     Ok(())
@@ -138,7 +138,7 @@ fn install_native_host() -> Result<(), String> {
     fs::create_dir_all(&manifest_dir)
         .map_err(|error| format!("Could not create the native host folder: {error}"))?;
     let executable = std::env::current_exe()
-        .map_err(|error| format!("Could not locate the Braid executable: {error}"))?;
+        .map_err(|error| format!("Could not locate the Fetchrail executable: {error}"))?;
     let chromium_manifest = manifest_dir.join(format!("{NATIVE_HOST_NAME}.chromium.json"));
     let firefox_manifest = manifest_dir.join(format!("{NATIVE_HOST_NAME}.firefox.json"));
     let [chromium_value, firefox_value] = native_host_manifests(&executable);
@@ -174,7 +174,7 @@ fn install_native_host() -> Result<(), String> {
     Ok(())
 }
 
-/// Takes the browser registrations away again when Braid is uninstalled.
+/// Takes the browser registrations away again when Fetchrail is uninstalled.
 #[cfg(windows)]
 pub fn remove_native_host() {
     let current_user = RegKey::predef(HKEY_CURRENT_USER);
@@ -232,7 +232,7 @@ mod tests {
     #[test]
     fn install_repair_and_failed_update() {
         let folder =
-            std::env::temp_dir().join(format!("braid-extension-test-{}", uuid::Uuid::new_v4()));
+            std::env::temp_dir().join(format!("fetchrail-extension-test-{}", uuid::Uuid::new_v4()));
         let files: &[(&str, &[u8])] = &[
             ("background.js", b"new code"),
             ("icons/16.png", b"icon"),
@@ -275,10 +275,10 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn native_host_manifests_use_the_application_executable() {
-        let executable = Path::new(r"C:\Apps\Braid.exe");
+        let executable = Path::new(r"C:\Apps\Fetchrail.exe");
         let [chromium, firefox] = native_host_manifests(executable);
-        assert_eq!(chromium["path"], r"C:\Apps\Braid.exe");
-        assert_eq!(firefox["path"], r"C:\Apps\Braid.exe");
+        assert_eq!(chromium["path"], r"C:\Apps\Fetchrail.exe");
+        assert_eq!(firefox["path"], r"C:\Apps\Fetchrail.exe");
         assert_eq!(
             chromium["allowed_origins"][0],
             format!("chrome-extension://{CHROMIUM_EXTENSION_ID}/")

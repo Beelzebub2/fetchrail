@@ -1,4 +1,4 @@
-//! Installing, updating and removing Braid.
+//! Installing, updating and removing Fetchrail.
 //!
 //! The setup program is this same executable: under a file name containing "setup" (or with
 //! `--setup`) it copies itself into place and adds shortcuts and an uninstall entry; with
@@ -33,15 +33,17 @@ use windows::{
     },
 };
 use winreg::{
-    enums::{HKEY_CURRENT_USER, KEY_SET_VALUE},
+    enums::{HKEY_CURRENT_USER, KEY_QUERY_VALUE, KEY_SET_VALUE},
     RegKey,
 };
 
-const EXE_NAME: &str = "Braid.exe";
+const EXE_NAME: &str = "Fetchrail.exe";
+const LEGACY_EXE_NAME: &str = "Braid.exe";
+// Keep the installed identity so existing settings and upgrades stay in place.
 const APP_DATA_FOLDER: &str = "com.rrmtools.braid";
 const UNINSTALL_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Uninstall\Braid";
 const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
-const UPDATE_EVENT: &str = "braid://update-status";
+const UPDATE_EVENT: &str = "fetchrail://update-status";
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -93,10 +95,10 @@ fn known_folder(id: &GUID) -> Result<PathBuf, String> {
 }
 
 pub fn default_dir() -> Result<PathBuf, String> {
-    Ok(known_folder(&FOLDERID_UserProgramFiles)?.join("Braid"))
+    Ok(known_folder(&FOLDERID_UserProgramFiles)?.join("Fetchrail"))
 }
 
-/// Where setup last installed Braid, if it did.
+/// Where setup last installed Fetchrail, if it did.
 pub fn installed_dir() -> Option<PathBuf> {
     RegKey::predef(HKEY_CURRENT_USER)
         .open_subkey(UNINSTALL_KEY)
@@ -114,7 +116,19 @@ pub fn is_installed_copy() -> bool {
 }
 
 pub fn has_desktop_shortcut() -> bool {
-    known_folder(&FOLDERID_Desktop).is_ok_and(|desktop| desktop.join("Braid.lnk").exists())
+    known_folder(&FOLDERID_Desktop).is_ok_and(|desktop| {
+        desktop.join("Fetchrail.lnk").exists() || desktop.join("Braid.lnk").exists()
+    })
+}
+
+fn installed_executable(dir: &Path) -> PathBuf {
+    let renamed = dir.join(EXE_NAME);
+    if renamed.exists() {
+        renamed
+    } else {
+        // Signed updates replace the executable at its existing installed path.
+        dir.join(LEGACY_EXE_NAME)
+    }
 }
 
 fn create_shortcut(link: &Path, target: &Path) -> Result<(), String> {
@@ -128,7 +142,7 @@ fn create_shortcut(link: &Path, target: &Path) -> Result<(), String> {
             if let Some(folder) = target.parent() {
                 shortcut.SetWorkingDirectory(&HSTRING::from(folder.as_os_str()))?;
             }
-            shortcut.SetDescription(&HSTRING::from("Braid download manager"))?;
+            shortcut.SetDescription(&HSTRING::from("Fetchrail download manager"))?;
             shortcut
                 .cast::<IPersistFile>()?
                 .Save(&HSTRING::from(link.as_os_str()), true)
@@ -138,9 +152,9 @@ fn create_shortcut(link: &Path, target: &Path) -> Result<(), String> {
 }
 
 fn register(dir: &Path) -> std::io::Result<()> {
-    let exe = dir.join(EXE_NAME);
+    let exe = installed_executable(dir);
     let (key, _) = RegKey::predef(HKEY_CURRENT_USER).create_subkey(UNINSTALL_KEY)?;
-    key.set_value("DisplayName", &"Braid")?;
+    key.set_value("DisplayName", &"Fetchrail")?;
     key.set_value("DisplayVersion", &env!("CARGO_PKG_VERSION"))?;
     key.set_value("Publisher", &"RRMTools")?;
     key.set_value("DisplayIcon", &exe.to_string_lossy().as_ref())?;
@@ -177,7 +191,7 @@ fn replace_file(
     })
 }
 
-/// Asks a running Braid to quit and waits until its browser bridge stops answering.
+/// Asks a running Fetchrail to quit and waits until its browser bridge stops answering.
 fn stop_running() -> Result<(), String> {
     let running = || {
         crate::native_host::bridge_port().is_some_and(|port| {
@@ -194,7 +208,7 @@ fn stop_running() -> Result<(), String> {
     while running() {
         if Instant::now() > deadline {
             return Err(
-                "Braid is still running. Quit it from its tray icon, then try again.".into(),
+                "Fetchrail is still running. Quit it from its tray icon, then try again.".into(),
             );
         }
         std::thread::sleep(Duration::from_millis(200));
@@ -214,33 +228,54 @@ pub fn install(options: &InstallOptions) -> Result<PathBuf, String> {
     fs::create_dir_all(&dir).map_err(|error| format!("Could not create the folder: {error}"))?;
     if source != target {
         replace_file(&target, |fresh| fs::copy(&source, fresh).map(drop))
-            .map_err(|error| format!("Could not copy Braid into place: {error}"))?;
+            .map_err(|error| format!("Could not copy Fetchrail into place: {error}"))?;
     }
     create_shortcut(
-        &known_folder(&FOLDERID_Programs)?.join("Braid.lnk"),
+        &known_folder(&FOLDERID_Programs)?.join("Fetchrail.lnk"),
         &target,
     )?;
-    let desktop = known_folder(&FOLDERID_Desktop)?.join("Braid.lnk");
+    let desktop = known_folder(&FOLDERID_Desktop)?.join("Fetchrail.lnk");
     if options.desktop_shortcut {
         create_shortcut(&desktop, &target)?;
     } else {
         let _ = fs::remove_file(desktop);
     }
-    register(&dir).map_err(|error| format!("Could not register Braid with Windows: {error}"))?;
-    Ok(target)
-}
-
-/// Removes what `install` added. Downloads are never touched; history and settings only on request.
-pub fn uninstall(remove_data: bool) -> Result<(), String> {
-    let dir = installed_dir().ok_or("Braid is not installed.")?;
-    stop_running()?;
     for folder in [&FOLDERID_Programs, &FOLDERID_Desktop] {
         if let Ok(folder) = known_folder(folder) {
             let _ = fs::remove_file(folder.join("Braid.lnk"));
         }
     }
     let current_user = RegKey::predef(HKEY_CURRENT_USER);
+    if let Ok(run) = current_user.open_subkey_with_flags(RUN_KEY, KEY_QUERY_VALUE | KEY_SET_VALUE) {
+        if run.get_value::<String, _>("Braid").is_ok()
+            || run.get_value::<String, _>("Fetchrail").is_ok()
+        {
+            run.set_value(
+                "Fetchrail",
+                &format!("\"{}\" --background", target.display()),
+            )
+            .map_err(|error| format!("Could not update launch at sign-in: {error}"))?;
+            let _ = run.delete_value("Braid");
+        }
+    }
+    register(&dir)
+        .map_err(|error| format!("Could not register Fetchrail with Windows: {error}"))?;
+    Ok(target)
+}
+
+/// Removes what `install` added. Downloads are never touched; history and settings only on request.
+pub fn uninstall(remove_data: bool) -> Result<(), String> {
+    let dir = installed_dir().ok_or("Fetchrail is not installed.")?;
+    stop_running()?;
+    for folder in [&FOLDERID_Programs, &FOLDERID_Desktop] {
+        if let Ok(folder) = known_folder(folder) {
+            let _ = fs::remove_file(folder.join("Fetchrail.lnk"));
+            let _ = fs::remove_file(folder.join("Braid.lnk"));
+        }
+    }
+    let current_user = RegKey::predef(HKEY_CURRENT_USER);
     if let Ok(run) = current_user.open_subkey_with_flags(RUN_KEY, KEY_SET_VALUE) {
+        let _ = run.delete_value("Fetchrail");
         let _ = run.delete_value("Braid");
     }
     crate::browser_extension::remove_native_host();
@@ -249,7 +284,7 @@ pub fn uninstall(remove_data: bool) -> Result<(), String> {
     // A running program cannot delete itself, so a detached shell finishes a moment after this
     // process has gone. It removes only what setup wrote: a folder shared with other files survives.
     let mut script = format!(
-        "ping -n 5 127.0.0.1 >nul & del /f /q \"{0}\\Braid.exe\" \"{0}\\Braid.old.exe\" \"{0}\\Braid.new.exe\" & rmdir \"{0}\"",
+        "ping -n 5 127.0.0.1 >nul & del /f /q \"{0}\\Fetchrail.exe\" \"{0}\\Fetchrail.old.exe\" \"{0}\\Fetchrail.new.exe\" \"{0}\\Braid.exe\" \"{0}\\Braid.old.exe\" \"{0}\\Braid.new.exe\" & rmdir \"{0}\"",
         dir.display()
     );
     if remove_data {
@@ -262,7 +297,7 @@ pub fn uninstall(remove_data: bool) -> Result<(), String> {
         .raw_arg(format!("/c \"{script}\""))
         .creation_flags(CREATE_NO_WINDOW)
         .spawn()
-        .map_err(|error| format!("Could not finish removing Braid: {error}"))?;
+        .map_err(|error| format!("Could not finish removing Fetchrail: {error}"))?;
     Ok(())
 }
 
@@ -288,9 +323,7 @@ pub fn run_silent(mode: SetupMode) -> Result<(), String> {
 
 /// Starts the installed app once setup is done.
 pub fn launch(launch_on_start: bool) -> Result<(), String> {
-    let exe = installed_dir()
-        .ok_or("Braid is not installed.")?
-        .join(EXE_NAME);
+    let exe = installed_executable(&installed_dir().ok_or("Fetchrail is not installed.")?);
     let mut command = Command::new(exe);
     if launch_on_start {
         command.arg("--launch-on-start");
@@ -298,7 +331,7 @@ pub fn launch(launch_on_start: bool) -> Result<(), String> {
     command
         .spawn()
         .map(drop)
-        .map_err(|error| format!("Could not start Braid: {error}"))
+        .map_err(|error| format!("Could not start Fetchrail: {error}"))
 }
 
 /// Run by the installed app at start: clears the executable an update parked and keeps the
@@ -421,26 +454,38 @@ mod tests {
     use super::*;
 
     #[test]
+    fn existing_installations_keep_working_after_the_rename() {
+        let dir =
+            std::env::temp_dir().join(format!("fetchrail-rename-test-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join(LEGACY_EXE_NAME), b"legacy").unwrap();
+        assert_eq!(installed_executable(&dir), dir.join(LEGACY_EXE_NAME));
+        fs::write(dir.join(EXE_NAME), b"renamed").unwrap();
+        assert_eq!(installed_executable(&dir), dir.join(EXE_NAME));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn setup_is_chosen_by_file_name_and_flags() {
         let mode = |exe: &str, args: &[&str]| {
             setup_mode_for(Path::new(exe), args.iter().map(|a| a.to_string()))
         };
-        assert_eq!(mode(r"C:\Apps\Braid.exe", &[]), None);
-        assert_eq!(mode(r"C:\Apps\Braid.exe", &["--background"]), None);
+        assert_eq!(mode(r"C:\Apps\Fetchrail.exe", &[]), None);
+        assert_eq!(mode(r"C:\Apps\Fetchrail.exe", &["--background"]), None);
         assert_eq!(
-            mode(r"C:\Downloads\Braid-Setup-v0.5.0-windows-x64.exe", &[]),
+            mode(r"C:\Downloads\Fetchrail-Setup-v0.5.0-windows-x64.exe", &[]),
             Some(SetupMode::Install)
         );
         assert_eq!(
-            mode(r"C:\Apps\Braid.exe", &["--setup"]),
+            mode(r"C:\Apps\Fetchrail.exe", &["--setup"]),
             Some(SetupMode::Install)
         );
         assert_eq!(
-            mode(r"C:\Apps\Braid.exe", &["--uninstall", "--silent"]),
+            mode(r"C:\Apps\Fetchrail.exe", &["--uninstall", "--silent"]),
             Some(SetupMode::Uninstall)
         );
         assert_eq!(
-            mode(r"C:\Downloads\Braid-Setup.exe", &["--quit"]),
+            mode(r"C:\Downloads\Fetchrail-Setup.exe", &["--quit"]),
             None,
             "a quit request goes to the running app, not to setup"
         );
@@ -448,17 +493,18 @@ mod tests {
 
     #[test]
     fn a_new_executable_replaces_the_old_one_and_parks_it() {
-        let dir = std::env::temp_dir().join(format!("braid-swap-test-{}", uuid::Uuid::new_v4()));
+        let dir =
+            std::env::temp_dir().join(format!("fetchrail-swap-test-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&dir).unwrap();
         let target = dir.join(EXE_NAME);
         replace_file(&target, |fresh| fs::write(fresh, b"one")).unwrap();
         assert_eq!(fs::read(&target).unwrap(), b"one");
-        assert!(!dir.join("Braid.old.exe").exists());
+        assert!(!dir.join("Fetchrail.old.exe").exists());
 
         replace_file(&target, |fresh| fs::write(fresh, b"two")).unwrap();
         replace_file(&target, |fresh| fs::write(fresh, b"three")).unwrap();
         assert_eq!(fs::read(&target).unwrap(), b"three");
-        assert_eq!(fs::read(dir.join("Braid.old.exe")).unwrap(), b"two");
+        assert_eq!(fs::read(dir.join("Fetchrail.old.exe")).unwrap(), b"two");
 
         let failed = replace_file(&target, |_| Err(std::io::Error::other("disk full")));
         assert!(failed.is_err());
@@ -467,7 +513,7 @@ mod tests {
             b"three",
             "a failed download leaves the working executable alone"
         );
-        assert!(!dir.join("Braid.new.exe").exists());
+        assert!(!dir.join("Fetchrail.new.exe").exists());
         fs::remove_dir_all(dir).unwrap();
     }
 }

@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Braid · Download companion</title>
+  <title>Fetchrail · Download companion</title>
   <link rel="icon" href="icon.svg" />
   <link rel="stylesheet" href="panel.css" />
 </head>
@@ -11,7 +11,7 @@
   <main class="shell">
     <header>
       <img src="icon.svg" width="28" height="28" alt="" />
-      <h1>Braid</h1>
+      <h1>Fetchrail</h1>
       <button id="connection" class="connection" title="Check connection"><span class="dot"></span><span id="connection-text">Connecting…</span></button>
       <button id="open-app" class="text-button">Open app <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 7h10v10M7 17 17 7"/></svg></button>
       <button id="expand" class="icon-button" title="Open in a tab" aria-label="Open in a tab"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M15 3h6v6M21 3l-7 7M3 21l7-7M9 21H3v-6"/></svg></button>
@@ -19,7 +19,7 @@
     <p id="notice" role="status" hidden></p>
     <section id="offline" hidden>
       <img class="offline-mark" src="icon.svg" width="64" height="64" alt="" />
-      <h2>Can't reach Braid</h2>
+      <h2>Can't reach Fetchrail</h2>
       <p>Trying again starts the desktop app if it is installed.</p>
       <button id="retry" class="primary">Try again</button>
     </section>
@@ -37,7 +37,7 @@
         <div><span class="caption">Downloading now</span><div class="hero"><strong id="speed">0</strong><span id="speed-unit">MB/s</span></div></div>
         <div class="stats-side"><span><span id="active">0</span> running · <span id="queued">0</span> waiting</span><select id="status-filter" aria-label="Filter downloads"><option value="all">Recent</option><option value="active">Active</option><option value="paused">Paused</option><option value="failed">Failed</option><option value="completed">Completed</option></select></div>
       </div>
-      <div id="downloads" class="scroll"><p class="empty">Connect to Braid to see your downloads.</p></div>
+      <div id="downloads" class="scroll"><p class="empty">Connect to Fetchrail to see your downloads.</p></div>
       <p id="list-note" class="list-note" hidden></p>
     </section>
     <section id="links-view" hidden>
@@ -47,7 +47,7 @@
       <div id="links" class="scroll"><p class="empty">Scan a page to choose files to download.</p></div>
     </section>
     <div class="action-bar">
-      <label class="capture"><span>Send browser downloads to Braid</span><input id="automatic-downloads" class="switch" type="checkbox" checked /></label>
+      <label class="capture"><span>Send browser downloads to Fetchrail</span><input id="automatic-downloads" class="switch" type="checkbox" checked /></label>
       <details class="transfer-options">
         <summary><span id="options-summary">Default queue · default connections · starts now</span><b></b></summary>
         <label class="option-row">Connections <select id="connections" aria-label="Connections"><option value="0">App default</option><option value="1">Up to 1</option><option value="2">Up to 2</option><option value="4">Up to 4</option><option value="8">Up to 8</option><option value="16">Up to 16</option><option value="32">Up to 32</option></select></label>
@@ -58,7 +58,7 @@
       </details>
       <button id="download-selected" class="primary" disabled hidden>Download selected</button>
     </div>
-    <footer><span>Local engine · No cloud required</span><span id="version">Braid</span></footer>
+    <footer><span>Local engine · No cloud required</span><span id="version">Fetchrail</span></footer>
   </main>
   <template id="download-template">
     <article class="transfer">

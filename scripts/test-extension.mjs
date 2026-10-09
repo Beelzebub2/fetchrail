@@ -15,8 +15,8 @@ const { build: runningBuild } = JSON.parse(await readFile(new URL("../browser-ex
 let diskBuild = runningBuild;
 const api = {
   runtime: {
-    id: "braid-test",
-    getURL: (path) => "chrome-extension://braid-test/" + path,
+    id: "fetchrail-test",
+    getURL: (path) => "chrome-extension://fetchrail-test/" + path,
     onInstalled: { addListener() {} }, onStartup: { addListener() {} },
     onMessage: { addListener(value) { listener = value; } },
     async getContexts() { return openPanels; },
@@ -30,7 +30,7 @@ const api = {
     },
   },
   alarms: {
-    create(name, options) { assert.equal(name, "braid.extensionUpdate"); assert.equal(options.periodInMinutes, 1); },
+    create(name, options) { assert.equal(name, "fetchrail.extensionUpdate"); assert.equal(options.periodInMinutes, 1); },
     onAlarm: { addListener(value) { alarmListener = value; } },
   },
   storage: { local: {
@@ -80,7 +80,7 @@ diskBuild = "f".repeat(64);
 openPanels = [{ contextType: "TAB" }];
 await checkUpdate();
 assert.equal(reloads, 0, "an open panel may hold an unsent draft");
-assert.equal(stored.braidReloadAttempt, undefined);
+assert.equal(stored.fetchrailReloadAttempt, undefined);
 openPanels = [];
 let releaseNative;
 holdNativeRequest = new Promise((resolve) => { releaseNative = resolve; });
@@ -110,7 +110,7 @@ api.extension = { getViews: () => [{ location: { href: api.runtime.getURL("panel
 await checkUpdate();
 assert.equal(reloads, 1);
 api.extension.getViews = () => [];
-alarmListener({ name: "braid.extensionUpdate" });
+alarmListener({ name: "fetchrail.extensionUpdate" });
 await new Promise(setImmediate);
 assert.equal(reloads, 2);
 // A stale unpacked installation can lack newly declared permissions until it reloads.

@@ -50,12 +50,12 @@ jobs:
         run: npm run release:build
       - name: Check bundled interface and native bridge
         run: |
-          $app = Start-Process -FilePath "$PWD/src-tauri/target/release/braid.exe" -ArgumentList '--background' -WindowStyle Hidden -PassThru
+          $app = Start-Process -FilePath "$PWD/src-tauri/target/release/fetchrail.exe" -ArgumentList '--background' -WindowStyle Hidden -PassThru
           try {
             $config = Join-Path $env:APPDATA 'com.rrmtools.braid/browser-bridge.json'
             $deadline = (Get-Date).AddSeconds(45)
             while (-not (Test-Path -LiteralPath $config)) {
-              if ($app.HasExited -or (Get-Date) -ge $deadline) { throw 'Braid did not start its browser bridge.' }
+              if ($app.HasExited -or (Get-Date) -ge $deadline) { throw 'Fetchrail did not start its browser bridge.' }
               Start-Sleep -Milliseconds 250
             }
             npm run browser:test -- --frontend
@@ -79,11 +79,11 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           $tag = $env:GITHUB_REF_NAME
-          $assets = @("release-artifacts/Braid-Setup-$tag-windows-x64.exe", "release-artifacts/Braid-Setup-$tag-windows-x64.sha256", "release-artifacts/latest.json")
+          $assets = @("release-artifacts/Fetchrail-Setup-$tag-windows-x64.exe", "release-artifacts/Fetchrail-Setup-$tag-windows-x64.sha256", "release-artifacts/latest.json")
           gh release view $tag --repo "$env:GITHUB_REPOSITORY" *> $null
           if ($LASTEXITCODE -eq 0) {
             gh release upload $tag @assets --clobber --repo "$env:GITHUB_REPOSITORY"
           } else {
-            gh release create $tag @assets --verify-tag --title "Braid $tag" --generate-notes --repo "$env:GITHUB_REPOSITORY"
+            gh release create $tag @assets --verify-tag --title "Fetchrail $tag" --generate-notes --repo "$env:GITHUB_REPOSITORY"
           }
           if ($LASTEXITCODE -ne 0) { throw 'Release publication failed.' }

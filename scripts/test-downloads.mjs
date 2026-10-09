@@ -10,10 +10,10 @@ import { fileURLToPath } from "node:url";
 import { setTimeout as delay } from "node:timers/promises";
 import vm from "node:vm";
 
-// Run with Braid closed. Original settings and history are restored in finally.
+// Run with Fetchrail closed. Original settings and history are restored in finally.
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
 const bin = resolve(root, process.argv[2] ?? "src-tauri/target/release");
-await access(join(bin, "braid.exe"));
+await access(join(bin, "fetchrail.exe"));
 const stateDir = join(process.env.APPDATA, "com.rrmtools.braid");
 const read = (name) => readFile(join(stateDir, name));
 const original = Object.fromEntries(await Promise.all(["downloads.json", "settings.json", "queues.json"].map(async (name) => [name, await read(name).catch((error) => { if (error.code === "ENOENT") return null; throw error; })])));
@@ -28,8 +28,8 @@ try {
     socket.once("error", () => done(false));
   });
 } catch {}
-assert.equal(running, false, "Close Braid before running the isolated download check.");
-const out = await mkdtemp(join(tmpdir(), "braid-download-check-"));
+assert.equal(running, false, "Close Fetchrail before running the isolated download check.");
+const out = await mkdtemp(join(tmpdir(), "fetchrail-download-check-"));
 let app;
 let host;
 const ids = [];
@@ -47,7 +47,7 @@ const server = createServer((request, response) => {
   observed.set(name, entry);
   response.setHeader("Content-Type", "application/octet-stream");
   if (name.startsWith("collision-")) response.setHeader("Content-Disposition", 'attachment; filename="same-name.bin"');
-  response.setHeader("ETag", '"braid-test-v1"');
+  response.setHeader("ETag", '"fetchrail-test-v1"');
   if (name !== "unknown.bin") response.setHeader("Accept-Ranges", "bytes");
   if (request.method === "HEAD") {
     if (name !== "unknown.bin") response.setHeader("Content-Length", data.length);
@@ -82,7 +82,7 @@ async function waitFor(fn, label, timeout = 20000) {
 async function launch() {
   let previousToken;
   try { previousToken = JSON.parse(await read("browser-bridge.json")).token; } catch {}
-  app = spawn(join(bin, "braid.exe"), ["--background"], { windowsHide: true, stdio: ["ignore", "ignore", "pipe"] });
+  app = spawn(join(bin, "fetchrail.exe"), ["--background"], { windowsHide: true, stdio: ["ignore", "ignore", "pipe"] });
   app.stderr.on("data", (chunk) => process.stderr.write(chunk));
   let startupError;
   app.once("error", (error) => { startupError = error; });
@@ -139,7 +139,7 @@ try {
     categories: [{ name: "Archives", extensions: ["zip"], folder: "Sorted" }] };
   await writeFile(join(stateDir, "settings.json"), JSON.stringify(settings));
   await launch();
-  host = spawn(join(bin, "braid.exe"), ["chrome-extension://fkmedfamaoejlhddajndhjemiedmnldh/"], { windowsHide: true, stdio: ["pipe", "pipe", "inherit"] });
+  host = spawn(join(bin, "fetchrail.exe"), ["chrome-extension://fkmedfamaoejlhddajndhjemiedmnldh/"], { windowsHide: true, stdio: ["pipe", "pipe", "inherit"] });
   let buffer = Buffer.alloc(0);
   host.stdout.on("data", (chunk) => {
     buffer = Buffer.concat([buffer, chunk]);
@@ -283,6 +283,6 @@ try {
     else await rm(join(stateDir, name), { force: true });
   }
   for (const id of ids) { const target = resolve(stateDir, "parts", id); assert.ok(target.startsWith(resolve(stateDir, "parts") + "\\")); await rm(target, { recursive: true, force: true }); }
-  assert.ok(resolve(out).startsWith(resolve(tmpdir()) + "\\braid-download-check-"));
+  assert.ok(resolve(out).startsWith(resolve(tmpdir()) + "\\fetchrail-download-check-"));
   await rm(out, { recursive: true, force: true });
 }

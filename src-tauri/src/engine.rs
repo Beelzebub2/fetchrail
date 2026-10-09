@@ -33,13 +33,13 @@ use crate::model::{
     DownloadStatus, EngineOverview, QueueRecord, SegmentProgress,
 };
 
-const DOWNLOAD_EVENT: &str = "braid://download-updated";
-const SETTINGS_EVENT: &str = "braid://settings-updated";
+const DOWNLOAD_EVENT: &str = "fetchrail://download-updated";
+const SETTINGS_EVENT: &str = "fetchrail://settings-updated";
 const STATE_FILE: &str = "downloads.json";
 const SETTINGS_FILE: &str = "settings.json";
 const QUEUES_FILE: &str = "queues.json";
-const QUEUES_EVENT: &str = "braid://queues-updated";
-const REMOVED_EVENT: &str = "braid://download-removed";
+const QUEUES_EVENT: &str = "fetchrail://queues-updated";
+const REMOVED_EVENT: &str = "fetchrail://download-removed";
 
 #[derive(Debug, thiserror::Error)]
 enum EngineError {
@@ -227,7 +227,7 @@ impl DownloadManager {
         }
 
         let client = Client::builder()
-            .user_agent(concat!("Braid/", env!("CARGO_PKG_VERSION")))
+            .user_agent(concat!("Fetchrail/", env!("CARGO_PKG_VERSION")))
             .redirect(reqwest::redirect::Policy::limited(10))
             .pool_max_idle_per_host(32)
             .tcp_nodelay(true)
@@ -1468,7 +1468,7 @@ impl DownloadManager {
             .file_name()
             .and_then(|value| value.to_str())
             .unwrap_or("download");
-        let temp_name = format!(".{}.{}.braid-part", safe_file_name(desired_name), record.id);
+        let temp_name = format!(".{}.{}.fetchrail-part", safe_file_name(desired_name), record.id);
         let temp_path = parent.join(temp_name);
         let output = fs::File::create(&temp_path).await?;
         let mut output = BufWriter::with_capacity(1024 * 1024, output);
@@ -1644,7 +1644,7 @@ fn sync_startup_registration(enabled: bool) -> Result<(), String> {
     use winreg::{enums::HKEY_CURRENT_USER, RegKey};
 
     let current_exe =
-        std::env::current_exe().map_err(|error| format!("Could not locate Braid: {error}"))?;
+        std::env::current_exe().map_err(|error| format!("Could not locate Fetchrail: {error}"))?;
     let hkcu = RegKey::predef(HKEY_CURRENT_USER);
     let (run_key, _) = hkcu
         .create_subkey(r"Software\Microsoft\Windows\CurrentVersion\Run")
@@ -1652,14 +1652,17 @@ fn sync_startup_registration(enabled: bool) -> Result<(), String> {
     if enabled {
         let command = format!("\"{}\" --background", current_exe.to_string_lossy());
         run_key
-            .set_value("Braid", &command)
+            .set_value("Fetchrail", &command)
             .map_err(|error| format!("Could not enable launch on startup: {error}"))?;
+        let _ = run_key.delete_value("Braid");
     } else {
-        match run_key.delete_value("Braid") {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => {
-                return Err(format!("Could not disable launch on startup: {error}"));
+        for name in ["Fetchrail", "Braid"] {
+            match run_key.delete_value(name) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(format!("Could not disable launch on startup: {error}"));
+                }
             }
         }
     }
@@ -1999,7 +2002,7 @@ mod tests {
 
     #[tokio::test]
     async fn connections_report_saved_bytes_per_part() {
-        let dir = std::env::temp_dir().join(format!("braid-segments-test-{}", Uuid::new_v4()));
+        let dir = std::env::temp_dir().join(format!("fetchrail-segments-test-{}", Uuid::new_v4()));
         tokio::fs::create_dir_all(&dir).await.unwrap();
         tokio::fs::write(dir.join("0.part"), [0u8; 30])
             .await
@@ -2034,7 +2037,7 @@ mod tests {
 
     #[tokio::test]
     async fn saved_parts_only_resume_for_the_same_representation_and_layout() {
-        let dir = std::env::temp_dir().join(format!("braid-parts-test-{}", Uuid::new_v4()));
+        let dir = std::env::temp_dir().join(format!("fetchrail-parts-test-{}", Uuid::new_v4()));
         let probe = super::ProbeResult {
             total_bytes: Some(100),
             accepts_ranges: true,

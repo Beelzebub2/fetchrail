@@ -180,7 +180,7 @@ function folderOf(category: Category | null, settings: DownloadSettings) {
 function updateNote(update: UpdateStatus) {
   switch (update.state) {
     case "unmanaged":
-      return "This copy was not installed with Braid Setup, so it does not update itself.";
+      return "This copy was not installed with Fetchrail Setup, so it does not update itself.";
     case "checking":
       return "Checking for a new version…";
     case "downloading":
@@ -421,7 +421,7 @@ function App() {
       })
       .catch((error) => setMessage(String(error)));
 
-    const unlisten = listen<DownloadRecord>("braid://download-updated", (event) => {
+    const unlisten = listen<DownloadRecord>("fetchrail://download-updated", (event) => {
       setDownloads((current) => {
         const exists = current.some((item) => item.id === event.payload.id);
         const next = exists
@@ -435,10 +435,10 @@ function App() {
       void refreshOverview();
     });
 
-    const unlistenRemoved = listen<string>("braid://download-removed", (event) =>
+    const unlistenRemoved = listen<string>("fetchrail://download-removed", (event) =>
       setDownloads((current) => current.filter((item) => item.id !== event.payload)),
     );
-    const unlistenQueues = listen<QueueRecord[]>("braid://queues-updated", (event) => {
+    const unlistenQueues = listen<QueueRecord[]>("fetchrail://queues-updated", (event) => {
       setQueues(event.payload);
       setSelectedQueue((current) =>
         event.payload.some((queue) => queue.name === current)
@@ -446,8 +446,8 @@ function App() {
           : event.payload[0]?.name ?? "Default",
       );
     });
-    const unlistenSettings = listen<DownloadSettings>("braid://settings-updated", (event) => setSettings(event.payload));
-    const unlistenUpdate = listen<UpdateStatus>("braid://update-status", (event) => setUpdate(event.payload));
+    const unlistenSettings = listen<DownloadSettings>("fetchrail://settings-updated", (event) => setSettings(event.payload));
+    const unlistenUpdate = listen<UpdateStatus>("fetchrail://update-status", (event) => setUpdate(event.payload));
     void invoke<UpdateStatus>("update_status").then((status) => !disposed && setUpdate(status));
     void getVersion().then((current) => !disposed && setVersion(current));
 
@@ -622,7 +622,7 @@ function App() {
       <aside className="sidebar">
         <div className="brand">
           <Logo />
-          <span className="nav-label">Braid</span>
+          <span className="nav-label">Fetchrail</span>
         </div>
 
         <nav className="nav-list" aria-label="Views">
@@ -834,7 +834,7 @@ function App() {
             <div className="modal-head">
               <div>
                 <h2 id="add-download-title">New download</h2>
-                <p>Braid checks the server first and opens parallel connections when it supports them.</p>
+                <p>Fetchrail checks the server first and opens parallel connections when it supports them.</p>
               </div>
               <button
                 type="button"
@@ -1393,7 +1393,7 @@ function SettingsPage({
         <section className="card" aria-labelledby="download-settings-title">
           <div className="card-head">
             <h2 id="download-settings-title">Downloads</h2>
-            <p>Where files land and how many connections Braid opens.</p>
+            <p>Where files land and how many connections Fetchrail opens.</p>
           </div>
           <label>
             Default download folder
@@ -1443,7 +1443,7 @@ function SettingsPage({
             {Array.from({ length: parts }, (_, index) => <span key={index} />)}
           </div>
           <p className="hint">
-            Each file is split into up to {parts} {parts === 1 ? "part" : "parts"}. Braid falls back to one connection
+            Each file is split into up to {parts} {parts === 1 ? "part" : "parts"}. Fetchrail falls back to one connection
             when a server does not support byte ranges.
           </p>
         </section>
@@ -1513,7 +1513,7 @@ function SettingsPage({
             <label>
               <span className="grow">
                 <strong>Launch on Windows startup</strong>
-                <small>Start Braid in the background after you sign in.</small>
+                <small>Start Fetchrail in the background after you sign in.</small>
               </span>
               <input
                 className="switch"
@@ -1548,7 +1548,7 @@ function SettingsPage({
             </label>
             <div>
               <div className="grow">
-                <strong>Braid {version}</strong>
+                <strong>Fetchrail {version}</strong>
                 <small role="status">{updateNote(update)}</small>
               </div>
               {update.state === "ready" ? (
@@ -1583,7 +1583,7 @@ function SettingsPage({
             </button>
           </div>
           <p className="hint">
-            Updates follow Braid automatically within about a minute after all companion panels close. Firefox
+            Updates follow Fetchrail automatically within about a minute after all companion panels close. Firefox
             development builds use Load Temporary Add-on in about:debugging and must be loaded again after a browser
             restart.
           </p>
@@ -1738,10 +1738,10 @@ export function DownloadPrompt({ id }: { id: string }) {
       })
       .catch((error) => setMessage(String(error)));
     // Started, removed or finished from the main window: there is nothing left to ask.
-    const unlisten = listen<DownloadRecord>("braid://download-updated", (event) => {
+    const unlisten = listen<DownloadRecord>("fetchrail://download-updated", (event) => {
       if (event.payload.id === id && event.payload.status !== "paused") void getCurrentWindow().destroy();
     });
-    const unlistenRemoved = listen<string>("braid://download-removed", (event) => {
+    const unlistenRemoved = listen<string>("fetchrail://download-removed", (event) => {
       if (event.payload === id) void getCurrentWindow().destroy();
     });
     return () => {
@@ -1864,7 +1864,7 @@ export function DownloadPrompt({ id }: { id: string }) {
   );
 }
 
-// The setup program: this window is all there is to installing or removing Braid.
+// The setup program: this window is all there is to installing or removing Fetchrail.
 export function Setup() {
   const [info, setInfo] = useState<SetupInfo | null>(null);
   const [dir, setDir] = useState("");
@@ -1912,10 +1912,10 @@ export function Setup() {
   const tagline =
     phase === "done"
       ? removing
-        ? "Braid was removed."
-        : "Braid is installed. Starting it now…"
+        ? "Fetchrail was removed."
+        : "Fetchrail is installed. Starting it now…"
       : removing
-        ? "Remove Braid from this PC?"
+        ? "Remove Fetchrail from this PC?"
         : "Many connections, one file.";
 
   return (
@@ -1928,7 +1928,7 @@ export function Setup() {
       }}
     >
       <header data-tauri-drag-region>
-        <span data-tauri-drag-region>Braid Setup</span>
+        <span data-tauri-drag-region>Fetchrail Setup</span>
         <button type="button" className="icon-button small" onClick={() => void getCurrentWindow().minimize()} aria-label="Minimize">
           <Minus size={16} />
         </button>
@@ -1944,7 +1944,7 @@ export function Setup() {
       </header>
       <div className="setup-hero">
         <Logo size={76} />
-        <h1>Braid</h1>
+        <h1>Fetchrail</h1>
         <p role="status">{tagline}</p>
       </div>
       <div className="setup-body">
@@ -1963,7 +1963,7 @@ export function Setup() {
                   disabled={info.installed || phase !== "ready"}
                   onClick={async () => {
                     const selected = await open({ directory: true, multiple: false });
-                    if (typeof selected === "string") setDir(selected.replace(/[\\/]+$/, "") + "\\Braid");
+                    if (typeof selected === "string") setDir(selected.replace(/[\\/]+$/, "") + "\\Fetchrail");
                   }}
                 >
                   <FolderOpen size={16} /> Browse

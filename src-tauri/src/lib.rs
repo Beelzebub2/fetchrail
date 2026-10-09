@@ -214,7 +214,7 @@ pub(crate) fn prompt_for_download(app: &AppHandle, id: Uuid) {
     .center()
     .build();
     if let Err(error) = window {
-        eprintln!("Braid download prompt: {error}");
+        eprintln!("Fetchrail download prompt: {error}");
     }
 }
 
@@ -243,8 +243,8 @@ fn require_webview() {
         unsafe {
             MessageBoxW(
                 None,
-                w!("Braid needs the Microsoft Edge WebView2 Runtime, which this PC does not have.\n\nInstall it from developer.microsoft.com/microsoft-edge/webview2 and start Braid again."),
-                w!("Braid"),
+                w!("Fetchrail needs the Microsoft Edge WebView2 Runtime, which this PC does not have.\n\nInstall it from developer.microsoft.com/microsoft-edge/webview2 and start Fetchrail again."),
+                w!("Fetchrail"),
                 MB_OK | MB_ICONWARNING,
             );
         }
@@ -259,7 +259,7 @@ struct SetupInfo {
     mode: install::SetupMode,
     version: &'static str,
     dir: String,
-    /// An earlier setup put Braid in `dir`; this one replaces it there.
+    /// An earlier setup put Fetchrail in `dir`; this one replaces it there.
     installed: bool,
     desktop_shortcut: bool,
 }
@@ -311,13 +311,13 @@ fn setup_finish(app: AppHandle, launch_on_start: bool) -> Result<(), String> {
     Ok(())
 }
 
-/// Runs the setup program: a single window that installs or removes Braid.
+/// Runs the setup program: a single window that installs or removes Fetchrail.
 #[cfg(windows)]
 pub fn run_setup(mode: install::SetupMode) {
     if std::env::args().any(|argument| argument == "--silent") {
         let result = install::run_silent(mode);
         if let Err(error) = &result {
-            eprintln!("Braid setup: {error}");
+            eprintln!("Fetchrail setup: {error}");
         }
         std::process::exit(i32::from(result.is_err()));
     }
@@ -331,7 +331,7 @@ pub fn run_setup(mode: install::SetupMode) {
                 install::SetupMode::Uninstall => "index.html?setup=uninstall",
             };
             tauri::WebviewWindowBuilder::new(app, "setup", tauri::WebviewUrl::App(page.into()))
-                .title("Braid Setup")
+                .title("Fetchrail Setup")
                 .inner_size(520.0, 620.0)
                 .resizable(false)
                 .maximizable(false)
@@ -348,7 +348,7 @@ pub fn run_setup(mode: install::SetupMode) {
             setup_finish,
         ])
         .run(context())
-        .expect("error while running Braid Setup");
+        .expect("error while running Fetchrail Setup");
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -381,7 +381,7 @@ pub fn run() {
             tauri::WebviewWindowBuilder::from_config(app.handle(), &app.config().app.windows[0])?
                 .build()?;
             if let Err(error) = browser_extension::install(app.handle()) {
-                eprintln!("Braid browser extension: {error}");
+                eprintln!("Fetchrail browser extension: {error}");
             }
             let manager =
                 tauri::async_runtime::block_on(DownloadManager::load(app.handle().clone()))
@@ -409,7 +409,7 @@ pub fn run() {
             tauri::async_runtime::block_on(browser_bridge::start(app.handle().clone(), manager))
                 .map_err(std::io::Error::other)?;
 
-            let show_item = MenuItem::with_id(app, "show", "Show Braid", true, None::<&str>)?;
+            let show_item = MenuItem::with_id(app, "show", "Show Fetchrail", true, None::<&str>)?;
             let extension_item = MenuItem::with_id(
                 app,
                 "extension",
@@ -417,12 +417,12 @@ pub fn run() {
                 true,
                 None::<&str>,
             )?;
-            let quit_item = MenuItem::with_id(app, "quit", "Quit Braid", true, None::<&str>)?;
+            let quit_item = MenuItem::with_id(app, "quit", "Quit Fetchrail", true, None::<&str>)?;
             let tray_menu = Menu::with_items(app, &[&show_item, &extension_item, &quit_item])?;
             TrayIconBuilder::new()
                 // The simplified mark stays legible at tray size.
                 .icon(tauri::include_image!("icons/tray.png"))
-                .tooltip("Braid Download Manager")
+                .tooltip("Fetchrail Download Manager")
                 .menu(&tray_menu)
                 .show_menu_on_left_click(false)
                 .on_menu_event(|app, event| match event.id().as_ref() {
@@ -432,7 +432,7 @@ pub fn run() {
                             app,
                             browser_extension::Browser::Chromium,
                         ) {
-                            eprintln!("Braid browser extension: {error}");
+                            eprintln!("Fetchrail browser extension: {error}");
                         }
                     }
                     "quit" => app.exit(0),
@@ -507,5 +507,5 @@ pub fn run() {
             restart_app,
         ])
         .run(context())
-        .expect("error while running Braid");
+        .expect("error while running Fetchrail");
 }

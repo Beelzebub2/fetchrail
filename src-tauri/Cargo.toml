@@ -1,10 +1,10 @@
 [package]
-name = "braid"
+name = "fetchrail"
 version = "0.5.0"
-description = "Braid high-performance download manager"
+description = "Fetchrail high-performance download manager"
 authors = ["RRMTools"]
 edition = "2021"
-default-run = "braid"
+default-run = "fetchrail"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
@@ -12,7 +12,7 @@ default-run = "braid"
 # The `_lib` suffix may seem redundant but it is necessary
 # to make the lib name unique and wouldn't conflict with the bin name.
 # This seems to be only an issue on Windows, see https://github.com/rust-lang/cargo/issues/8519
-name = "braid_lib"
+name = "fetchrail_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]

@@ -34,10 +34,10 @@ pub async fn start(app: AppHandle, manager: Arc<DownloadManager>) -> Result<(), 
     let data_dir = app
         .path()
         .app_data_dir()
-        .map_err(|error| format!("Could not locate Braid app data: {error}"))?;
+        .map_err(|error| format!("Could not locate Fetchrail app data: {error}"))?;
     tokio::fs::create_dir_all(&data_dir)
         .await
-        .map_err(|error| format!("Could not create Braid app data: {error}"))?;
+        .map_err(|error| format!("Could not create Fetchrail app data: {error}"))?;
     let config_bytes = serde_json::to_vec(&config)
         .map_err(|error| format!("Could not serialize browser bridge state: {error}"))?;
     tokio::fs::write(data_dir.join(BRIDGE_CONFIG_FILE), config_bytes)
@@ -54,7 +54,7 @@ pub async fn start(app: AppHandle, manager: Arc<DownloadManager>) -> Result<(), 
             let token = config.token.clone();
             tauri::async_runtime::spawn(async move {
                 if let Err(error) = handle_connection(stream, app, manager, &token).await {
-                    eprintln!("Braid browser bridge: {error}");
+                    eprintln!("Fetchrail browser bridge: {error}");
                 }
             });
         }

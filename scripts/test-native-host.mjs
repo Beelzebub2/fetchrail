@@ -6,7 +6,7 @@ import { fileURLToPath } from "node:url";
 
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
 const frontend = process.argv[2] === "--frontend";
-const host = join(resolve(root, process.argv[3] ?? "src-tauri/target/release"), "braid.exe");
+const host = join(resolve(root, process.argv[3] ?? "src-tauri/target/release"), "fetchrail.exe");
 const child = spawn(host, ["chrome-extension://fkmedfamaoejlhddajndhjemiedmnldh/"], { stdio: ["pipe", "pipe", "inherit"], windowsHide: true });
 const url = frontend ? undefined : process.argv[2];
 
@@ -30,7 +30,7 @@ child.stdin.write(Buffer.concat([header, request]));
 
 let output = Buffer.alloc(0);
 const timeout = setTimeout(() => {
-  console.error(frontend ? "Timed out waiting for the bundled Braid interface to render and connect to the engine." : "Timed out waiting for the Braid native host.");
+  console.error(frontend ? "Timed out waiting for the bundled Fetchrail interface to render and connect to the engine." : "Timed out waiting for the Fetchrail native host.");
   child.kill();
   process.exitCode = 1;
 }, frontend ? 45000 : 20000);
