@@ -53,6 +53,11 @@ try {
         if (name === "get_download") return structuredClone(window.testRecord);
         if (name === "list_downloads") return [structuredClone(window.testRecord)];
         if (name === "get_settings") return structuredClone(window.testSettings);
+        if (name === "get_overview") return { active: 0, queued: 0, completed: 1, failed: 0, currentSpeedBps: 0 };
+        if (name === "list_queues") return [{ name: "Default", paused: false, startsAt: null, stopsAt: null }];
+        if (name === "plugin:app|version") return "0.5.2";
+        if (name === "update_status") return { state: "current" };
+        if (name === "restart_app") throw "Could not restart Fetchrail: test launch failure";
         if (name === "pause_download") window.testRecord.status = "paused";
         else if (name === "resume_download") window.testRecord.status = "downloading";
         else if (name === "cancel_download") window.testRecord.status = "cancelled";
@@ -137,8 +142,51 @@ try {
   await page.waitForFunction(() => window.testCalls.some((call) => call.name === "resume_download"));
   const promptCalls = await page.evaluate(() => window.testCalls.map((call) => call.name));
   assert.ok(promptCalls.indexOf("show_download_progress") < promptCalls.indexOf("resume_download"), "Start must open the progress window before the transfer begins.");
+  await page.goto(base);
+  await page.getByRole("button", { name: "Settings", exact: true }).click();
+  await page.getByRole("heading", { name: "Background behavior" }).waitFor();
+  for (const width of [960, 1280, 1440]) {
+    await page.setViewportSize({ width, height: 1000 });
+    for (const state of ["failed", "ready"]) {
+      await page.evaluate((state) => window.testEmit("fetchrail://update-status", state === "ready"
+        ? { state, version: "0.5.3" }
+        : { state, message: "error sending request for url (https://github.com/Beelzebub2/fetchrail/releases/latest/download/latest.json?" + "x".repeat(200) + ")" }), state);
+      const background = page.locator('[aria-labelledby="background-settings-title"]');
+      await background.getByRole("status").filter({ hasText: state === "ready" ? "0.5.3" : "Could not check" }).waitFor();
+      const layout = await background.evaluate((card) => {
+        const bounds = card.getBoundingClientRect();
+        const row = card.querySelector(".update-row");
+        const status = row.querySelector('[role="status"]');
+        const ranges = document.createRange();
+        ranges.selectNodeContents(status);
+        const contained = (rect) => rect.left >= bounds.left && rect.right <= bounds.right && rect.bottom <= bounds.bottom;
+        return {
+          togglesContained: [...card.querySelectorAll(".switch")].every((input) => {
+            const label = input.previousElementSibling.getBoundingClientRect();
+            const toggle = input.getBoundingClientRect();
+            return contained(toggle) && label.right <= toggle.left;
+          }),
+          buttonContained: contained(row.querySelector("button").getBoundingClientRect()),
+          textContained: [...ranges.getClientRects()].every(contained),
+        };
+      });
+      assert.deepEqual(layout, { togglesContained: true, buttonContained: true, textContained: true }, `Settings ${width}px/${state} must stay inside its card.`);
+      if (width === 1280) {
+        await background.scrollIntoViewIfNeeded();
+        await page.screenshot({ path: join(output, `settings-${state}.png`), fullPage: true });
+      }
+    }
+  }
+  await page.locator('[aria-labelledby="background-settings-title"]').getByRole("button", { name: "Restart to update" }).click();
+  await page.getByRole("alert").filter({ hasText: "Could not restart Fetchrail: test launch failure" }).waitFor();
+  assert.equal(await page.getByRole("heading", { name: "Background behavior" }).isVisible(), true, "A failed relaunch must keep the app open and explain the error.");
+  await page.getByRole("button", { name: "Dismiss error" }).click();
+  await page.locator(".sidebar").getByRole("button", { name: /Restart to update/ }).click();
+  await page.getByRole("alert").filter({ hasText: "Could not restart Fetchrail: test launch failure" }).waitFor();
+  assert.equal(await page.evaluate(() => window.testCalls.filter((call) => call.name === "restart_app").length), 2);
   assert.deepEqual(errors, []);
   console.log("PASS: live progress, connection details, pause/resume/cancel, speed limits, completion settings, keyboard tabs, themes, completion actions, close behavior, and prompt handoff");
+  console.log("PASS: settings contain switches, update buttons and long error text; both restart actions report launch failures");
   console.log("Screenshots: " + output);
 } finally {
   await browser.close();

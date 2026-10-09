@@ -92,6 +92,8 @@ npm run release:package
 ```
 
 The optimized executable is `src-tauri/target/release/fetchrail.exe`. Packaged setup and its SHA-256 checksum are written to `release-artifacts/`.
+The desktop build produces only the Rust library needed by the executable, avoiding unused static and shared library outputs. Release optimization settings stay enabled.
+
 
 Release builds enable `tauri/custom-protocol` to embed the frontend. A release build without this feature fails compilation instead of shipping an executable that requires the development server. `npm run tauri build -- --no-bundle` also enables it automatically.
 
@@ -136,6 +138,8 @@ npm run release:check
 Pass a specific tag after `--` to validate it explicitly.
 
 The Windows runner builds the frontend, companions, and executable; checks Rust formatting; runs Rust and browser checks; verifies the bundled interface and bridge; and tests real multi-connection downloads, silent setup, and removal before publishing.
+Pushes to `main` run the same build and checks and cache compiled Rust dependencies. Tag builds reuse the cache from `main`; only tags package, sign, and publish releases. A new Rust toolchain or changed dependencies can require rebuilding the cache.
+
 
 Release assets are:
 

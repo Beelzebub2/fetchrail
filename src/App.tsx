@@ -731,7 +731,7 @@ function App() {
           {update.state === "ready" && (
             <button
               className="nav-item update-ready"
-              onClick={() => void invoke("restart_app")}
+              onClick={() => void invoke("restart_app").catch((error) => setMessage(String(error)))}
               title={`Restart to finish updating to ${update.version}`}
             >
               <RotateCw size={16} />
@@ -771,6 +771,7 @@ function App() {
             update={update}
             onClose={() => setShowSettings(false)}
             onSave={saveSettings}
+            onRestart={() => void invoke("restart_app").catch((error) => setMessage(String(error)))}
             onAppearance={saveAppearance}
             onCreateQueue={(name) => queueCommand("create_queue", { name })}
             onDeleteQueue={(name) => queueCommand("delete_queue", { name })}
@@ -1417,6 +1418,7 @@ function SettingsPage({
   update,
   onClose,
   onSave,
+  onRestart,
   onAppearance,
   onCreateQueue,
   onDeleteQueue,
@@ -1430,6 +1432,7 @@ function SettingsPage({
   update: UpdateStatus;
   onClose: () => void;
   onSave: (settings: DownloadSettings) => Promise<void>;
+  onRestart: () => void;
   onAppearance: (look: Partial<Appearance>) => Promise<void>;
   onCreateQueue: (name: string) => Promise<boolean>;
   onDeleteQueue: (name: string) => Promise<boolean>;
@@ -1651,13 +1654,13 @@ function SettingsPage({
                 onChange={(event) => setDraft({ ...draft, autoUpdate: event.target.checked })}
               />
             </label>
-            <div>
+            <div className="update-row">
               <div className="grow">
                 <strong>Fetchrail {version}</strong>
                 <small role="status">{updateNote(update)}</small>
               </div>
               {update.state === "ready" ? (
-                <button type="button" className="primary-button" onClick={() => void invoke("restart_app")}>
+                <button type="button" className="primary-button" onClick={onRestart}>
                   <RotateCw size={16} /> Restart to update
                 </button>
               ) : (

@@ -223,8 +223,14 @@ async fn check_for_update(app: AppHandle) -> serde_json::Value {
 }
 
 #[tauri::command]
-fn restart_app(app: AppHandle) {
-    app.restart();
+fn restart_app(app: AppHandle) -> Result<(), String> {
+    #[cfg(windows)]
+    return install::restart(&app);
+    #[cfg(not(windows))]
+    {
+        app.request_restart();
+        Ok(())
+    }
 }
 
 const PROMPT_WINDOW: &str = "confirm-";
