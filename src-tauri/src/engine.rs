@@ -1468,7 +1468,11 @@ impl DownloadManager {
             .file_name()
             .and_then(|value| value.to_str())
             .unwrap_or("download");
-        let temp_name = format!(".{}.{}.fetchrail-part", safe_file_name(desired_name), record.id);
+        let temp_name = format!(
+            ".{}.{}.fetchrail-part",
+            safe_file_name(desired_name),
+            record.id
+        );
         let temp_path = parent.join(temp_name);
         let output = fs::File::create(&temp_path).await?;
         let mut output = BufWriter::with_capacity(1024 * 1024, output);
