@@ -4,6 +4,7 @@ import vm from "node:vm";
 import { randomUUID } from "node:crypto";
 
 const requests = [];
+const titles = [];
 let listener;
 let alarmListener;
 let openPanels = [];
@@ -37,7 +38,7 @@ const api = {
     async set(values) { Object.assign(stored, values); },
     async remove(key) { delete stored[key]; },
   } },
-  action: { async setBadgeBackgroundColor() {}, async setBadgeText() {}, async setTitle() {} },
+  action: { async setBadgeBackgroundColor() {}, async setBadgeText() {}, async setTitle({ title }) { titles.push(title); } },
   contextMenus: { onClicked: { addListener() {} } },
   downloads: { onCreated: { addListener() {} } },
 };
@@ -112,4 +113,11 @@ api.extension.getViews = () => [];
 alarmListener({ name: "braid.extensionUpdate" });
 await new Promise(setImmediate);
 assert.equal(reloads, 2);
-console.log("Extension checks passed: sender isolation, URL validation, batches, controls, idle updates, draft protection, busy deferral, reload-loop prevention, Firefox fallback.");
+// A stale unpacked installation can lack newly declared permissions until it reloads.
+delete api.downloads;
+vm.runInContext(await readFile(new URL("../browser-extension/dist/chromium/background.js", import.meta.url), "utf8"),
+  vm.createContext({ browser: api, crypto: { randomUUID }, URL }));
+await new Promise(setImmediate);
+assert.match(titles.at(-1), /reload the extension to enable browser download capture/);
+assert.equal((await send({ type: "ping" })).ok, true, "Missing capture permission must not break the app connection.");
+console.log("Extension checks passed: sender isolation, URL validation, batches, controls, idle updates, draft protection, busy deferral, reload-loop prevention, Firefox fallback, missing download permission recovery.");

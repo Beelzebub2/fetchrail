@@ -135,7 +135,8 @@ async function routeBrowserDownload(item) {
   }
 }
 
-api.downloads.onCreated.addListener((item) => {
+if (!api.downloads?.onCreated) void setBadge("!", "Braid: reload the extension to enable browser download capture.");
+api.downloads?.onCreated?.addListener((item) => {
   if (item.state !== "in_progress" || item.paused || item.incognito
     || (item.danger && item.danger !== "safe")
     || (item.byExtensionId && item.byExtensionId !== api.runtime.id)
