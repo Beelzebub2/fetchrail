@@ -58,11 +58,20 @@ pub fn backoff(attempt: usize) -> Duration {
     Duration::from_millis(base + jitter)
 }
 
+pub fn slow_progress(bytes: u64, elapsed: Duration, best_rate: &mut f64) -> bool {
+    let rate = bytes as f64 / elapsed.as_secs_f64().max(0.001);
+    let slow = rate < 2048.0_f64.max(*best_rate * 0.05);
+    *best_rate = best_rate.max(rate);
+    slow
+}
+
 pub struct OriginGate {
     active: AtomicUsize,
     throttles: AtomicUsize,
+    waits: AtomicUsize,
     changed: Notify,
     cooldown: Mutex<Instant>,
+    admission: Mutex<()>,
 }
 
 pub struct OriginPermit(Arc<OriginGate>);
@@ -78,8 +87,10 @@ impl OriginGate {
         Self {
             active: AtomicUsize::new(0),
             throttles: AtomicUsize::new(0),
+            waits: AtomicUsize::new(0),
             changed: Notify::new(),
             cooldown: Mutex::new(Instant::now()),
+            admission: Mutex::new(()),
         }
     }
     pub async fn acquire(
@@ -87,6 +98,17 @@ impl OriginGate {
         limit: usize,
         cancel: &CancellationToken,
     ) -> Option<OriginPermit> {
+        // Queue admission so a refilling download cannot overtake jobs already waiting.
+        let _admission = match self.admission.try_lock() {
+            Ok(guard) => guard,
+            Err(_) => {
+                self.waits.fetch_add(1, Ordering::Relaxed);
+                tokio::select! {
+                    guard = self.admission.lock() => guard,
+                    _ = cancel.cancelled() => return None,
+                }
+            }
+        };
         loop {
             if cancel.is_cancelled() {
                 return None;
@@ -113,6 +135,7 @@ impl OriginGate {
                     }
                 }
             }
+            self.waits.fetch_add(1, Ordering::Relaxed);
             tokio::select! { _ = &mut notified => {}, _ = cancel.cancelled() => return None }
         }
     }
@@ -127,6 +150,12 @@ impl OriginGate {
     }
     pub fn throttles(&self) -> usize {
         self.throttles.load(Ordering::Relaxed)
+    }
+    pub fn is_waiting(&self) -> bool {
+        self.admission.try_lock().is_err()
+    }
+    pub fn waits(&self) -> usize {
+        self.waits.load(Ordering::Relaxed)
     }
 }
 
@@ -249,6 +278,52 @@ impl Adaptive {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures_util::FutureExt;
+    #[test]
+    fn slow_progress_detects_a_trickling_tail_without_rejecting_a_steady_slow_source() {
+        let window = Duration::from_secs(10);
+        let mut best = 0.0;
+        assert!(!slow_progress(8 * 1024 * 1024, window, &mut best));
+        assert!(slow_progress(40 * 1024, window, &mut best));
+        let mut best = 0.0;
+        for _ in 0..10 {
+            assert!(!slow_progress(40 * 1024, window, &mut best));
+        }
+        assert!(slow_progress(1024, window, &mut best));
+    }
+    #[tokio::test]
+    async fn origin_admits_waiters_before_refills_and_releases_cancelled_waiters() {
+        let gate = Arc::new(OriginGate::new());
+        let cancel = CancellationToken::new();
+        let held = gate.acquire(1, &cancel).await.unwrap();
+        assert_eq!(gate.waits(), 0);
+        let first = gate.acquire(1, &cancel);
+        tokio::pin!(first);
+        assert!(first.as_mut().now_or_never().is_none());
+        assert!(gate.is_waiting());
+        assert!(gate.waits() > 0);
+        drop(held);
+        let refill = gate.acquire(1, &cancel);
+        tokio::pin!(refill);
+        assert!(refill.as_mut().now_or_never().is_none());
+        let first = first.await.unwrap();
+        drop(first);
+        let held = refill.await.unwrap();
+        assert!(!gate.is_waiting());
+        assert!(
+            gate.waits() >= 2,
+            "Remember waits between sampling instants"
+        );
+        let stopped = cancel.child_token();
+        let waiting = gate.acquire(1, &stopped);
+        tokio::pin!(waiting);
+        assert!(waiting.as_mut().now_or_never().is_none());
+        stopped.cancel();
+        assert!(waiting.await.is_none());
+        assert!(!gate.is_waiting());
+        drop(held);
+        assert!(gate.acquire(1, &cancel).await.is_some());
+    }
     #[tokio::test]
     async fn bandwidth_is_shared_and_cancel_does_not_reserve_future_capacity() {
         let bandwidth = Arc::new(Bandwidth::new());
