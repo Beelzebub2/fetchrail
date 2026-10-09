@@ -15,6 +15,7 @@ use crate::native_protocol::{
 };
 
 pub const CHROMIUM_EXTENSION_ID: &str = "fkmedfamaoejlhddajndhjemiedmnldh";
+pub const CHROMIUM_STORE_EXTENSION_ID: &str = "ccmbmcgihlemlheldpkgnidgohlkaipb";
 pub const FIREFOX_EXTENSION_ID: &str = "browser@braid.rrmtools.uk";
 
 pub fn is_browser_invocation() -> bool {
@@ -22,10 +23,16 @@ pub fn is_browser_invocation() -> bool {
 }
 
 fn is_browser_invocation_args(args: impl IntoIterator<Item = OsString>) -> bool {
-    let chromium_origin = format!("chrome-extension://{CHROMIUM_EXTENSION_ID}/");
+    let chromium_origins = [
+        format!("chrome-extension://{CHROMIUM_EXTENSION_ID}/"),
+        format!("chrome-extension://{CHROMIUM_STORE_EXTENSION_ID}/"),
+    ];
     args.into_iter().any(|argument| {
         let argument = argument.to_string_lossy();
-        argument == chromium_origin || argument == FIREFOX_EXTENSION_ID
+        chromium_origins
+            .iter()
+            .any(|origin| argument == origin.as_str())
+            || argument == FIREFOX_EXTENSION_ID
     })
 }
 
@@ -208,12 +215,18 @@ mod tests {
         assert!(is_browser_invocation_args([OsString::from(format!(
             "chrome-extension://{CHROMIUM_EXTENSION_ID}/"
         ))]));
+        assert!(is_browser_invocation_args([OsString::from(format!(
+            "chrome-extension://{CHROMIUM_STORE_EXTENSION_ID}/"
+        ))]));
         assert!(is_browser_invocation_args([
             OsString::from(r"C:\manifest\com.rrmtools.braid.firefox.json"),
             OsString::from(FIREFOX_EXTENSION_ID),
         ]));
         assert!(!is_browser_invocation_args([OsString::from(
             "--background",
+        )]));
+        assert!(!is_browser_invocation_args([OsString::from(
+            "chrome-extension://arbitrary-extension-id/",
         )]));
     }
 }

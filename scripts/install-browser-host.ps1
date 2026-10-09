@@ -1,6 +1,7 @@
 param(
     [string]$HostExe = "",
-    [string]$ChromiumExtensionId = "fkmedfamaoejlhddajndhjemiedmnldh"
+    [string]$ChromiumExtensionId = "fkmedfamaoejlhddajndhjemiedmnldh",
+    [string]$ChromiumStoreExtensionId = "ccmbmcgihlemlheldpkgnidgohlkaipb"
 )
 
 $ErrorActionPreference = "Stop"
@@ -23,7 +24,10 @@ $firefoxManifest = Join-Path $manifestDir "com.rrmtools.braid.firefox.json"
     description = "Fetchrail browser integration"
     path = $hostPath
     type = "stdio"
-    allowed_origins = @("chrome-extension://$ChromiumExtensionId/")
+    allowed_origins = @(
+        "chrome-extension://$ChromiumExtensionId/"
+        "chrome-extension://$ChromiumStoreExtensionId/"
+    )
 } | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $chromiumManifest -Encoding UTF8
 
 [ordered]@{
@@ -48,5 +52,5 @@ foreach ($registration in $registrations) {
 }
 
 Write-Host "Fetchrail native host registered for Chrome, Edge, Chromium, Vivaldi, Brave and Firefox."
-Write-Host "Chromium development extension id: $ChromiumExtensionId"
+Write-Host "Chromium extension ids: $ChromiumExtensionId, $ChromiumStoreExtensionId"
 Write-Host "Open Fetchrail Settings > Browser companion > Open extension folder, then load that folder in your browser."
