@@ -88,10 +88,11 @@ The `downloads` permission supports automatic routing. Page scanning uses `activ
 The unpacked Chromium development key keeps its extension ID stable across folder changes:
 
 ```text
-fkmedfamaoejlhddajndhjemiedmnldh
+Development unpacked extension: fkmedfamaoejlhddajndhjemiedmnldh
+Chrome Web Store extension: ccmbmcgihlemlheldpkgnidgohlkaipb
 ```
 
-The registration script allow-lists this ID for Chrome, Edge, Chromium, Vivaldi, and Brave. Published Chrome Web Store and Edge Add-ons builds must use their store-assigned IDs instead. Firefox uses `browser@braid.rrmtools.uk`.
+The registration script allow-lists both Chromium IDs for Chrome, Edge, Chromium, Vivaldi, and Brave. Firefox uses `browser@braid.rrmtools.uk`.
 
 ## Companion updates
 
