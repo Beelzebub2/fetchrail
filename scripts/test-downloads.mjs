@@ -261,7 +261,7 @@ try {
     let captured;
     const events = [];
     const item = { id: 42, state: "in_progress", paused: false, incognito: false, danger: "safe",
-      url: base + name, filename: join(out, name), totalBytes: data.length, mime: "application/octet-stream" };
+      url: base + name, filename: join(out, name), totalBytes: data.length, bytesReceived: 1, mime: "application/octet-stream" };
     const api = {
       runtime: { id: "capture-test", getURL: (path) => "chrome-extension://capture-test/" + path,
         onInstalled: { addListener() {} }, onStartup: { addListener() {} }, onMessage: { addListener() {} } },
@@ -271,7 +271,7 @@ try {
       action: { async setBadgeBackgroundColor() {}, async setBadgeText() {}, async setTitle() {} },
       downloads: {
         onCreated: { addListener(value) { listener = value; } },
-        async pause() { events.push("pause"); item.paused = true; },
+        async pause() { events.push("pause"); item.paused = true; if (browser === "firefox") Object.assign(item, { state: "interrupted", canResume: true, error: "USER_CANCELED" }); },
         async search() { events.push("search"); return [{ ...item }]; },
         async cancel() {
           assert.equal((await record(captured)).status, "paused", "The engine must own the download before browser cancellation.");
