@@ -1,4 +1,5 @@
 import { readFile } from "node:fs/promises";
+import { pathToFileURL } from "node:url";
 
 const apiBase = (process.env.CWS_API_BASE ?? "https://chromewebstore.googleapis.com").replace(/\/$/, "");
 const token = process.env.CWS_ACCESS_TOKEN;
@@ -73,5 +74,5 @@ export async function run(mode, zipPath) {
   return publishResponse;
 }
 
-if (process.argv[1] && import.meta.url === new URL(process.argv[1], "file:").href)
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href)
   await run(process.argv[2] ?? "status", process.argv[3]);
