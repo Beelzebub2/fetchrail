@@ -151,6 +151,7 @@ pub struct Adaptive {
     enabled: bool,
     baseline_target: usize,
     baseline_rate: f64,
+    minimum_target: usize,
     rate_sum: f64,
     samples: usize,
     hold_windows: usize,
@@ -166,6 +167,7 @@ impl Adaptive {
             enabled,
             baseline_target: target,
             baseline_rate: 0.0,
+            minimum_target: 1,
             rate_sum: 0.0,
             samples: 0,
             hold_windows: 0,
@@ -180,6 +182,7 @@ impl Adaptive {
             self.target = (self.target / 2).max(1);
             self.baseline_target = self.target;
             self.baseline_rate = 0.0;
+            self.minimum_target = 1;
             self.rate_sum = 0.0;
             self.samples = 0;
             self.hold_windows = 3;
@@ -198,6 +201,12 @@ impl Adaptive {
         let rate = self.rate_sum / self.samples as f64;
         self.rate_sum = 0.0;
         self.samples = 0;
+        if self.target == self.baseline_target
+            && self.baseline_rate > 0.0
+            && (rate < self.baseline_rate * 0.8 || rate > self.baseline_rate * 1.2)
+        {
+            self.minimum_target = 1;
+        }
         if self.hold_windows > 0 {
             self.baseline_rate = rate;
             self.hold_windows -= 1;
@@ -210,6 +219,10 @@ impl Adaptive {
                 rate >= self.baseline_rate * 0.95
             };
             if !useful {
+                if self.target < self.baseline_target {
+                    // Keep a proven faster count until bandwidth changes or the server throttles.
+                    self.minimum_target = self.baseline_target;
+                }
                 self.target = self.baseline_target;
                 self.probe_more = !self.probe_more;
                 self.hold_windows = 3;
@@ -218,15 +231,17 @@ impl Adaptive {
         }
         self.baseline_target = self.target;
         self.baseline_rate = rate;
-        if (self.probe_more && self.target == self.max) || (!self.probe_more && self.target == 1) {
-            self.probe_more = !self.probe_more;
+        if (self.probe_more && self.target == self.max)
+            || (!self.probe_more && self.target <= self.minimum_target)
+        {
+            self.probe_more = self.target <= self.minimum_target;
             self.hold_windows = 3;
             return;
         }
         self.target = if self.probe_more {
             (self.target * 2).min(self.max)
         } else {
-            self.target.div_ceil(2)
+            self.target.div_ceil(2).max(self.minimum_target)
         };
     }
 }
@@ -359,6 +374,32 @@ mod tests {
             reached_maximum,
             "A former plateau must not permanently prevent growth."
         );
+    }
+    #[test]
+    fn adaptive_keeps_the_fastest_proven_count_until_capacity_changes() {
+        let mut auto = Adaptive::new(8, true);
+        let mut reductions = 0;
+        for _ in 0..160 {
+            let before = auto.target;
+            auto.sample(before as f64 * 100.0, false);
+            reductions += usize::from(auto.target < before);
+        }
+        assert_eq!(auto.target, 8);
+        assert_eq!(
+            reductions, 1,
+            "Do not repeatedly sacrifice throughput to retest a known slower count."
+        );
+        for _ in 0..160 {
+            auto.sample(100.0, false);
+        }
+        assert!(
+            auto.target <= 2,
+            "A changed bandwidth cap must allow fewer connections again."
+        );
+        for _ in 0..160 {
+            auto.sample(auto.target as f64 * 100.0, false);
+        }
+        assert_eq!(auto.target, 8);
     }
     #[test]
     fn adaptive_recovers_from_throttling_and_honors_manual_limits() {
