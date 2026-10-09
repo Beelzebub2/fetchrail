@@ -41,6 +41,7 @@ const data = Buffer.alloc(8 * 1024 * 1024);
 for (let index = 0; index < data.length; index++) data[index] = (index * 31 + (index >>> 13)) & 255;
 const digest = (bytes) => createHash("sha256").update(bytes).digest("hex");
 const expectedHash = digest(data);
+const adaptiveData = Buffer.concat(Array(8).fill(data));
 let benchmarkData;
 if (process.env.FETCHRAIL_BENCHMARK === "1") {
   const benchmarkMiB=Number(process.env.FETCHRAIL_BENCHMARK_MIB ?? 32);
@@ -57,7 +58,7 @@ const otherOrigin = createServer((request,response) => { leakedCredentials ||= B
 await new Promise((done) => otherOrigin.listen(0,"127.0.0.1",done));
 const server = createServer((request, response) => {
   const name = request.url.slice(1);
-  const payload=name.startsWith("benchmark-") ? benchmarkData : data;
+  const payload=name === "adaptive-large.bin" ? adaptiveData : name.startsWith("benchmark-") ? benchmarkData : data;
   if (name==="empty.bin") { response.writeHead(416,{"Content-Range":"bytes */0"}).end(); return; }
   if (name === "auth.bin") { response.writeHead(403).end(); return; }
   if (name === "landing.html") { response.writeHead(200, { "Content-Type": "text/html" }).end("<button>Download</button>"); return; }
@@ -95,7 +96,7 @@ const server = createServer((request, response) => {
   entry.active++; entry.peak = Math.max(entry.peak, entry.active);
   globalActive++; globalPeak=Math.max(globalPeak,globalActive);
   const disconnect = name === "disconnect.bin" && !dropped && end-start > 1;
-  const tick=name.startsWith("benchmark-tail-") ? (start===0 && end>0 ? 25 : 1) : name.startsWith("benchmark-disk-") ? 1 : 15;
+  const tick=name === "adaptive-large.bin" ? 50 : name.startsWith("benchmark-tail-") ? (start===0 && end>0 ? 25 : 1) : name.startsWith("benchmark-disk-") ? 1 : 15;
   const block=name.startsWith("benchmark-") ? 256*1024 : 65536;
   if (disconnect) dropped=true;
   let sent = 0;
@@ -155,7 +156,7 @@ async function add(name, options = {}) {
   const result = await native("addDownloads", { source: "popup", items: [{ url: base + name }], connections: 4, ...options });
   assert.equal(result.accepted, 1); ids.push(result.ids[0]); return result.ids[0];
 }
-async function complete(id, connections) {
+async function complete(id, connections, payload = data) {
   const item = await waitFor(async () => {
     const item = await record(id);
     if (item?.status === "failed") throw new Error(item.error);
@@ -163,11 +164,11 @@ async function complete(id, connections) {
   }, "download completion");
   assert.equal(item.connections, connections);
   const full = await waitFor(async () => { const saved=JSON.parse(await read("downloads.json")).find((item)=>item.id===id); return saved?.status === "completed" && saved; },"completion persisted");
-  assert.equal(digest(await readFile(full.destination)), expectedHash, "Downloaded bytes must match the original.");
+  assert.equal(digest(await readFile(full.destination)), payload === data ? expectedHash : digest(payload), "Downloaded bytes must match the original.");
   const zone=await readFile(full.destination+":Zone.Identifier","utf8");
   assert.match(zone,/ZoneId=3/); assert.ok(!zone.includes("session=fixture"));
-  assert.equal(item.downloadedBytes, data.length);
-  assert.equal(item.mergedBytes, data.length, "Direct staging and copied parts must both report all bytes ready for publication.");
+  assert.equal(item.downloadedBytes, payload.length);
+  assert.equal(item.mergedBytes, payload.length, "Direct staging and copied parts must both report all bytes ready for publication.");
   return item;
 }
 try {
@@ -462,6 +463,23 @@ try {
   await Promise.all([complete(limitedA,4),complete(limitedB,4)]);
   assert.ok(performance.now()-limitedStart>=7500,"The 2 MiB/s bandwidth budget must be shared across both 8 MiB downloads.");
   console.log("PASS: the configured global bandwidth limit is shared across concurrent downloads");
+  app.kill(); await new Promise((done) => app.once("exit", done));
+  await writeFile(join(stateDir,"settings.json"), JSON.stringify({ ...settings, adaptiveConnections: true, speedLimitBps: 0 }));
+  await launch();
+  const adaptive = await add("adaptive-large.bin", { connections: 8 });
+  const samples = [];
+  await waitFor(async () => {
+    const item = await record(adaptive);
+    if (item?.status === "failed") throw new Error(item.error);
+    samples.push(item);
+    return item?.status === "completed";
+  }, "adaptive parallel download", 30000);
+  await complete(adaptive, 8, adaptiveData);
+  assert.ok(samples.some((item) => item?.activeConnections >= 4), "Start with simultaneous receiving requests.");
+  assert.ok(samples.some((item) => item?.activeConnections === 8), "A faster source must be allowed to use all eight requests.");
+  assert.ok(samples.every((item) => !item || item.activeConnections <= 8));
+  assert.ok(observed.get("adaptive-large.bin").peak >= 4 && observed.get("adaptive-large.bin").peak <= 8);
+  console.log("PASS: adaptive workers start in parallel, grow to eight, report real receiving counts and publish identical 64 MiB output");
   app.kill(); await new Promise((done)=>app.once("exit",done));
   if (benchmarkData) settings.speedLimitBps = 0;
   await writeFile(join(stateDir,"settings.json"),JSON.stringify(settings)); await launch();

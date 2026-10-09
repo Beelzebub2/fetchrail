@@ -47,6 +47,7 @@ type SegmentProgress = {
   downloadedBytes: number;
   speedBps: number;
   active: boolean;
+  activeConnections?: number;
 };
 
 export type DownloadRecord = {
@@ -151,6 +152,7 @@ type Part = {
   downloaded: number;
   fraction: number;
   speed: number;
+  activeConnections: number;
   state: PartState;
 };
 
@@ -330,7 +332,7 @@ export function partsOf(item: DownloadRecord): Part[] {
         : item.status === "downloading"
           ? segment.active
             ? "receiving"
-            : "connecting"
+            : "waiting"
           : item.status === "paused"
             ? "paused"
             : item.status === "failed" || item.status === "cancelled"
@@ -342,15 +344,20 @@ export function partsOf(item: DownloadRecord): Part[] {
       downloaded: segment.downloadedBytes,
       fraction: state === "done" ? 1 : segment.length ? Math.min(1, segment.downloadedBytes / segment.length) : 0,
       speed: segment.speedBps,
+      activeConnections: state === "receiving" ? segment.activeConnections ?? 1 : 0,
       state,
     };
   });
 }
 
-function partNote(part: Part) {
+export function receivingConnections(item: DownloadRecord) {
+  return partsOf(item).reduce((count, part) => count + part.activeConnections, 0);
+}
+
+export function partNote(part: Part) {
   const notes: Record<PartState, string> = {
     done: "Done",
-    receiving: formatSpeed(part.speed),
+    receiving: `${part.activeConnections} connection${part.activeConnections === 1 ? "" : "s"} · ${formatSpeed(part.speed)}`,
     connecting: "Connecting",
     paused: "Paused",
     stopped: "Stopped",
@@ -527,7 +534,7 @@ function App() {
     () =>
       downloads
         .filter((item) => item.status === "downloading")
-        .reduce((count, item) => count + Math.min(item.connections, partsOf(item).filter((part) => part.state !== "done").length), 0),
+        .reduce((count, item) => count + receivingConnections(item), 0),
     [downloads],
   );
 
@@ -1108,18 +1115,16 @@ function DownloadRow({
   const requested = item.requestedConnections ?? item.connections;
   const summary =
     item.status === "completed"
-      ? item.connections > 1
-        ? `Completed with up to ${item.connections} workers`
-        : "Single connection"
+      ? "Completed"
       : item.status === "merging"
         ? "Verifying and safely publishing the file"
         : !split
           ? `Opens up to ${requested} connections when it starts`
           : item.status === "downloading"
             ? [
-                `${count("receiving")} receiving`,
-                count("connecting") && `${count("connecting")} connecting`,
-                count("done") && `${count("done")} done`,
+                `${receivingConnections(item)} connections receiving`,
+                `target ${item.connections}`,
+                count("done") && `${count("done")} sections done`,
               ]
                 .filter(Boolean)
                 .join(" · ")
@@ -1392,7 +1397,7 @@ function DownloadRow({
           <div className="connections-body">
             {item.sha256 && <label className="file-checksum">SHA-256<input className="mono" readOnly value={item.sha256} aria-label="Completed file SHA-256" /></label>}
             <div className="connections-head">
-              <span className="overline">Connections</span>
+              <span className="overline">File sections</span>
               <span>{summary}</span>
             </div>
             {split && (
@@ -1417,7 +1422,7 @@ function DownloadRow({
                       <span className="mono percent">
                         {part.length ? Math.floor(part.fraction * 100) + "%" : formatBytes(part.downloaded)}
                       </span>
-                      <span className={"note " + part.state}>{partNote(part)}</span>
+                      <span className={"note " + part.state} title={partNote(part)}>{part.state === "receiving" ? <>{part.activeConnections} receiving<br />{formatSpeed(part.speed)}</> : partNote(part)}</span>
                     </div>
                   ))}
                 </div>

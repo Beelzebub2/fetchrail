@@ -128,7 +128,7 @@ impl ByteRange {
     }
 }
 
-/// Live byte counter for one connection, shared between its transfer and the progress reporter.
+/// Live byte counter for one queued range, shared with the progress reporter.
 struct SegmentCounter {
     range: ByteRange,
     downloaded: AtomicU64,
@@ -146,20 +146,27 @@ fn segment_progress(segments: &[SegmentCounter], speeds: &[f64]) -> Vec<SegmentP
     segments
         .chunks(group_size)
         .enumerate()
-        .map(|(group, parts)| SegmentProgress {
-            start: parts[0].range.start,
-            length: parts
+        .map(|(group, parts)| {
+            let active_connections = parts
                 .iter()
-                .all(|part| part.range.end != u64::MAX)
-                .then(|| parts.iter().map(|part| part.range.len()).sum()),
-            downloaded_bytes: parts
-                .iter()
-                .map(|part| part.downloaded.load(Ordering::Relaxed))
-                .sum(),
-            speed_bps: (group * group_size..group * group_size + parts.len())
-                .map(|index| speeds.get(index).copied().unwrap_or(0.0).max(0.0) as u64)
-                .sum(),
-            active: parts.iter().any(|part| part.active.load(Ordering::Relaxed)),
+                .filter(|part| part.active.load(Ordering::Relaxed))
+                .count();
+            SegmentProgress {
+                start: parts[0].range.start,
+                length: parts
+                    .iter()
+                    .all(|part| part.range.end != u64::MAX)
+                    .then(|| parts.iter().map(|part| part.range.len()).sum()),
+                downloaded_bytes: parts
+                    .iter()
+                    .map(|part| part.downloaded.load(Ordering::Relaxed))
+                    .sum(),
+                speed_bps: (group * group_size..group * group_size + parts.len())
+                    .map(|index| speeds.get(index).copied().unwrap_or(0.0).max(0.0) as u64)
+                    .sum(),
+                active: active_connections > 0,
+                active_connections,
+            }
         })
         .collect()
 }
@@ -1462,9 +1469,11 @@ impl DownloadManager {
         let part_dir = self.part_dir(task.record.read().await.id);
 
         let mut ranges = match total {
-            Some(total) if probe.accepts_ranges => {
-                queued_ranges(total, settings.min_segment_size_mb * 1024 * 1024)
-            }
+            Some(total) if probe.accepts_ranges => queued_ranges(
+                total,
+                settings.min_segment_size_mb * 1024 * 1024,
+                connection_count,
+            ),
             Some(total) => split_ranges(total, 1),
             None => vec![ByteRange {
                 start: 0,
@@ -1651,11 +1660,17 @@ impl DownloadManager {
             maximum,
             settings.adaptive_connections && probe.accepts_ranges,
         );
+        task.record.write().await.connections = auto.target;
+        let origin = self.origin(url).await;
+        let mut last_throttles = origin.throttles();
         let mut pending = (0..segments.len()).collect::<std::collections::VecDeque<_>>();
         let batch = cancel.child_token();
         let mut active = FuturesUnordered::new();
         let mut sample = interval(Duration::from_secs(4));
+        sample.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         sample.tick().await;
+        let mut last_sample = Instant::now();
+        let mut sample_ready = true;
         let mut last_bytes = segments
             .iter()
             .map(|part| part.downloaded.load(Ordering::Relaxed))
@@ -1678,6 +1693,8 @@ impl DownloadManager {
             if active.is_empty() {
                 break;
             }
+            // Lower targets drain existing requests before their throughput can be compared.
+            sample_ready &= active.len() == auto.target;
             tokio::select! {
                 result = active.next() => {
                     if let Some(Err(error)) = result {
@@ -1686,11 +1703,16 @@ impl DownloadManager {
                 },
                 _ = sample.tick(), if failure.is_none() => {
                     let bytes = segments.iter().map(|part| part.downloaded.load(Ordering::Relaxed)).sum::<u64>();
-                    let rate = bytes.saturating_sub(last_bytes) as f64 / 4.0;
-                    let throttled = task.record.read().await.status_detail.as_deref().is_some_and(|value| value.contains("HTTP 429") || value.contains("HTTP 503"));
-                    if !pending.is_empty() { auto.sample(rate, throttled); }
+                    let now = Instant::now();
+                    let rate = bytes.saturating_sub(last_bytes) as f64 / now.duration_since(last_sample).as_secs_f64().max(0.001);
+                    let throttles = origin.throttles();
+                    let throttled = throttles != last_throttles;
+                    if !pending.is_empty() && (throttled || sample_ready) { auto.sample(rate, throttled); }
                     task.record.write().await.connections = auto.target;
                     last_bytes = bytes;
+                    last_sample = now;
+                    last_throttles = throttles;
+                    sample_ready = true;
                 }
             }
         }
@@ -2836,8 +2858,14 @@ async fn recover_published(record: &mut DownloadRecord, part_dir: &Path) -> Engi
     Ok(())
 }
 
-fn queued_ranges(total: u64, minimum: u64) -> Vec<ByteRange> {
-    let count = total.div_ceil(minimum.max(1)).clamp(1, 4096) as usize;
+fn queued_ranges(total: u64, minimum: u64, connections: usize) -> Vec<ByteRange> {
+    // Keep work to steal at the tail without thousands of tiny HTTP requests on large files.
+    let piece_size = minimum.max(
+        total
+            .div_ceil(connections.max(1) as u64 * 8)
+            .min(32 * 1024 * 1024),
+    );
+    let count = total.div_ceil(piece_size.max(1)).clamp(1, 4096) as usize;
     split_ranges(total, count)
 }
 
@@ -3225,6 +3253,61 @@ mod tests {
         let counters = super::segment_counters(&dir, &unknown).await.unwrap();
         assert_eq!(super::segment_progress(&counters, &[])[0].length, None);
         tokio::fs::remove_dir_all(dir).await.unwrap();
+    }
+
+    #[test]
+    fn compact_sections_preserve_all_receiving_connections() {
+        use std::sync::atomic::{AtomicBool, AtomicU64};
+        let counters = (0..320)
+            .map(|index| super::SegmentCounter {
+                range: super::ByteRange {
+                    start: index * 100,
+                    end: index * 100 + 99,
+                },
+                downloaded: AtomicU64::new(10),
+                active: AtomicBool::new(index < 8),
+            })
+            .collect::<Vec<_>>();
+        let sections = super::segment_progress(&counters, &vec![100.0; 320]);
+        assert_eq!(sections.len(), 32);
+        assert_eq!(sections.iter().filter(|part| part.active).count(), 1);
+        assert_eq!(
+            sections
+                .iter()
+                .map(|part| part.active_connections)
+                .sum::<usize>(),
+            8
+        );
+        assert_eq!(
+            sections
+                .iter()
+                .map(|part| part.downloaded_bytes)
+                .sum::<u64>(),
+            3200
+        );
+        assert_eq!(
+            sections.iter().map(|part| part.speed_bps).sum::<u64>(),
+            32000
+        );
+    }
+
+    #[test]
+    fn large_files_use_bounded_pieces_with_enough_work_for_every_worker() {
+        let total = 5 * 1024 * 1024 * 1024;
+        let ranges = super::queued_ranges(total, 4 * 1024 * 1024, 8);
+        assert!(ranges.len() >= 8 * 8 && ranges.len() < 1280 / 4);
+        assert_eq!(ranges[0].start, 0);
+        assert_eq!(ranges.last().unwrap().end, total - 1);
+        assert_eq!(ranges.iter().map(|range| range.len()).sum::<u64>(), total);
+        assert!(ranges
+            .windows(2)
+            .all(|pair| pair[0].end + 1 == pair[1].start));
+        assert!(ranges.iter().all(|range| range.len() <= 32 * 1024 * 1024));
+        assert_eq!(
+            super::queued_ranges(8 * 1024 * 1024, 1024 * 1024, 4).len(),
+            8
+        );
+        assert!(super::queued_ranges(0, 0, 0).is_empty());
     }
 
     #[tokio::test]

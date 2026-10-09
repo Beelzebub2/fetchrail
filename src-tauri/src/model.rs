@@ -125,8 +125,10 @@ pub struct SegmentProgress {
     pub length: Option<u64>,
     pub downloaded_bytes: u64,
     pub speed_bps: u64,
-    /// The connection is open and receiving.
+    /// At least one request is receiving within this file section.
     pub active: bool,
+    #[serde(default)]
+    pub active_connections: usize,
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]

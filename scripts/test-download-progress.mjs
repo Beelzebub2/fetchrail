@@ -75,11 +75,25 @@ try {
   assert.equal(await page.locator("tbody tr").count(), 4);
   assert.equal(await page.getByRole("progressbar").getAttribute("aria-valuenow"), "12");
   await page.screenshot({ path: join(output, "download-status.png"), fullPage: true });
+  await page.evaluate(() => {
+    window.testRecord.connections = 8;
+    window.testRecord.segments = [
+      { start: 0, length: 16 * 1024 ** 3, downloadedBytes: 4 * 1024 ** 3, speedBps: 75 * 1024 ** 2, active: true, activeConnections: 8 },
+      { start: 16 * 1024 ** 3, length: 16 * 1024 ** 3, downloadedBytes: 0, speedBps: 0, active: false, activeConnections: 0 },
+    ];
+    window.testEmit("fetchrail://download-updated", structuredClone(window.testRecord));
+  });
+  await page.locator(".transfer-connections-head").getByText("8 connections receiving · target 8").waitFor();
+  assert.equal(await page.locator("tbody tr").count(), 2, "File sections must not masquerade as connections.");
+  assert.equal(await page.locator("tbody tr").filter({ hasText: "8 connections" }).count(), 1);
+  assert.equal(await page.locator("tbody tr").filter({ hasText: "Waiting" }).count(), 1, "Queued sections are not connecting requests.");
+  await page.screenshot({ path: join(output, "grouped-connections.png"), fullPage: true });
   await page.getByRole("button", { name: "Hide details" }).click();
   assert.equal(await page.locator("tbody").count(), 0);
   await page.getByRole("button", { name: "Show details" }).click();
   await page.getByRole("button", { name: "Pause", exact: true }).click();
   await page.getByRole("button", { name: "Resume", exact: true }).waitFor();
+  await page.locator(".transfer-connections-head").getByText("0 connections receiving · target 8").waitFor();
   await page.getByRole("button", { name: "Resume", exact: true }).click();
   await page.getByRole("button", { name: "Pause", exact: true }).waitFor();
 
@@ -142,7 +156,19 @@ try {
   await page.waitForFunction(() => window.testCalls.some((call) => call.name === "resume_download"));
   const promptCalls = await page.evaluate(() => window.testCalls.map((call) => call.name));
   assert.ok(promptCalls.indexOf("show_download_progress") < promptCalls.indexOf("resume_download"), "Start must open the progress window before the transfer begins.");
+  await page.setViewportSize({ width: 1280, height: 1000 });
   await page.goto(base);
+  await page.evaluate(() => {
+    window.testRecord.connections = 8;
+    window.testRecord.segments[0].activeConnections = 8;
+    window.testRecord.segments.slice(1).forEach((segment) => { segment.active = false; segment.activeConnections = 0; });
+    window.testEmit("fetchrail://download-updated", structuredClone(window.testRecord));
+  });
+  await page.locator(".throughput").getByText("8 connections", { exact: true }).waitFor();
+  await page.getByRole("button", { name: "Show connections for example-archive.rar" }).click();
+  await page.locator(".connections-head").getByText("8 connections receiving · target 8").waitFor();
+  assert.match(await page.locator(".lane .note.receiving").innerText(), /8 receiving/);
+  await page.screenshot({ path: join(output, "main-connections.png"), fullPage: true, animations: "disabled" });
   await page.getByRole("button", { name: "Settings", exact: true }).click();
   await page.getByRole("heading", { name: "Background behavior" }).waitFor();
   for (const width of [960, 1280, 1440]) {

@@ -5,7 +5,7 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import { Activity, Check, ChevronDown, ChevronUp, FolderOpen, Gauge, Pause, Play, X } from "lucide-react";
 import {
   applyLook, CompletionOptions, DownloadRecord, DownloadSettings, formatBytes,
-  formatEta, formatSpeed, Logo, partsOf, progressOf, statusLabel, Strands,
+  formatEta, formatSpeed, Logo, partNote, partsOf, progressOf, receivingConnections, statusLabel, Strands,
 } from "./App";
 import "./DownloadProgress.css";
 
@@ -199,12 +199,12 @@ export function DownloadProgress({ id }: { id: string }) {
             </div>
           </div>
           {details && <section className="transfer-connections" id="transfer-connections" aria-label="Connection details">
-            <div className="transfer-connections-head"><span><Activity size={14} />Start positions and progress by connection</span><small>{item.segments.length || (complete ? item.connections : 1)} connections</small></div>
+            <div className="transfer-connections-head"><span><Activity size={14} />Progress by file section</span><small>{complete ? "Completed" : `${receivingConnections(item)} connections receiving · target ${item.connections}`}</small></div>
             <Strands parts={parts} />
             <div className="transfer-table-scroll">
-              <table><thead><tr><th>No.</th><th>Downloaded</th><th>Info</th><th className="right">Progress</th></tr></thead><tbody>
+              <table><thead><tr><th>Section</th><th>Downloaded</th><th>Info</th><th className="right">Progress</th></tr></thead><tbody>
                 {parts.map((part, index) => <tr key={part.start} title={`Starts at byte ${part.start}${part.length != null ? ` · ${formatBytes(part.length, true)} part` : ""}`}>
-                  <td>{index + 1}</td><td>{formatBytes(part.downloaded, true)}</td><td>{part.state === "receiving" ? `Receiving data… ${formatSpeed(part.speed)}` : part.state === "connecting" ? "Connecting…" : part.state === "done" ? "Complete" : part.state === "paused" ? "Paused" : part.state === "stopped" ? "Stopped" : "Waiting…"}</td><td className="right">{part.length == null ? "—" : `${(part.fraction * 100).toFixed(1)}%`}</td>
+                  <td>{index + 1}</td><td>{formatBytes(part.downloaded, true)}</td><td>{partNote(part)}</td><td className="right">{part.length == null ? "—" : `${(part.fraction * 100).toFixed(1)}%`}</td>
                 </tr>)}
               </tbody></table>
             </div>
