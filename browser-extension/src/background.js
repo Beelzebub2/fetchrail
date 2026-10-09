@@ -116,6 +116,13 @@ async function routeBrowserDownload(item) {
     }]);
     engineId = result.ids[0];
     if (result.accepted !== 1 || !engineId) throw new Error(result.errors[0]?.message ?? "Braid did not accept the download.");
+    const [latest] = await api.downloads.search({ id: item.id });
+    paused = latest?.state === "in_progress" && latest.paused;
+    // Verification can outlast a user action or the browser's safety verdict.
+    if (!paused || latest.incognito || (latest.danger && latest.danger !== "safe")
+      || (latest.finalUrl || latest.url) !== (current.finalUrl || current.url)) {
+      throw new Error("The browser download changed during verification.");
+    }
     await api.downloads.cancel(item.id);
     paused = false;
     // History cleanup must not roll back a successful handoff.

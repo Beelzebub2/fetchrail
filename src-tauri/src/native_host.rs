@@ -74,7 +74,8 @@ fn handle_payload(payload: &[u8]) -> NativeResponse {
 }
 
 fn forward_request(request: NativeRequest) -> Result<NativeResponse, String> {
-    for attempt in 0..24 {
+    // WebView2 and companion deployment can take several seconds on a cold start.
+    for attempt in 0..100 {
         if let Ok(config) = read_bridge_config() {
             match send_to_bridge(&config, &request) {
                 Ok(Some(response)) => return Ok(response),

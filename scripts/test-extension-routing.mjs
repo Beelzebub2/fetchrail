@@ -12,6 +12,7 @@ for (const browser of ["chromium", "firefox"]) {
   let listener;
   let fail;
   let current;
+  let afterAcceptance;
   const engineId = randomUUID();
   const api = {
     runtime: {
@@ -25,7 +26,7 @@ for (const browser of ["chromium", "firefox"]) {
     downloads: {
       onCreated: { addListener(value) { listener = value; } },
       async pause(id) { events.push("pause"); if (fail === "pause") throw new Error("Already completed"); current.paused = true; },
-      async search({ id }) { events.push("search"); return fail === "missing" ? [] : [current]; },
+      async search({ id }) { events.push("search"); return fail === "missing" ? [] : [{ ...current }]; },
       async cancel(id) { events.push("cancel"); if (fail === "cancel") throw new Error("Cannot cancel"); },
       async erase({ id }) { events.push("erase"); if (fail === "erase") throw new Error("Cannot erase"); },
       async resume(id) { events.push("resume"); },
@@ -37,6 +38,7 @@ for (const browser of ["chromium", "firefox"]) {
     events.push(message.method);
     if (fail === "offline") throw new Error("Host unavailable");
     if (message.method === "controlDownload") return { ok: true, result: {} };
+    if (afterAcceptance) Object.assign(current, afterAcceptance);
     return { ok: true, result: fail === "rejected"
       ? { accepted: 0, ids: [], errors: [{ index: 0, message: "Browser session required" }] }
       : { accepted: 1, ids: [engineId], errors: [] } };
@@ -50,7 +52,7 @@ for (const browser of ["chromium", "firefox"]) {
   const context = vm.createContext({ [browser === "firefox" ? "browser" : "chrome"]: api, crypto: { randomUUID }, URL });
   vm.runInContext(await readFile(new URL(`../browser-extension/dist/${browser}/background.js`, import.meta.url), "utf8"), context);
   const reset = (overrides = {}) => {
-    events.length = 0; requests.length = 0; fail = undefined; delete saved.automaticDownloads;
+    events.length = 0; requests.length = 0; fail = undefined; afterAcceptance = undefined; delete saved.automaticDownloads;
     current = { id: 42, state: "in_progress", paused: false, incognito: false, danger: "safe",
       url: "https://example.com/redirect", finalUrl: "https://cdn.example.com/file.zip?token=123",
       filename: "C:\\Users\\someone\\Downloads\\file.zip", totalBytes: 8388608, mime: "application/zip", ...overrides };
@@ -65,7 +67,7 @@ for (const browser of ["chromium", "firefox"]) {
   const route = async () => { listener({ ...current }); await settled(); };
   reset();
   listener({ ...current }); listener({ ...current }); await settled();
-  assert.deepEqual(events, ["pause", "search", "addDownloads", "cancel", "erase"]);
+  assert.deepEqual(events, ["pause", "search", "addDownloads", "search", "cancel", "erase"]);
   assert.equal(requests.length, 1, "duplicate events must not create two engine jobs");
   assert.equal(requests[0].params.source, "clickMonitor");
   assert.deepEqual(JSON.parse(JSON.stringify(requests[0].params.items[0])), {
@@ -83,11 +85,18 @@ for (const browser of ["chromium", "firefox"]) {
   reset(); fail = "pause"; await route(); assert.deepEqual(events, ["pause"]);
   reset(); fail = "missing"; await route(); assert.deepEqual(events, ["pause", "search", "resume"]);
   reset(); fail = "cancel"; await route();
-  assert.deepEqual(events, ["pause", "search", "addDownloads", "cancel", "controlDownload", "resume"]);
+  assert.deepEqual(events, ["pause", "search", "addDownloads", "search", "cancel", "controlDownload", "resume"]);
   assert.equal(requests.at(-1).params.downloadId, engineId);
   assert.equal(requests.at(-1).params.action, "cancel");
   reset(); fail = "erase"; await route();
-  assert.deepEqual(events, ["pause", "search", "addDownloads", "cancel", "erase"]);
+  assert.deepEqual(events, ["pause", "search", "addDownloads", "search", "cancel", "erase"]);
   reset({ totalBytes: -1 }); await route(); assert.equal(requests[0].params.items[0].expectedBytes, undefined);
-  console.log(`PASS: ${browser} automatic routing, redirects, metadata, opt-out, duplicate protection, browser fallback and rollback.`);
+  for (const change of [{ state: "complete" }, { state: "interrupted" }, { paused: false },
+    { danger: "content" }, { incognito: true }, { finalUrl: "https://example.com/changed.zip" }]) {
+    reset(); afterAcceptance = change; await route();
+    assert.deepEqual(events, ["pause", "search", "addDownloads", "search", "controlDownload",
+      ...(current.state === "in_progress" && current.paused ? ["resume"] : [])]);
+    assert.equal(requests.at(-1).params.action, "cancel", "A changed browser transfer must roll back the engine job.");
+  }
+  console.log(`PASS: ${browser} automatic routing, redirects, metadata, opt-out, duplicate protection, browser fallback, rollback and changes during verification.`);
 }

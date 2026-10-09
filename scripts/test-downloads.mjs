@@ -8,6 +8,7 @@ import { tmpdir } from "node:os";
 import { join, resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { setTimeout as delay } from "node:timers/promises";
+import vm from "node:vm";
 
 // Run with Braid closed. Original settings and history are restored in finally.
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
@@ -161,11 +162,61 @@ try {
   await complete(first, 4); await complete(second, 4);
   assert.ok(observed.get("range.bin").peak >= 4, "Expected four simultaneous byte-range requests.");
   console.log("PASS: concurrent downloads, four connections, exact SHA-256 output");
-  const captured = await add("captured.bin", { source: "clickMonitor", items: [{ url: base + "captured.bin", expectedBytes: data.length, expectedMime: "application/octet-stream" }] });
-  assert.equal((await record(captured)).status, "paused", "A caught download waits for the answer to its prompt.");
-  await native("controlDownload", { downloadId: captured, action: "resume" });
-  await complete(captured, 4);
-  assert.ok(observed.get("captured.bin").ranges.some(({ start, end }) => start === 0 && end === 0), "Capture must verify a GET before accepting the browser handoff.");
+  for (const browser of ["chromium", "firefox"]) {
+    const name = `captured-${browser}.bin`;
+    let listener;
+    let captured;
+    const events = [];
+    const item = { id: 42, state: "in_progress", paused: false, incognito: false, danger: "safe",
+      url: base + name, filename: join(out, name), totalBytes: data.length, mime: "application/octet-stream" };
+    const api = {
+      runtime: { id: "capture-test", getURL: (path) => "chrome-extension://capture-test/" + path,
+        onInstalled: { addListener() {} }, onStartup: { addListener() {} }, onMessage: { addListener() {} } },
+      alarms: { create() {}, onAlarm: { addListener() {} } },
+      contextMenus: { onClicked: { addListener() {} } },
+      storage: { local: { async get() { return {}; } } },
+      action: { async setBadgeBackgroundColor() {}, async setBadgeText() {}, async setTitle() {} },
+      downloads: {
+        onCreated: { addListener(value) { listener = value; } },
+        async pause() { events.push("pause"); item.paused = true; },
+        async search() { events.push("search"); return [{ ...item }]; },
+        async cancel() {
+          assert.equal((await record(captured)).status, "paused", "The engine must own the download before browser cancellation.");
+          events.push("cancel"); item.state = "interrupted";
+        },
+        async erase() { events.push("erase"); },
+        async resume() { events.push("resume"); item.paused = false; },
+      },
+    };
+    const sendNative = async (hostName, message) => {
+      assert.equal(hostName, "com.rrmtools.braid");
+      events.push(message.method);
+      const result = await native(message.method, message.params);
+      if (result.accepted) { captured = result.ids[0]; ids.push(captured); }
+      return { ok: true, result };
+    };
+    if (browser === "firefox") api.runtime.sendNativeMessage = sendNative;
+    else api.runtime.sendNativeMessage = (hostName, message, callback) => {
+      sendNative(hostName, message).then(callback, (error) => {
+        api.runtime.lastError = { message: error.message }; callback(); delete api.runtime.lastError;
+      });
+    };
+    const context = vm.createContext({ [browser === "firefox" ? "browser" : "chrome"]: api, crypto: { randomUUID }, URL });
+    vm.runInContext(await readFile(join(root, "browser-extension", "dist", browser, "background.js"), "utf8"), context);
+    listener({ ...item });
+    await waitFor(() => vm.runInContext("activeActions", context) === 0, `${browser} extension capture`);
+    assert.deepEqual(events, ["pause", "search", "addDownloads", "search", "cancel", "erase"]);
+    assert.equal((await record(captured)).fileName, name);
+    assert.ok(observed.get(name).ranges.some(({ start, end }) => start === 0 && end === 0), "Capture must verify a GET before accepting the browser handoff.");
+    await native("controlDownload", { downloadId: captured, action: "resume" });
+    await complete(captured, 4);
+    events.length = 0;
+    Object.assign(item, { state: "in_progress", paused: false, url: base + "auth.bin" });
+    listener({ ...item });
+    await waitFor(() => vm.runInContext("activeActions", context) === 0, `${browser} authenticated download fallback`);
+    assert.deepEqual(events, ["pause", "search", "addDownloads", "resume"]);
+    console.log(`PASS: ${browser} extension capture through the real native host and engine, exact SHA-256, browser fallback`);
+  }
   for (const item of [{ url: base + "auth.bin" }, { url: base + "range.bin", expectedBytes: data.length + 1 },
     { url: base + "range.bin", expectedMime: "text/html" }, { url: base + "invalid.bin" }]) {
     const rejected = await native("addDownloads", { source: "clickMonitor", items: [item] });

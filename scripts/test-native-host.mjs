@@ -33,7 +33,7 @@ const timeout = setTimeout(() => {
   console.error(frontend ? "Timed out waiting for the bundled Braid interface to render and connect to the engine." : "Timed out waiting for the Braid native host.");
   child.kill();
   process.exitCode = 1;
-}, frontend ? 45000 : 8000);
+}, frontend ? 45000 : 20000);
 timeout.unref();
 
 child.stdout.on("data", (chunk) => {
