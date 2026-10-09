@@ -141,11 +141,14 @@ function renderDownloads() {
     card.querySelector(".file-badge").textContent = extension(item.fileName);
     card.querySelector("strong").textContent = item.fileName;
     card.querySelector("strong").title = item.fileName;
-    const percent = item.status === "completed" ? 100 : item.totalBytes ? Math.min(100, item.downloadedBytes / item.totalBytes * 100) : 0;
+    const merging = item.status === "merging";
+    const mergeTotal = item.totalBytes ?? item.downloadedBytes;
+    const percent = item.status === "completed" ? 100 : merging ? (mergeTotal > 0 ? Math.min(100, (item.mergedBytes ?? 0) / mergeTotal * 100) : 100) : item.totalBytes ? Math.min(100, item.downloadedBytes / item.totalBytes * 100) : 0;
     const parts = partsOf(item);
     const bar = card.querySelector(".strands");
-    bar.setAttribute("aria-valuenow", percent.toFixed(0));
-    renderStrands(bar, parts);
+    bar.setAttribute("aria-label", (merging ? "Joining parts for " : "Download progress for ") + item.fileName);
+    bar.setAttribute("aria-valuenow", String(Math.floor(percent)));
+    renderStrands(bar, merging ? [{ length: mergeTotal, fraction: percent / 100, state: "joining" }] : parts);
     const split = !!item.segments?.length;
     const open = split && opened.has(item.id);
     const toggle = card.querySelector(".toggle");
@@ -156,12 +159,12 @@ function renderDownloads() {
     const lanes = card.querySelector(".lanes");
     lanes.hidden = !open;
     if (open) renderLanes(lanes, parts);
-    const status = item.status === "merging" ? "Finalizing" : item.status[0].toUpperCase() + item.status.slice(1);
+    const status = merging ? (percent < 100 ? "Joining parts" : "Saving file…") : item.status[0].toUpperCase() + item.status.slice(1);
     const schedule = item.status === "scheduled" && item.scheduledFor ? " · " + new Date(item.scheduledFor).toLocaleString() : "";
     const downloading = item.status === "downloading";
     const sizes = bytes(item.downloadedBytes) + " of " + bytes(item.totalBytes);
-    card.querySelector(".transfer-state").textContent = (downloading ? sizes : status + schedule + (["paused", "failed", "cancelled"].includes(item.status) ? " · " + sizes : "")) + (item.queue !== "Default" ? " · " + item.queue : "");
-    card.querySelector(".rate").textContent = downloading ? [item.speedBps ? bytes(item.speedBps) + "/s" : "", eta(item.etaSeconds)].filter(Boolean).join(" · ") : item.status === "completed" ? bytes(item.totalBytes ?? item.downloadedBytes) : item.totalBytes ? percent.toFixed(0) + "%" : "";
+    card.querySelector(".transfer-state").textContent = (merging ? status + " · " + bytes(item.mergedBytes ?? 0) + " of " + bytes(mergeTotal) : downloading ? sizes : status + schedule + (["paused", "failed", "cancelled"].includes(item.status) ? " · " + sizes : "")) + (item.queue !== "Default" ? " · " + item.queue : "");
+    card.querySelector(".rate").textContent = merging ? [Math.floor(percent) + "%", item.speedBps ? bytes(item.speedBps) + "/s" : "", eta(item.etaSeconds)].filter(Boolean).join(" · ") : downloading ? [item.speedBps ? bytes(item.speedBps) + "/s" : "", eta(item.etaSeconds)].filter(Boolean).join(" · ") : item.status === "completed" ? bytes(item.totalBytes ?? item.downloadedBytes) : item.totalBytes ? percent.toFixed(0) + "%" : "";
     card.querySelector(".transfer-meta").title = item.connections + " connections. Requested up to " + (item.requestedConnections ?? item.connections) + "; adapted to file size and server support.";
     const error = card.querySelector(".transfer-error");
     error.hidden = !item.error;
@@ -209,6 +212,19 @@ async function refresh() {
   $("#list-note").hidden = result.total <= downloads.length;
   $("#list-note").textContent = `Showing the latest ${downloads.length} of ${result.total}`;
   renderDownloads();
+  renderBrowserBatch(await request("getBrowserBatch"));
+}
+
+function renderBrowserBatch(batch) {
+  $("#browser-batch").hidden = !batch;
+  if (!batch) return;
+  const active = ["waiting", "capturing"].includes(batch.status);
+  $("#batch-status").textContent = `${active ? `Page ${batch.index + 1} of ${batch.items.length}` : batch.status === "complete" ? "Batch complete" : "Batch stopped"} · ${batch.accepted} handed to Fetchrail · ${batch.skipped} skipped`;
+  $("#batch-error").textContent = batch.error || (active ? "Complete the download steps in the opened tab. Capture advances the batch automatically." : "");
+  for (const id of ["retry", "skip", "stop"]) {
+    $("#batch-" + id).hidden = !active;
+    $("#batch-" + id).disabled = batch.status === "capturing";
+  }
 }
 
 async function connect() {
@@ -249,6 +265,7 @@ function setView(view) {
   $("#downloads-view").hidden = view !== "downloads";
   $("#links-view").hidden = view !== "links";
   $("#download-selected").hidden = view !== "links";
+  $("#browse-selected").hidden = view !== "links";
   if (view === "links" && !links.length) void scan();
 }
 
@@ -264,6 +281,7 @@ function updateSelection() {
   $("#select-all").indeterminate = count > 0 && count < visible.length;
   $("#selection-count").textContent = selected.size + " selected";
   $("#download-selected").disabled = !selected.size || busy;
+  $("#browse-selected").disabled = !selected.size || busy;
   $("#download-selected").textContent = selected.size ? "Download " + selected.size + " selected" : "Download selected";
 }
 
@@ -315,7 +333,21 @@ function transferOptions() {
   const start = $("#start").value;
   const date = new Date($("#schedule").value);
   if (start === "scheduled" && (!Number.isFinite(date.getTime()) || date.getTime() <= Date.now())) throw new Error("Choose a future start date and time.");
-  return { connections: Number($("#connections").value) || null, queue: $("#queue").value, startPaused: start === "paused", scheduledFor: start === "scheduled" ? date.toISOString() : null };
+  const limit = Number($("#speed-limit").value);
+  if (!Number.isFinite(limit) || limit < 0 || !Number.isInteger(limit)) throw new Error("Choose a whole-number speed limit of zero or more KiB/s.");
+  return { connections: Number($("#connections").value) || null, queue: $("#queue").value, startPaused: start === "paused", scheduledFor: start === "scheduled" ? date.toISOString() : null, speedLimitBps: limit * 1024 };
+}
+
+async function browsePages(items, fromSelection = false) {
+  try {
+    const options = transferOptions();
+    if (!await api.permissions.request({ origins: ["http://*/*", "https://*/*"] })) throw new Error("Browser access is required to associate the final file with its download page.");
+    const batch = await request("startBrowserBatch", { items, ...options, followButtons: $("#follow-buttons").checked });
+    renderBrowserBatch(batch);
+    if (fromSelection) { selected.clear(); renderLinks(); setView("downloads"); }
+    else $("#urls").value = "";
+    notice("Browser batch started. Complete the download steps in its tab.");
+  } catch (error) { notice(error.message, true); }
 }
 
 async function add(items, fromSelection = false) {
@@ -338,7 +370,23 @@ async function add(items, fromSelection = false) {
 $("#add-form").addEventListener("submit", (event) => {
   event.preventDefault();
   const items = $("#urls").value.trim().split(/\s+/).filter(Boolean).map((url) => ({ url }));
-  void add(items);
+  if ($("#link-mode").value === "browser") void browsePages(items);
+  else void add(items);
+});
+$("#link-mode").addEventListener("change", () => {
+  $("#browser-help").hidden = $("#link-mode").value !== "browser";
+  $("#add").textContent = $("#link-mode").value === "browser" ? "Browse pages" : "Download";
+});
+$("#browse-selected").addEventListener("click", () => void browsePages(links.filter((item) => selected.has(item.url)), true));
+for (const action of ["retry", "skip", "stop"]) $("#batch-" + action).addEventListener("click", async () => {
+  try { renderBrowserBatch(await request("browserBatchControl", { action })); } catch (error) { notice(error.message, true); }
+});
+$("#browser-session").addEventListener("change", async () => {
+  const input = $("#browser-session");
+  try {
+    if (input.checked && !await api.permissions.request({ origins: ["http://*/*", "https://*/*"] })) throw new Error("Browser access was not granted.");
+    await api.storage.local.set({ useBrowserSession: input.checked });
+  } catch (error) { input.checked = false; notice(error.message, true); }
 });
 $("#download-selected").addEventListener("click", () => void add(links.filter((item) => selected.has(item.url)).map(({ url, suggestedFileName }) => ({ url, suggestedFileName })), true));
 $("#connection").addEventListener("click", () => void connect());
@@ -376,8 +424,9 @@ $("#automatic-downloads").addEventListener("change", async () => {
 
 async function initialize() {
   try {
-    const saved = await api.storage.local.get(["connections", "queue", "automaticDownloads"]);
+    const saved = await api.storage.local.get(["connections", "queue", "automaticDownloads", "useBrowserSession"]);
     $("#automatic-downloads").checked = saved.automaticDownloads !== false;
+    $("#browser-session").checked = saved.useBrowserSession === true;
     if ([0, 1, 2, 4, 8, 16, 32].includes(saved.connections)) $("#connections").value = String(saved.connections);
     preferredQueue = saved.queue ?? "Default";
     optionsSummary();

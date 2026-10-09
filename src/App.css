@@ -184,6 +184,12 @@ h1, h2, p { margin: 0; }
 .failed .fill.stopped { background: var(--danger); }
 .fill.unknown { width: 100% !important; box-shadow: none; animation: pulse 1.6s ease-in-out infinite; }
 
+.merge-progress { height: 8px; margin-top: 8px; overflow: hidden; border-radius: 6px; background: var(--track); }
+.merge-fill { position: relative; display: block; height: 100%; overflow: hidden; border-radius: inherit; background: var(--accent); transition: width 180ms linear; }
+.merge-fill::after { content: ""; position: absolute; inset: 0; background: linear-gradient(100deg, transparent 15%, #ffffff38 50%, transparent 85%); animation: merge-shimmer 1.6s ease-in-out infinite; }
+.merge-detail { display: block; margin-top: 5px; color: var(--text-3); font-size: 11px; }
+.merge-spinner { color: var(--accent-text); animation: merge-spin 1.8s linear infinite; }
+
 .connections { display: grid; grid-template-rows: 0fr; transition: grid-template-rows 320ms var(--ease); }
 .expanded > .connections { grid-template-rows: 1fr; }
 .connections > div { min-height: 0; overflow: hidden; }
@@ -222,6 +228,13 @@ h1, h2, p { margin: 0; }
 .toast span { flex: 1; color: var(--text); overflow-wrap: anywhere; }
 
 .form label { display: grid; gap: 6px; color: var(--text-2); font-size: 12.5px; font-weight: 500; }
+.form textarea { width: 100%; resize: vertical; min-height: 90px; padding: 10px 12px; border: 1px solid var(--line); border-radius: 10px; color: var(--text); background: var(--field); font-size: 13px; }
+.form textarea:focus { outline: 2px solid var(--accent); outline-offset: 1px; }
+.form .rows > .queue-settings-item { display: block; }
+.queue-settings-item > div:first-child { display: flex; align-items: center; gap: 12px; padding: 6px 0; }
+.queue-window { display: flex; flex-wrap: wrap; align-items: end; gap: 8px; padding: 8px 0; }
+.queue-window label { flex: 1 1 170px; }
+.queue-window button { min-height: 36px; }
 .form input:not([type=checkbox],[type=radio]),.form select { width: 100%; min-width: 0; height: 40px; padding: 0 12px; border: 1px solid var(--line); border-radius: 10px; outline: 0; color: var(--text); background: var(--field); font-size: 14px; font-weight: 400; transition: border-color 150ms, box-shadow 150ms; }
 .form input:not([type=checkbox],[type=radio]):focus,.form select:focus { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
 .form input:is([type=number],[type=datetime-local],.mono),.path-input input { font-family: var(--mono); font-size: 13px; }
@@ -322,6 +335,8 @@ h1, h2, p { margin: 0; }
 @keyframes rise-in { from { opacity: 0; transform: translateY(8px); } }
 @keyframes fade-in { from { opacity: 0; } }
 @keyframes pulse { 50% { opacity: .35; } }
+@keyframes merge-shimmer { from { transform: translateX(-100%); } to { transform: translateX(100%); } }
+@keyframes merge-spin { to { transform: rotate(360deg); } }
 
 @media (max-width:1080px) {
   .app-shell { grid-template-columns: 64px minmax(0, 1fr); }

@@ -6,6 +6,185 @@ const UPDATE_ALARM = "fetchrail.extensionUpdate";
 let activeActions = 0;
 let checkingUpdate = false;
 const routingDownloads = new Set();
+const recentRequests = new Map();
+let useBrowserSession = false;
+const captureReady = Promise.all([
+  api.storage.local.get("useBrowserSession").then((saved) => { useBrowserSession = saved.useBrowserSession === true; }),
+  api.storage.session?.get("recentRequests").then((saved) => {
+    for (const [url, trace] of saved.recentRequests ?? []) if (Date.now() - trace.time < 120000) recentRequests.set(url, trace);
+  }),
+]).catch(() => {});
+api.storage.onChanged?.addListener((changes, area) => {
+  if (area === "local" && changes.useBrowserSession) {
+    useBrowserSession = changes.useBrowserSession.newValue === true;
+    if (!useBrowserSession) {
+      recentRequests.clear();
+      void api.storage.session?.remove("recentRequests").catch(() => {});
+    }
+  }
+});
+
+function rememberRequest(details) {
+  if (details.incognito || details.tabId < 0) return;
+  const context = {};
+  if (useBrowserSession) {
+    for (const header of details.requestHeaders ?? []) {
+      const key = { cookie: "cookie", authorization: "authorization", referer: "referer", "user-agent": "userAgent" }[header.name.toLowerCase()];
+      if (key && header.value && header.value.length <= 16384) context[key] = header.value;
+    }
+  }
+  const now = Date.now();
+  for (const [url, trace] of recentRequests) if (now - trace.time > 120000) recentRequests.delete(url);
+  recentRequests.delete(details.url);
+  recentRequests.set(details.url, { tabId: details.tabId, method: details.method, context, time: now });
+  if (recentRequests.size > 500) recentRequests.delete(recentRequests.keys().next().value);
+  while (recentRequests.size > 1 && JSON.stringify([...recentRequests]).length > 512000) recentRequests.delete(recentRequests.keys().next().value);
+  void api.storage.session?.set({ recentRequests: [...recentRequests] }).catch(() => {});
+}
+
+if (api.webRequest?.onBeforeSendHeaders) {
+  const options = globalThis.browser ? ["requestHeaders"] : ["requestHeaders", "extraHeaders"];
+  api.webRequest.onBeforeSendHeaders.addListener((details) => { void captureReady.then(() => rememberRequest(details)); }, { urls: ["http://*/*", "https://*/*"], types: ["main_frame", "xmlhttprequest", "other"] }, options);
+}
+
+let batchOperations = Promise.resolve();
+function changeBatch(action) {
+  const result = batchOperations.then(action);
+  batchOperations = result.catch(() => {});
+  return result;
+}
+
+async function openBatchPage(batch) {
+  if (batch.index >= batch.items.length) {
+    batch.status = "complete";
+    batch.tabIds = [];
+  } else {
+    batch.status = "waiting";
+    batch.error = null;
+    batch.followSteps = 0;
+    if (batch.tabId == null) {
+      const tab = await api.tabs.create({ url: "about:blank", active: true });
+      batch.tabId = tab.id;
+    }
+    batch.tabIds = [batch.tabId];
+    await api.storage.local.set({ browserBatch: batch });
+    await api.tabs.update(batch.tabId, { url: batch.items[batch.index].url, active: true });
+  }
+  await api.storage.local.set({ browserBatch: batch });
+  return batch;
+}
+
+async function followDownloadButtons(tabId) {
+  await api.scripting.executeScript({
+    target: { tabId },
+    func: () => {
+      if (globalThis.fetchrailButtonFollower) return;
+      const seen = new Set();
+      let clicks = 0;
+      let lastClick = 0;
+      let checking = false;
+      const tick = async () => {
+        if (checking || clicks >= 20 || Date.now() - lastClick < 2500) return;
+        // Leave login, CAPTCHA and ambiguous buttons to the person using the page.
+        if (document.querySelector('iframe[src*="recaptcha"], iframe[src*="hcaptcha"], iframe[src*="challenges.cloudflare.com"]')) return;
+        const candidates = [...document.querySelectorAll('a[href], button, input[type="submit"], input[type="button"], [role="button"]')].filter((element) => {
+          const text = (element.textContent || element.value || element.getAttribute("aria-label") || "").trim().replace(/\s+/g, " ");
+          return /^(download( now| file| link)?|free download|slow download|generate download link|create download link|get download link|continue to download|download \([\d.]+\s*(kb|mb|gb)\))$/i.test(text)
+            && !element.disabled && element.getAttribute("aria-disabled") !== "true" && element.getClientRects().length > 0;
+        });
+        if (candidates.length !== 1) return;
+        const element = candidates[0];
+        const signature = location.href + "|" + (element.href || element.form?.action || "") + "|" + (element.id || "") + "|" + (element.textContent || element.value || "");
+        if (seen.has(signature)) return;
+        seen.add(signature);
+        lastClick = Date.now();
+        checking = true;
+        try {
+          const response = await (globalThis.browser ?? globalThis.chrome).runtime.sendMessage({ type: "downloadStep" });
+          if (response?.click) { clicks++; element.click(); }
+          else globalThis.fetchrailButtonFollower?.();
+        } catch { globalThis.fetchrailButtonFollower?.(); }
+        finally { checking = false; }
+      };
+      const observer = new MutationObserver(tick);
+      observer.observe(document.documentElement, { childList: true, subtree: true, attributes: true });
+      const timer = setInterval(tick, 1000);
+      globalThis.fetchrailButtonFollower = () => { clearInterval(timer); observer.disconnect(); delete globalThis.fetchrailButtonFollower; };
+      tick();
+    },
+  });
+}
+
+async function stopFollowingButtons(tabIds) {
+  if (!api.scripting) return;
+  await Promise.all(tabIds.map((tabId) => api.scripting.executeScript({ target: { tabId }, func: () => globalThis.fetchrailButtonFollower?.() }).catch(() => {})));
+}
+
+api.tabs?.onUpdated?.addListener((tabId, change) => {
+  if (change.status !== "complete") return;
+  void changeBatch(async () => {
+    const { browserBatch: batch } = await api.storage.local.get("browserBatch");
+    if (batch?.status === "waiting" && batch.followButtons && batch.tabIds.includes(tabId)) {
+      await followDownloadButtons(tabId).catch(async (error) => {
+        batch.error = "Follow the download buttons manually on this page. " + error.message;
+        await api.storage.local.set({ browserBatch: batch });
+      });
+    }
+  });
+});
+
+async function startBrowserBatch(items, options, followButtons = false) {
+  if (!Array.isArray(items) || !items.length || items.length > 1000) throw new Error("Choose between 1 and 1,000 download pages.");
+  const unique = new Map();
+  for (const item of items) {
+    const url = new URL(item.url);
+    if (!["http:", "https:"].includes(url.protocol)) throw new Error("Only HTTP and HTTPS pages are supported.");
+    url.hash = "";
+    unique.set(url.href, { url: url.href });
+  }
+  await nativeRequest("ping");
+  return changeBatch(async () => {
+    const { browserBatch } = await api.storage.local.get("browserBatch");
+    if (browserBatch && ["waiting", "capturing"].includes(browserBatch.status)) throw new Error("Finish or stop the current browser batch first.");
+    return openBatchPage({ id: crypto.randomUUID(), items: [...unique.values()], options, followButtons, index: 0, accepted: 0, skipped: 0, tabId: null, tabIds: [] });
+  });
+}
+
+async function batchControl(action) {
+  return changeBatch(async () => {
+    const { browserBatch: batch } = await api.storage.local.get("browserBatch");
+    if (!batch || !["waiting", "capturing"].includes(batch.status)) throw new Error("There is no active browser batch.");
+    if (batch.status === "capturing") throw new Error("Wait for the current download handoff to finish.");
+    await stopFollowingButtons(batch.tabIds);
+    if (action === "stop") { batch.status = "stopped"; batch.tabIds = []; }
+    else if (action === "skip") { batch.index++; batch.skipped++; return openBatchPage(batch); }
+    else if (action === "retry") { batch.tabId = null; return openBatchPage(batch); }
+    else throw new Error("Unknown browser batch action.");
+    await api.storage.local.set({ browserBatch: batch });
+    return batch;
+  });
+}
+
+api.tabs?.onCreated?.addListener((tab) => {
+  if (tab.incognito || tab.openerTabId == null) return;
+  void changeBatch(async () => {
+    const { browserBatch: batch } = await api.storage.local.get("browserBatch");
+    if (batch?.status === "waiting" && batch.tabIds.includes(tab.openerTabId)) {
+      batch.tabIds.push(tab.id);
+      await api.storage.local.set({ browserBatch: batch });
+    }
+  });
+});
+api.tabs?.onRemoved?.addListener((tabId) => {
+  void changeBatch(async () => {
+    const { browserBatch: batch } = await api.storage.local.get("browserBatch");
+    if (batch?.status === "waiting" && batch.tabId === tabId) {
+      batch.tabId = null;
+      batch.error = "The download page was closed. Reopen it or skip this item.";
+      await api.storage.local.set({ browserBatch: batch });
+    }
+  });
+});
 
 async function panelIsOpen() {
   if (api.runtime.getContexts) {
@@ -77,7 +256,8 @@ async function addItems(source, items, options = {}) {
     url.hash = "";
     return { url: url.href, ...(item.suggestedFileName ? { suggestedFileName: item.suggestedFileName } : {}),
       ...(item.expectedBytes != null ? { expectedBytes: item.expectedBytes } : {}),
-      ...(item.expectedMime ? { expectedMime: item.expectedMime } : {}) };
+      ...(item.expectedMime ? { expectedMime: item.expectedMime } : {}),
+      ...(item.requestContext ? { requestContext: item.requestContext } : {}) };
   }).filter((item) => !seen.has(item.url) && seen.add(item.url));
   let accepted = 0;
   const ids = [];
@@ -99,21 +279,43 @@ async function addItems(source, items, options = {}) {
 }
 
 async function routeBrowserDownload(item) {
+  await captureReady;
   let paused = false;
   let engineId;
+  let handedOff = false;
+  let batchId;
+  let batchOptions;
+  const trace = recentRequests.get(item.finalUrl || item.url);
   try {
-    if ((await api.storage.local.get("automaticDownloads")).automaticDownloads === false) return;
+    if (trace && Date.now() - trace.time < 120000) {
+      await changeBatch(async () => {
+        const { browserBatch: batch } = await api.storage.local.get("browserBatch");
+        if (batch?.status === "waiting" && batch.tabIds.includes(trace.tabId)) {
+          batch.status = "capturing";
+          batch.browserDownloadId = item.id;
+          batchId = batch.id;
+          batchOptions = batch.options;
+          await stopFollowingButtons(batch.tabIds);
+          await api.storage.local.set({ browserBatch: batch });
+        }
+      });
+      if (trace.method !== "GET") throw new Error("This download uses a form submission and must finish in the browser.");
+    }
+    if (!batchId && (await api.storage.local.get("automaticDownloads")).automaticDownloads === false) return;
     await api.downloads.pause(item.id);
     paused = true;
     const [current] = await api.downloads.search({ id: item.id });
     if (!current || current.state !== "in_progress" || !current.paused || current.incognito
       || (current.danger && current.danger !== "safe")) return;
-    const result = await addItems("clickMonitor", [{
+    const requestTrace = recentRequests.get(current.finalUrl || current.url);
+    const context = useBrowserSession && requestTrace?.method === "GET" && Date.now() - requestTrace.time < 120000 ? requestTrace.context : {};
+    const result = await addItems(batchId ? "browserBatch" : "clickMonitor", [{
       url: current.finalUrl || current.url,
       suggestedFileName: current.filename?.split(/[\\/]/).pop(),
       expectedBytes: current.totalBytes >= 0 ? current.totalBytes : null,
       expectedMime: current.mime,
-    }]);
+      ...(Object.keys(context).length ? { requestContext: context } : {}),
+    }], batchOptions ?? {});
     engineId = result.ids[0];
     if (result.accepted !== 1 || !engineId) throw new Error(result.errors[0]?.message ?? "Fetchrail did not accept the download.");
     const [latest] = await api.downloads.search({ id: item.id });
@@ -124,12 +326,28 @@ async function routeBrowserDownload(item) {
       throw new Error("The browser download changed during verification.");
     }
     await api.downloads.cancel(item.id);
+    handedOff = true;
     paused = false;
     // History cleanup must not roll back a successful handoff.
     await api.downloads.erase({ id: item.id }).catch(() => {});
+    if (batchId) await changeBatch(async () => {
+      const { browserBatch: batch } = await api.storage.local.get("browserBatch");
+      if (batch?.id !== batchId) return;
+      batch.accepted++; batch.index++;
+      await openBatchPage(batch);
+    });
+    recentRequests.delete(current.finalUrl || current.url);
+    void api.storage.session?.set({ recentRequests: [...recentRequests] }).catch(() => {});
   } catch (error) {
-    if (engineId) await nativeRequest("controlDownload", { downloadId: engineId, action: "cancel" }).catch(() => {});
-    await setBadge("!", "Fetchrail: continuing in your browser. " + error.message);
+    if (engineId && !handedOff) await nativeRequest("controlDownload", { downloadId: engineId, action: "cancel" }).catch(() => {});
+    await setBadge("!", (handedOff ? "Fetchrail: file accepted; could not open the next page. " : "Fetchrail: continuing in your browser. ") + error.message);
+    if (batchId) await changeBatch(async () => {
+      const { browserBatch: batch } = await api.storage.local.get("browserBatch");
+      if (batch?.id !== batchId) return;
+      batch.status = "waiting";
+      batch.error = handedOff ? "File accepted. Reopen the next page to continue. " + error.message : "Continuing in the browser. " + error.message + " Skip this item once it finishes, or retry.";
+      await api.storage.local.set({ browserBatch: batch });
+    });
   } finally {
     if (paused) await api.downloads.resume(item.id).catch((error) => setBadge("!", "Fetchrail: resume the browser download manually. " + error.message));
   }
@@ -199,13 +417,46 @@ api.contextMenus.onClicked.addListener((info, tab) => {
 });
 
 api.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  // Injected followers can only ask to advance an active batch step, never read local data.
+  if (message.type === "downloadStep" && sender.id === api.runtime.id && sender.tab && !sender.tab.incognito) {
+    void changeBatch(async () => {
+      const { browserBatch: batch } = await api.storage.local.get("browserBatch");
+      if (batch?.status !== "waiting" || !batch.followButtons || !batch.tabIds.includes(sender.tab.id)) return { click: false };
+      if ((batch.followSteps ?? 0) >= 20) {
+        batch.error = "Automatic steps stopped after 20 buttons. Continue manually or skip this item.";
+        await api.storage.local.set({ browserBatch: batch });
+        return { click: false };
+      }
+      batch.followSteps = (batch.followSteps ?? 0) + 1;
+      await api.storage.local.set({ browserBatch: batch });
+      return { click: true };
+    }).then(sendResponse, () => sendResponse({ click: false }));
+    return true;
+  }
   // Only extension pages can read or control local downloads.
   if (sender.id !== api.runtime.id || !sender.url?.startsWith(api.runtime.getURL(""))) return false;
   const run = async () => {
     if (message.type === "collectLinks") return collectLinks(message.tabId);
+    if (message.type === "startBrowserBatch") return startBrowserBatch(message.items, {
+      connections: message.connections ?? null, queue: message.queue ?? null,
+      startPaused: message.startPaused ?? false, scheduledFor: message.scheduledFor ?? null,
+      speedLimitBps: message.speedLimitBps ?? 0,
+    }, message.followButtons === true);
+    if (message.type === "getBrowserBatch") return changeBatch(async () => {
+      const { browserBatch: batch } = await api.storage.local.get("browserBatch");
+      if (batch?.status === "capturing" && !routingDownloads.size) {
+        await api.downloads.resume(batch.browserDownloadId).catch(() => {});
+        batch.status = "waiting";
+        batch.error = "The previous handoff was interrupted. Check Fetchrail and browser downloads before retrying or skipping this item.";
+        await api.storage.local.set({ browserBatch: batch });
+      }
+      return batch ?? null;
+    });
+    if (message.type === "browserBatchControl") return batchControl(message.action);
     if (message.type === "addDownloads") return addItems("popup", message.items, {
       connections: message.connections ?? null, queue: message.queue ?? null,
       startPaused: message.startPaused ?? false, scheduledFor: message.scheduledFor ?? null,
+      speedLimitBps: message.speedLimitBps ?? 0,
     });
     if (["ping", "getDownloads", "showApp"].includes(message.type)) return nativeRequest(message.type);
     if (message.type === "controlDownload") return nativeRequest("controlDownload", { downloadId: message.downloadId, action: message.action });

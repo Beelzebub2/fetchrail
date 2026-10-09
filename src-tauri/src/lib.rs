@@ -3,12 +3,14 @@ compile_error!("Release builds must embed the frontend: enable --features tauri/
 
 mod browser_bridge;
 mod browser_extension;
+mod download_window;
 mod engine;
 #[cfg(windows)]
 pub mod install;
 mod model;
 pub mod native_host;
 pub mod native_protocol;
+mod rate_limit;
 
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -17,7 +19,10 @@ use std::sync::{
 
 use chrono::{DateTime, Utc};
 use engine::DownloadManager;
-use model::{AddDownloadRequest, DownloadRecord, DownloadSettings, EngineOverview, QueueRecord};
+use model::{
+    AddDownloadRequest, BatchDownloadResult, DownloadRecord, DownloadSettings, EngineOverview,
+    QueueRecord,
+};
 use tauri::{
     menu::{Menu, MenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
@@ -38,6 +43,33 @@ async fn add_download(
     request: AddDownloadRequest,
 ) -> Result<DownloadRecord, String> {
     manager.inner().add(request).await
+}
+
+#[tauri::command]
+async fn add_downloads(
+    manager: State<'_, Arc<DownloadManager>>,
+    requests: Vec<AddDownloadRequest>,
+) -> Result<BatchDownloadResult, String> {
+    manager.inner().add_batch(requests).await
+}
+
+#[tauri::command]
+async fn set_download_speed_limit(
+    manager: State<'_, Arc<DownloadManager>>,
+    id: Uuid,
+    speed_limit_bps: u64,
+) -> Result<DownloadRecord, String> {
+    manager.set_speed_limit(id, speed_limit_bps).await
+}
+
+#[tauri::command]
+async fn schedule_queue(
+    manager: State<'_, Arc<DownloadManager>>,
+    name: String,
+    starts_at: Option<DateTime<Utc>>,
+    stops_at: Option<DateTime<Utc>>,
+) -> Result<Vec<QueueRecord>, String> {
+    manager.schedule_queue(name, starts_at, stops_at).await
 }
 
 #[tauri::command]
@@ -474,6 +506,9 @@ pub fn run() {
                     }
                     return;
                 }
+                if window.label().starts_with(download_window::PROGRESS_WINDOW) {
+                    return;
+                }
                 if manager.minimize_to_tray_enabled() {
                     api.prevent_close();
                     let _ = window.hide();
@@ -484,7 +519,14 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             frontend_ready,
+            download_window::get_download,
+            download_window::show_download_progress,
+            download_window::set_download_completion_options,
+            download_window::open_download,
             add_download,
+            add_downloads,
+            set_download_speed_limit,
+            schedule_queue,
             list_downloads,
             get_overview,
             pause_download,

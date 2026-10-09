@@ -28,11 +28,23 @@
       <button data-view="links" aria-pressed="false">This page <span id="link-count">0</span></button>
     </nav>
     <section id="downloads-view">
+      <label class="option-row">Link type <select id="link-mode"><option value="direct">Direct file links</option><option value="browser">Browse download pages</option></select></label>
+      <div id="browser-help" hidden>
+        <p class="hint">Opens each page in a browser tab. Fetchrail captures the final file and opens the next page. Complete login, CAPTCHA or ambiguous steps yourself.</p>
+        <label class="capture"><span>Follow a single clear download button automatically</span><input id="follow-buttons" class="switch" type="checkbox" checked /></label>
+      </div>
       <form id="add-form" class="add-field">
         <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M10 13a5 5 0 0 0 7.5.5l3-3a5 5 0 0 0-7-7l-1.8 1.7M14 11a5 5 0 0 0-7.5-.5l-3 3a5 5 0 0 0 7 7l1.7-1.7"/></svg>
         <textarea id="urls" rows="1" placeholder="Paste one or more links" aria-label="Download URLs, one per line" required spellcheck="false"></textarea>
         <button id="add" class="primary" type="submit">Download</button>
       </form>
+      <section id="browser-batch" hidden aria-label="Browser download batch">
+        <p id="batch-status" role="status"></p>
+        <p id="batch-error" class="hint"></p>
+        <button id="batch-retry" class="text-button">Reopen page</button>
+        <button id="batch-skip" class="text-button">Skip item</button>
+        <button id="batch-stop" class="text-button">Stop batch</button>
+      </section>
       <div class="stats" aria-label="Download statistics">
         <div><span class="caption">Downloading now</span><div class="hero"><strong id="speed">0</strong><span id="speed-unit">MB/s</span></div></div>
         <div class="stats-side"><span><span id="active">0</span> running · <span id="queued">0</span> waiting</span><select id="status-filter" aria-label="Filter downloads"><option value="all">Recent</option><option value="active">Active</option><option value="paused">Paused</option><option value="failed">Failed</option><option value="completed">Completed</option></select></div>
@@ -54,9 +66,13 @@
         <label class="option-row">Queue <select id="queue" aria-label="Queue"><option>Default</option></select></label>
         <label class="option-row">Start <select id="start" aria-label="Start"><option value="now">Immediately</option><option value="paused">Paused</option><option value="scheduled">At a scheduled time</option></select></label>
         <label id="schedule-row" class="option-row" hidden>Start time <input id="schedule" type="datetime-local" aria-label="Start time" /></label>
+        <label class="option-row">File speed limit (KiB/s) <input id="speed-limit" type="number" min="0" max="1000000" step="1" value="0" /></label>
+        <label class="capture"><span>Use browser session for captured files</span><input id="browser-session" class="switch" type="checkbox" /></label>
+        <p class="hint">Session support passes the final file's cookies, referrer and authorization to the local app for resume and scheduling. 0 KiB/s means unlimited.</p>
         <p class="hint" id="engine-hint">Connections adapt to the file size and server support.</p>
       </details>
       <button id="download-selected" class="primary" disabled hidden>Download selected</button>
+      <button id="browse-selected" class="text-button" disabled hidden>Browse selected download pages</button>
     </div>
     <footer><span>Local engine · No cloud required</span><span id="version">Fetchrail</span></footer>
   </main>

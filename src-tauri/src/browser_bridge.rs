@@ -128,7 +128,8 @@ async fn process_request(
                     "appVersion": env!("CARGO_PKG_VERSION"),
                     "frontendReady": app.state::<crate::FrontendReady>().0.load(std::sync::atomic::Ordering::Relaxed),
                     "frontendUrl": app.get_webview_window("main").and_then(|window| window.url().ok()).map(|url| url.to_string()),
-                    "capabilities": ["addDownloads", "getDownloads", "controlDownload", "showApp", "queues", "scheduling", "connections"],
+                    "capabilities": ["addDownloads", "getDownloads", "controlDownload", "showApp", "queues", "scheduling", "connections", "speedLimits", "browserSessions"],
+                    "speedLimitBps": settings.speed_limit_bps,
                     "connectionsPerDownload": settings.connections_per_download,
                     "maxConcurrentDownloads": settings.max_concurrent_downloads,
                     "minSegmentSizeMb": settings.min_segment_size_mb,
@@ -146,12 +147,14 @@ async fn process_request(
                 "status": record.status,
                 "totalBytes": record.total_bytes,
                 "downloadedBytes": record.downloaded_bytes,
+                "mergedBytes": record.merged_bytes,
                 "speedBps": record.speed_bps,
                 "etaSeconds": record.eta_seconds,
                 "connections": record.connections,
                 "requestedConnections": record.requested_connections,
                 "queue": record.queue,
                 "scheduledFor": record.scheduled_for,
+                "speedLimitBps": record.speed_limit_bps,
                 // [downloaded, length] pairs keep a full list of 32-connection transfers within the response limit.
                 "segments": record.segments.iter().map(|part| json!([part.downloaded_bytes, part.length])).collect::<Vec<_>>(),
                 "error": record.error.as_ref().map(|error| error.chars().take(300).collect::<String>())
@@ -190,22 +193,28 @@ async fn process_request(
             let mut errors = Vec::new();
             let mut ids = Vec::new();
             let caught = matches!(request.params.source, Some(BrowserSource::ClickMonitor));
+            let captured =
+                caught || matches!(request.params.source, Some(BrowserSource::BrowserBatch));
             for (index, item) in request.params.items.into_iter().enumerate() {
                 let result = async {
-                    if caught {
+                    let file_name = if captured {
                         manager
                             .validate_browser_download(
                                 &item.url,
                                 item.expected_bytes,
                                 item.expected_mime.as_deref(),
+                                item.request_context.as_ref(),
                             )
-                            .await?;
-                    }
+                            .await?
+                            .or(item.suggested_file_name)
+                    } else {
+                        item.suggested_file_name
+                    };
                     manager
                         .add(AddDownloadRequest {
                             url: item.url,
                             directory: None,
-                            file_name: item.suggested_file_name,
+                            file_name,
                             queue: request.params.queue.clone(),
                             scheduled_for: request.params.scheduled_for,
                             // A caught download waits, paused, for the answer to its prompt.
@@ -216,6 +225,8 @@ async fn process_request(
                             },
                             connections: request.params.connections,
                             expected_bytes: item.expected_bytes,
+                            speed_limit_bps: request.params.speed_limit_bps,
+                            request_context: item.request_context,
                         })
                         .await
                 }

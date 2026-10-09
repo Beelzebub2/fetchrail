@@ -1,3 +1,4 @@
+use crate::model::BrowserRequestContext;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -42,6 +43,7 @@ pub struct NativeParams {
     pub scheduled_for: Option<DateTime<Utc>>,
     pub download_id: Option<Uuid>,
     pub action: Option<DownloadAction>,
+    pub speed_limit_bps: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -59,6 +61,7 @@ pub enum BrowserSource {
     DownloadAll,
     ClickMonitor,
     Popup,
+    BrowserBatch,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -68,6 +71,7 @@ pub struct BrowserDownloadItem {
     pub suggested_file_name: Option<String>,
     pub expected_bytes: Option<u64>,
     pub expected_mime: Option<String>,
+    pub request_context: Option<BrowserRequestContext>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -166,6 +170,30 @@ pub fn validate_request(request: &NativeRequest) -> Result<(), String> {
                 return Err("Invalid queue name.".into());
             }
             for item in &request.params.items {
+                if let Some(context) = &item.request_context {
+                    if !matches!(
+                        request.params.source,
+                        Some(BrowserSource::ClickMonitor | BrowserSource::BrowserBatch)
+                    ) {
+                        return Err(
+                            "Session headers are only accepted for a captured browser download."
+                                .into(),
+                        );
+                    }
+                    for value in [
+                        &context.cookie,
+                        &context.authorization,
+                        &context.referer,
+                        &context.user_agent,
+                    ]
+                    .into_iter()
+                    .flatten()
+                    {
+                        if value.len() > 16 * 1024 || value.chars().any(char::is_control) {
+                            return Err("Invalid browser request header.".into());
+                        }
+                    }
+                }
                 if item
                     .expected_mime
                     .as_ref()
@@ -202,7 +230,8 @@ pub fn validate_request(request: &NativeRequest) -> Result<(), String> {
             || request.params.connections.is_some()
             || request.params.queue.is_some()
             || request.params.start_paused.is_some()
-            || request.params.scheduled_for.is_some())
+            || request.params.scheduled_for.is_some()
+            || request.params.speed_limit_bps.is_some())
     {
         return Err("Download options are only accepted by addDownloads.".into());
     }
@@ -230,6 +259,7 @@ mod tests {
                     suggested_file_name: None,
                     expected_bytes: None,
                     expected_mime: None,
+                    request_context: None,
                 }],
                 ..NativeParams::default()
             },

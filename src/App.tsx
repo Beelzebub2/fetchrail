@@ -49,7 +49,8 @@ type SegmentProgress = {
   active: boolean;
 };
 
-type DownloadRecord = {
+export type DownloadRecord = {
+  speedLimitBps: number;
   id: string;
   url: string;
   fileName: string;
@@ -59,6 +60,7 @@ type DownloadRecord = {
   downloadedBytes: number;
   speedBps: number;
   etaSeconds: number | null;
+  mergedBytes: number;
   connections: number;
   requestedConnections: number | null;
   error: string | null;
@@ -67,6 +69,16 @@ type DownloadRecord = {
   queue: string;
   scheduledFor: string | null;
   segments: SegmentProgress[];
+  resumeSupported: boolean | null;
+  completionOptions: CompletionOptions;
+};
+
+export type CompletionOptions = {
+  showCompleteDialog: boolean;
+  hangUp: boolean;
+  exitApp: boolean;
+  turnOffComputer: boolean;
+  forceShutdown: boolean;
 };
 
 type Theme = "dark" | "light";
@@ -93,7 +105,8 @@ type SetupInfo = {
   desktopShortcut: boolean;
 };
 
-type DownloadSettings = Appearance & {
+export type DownloadSettings = Appearance & {
+  speedLimitBps: number;
   autoUpdate: boolean;
   categories: Category[];
   defaultDownloadDir: string;
@@ -107,6 +120,8 @@ type DownloadSettings = Appearance & {
 type QueueRecord = {
   name: string;
   paused: boolean;
+  startsAt: string | null;
+  stopsAt: string | null;
 };
 
 type StartMode = "now" | "paused" | "schedule";
@@ -156,7 +171,7 @@ document.documentElement.dataset.accent = localStorage.getItem("accent") ?? "emb
 
 const isTauri = () => "__TAURI_INTERNALS__" in window;
 
-function applyLook(look: Appearance) {
+export function applyLook(look: Appearance) {
   for (const key of ["theme", "accent"] as const) {
     document.documentElement.dataset[key] = look[key];
     localStorage.setItem(key, look[key]);
@@ -205,7 +220,7 @@ function nameFromUrl(url: string) {
 }
 
 // Sizes and byte ranges pass `fine` so neighbouring gigabyte values stay distinguishable.
-function formatBytes(value: number | null, fine = false) {
+export function formatBytes(value: number | null, fine = false) {
   if (value == null) return "Unknown";
   if (value < 1024) return String(value) + " B";
   const units = ["KB", "MB", "GB", "TB"];
@@ -219,11 +234,11 @@ function formatBytes(value: number | null, fine = false) {
   return numeric + " " + units[index];
 }
 
-function formatSpeed(value: number) {
+export function formatSpeed(value: number) {
   return value > 0 ? formatBytes(value) + "/s" : "—";
 }
 
-function formatEta(value: number | null) {
+export function formatEta(value: number | null) {
   if (value == null || !Number.isFinite(value)) return "—";
   if (value <= 0) return "Done";
   const hours = Math.floor(value / 3600);
@@ -239,6 +254,14 @@ function formatDateTime(value: string) {
   return Number.isNaN(date.getTime())
     ? "Invalid date"
     : date.toLocaleString([], { dateStyle: "short", timeStyle: "short" });
+}
+
+function queueWaitNote(queue: QueueRecord | undefined) {
+  if (!queue) return "";
+  if (queue.paused) return `${queue.name} is paused`;
+  if (queue.startsAt && new Date(queue.startsAt).getTime() > Date.now()) return `${queue.name} starts ${formatDateTime(queue.startsAt)}`;
+  if (queue.stopsAt && new Date(queue.stopsAt).getTime() <= Date.now()) return `${queue.name} schedule has ended`;
+  return "";
 }
 
 function hostOf(url: string) {
@@ -260,20 +283,24 @@ function defaultScheduleValue() {
   return toDateTimeLocalValue(new Date(Date.now() + 30 * 60_000).toISOString());
 }
 
-function progressOf(item: DownloadRecord) {
+export function progressOf(item: DownloadRecord) {
   if (item.status === "completed") return 100;
+  if (item.status === "merging") {
+    const total = item.totalBytes ?? item.downloadedBytes;
+    return total > 0 ? Math.min(100, ((item.mergedBytes ?? 0) / total) * 100) : 100;
+  }
   if (!item.totalBytes || item.totalBytes <= 0) return 0;
   return Math.min(100, (item.downloadedBytes / item.totalBytes) * 100);
 }
 
-function statusLabel(status: DownloadStatus) {
+export function statusLabel(status: DownloadStatus) {
   const labels: Record<DownloadStatus, string> = {
     queued: "Queued",
     scheduled: "Scheduled",
     connecting: "Connecting",
     downloading: "Downloading",
     paused: "Paused",
-    merging: "Finalizing",
+    merging: "Joining parts",
     completed: "Completed",
     failed: "Failed",
     cancelled: "Cancelled",
@@ -282,14 +309,14 @@ function statusLabel(status: DownloadStatus) {
 }
 
 // One entry per connection. Before the engine has split the file, the whole download is a single part.
-function partsOf(item: DownloadRecord): Part[] {
+export function partsOf(item: DownloadRecord): Part[] {
   const segments = item.segments.length
     ? item.segments
     : [{ start: 0, length: item.totalBytes, downloadedBytes: item.downloadedBytes, speedBps: item.speedBps, active: false }];
   return segments.map((segment) => {
     const complete = segment.length != null && segment.downloadedBytes >= segment.length;
     const state: PartState =
-      complete || item.status === "merging"
+      complete || item.status === "merging" || item.status === "completed"
         ? "done"
         : item.status === "downloading"
           ? segment.active
@@ -323,7 +350,7 @@ function partNote(part: Part) {
   return notes[part.state];
 }
 
-function Logo({ size = 30 }: { size?: number }) {
+export function Logo({ size = 30 }: { size?: number }) {
   return (
     <svg className="logo" width={size} height={size} viewBox="0 0 48 48" aria-hidden="true">
       <rect width="48" height="48" rx="12" />
@@ -342,7 +369,7 @@ function Logo({ size = 30 }: { size?: number }) {
   );
 }
 
-function Strands({ parts, className = "" }: { parts: Part[]; className?: string }) {
+export function Strands({ parts, className = "" }: { parts: Part[]; className?: string }) {
   return (
     <div className={"strands " + className}>
       {parts.map((part, index) => (
@@ -373,6 +400,8 @@ function App() {
   const [showAdd, setShowAdd] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
   const [url, setUrl] = useState("");
+  const [downloadLimit, setDownloadLimit] = useState(0);
+  const [batchError, setBatchError] = useState<string | null>(null);
   const [directory, setDirectory] = useState("");
   const [selectedQueue, setSelectedQueue] = useState("Default");
   const [startMode, setStartMode] = useState<StartMode>("now");
@@ -448,6 +477,7 @@ function App() {
     });
     const unlistenSettings = listen<DownloadSettings>("fetchrail://settings-updated", (event) => setSettings(event.payload));
     const unlistenUpdate = listen<UpdateStatus>("fetchrail://update-status", (event) => setUpdate(event.payload));
+    const unlistenCompletion = listen<{ id: string; message: string }>("fetchrail://completion-error", (event) => setMessage(event.payload.message));
     void invoke<UpdateStatus>("update_status").then((status) => !disposed && setUpdate(status));
     void getVersion().then((current) => !disposed && setVersion(current));
 
@@ -458,6 +488,7 @@ function App() {
       void unlistenQueues.then((stop) => stop());
       void unlistenSettings.then((stop) => stop());
       void unlistenUpdate.then((stop) => stop());
+      void unlistenCompletion.then((stop) => stop());
     };
   }, []);
 
@@ -496,30 +527,43 @@ function App() {
     let scheduledFor: string | null = null;
     if (startMode === "schedule") {
       const when = new Date(scheduledLocal);
-      if (!scheduledLocal || Number.isNaN(when.getTime())) {
-        setMessage("Choose a valid date and time for the scheduled download.");
+      if (!scheduledLocal || Number.isNaN(when.getTime()) || when.getTime() <= Date.now()) {
+        setMessage("Choose a future date and time for the scheduled download.");
         return;
       }
       scheduledFor = when.toISOString();
     }
     setBusy(true);
     setMessage(null);
+    setBatchError(null);
     try {
-      await invoke<DownloadRecord>("add_download", {
-        request: {
-          url: url.trim(),
+      const urls = url.trim().split(/\s+/).filter(Boolean);
+      const result = await invoke<{ accepted: DownloadRecord[]; errors: { index: number; message: string }[] }>("add_downloads", {
+        requests: urls.map((item) => ({
+          url: item,
           directory: directory.trim() || null,
           fileName: null,
           queue: selectedQueue,
           scheduledFor,
           startPaused: startMode === "paused",
           connections: connections || null,
-        },
+          speedLimitBps: downloadLimit * 1024,
+        })),
       });
+      if (result.errors.length) {
+        setUrl(result.errors.map((error) => urls[error.index]).join("\n"));
+        const error = `${result.accepted.length} added. ${result.errors.length} rejected: ${result.errors[0].message}`;
+        setBatchError(error);
+        setMessage(error);
+        return;
+      }
       setUrl("");
       setStartMode("now");
       setScheduledLocal("");
       setShowAdd(false);
+      if (startMode === "now" && result.accepted.length === 1) {
+        await invoke("show_download_progress", { id: result.accepted[0].id }).catch((error) => setMessage(String(error)));
+      }
     } catch (error) {
       setMessage(String(error));
     } finally {
@@ -547,7 +591,7 @@ function App() {
   }
 
   async function queueCommand(
-    name: "create_queue" | "delete_queue" | "set_queue_paused",
+    name: "create_queue" | "delete_queue" | "set_queue_paused" | "schedule_queue",
     args: Record<string, unknown>,
   ) {
     setBusy(true);
@@ -731,6 +775,7 @@ function App() {
             onCreateQueue={(name) => queueCommand("create_queue", { name })}
             onDeleteQueue={(name) => queueCommand("delete_queue", { name })}
             onToggleQueue={(name, paused) => queueCommand("set_queue_paused", { name, paused })}
+            onScheduleQueue={(name, startsAt, stopsAt) => queueCommand("schedule_queue", { name, startsAt, stopsAt })}
           />
         ) : (
           <>
@@ -833,8 +878,8 @@ function App() {
           >
             <div className="modal-head">
               <div>
-                <h2 id="add-download-title">New download</h2>
-                <p>Fetchrail checks the server first and opens parallel connections when it supports them.</p>
+                <h2 id="add-download-title">New downloads</h2>
+                <p>Paste file links, one per line. For pages with several download buttons, use Browse download pages in the browser companion.</p>
               </div>
               <button
                 type="button"
@@ -846,14 +891,15 @@ function App() {
               </button>
             </div>
             <label>
-              Download URL
-              <input
+              Download URLs
+              <textarea
                 autoFocus
                 className="mono"
                 value={url}
                 onChange={(event) => setUrl(event.target.value)}
                 placeholder="https://example.com/archive.zip"
-                type="url"
+                rows={4}
+                spellCheck={false}
                 required
               />
             </label>
@@ -951,13 +997,18 @@ function App() {
                 />
               </label>
             )}
+            <label>
+              Speed limit for each file (KiB/s, 0 = unlimited)
+              <input type="number" min={0} max={1_000_000} step={1} value={downloadLimit} onChange={(event) => setDownloadLimit(Number(event.target.value))} />
+            </label>
+            {batchError && <p role="alert" className="extension-error">{batchError}</p>}
             <div className="modal-actions">
               <button type="button" className="ghost-button" onClick={closeAdd}>
                 Cancel
               </button>
               <button className="primary-button" disabled={busy || !url.trim()}>
                 {startMode === "schedule" ? <CalendarClock size={16} /> : <Download size={16} />}
-                {busy ? "Adding…" : startMode === "schedule" ? "Schedule download" : startMode === "paused" ? "Add paused" : "Download"}
+                {busy ? "Adding…" : startMode === "schedule" ? "Schedule downloads" : startMode === "paused" ? "Add paused" : "Download"}
               </button>
             </div>
           </form>
@@ -1020,6 +1071,8 @@ function DownloadRow({
   const [expanded, setExpanded] = useState(false);
   const [editingSchedule, setEditingSchedule] = useState(false);
   const [scheduleDraft, setScheduleDraft] = useState("");
+  const [editingLimit, setEditingLimit] = useState(false);
+  const [limitDraft, setLimitDraft] = useState(0);
   const running = runningStatuses.has(item.status);
   const canPause = ["queued", "scheduled", "connecting", "downloading"].includes(item.status);
   const canResume = ["paused", "failed", "cancelled"].includes(item.status);
@@ -1065,8 +1118,8 @@ function DownloadRow({
       : sized
         ? statusLabel(item.status) + " · " + sizes
         : item.status === "queued"
-          ? queues.some((queue) => queue.name === item.queue && queue.paused)
-            ? `Waiting · ${item.queue} is paused`
+          ? queueWaitNote(queues.find((queue) => queue.name === item.queue))
+            ? `Waiting · ${queueWaitNote(queues.find((queue) => queue.name === item.queue))}`
             : "Waiting for a free slot"
           : item.status === "scheduled" && item.scheduledFor
             ? "Starts " + formatDateTime(item.scheduledFor)
@@ -1103,6 +1156,27 @@ function DownloadRow({
               </span>
               <span className="mono">{formatBytes(item.totalBytes ?? item.downloadedBytes, true)}</span>
             </div>
+          ) : item.status === "merging" ? (
+            <>
+              <div className="progress-line">
+                <span><RotateCw size={14} className="merge-spinner" />{progress < 100 ? "Joining parts" : "Saving file…"}</span>
+                <span className="mono">{Math.floor(progress)}%</span>
+              </div>
+              <div
+                className="merge-progress"
+                role="progressbar"
+                aria-label={`Joining parts for ${item.fileName}`}
+                aria-valuemin={0}
+                aria-valuemax={100}
+                aria-valuenow={Math.floor(progress)}
+                aria-valuetext={`${Math.floor(progress)}% joined${progress === 100 ? ", saving file" : ""}`}
+              >
+                <i className="merge-fill" style={{ width: `${progress}%` }} />
+              </div>
+              <small className="merge-detail mono">
+                {formatBytes(item.mergedBytes ?? 0, true)} of {formatBytes(item.totalBytes ?? item.downloadedBytes, true)} joined
+              </small>
+            </>
           ) : (
             <>
               <div className={sized ? "progress-line mono" : "progress-line"}>
@@ -1133,7 +1207,7 @@ function DownloadRow({
               {parts.length - count("done")} of {parts.length} connections
             </small>
           )}
-          {item.status === "merging" && <small>Joining parts</small>}
+          {item.status === "merging" && <small>Disk write</small>}
         </div>
         <div className="col-eta">
           <span className="mono">{running ? formatEta(item.etaSeconds) : "—"}</span>
@@ -1178,6 +1252,16 @@ function DownloadRow({
             <Ellipsis size={16} />
           </button>
           <div className="menu" popover="auto" id={menuId} style={{ positionAnchor: anchor }}>
+            <button popoverTarget={menuId} popoverTargetAction="hide" onClick={() => { setLimitDraft(item.speedLimitBps / 1024); setEditingLimit(true); }}>
+              Speed limit…
+            </button>
+            <button
+              popoverTarget={menuId}
+              popoverTargetAction="hide"
+              onClick={() => command("show_download_progress", item.id)}
+            >
+              <Activity size={15} /> Download progress…
+            </button>
             {canSchedule && (
               <button
                 popoverTarget={menuId}
@@ -1264,6 +1348,15 @@ function DownloadRow({
         </div>
       )}
       {/* Kept mounted so the lanes can fan out and fold back; inert keeps the folded panel out of the tab order. */}
+      {editingLimit && (
+        <div className="row-schedule" role="group" aria-label={`Speed limit for ${item.fileName}`}>
+          <label>KiB/s (0 = unlimited) <input type="number" min={0} max={1_000_000} step={1} value={limitDraft} onChange={(event) => setLimitDraft(Number(event.target.value))} /></label>
+          <button type="button" className="secondary-button" disabled={!Number.isFinite(limitDraft) || limitDraft < 0} onClick={async () => {
+            if (await command("set_download_speed_limit", item.id, { speedLimitBps: Math.round(limitDraft * 1024) })) setEditingLimit(false);
+          }}>Apply</button>
+          <button type="button" className="ghost-button" onClick={() => setEditingLimit(false)}>Cancel</button>
+        </div>
+      )}
       <div className="connections" id={panelId} inert={!expanded}>
         <div>
           <div className="connections-body">
@@ -1306,6 +1399,8 @@ function DownloadRow({
               <dd className="mono" title={item.destination}>{item.destination}</dd>
               <dt>Queue</dt>
               <dd>{item.queue} · Added {formatDateTime(item.createdAt)}</dd>
+              <dt>Speed limit</dt>
+              <dd>{item.speedLimitBps ? formatSpeed(item.speedLimitBps) : "Unlimited"}</dd>
             </dl>
           </div>
         </div>
@@ -1326,6 +1421,7 @@ function SettingsPage({
   onCreateQueue,
   onDeleteQueue,
   onToggleQueue,
+  onScheduleQueue,
 }: {
   settings: DownloadSettings;
   queues: QueueRecord[];
@@ -1338,6 +1434,7 @@ function SettingsPage({
   onCreateQueue: (name: string) => Promise<boolean>;
   onDeleteQueue: (name: string) => Promise<boolean>;
   onToggleQueue: (name: string, paused: boolean) => Promise<boolean>;
+  onScheduleQueue: (name: string, startsAt: string | null, stopsAt: string | null) => Promise<boolean>;
 }) {
   const [draft, setDraft] = useState(settings);
   const [queueName, setQueueName] = useState("");
@@ -1438,6 +1535,11 @@ function SettingsPage({
                 onChange={(e) => setDraft({ ...draft, minSegmentSizeMb: Number(e.target.value) })}
               />
             </label>
+            <label>
+              Total speed limit (KiB/s)
+              <input type="number" min={0} max={1_000_000} step={1} value={draft.speedLimitBps / 1024} onChange={(event) => setDraft({ ...draft, speedLimitBps: Math.round(Number(event.target.value) * 1024) })} />
+              <small>0 = unlimited. Shared across every file and connection; changes apply when saved.</small>
+            </label>
           </div>
           <div className="strands preview" key={parts} aria-hidden="true">
             {Array.from({ length: parts }, (_, index) => <span key={index} />)}
@@ -1451,7 +1553,7 @@ function SettingsPage({
         <section className="card" aria-labelledby="queue-settings-title">
           <div className="card-head">
             <h2 id="queue-settings-title">Queues</h2>
-            <p>Paused queues keep their pending downloads waiting.</p>
+            <p>Queue schedules start and stop transfers automatically. Keep Fetchrail running; times use your local timezone.</p>
           </div>
           <div className="queue-create">
             <input
@@ -1474,10 +1576,11 @@ function SettingsPage({
           </div>
           <div className="rows">
             {queues.map((queue) => (
-              <div key={queue.name}>
+              <div className="queue-settings-item" key={queue.name}>
+                <div>
                 <div className="grow">
                   <strong>{queue.name}</strong>
-                  <small>{queue.paused ? "New downloads are waiting" : "Ready to start downloads"}</small>
+                  <small>{queueWaitNote(queue) || (queue.stopsAt ? `Runs until ${formatDateTime(queue.stopsAt)}` : "Ready to start downloads")}</small>
                 </div>
                 <label className="switch-label">
                   {queue.paused ? "Paused" : "Active"}
@@ -1499,6 +1602,8 @@ function SettingsPage({
                 >
                   <Trash2 size={16} />
                 </button>
+              </div>
+                <QueueSchedule key={`${queue.name}:${queue.startsAt}:${queue.stopsAt}`} queue={queue} busy={busy} save={onScheduleQueue} />
               </div>
             ))}
           </div>
@@ -1714,6 +1819,26 @@ function SettingsPage({
 }
 
 // The window a browser hand-over opens: confirm where the file goes, then start it, keep it for later or drop it.
+function QueueSchedule({ queue, busy, save }: { queue: QueueRecord; busy: boolean; save: (name: string, start: string | null, stop: string | null) => Promise<boolean> }) {
+  const [start, setStart] = useState(queue.startsAt ? toDateTimeLocalValue(queue.startsAt) : "");
+  const [stop, setStop] = useState(queue.stopsAt ? toDateTimeLocalValue(queue.stopsAt) : "");
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState("");
+  return <div className="queue-window">
+    <label>Start <input type="datetime-local" value={start} onChange={(event) => setStart(event.target.value)} /></label>
+    <label>Stop <input type="datetime-local" value={stop} onChange={(event) => setStop(event.target.value)} /></label>
+    <button type="button" className="secondary-button" disabled={busy || saving} onClick={async () => {
+      const from = start ? new Date(start) : null;
+      const until = stop ? new Date(stop) : null;
+      if ((from && !Number.isFinite(from.getTime())) || (until && (!Number.isFinite(until.getTime()) || until.getTime() <= (from?.getTime() ?? Date.now())))) { setError("Choose a stop time after the start time."); return; }
+      setSaving(true); setError("");
+      try { await save(queue.name, from?.toISOString() ?? null, until?.toISOString() ?? null); } finally { setSaving(false); }
+    }}>Save schedule</button>
+    {(queue.startsAt || queue.stopsAt) && <button type="button" className="ghost-button" disabled={busy || saving} onClick={() => void save(queue.name, null, null)}>Clear</button>}
+    {error && <small role="alert">{error}</small>}
+  </div>;
+}
+
 export function DownloadPrompt({ id }: { id: string }) {
   const [item, setItem] = useState<DownloadRecord | null>(null);
   const [settings, setSettings] = useState<DownloadSettings | null>(null);
@@ -1737,9 +1862,12 @@ export function DownloadPrompt({ id }: { id: string }) {
         setCategory(categoryFor(found.fileName, current)?.name ?? "");
       })
       .catch((error) => setMessage(String(error)));
-    // Started, removed or finished from the main window: there is nothing left to ask.
+    // A download started from either window moves on to its progress window.
     const unlisten = listen<DownloadRecord>("fetchrail://download-updated", (event) => {
-      if (event.payload.id === id && event.payload.status !== "paused") void getCurrentWindow().destroy();
+      if (event.payload.id === id && event.payload.status !== "paused") {
+        if (event.payload.status !== "cancelled") void invoke("show_download_progress", { id }).catch((error) => setMessage(String(error)));
+        void getCurrentWindow().destroy();
+      }
     });
     const unlistenRemoved = listen<string>("fetchrail://download-removed", (event) => {
       if (event.payload === id) void getCurrentWindow().destroy();
@@ -1769,7 +1897,10 @@ export function DownloadPrompt({ id }: { id: string }) {
           });
         }
         await invoke("place_download", { id, directory: folder, fileName: name });
-        if (action === "start") await invoke("resume_download", { id });
+        if (action === "start") {
+          await invoke("show_download_progress", { id });
+          await invoke("resume_download", { id });
+        }
       }
       await getCurrentWindow().destroy();
     } catch (error) {

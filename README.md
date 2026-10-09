@@ -31,8 +31,9 @@ Keep large downloads moving, pick up interrupted transfers, and organize files w
 | **Parallel downloads** | Adaptive HTTP(S) byte ranges, up to 32 connections per download, and automatic single-stream fallback. |
 | **Resume with confidence** | Persistent partial files, pause/resume controls, transient-error retries, and validation before reusing saved bytes. |
 | **Progress you can inspect** | Live speed, ETA, byte counts, and an expandable view of every connection's range and progress. |
-| **An organized download list** | Named queues, scheduled starts, search, status filters, and editable file categories that sort files into folders. |
-| **A browser companion** | Automatic download handoff, page-link and media selection, URL batches, and transfer controls for Chromium browsers and Firefox. |
+| **Speed limits and schedules** | Live global and per-file bandwidth caps, persistent scheduled starts, and queue start/stop windows. |
+| **An organized download list** | Desktop URL batches with per-link errors, named queues, search, status filters, and editable file categories that sort files into folders. |
+| **A browser companion** | Automatic download handoff, page-link and media selection, browser batches for multi-step download pages, optional session support, and transfer controls for Chromium browsers and Firefox. |
 | **A desktop app that stays out of the way** | Dark and light themes, four accents, a system tray, optional launch at sign-in, and signed automatic updates. |
 
 ## Install
@@ -57,6 +58,10 @@ To uninstall, use **Windows Settings → Apps → Installed apps → Fetchrail**
 
 Pause a transfer to free a download slot, then resume it when you are ready. If Fetchrail closes during a transfer, the download returns paused on the next launch.
 
+Use **New downloads** to paste several file URLs, one per line. The batch shares your folder, queue, start time and per-file speed limit; rejected links stay in the form for correction. **Settings → Downloads** sets the total speed limit, and each download's **More → Speed limit** changes its cap while running. Limits use KiB/s; zero means unlimited.
+
+In **Settings → Queues**, save a start time and optional stop time for a queue. At the stop time, active network transfers return to the queue with their partial bytes intact. Clear or extend the window to continue them. Schedules use local time in the interface and UTC on disk; Fetchrail must be running to execute them, including in the tray.
+
 Files are sorted into **Compressed**, **Documents**, **Music**, **Programs**, and **Video** folders by default. Customize their extensions and destinations in **Settings → File categories**. Files without a matching category use the default download folder.
 
 ## Browser companion
@@ -70,9 +75,11 @@ Fetchrail includes companions for **Chrome, Edge, Chromium, Vivaldi, Brave, and 
 
 Open the extension to paste URL batches, choose links from **This page**, or control live transfers. You can also right-click a link and choose **Download with Fetchrail**. For a caught browser download, Fetchrail opens **Download file info** so you can confirm its name, category, and folder before starting or keeping it for later.
 
+**Start download** opens a separate progress window with live speed, time left, resume support, and individual connections. Its **Speed limiter** tab controls that download’s bandwidth; **Options on completion** can show the completed window, disconnect a modem, exit Fetchrail, or shut down Windows. Reopen it through a download’s **More → Download progress** menu. Closing the progress window keeps the transfer running.
+
 **Send browser downloads to Fetchrail** is enabled by default. The companion verifies a transfer before cancelling the browser's copy; a failed handoff continues in the browser.
 
-The companion does not forward browser cookies, session credentials, referrers, or POST bodies. Downloads that depend on these may need to stay in the browser. Blob/data URLs, private downloads, browser-flagged unsafe files, and downloads from other extensions stay in the browser. Page-link scanning does not provide protected-stream extraction.
+For sites with several buttons or countdowns, choose **Browse download pages** in the companion. It opens each page, follows a single clear download button when enabled, captures the final file, and advances the batch. Complete login, CAPTCHA or competing buttons yourself. **Use browser session for captured files** enables cookie/referrer support with optional browser access. POST-only exports, one-time links and expired sessions may still need to finish in the browser. Blob/data URLs, private downloads, browser-flagged unsafe files, and downloads from other extensions stay in the browser. Page-link scanning does not provide protected-stream extraction.
 
 See the [browser companion guide](browser-extension/README.md) for permissions, automatic companion updates, and source-build registration.
 

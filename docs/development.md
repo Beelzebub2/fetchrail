@@ -34,15 +34,25 @@ cargo check --manifest-path src-tauri/Cargo.toml --all-targets --locked
 
 `npm run build` builds both extension variants, type-checks the frontend, and creates its production bundle. `npm run browser:build` builds just the extensions. `npm run browser:check` verifies extension sender checks, URL handling, batching, deduplication, options, and automatic routing.
 
-After building the release executable, close Fetchrail before running:
+The progress-window interaction check runs against the built frontend with mocked native commands and Microsoft Edge. With Playwright available, run `node scripts/test-download-progress.mjs`; optionally pass an absolute path to a Playwright module as its first argument. It checks the tabs, live updates, connection details, controls, speed limits, completion settings, themes, and the transition from the file-info prompt, and saves screenshots to a temporary folder.
+
+For the real download-engine check, close Fetchrail before running:
 
 ```powershell
 npm run engine:test
 ```
 
-This local HTTP-server check covers simultaneous downloads, four parallel ranges, exact SHA-256 output, browser-handoff verification, pause/resume, restart recovery, unsupported ranges, unknown lengths, transient retries, scheduling, cancellation, and invalid-range rejection.
+This local HTTP-server check covers simultaneous downloads, global and per-file speed caps across parallel ranges, queue start/stop windows, exact SHA-256 output, cookie/referrer handoff and restart, HTML landing-page rejection, pause/resume, unsupported ranges, unknown lengths, transient retries, scheduling, cancellation, and invalid-range rejection. `npm run browser:check` also covers multi-step batches, automatic button selection, popup tracking, worker suspension, session forwarding and browser fallback using isolated extension fixtures.
 
-Finish or pause existing transfers first. The check uses a test destination and restores the original settings and history, including an installation with no previous state. It refuses to run while an app bridge is already available.
+Finish or pause existing transfers first and close Fetchrail, including any legacy Braid copy. The check uses a test destination and restores the original settings and history, including an installation with no previous state. It refuses to run while either application process or an app bridge is already available.
+
+The Rust transfer tests use isolated temporary files and a local HTTP server without touching desktop state. They cover buffered cancellation/resume, independent range retries, interrupted bodies, single-stream restarts, unknown lengths, invalid ranges, and shared speed limits. To measure the actual transfer path with three 512 MiB runs at one, four, and eight connections:
+
+```powershell
+npm run engine:bench
+```
+
+This benchmark starts a standard Node HTTP/1.1 server, builds the release transfer tests, and measures network-to-file throughput including final buffer flushes. It excludes merging and does not predict a remote host's speed. Set `FETCHRAIL_BENCH_CONNECTIONS` to a comma-separated list to limit the connection counts tested. The benchmark is ignored during normal test runs and removes its temporary files after successful runs.
 
 ## Browser integration from source
 

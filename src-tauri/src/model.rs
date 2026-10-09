@@ -34,6 +34,9 @@ pub struct DownloadRecord {
     pub status: DownloadStatus,
     pub total_bytes: Option<u64>,
     pub downloaded_bytes: u64,
+    /// Bytes written to the joined file, separate from network download progress.
+    #[serde(default)]
+    pub merged_bytes: u64,
     pub speed_bps: u64,
     pub eta_seconds: Option<u64>,
     pub connections: usize,
@@ -52,6 +55,38 @@ pub struct DownloadRecord {
     /// The user chose this file name; a name suggested by the server must not replace it.
     #[serde(default)]
     pub name_locked: bool,
+    #[serde(default)]
+    pub speed_limit_bps: u64,
+    /// Server support is unknown until the first probe.
+    #[serde(default)]
+    pub resume_supported: Option<bool>,
+    #[serde(default)]
+    pub completion_options: CompletionOptions,
+    /// Completion dialogs belong to downloads opened in a progress window.
+    #[serde(default)]
+    pub progress_requested: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, rename_all = "camelCase")]
+pub struct CompletionOptions {
+    pub show_complete_dialog: bool,
+    pub hang_up: bool,
+    pub exit_app: bool,
+    pub turn_off_computer: bool,
+    pub force_shutdown: bool,
+}
+
+impl Default for CompletionOptions {
+    fn default() -> Self {
+        Self {
+            show_complete_dialog: true,
+            hang_up: false,
+            exit_app: false,
+            turn_off_computer: false,
+            force_shutdown: false,
+        }
+    }
 }
 
 /// File endings that share a download folder.
@@ -98,6 +133,9 @@ pub enum Accent {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DownloadSettings {
+    /// Shared by all downloads and connections; zero is unlimited.
+    #[serde(default)]
+    pub speed_limit_bps: u64,
     pub default_download_dir: String,
     pub max_concurrent_downloads: usize,
     pub connections_per_download: usize,
@@ -167,6 +205,18 @@ pub struct AddDownloadRequest {
     pub connections: Option<usize>,
     /// The size a browser already saw, shown until the engine has probed the server itself.
     pub expected_bytes: Option<u64>,
+    pub speed_limit_bps: Option<u64>,
+    pub request_context: Option<BrowserRequestContext>,
+}
+
+/// Only headers needed to replay the final browser GET. Never included in UI events.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct BrowserRequestContext {
+    pub cookie: Option<String>,
+    pub authorization: Option<String>,
+    pub referer: Option<String>,
+    pub user_agent: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -174,6 +224,32 @@ pub struct AddDownloadRequest {
 pub struct QueueRecord {
     pub name: String,
     pub paused: bool,
+    #[serde(default)]
+    pub starts_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub stops_at: Option<DateTime<Utc>>,
+}
+
+impl QueueRecord {
+    pub fn allows_downloads(&self, now: DateTime<Utc>) -> bool {
+        !self.paused
+            && !self.starts_at.is_some_and(|start| now < start)
+            && !self.stops_at.is_some_and(|stop| now >= stop)
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchDownloadResult {
+    pub accepted: Vec<DownloadRecord>,
+    pub errors: Vec<BatchDownloadError>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchDownloadError {
+    pub index: usize,
+    pub message: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -223,8 +299,42 @@ mod tests {
     use super::*;
 
     #[test]
+    fn queue_windows_honor_both_boundaries_and_manual_pause() {
+        let now = Utc::now();
+        let mut queue = QueueRecord {
+            name: "Night".into(),
+            paused: false,
+            starts_at: Some(now),
+            stops_at: Some(now + chrono::Duration::minutes(1)),
+        };
+        assert!(!queue.allows_downloads(now - chrono::Duration::seconds(1)));
+        assert!(queue.allows_downloads(now));
+        assert!(!queue.allows_downloads(now + chrono::Duration::minutes(1)));
+        queue.paused = true;
+        assert!(!queue.allows_downloads(now));
+        let old: QueueRecord =
+            serde_json::from_str(r#"{"name":"Default","paused":false}"#).unwrap();
+        assert!(old.allows_downloads(now));
+    }
+
+    #[test]
+    fn old_download_history_keeps_completion_actions_disabled() {
+        let options: CompletionOptions = serde_json::from_str("{}").unwrap();
+        assert!(options.show_complete_dialog);
+        assert!(!options.hang_up);
+        assert!(!options.exit_app);
+        assert!(!options.turn_off_computer);
+        assert!(!options.force_shutdown);
+        let partial: CompletionOptions =
+            serde_json::from_str(r#"{"showCompleteDialog":false}"#).unwrap();
+        assert!(!partial.show_complete_dialog);
+        assert!(!partial.turn_off_computer);
+    }
+
+    #[test]
     fn files_are_sorted_into_category_folders() {
         let settings = DownloadSettings {
+            speed_limit_bps: 0,
             default_download_dir: r"D:\Downloads".into(),
             max_concurrent_downloads: 3,
             connections_per_download: 8,
