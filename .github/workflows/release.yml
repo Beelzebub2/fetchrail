@@ -109,3 +109,49 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'Release publication failed.' }
           gh release edit $tag --title "Fetchrail $tag" --repo "$env:GITHUB_REPOSITORY"
           if ($LASTEXITCODE -ne 0) { throw 'Release title update failed.' }
+
+  chrome-web-store:
+    name: Chrome Web Store
+    needs: windows
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '24'
+          cache: npm
+      - name: Check release and build extension
+        run: |
+          node scripts/check-release.mjs "$GITHUB_REF_NAME"
+          npm ci
+          npm run browser:build
+      - name: Prepare production extension package
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          node scripts/prepare-chrome-web-store.mjs "$GITHUB_REF_NAME"
+          mkdir -p release-artifacts
+          (cd "release-artifacts/chrome-web-store-$version" && zip -qr "../chrome-web-store-$version.zip" .)
+      - name: Authenticate to Google Cloud with GitHub OIDC
+        id: auth
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
+        with:
+          workload_identity_provider: ${{ vars.CWS_WIF_PROVIDER }}
+          service_account: ${{ vars.CWS_SERVICE_ACCOUNT }}
+          token_format: access_token
+          access_token_scopes: https://www.googleapis.com/auth/chromewebstore
+          create_credentials_file: false
+      - name: Submit extension update
+        env:
+          CWS_ACCESS_TOKEN: ${{ steps.auth.outputs.access_token }}
+          CWS_PUBLISHER_ID: ${{ vars.CWS_PUBLISHER_ID }}
+          CWS_EXTENSION_ID: ${{ vars.CWS_EXTENSION_ID }}
+        run: |
+          export CWS_VERSION="${GITHUB_REF_NAME#v}"
+          node scripts/chrome-web-store.mjs publish "release-artifacts/chrome-web-store-${CWS_VERSION}.zip"
