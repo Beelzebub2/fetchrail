@@ -12,6 +12,7 @@ dist
 dist-ssr
 release-artifacts/
 artifacts/
+/website/ # Hosted separately on Cloudflare Workers
 *.local
 
 # Editor directories and files
