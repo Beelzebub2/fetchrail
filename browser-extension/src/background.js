@@ -298,7 +298,9 @@ async function saveHandoff(id, entry) {
 }
 
 function safeBrowserItem(item) {
-  return item?.state === "in_progress" && !item.incognito && (!item.danger || item.danger === "safe")
+  const active = item?.state === "in_progress" || (globalThis.browser && item?.state === "interrupted"
+    && item.paused && item.canResume && (!item.error || item.error === "USER_CANCELED"));
+  return active && !item.incognito && (!item.danger || item.danger === "safe")
     && (!item.byExtensionId || item.byExtensionId === api.runtime.id) && /^https?:\/\//i.test(item.finalUrl || item.url);
 }
 
@@ -382,6 +384,15 @@ async function routeBrowserDownload(item) {
     if (!batchId && item.totalBytes >= 0 && item.totalBytes < minimum) return;
     const observed = matchingRequest(item);
     if (observed && observed.method !== "GET") return;
+    // Firefox pause cancels the connection; wait for partial data so rollback can resume it.
+    if (globalThis.browser) {
+      for (let attempt = 0; item?.bytesReceived === 0 && safeBrowserItem(item) && !item.paused && attempt < 100; attempt++) {
+        await new Promise((resolve) => setTimeout(resolve, 100));
+        [item] = await api.downloads.search({ id: item.id });
+      }
+      if (!safeBrowserItem(item) || item.paused || !(item.bytesReceived > 0)) throw new Error("Firefox download is not ready for pickup; continuing in the browser.");
+      if (!batchId && item.totalBytes >= 0 && item.totalBytes < minimum) return;
+    }
     entry = { browserId: item.id, url, phase: "preparing", time: Date.now(), autoStart: batchId ? !batchOptions.startPaused : policy.captureMode === "auto", source: batchId ? "browserBatch" : "clickMonitor" };
     await saveHandoff(handoffId,entry);
     await api.downloads.pause(item.id);
@@ -404,7 +415,7 @@ async function routeBrowserDownload(item) {
     if (result.accepted !== 1 || !engineId) throw new Error(result.errors[0]?.message ?? "Fetchrail did not accept the download.");
     entry.engineId = engineId;
     const [latest] = await api.downloads.search({ id: item.id });
-    paused = latest?.state === "in_progress" && latest.paused;
+    paused = latest?.paused && (latest.state === "in_progress" || (globalThis.browser && latest.state === "interrupted"));
     if (!paused || !safeBrowserItem(latest) || (latest.finalUrl || latest.url) !== (current.finalUrl || current.url)) throw new Error("Browser download changed during verification.");
     entry.phase = "cancelling"; await saveHandoff(handoffId,entry);
     await api.downloads.cancel(item.id); paused = false;
@@ -449,12 +460,12 @@ async function recoverHandoffs() {
       try {
         const [browser] = await api.downloads.search({ id: entry.browserId });
         const result = await nativeRequest("getHandoff",{ handoffId });
-        if (entry.phase === "committing" || (entry.phase === "cancelling" && browser?.state === "interrupted")) {
+        if (entry.phase === "committing" || (entry.phase === "cancelling" && browser?.state === "interrupted" && !browser.paused)) {
           if (result.ids.length) await nativeRequest("commitHandoff",{ handoffId,autoStart:entry.autoStart,source:entry.source });
           else if (Date.now()-entry.time < 60000) continue;
         } else {
           for (const downloadId of result.ids) await nativeRequest("controlDownload",{ downloadId,action:"cancel" });
-          if (browser?.state === "in_progress" && browser.paused && (browser.finalUrl || browser.url) === entry.url) await api.downloads.resume(browser.id);
+          if (safeBrowserItem(browser) && browser.paused && (browser.finalUrl || browser.url) === entry.url) await api.downloads.resume(browser.id);
           if (!result.ids.length && Date.now()-entry.time < 60000) continue;
         }
         await saveHandoff(handoffId,null);

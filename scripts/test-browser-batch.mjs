@@ -39,7 +39,7 @@ for (const browser of ["chromium", "firefox"]) {
     },
     downloads: {
       onCreated: { addListener(fn) { created = fn; } },
-      async pause() { events.push("pause"); current.paused = true; },
+      async pause() { events.push("pause"); current.paused = true; if (browser === "firefox") Object.assign(current, { state: "interrupted", canResume: true, error: "USER_CANCELED" }); },
       async search() { return [{ ...current }]; },
       async cancel() { events.push("cancel"); if (failure === "cancel") throw new Error("Cannot cancel"); },
       async erase() { events.push("erase"); },
@@ -79,7 +79,7 @@ for (const browser of ["chromium", "firefox"]) {
   assert.equal(requests.filter((r) => r.method === "addDownloads").length, 0);
   let nextDownloadId = 42;
   const capture = async (tabId = 10, method = "GET") => {
-    current = { id: nextDownloadId++, state: "in_progress", paused: false, incognito: false, danger: "safe", url: "https://host.test/redirect", finalUrl: "https://cdn.test/final.zip?token=123", totalBytes: 1234, mime: "application/zip", filename: "final.zip" };
+    current = { id: nextDownloadId++, state: "in_progress", paused: false, incognito: false, danger: "safe", url: "https://host.test/redirect", finalUrl: "https://cdn.test/final.zip?token=123", totalBytes: 1234, bytesReceived: 1, mime: "application/zip", filename: "final.zip" };
     webRequest({ url: current.finalUrl, tabId, method, requestHeaders: [
       { name: "Cookie", value: "session=test" }, { name: "Referer", value: "https://host.test/step/5" },
       { name: "User-Agent", value: "Browser test" }, { name: "X-Unrelated", value: "do-not-forward" },
