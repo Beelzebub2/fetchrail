@@ -12,6 +12,9 @@ for (const browser of ["chromium", "firefox"]) {
   let listener;
   let fail;
   let current;
+  let nextId = 42;
+  let committed = false;
+  let loseReply = false;
   let afterAcceptance;
   const engineId = randomUUID();
   const api = {
@@ -19,7 +22,7 @@ for (const browser of ["chromium", "firefox"]) {
       id: "routing-test", getURL: (path) => "chrome-extension://routing-test/" + path,
       onInstalled: { addListener() {} }, onStartup: { addListener() {} }, onMessage: { addListener() {} },
     },
-    storage: { local: { async get(key) { return { [key]: saved[key] }; } } },
+    storage: { local: { async get(key) { return Object.fromEntries((Array.isArray(key) ? key : [key]).map((key) => [key,saved[key]])); }, async set(value) { Object.assign(saved,value); } } },
     alarms: { create() {}, onAlarm: { addListener() {} } },
     contextMenus: { onClicked: { addListener() {} } },
     action: { async setBadgeBackgroundColor() {}, async setBadgeText() {}, async setTitle() {} },
@@ -38,6 +41,9 @@ for (const browser of ["chromium", "firefox"]) {
     events.push(message.method);
     if (fail === "offline") throw new Error("Host unavailable");
     if (message.method === "controlDownload") return { ok: true, result: {} };
+    if (message.method === "commitHandoff") return { ok:true,result:{ids:[engineId]} };
+    if (message.method === "getHandoff") return {ok:true,result:{ids:committed ? [engineId] : [],statuses:committed ? ["paused"] : []}};
+    if (loseReply) { committed=true; throw new Error("Lost acceptance reply"); }
     if (afterAcceptance) Object.assign(current, afterAcceptance);
     return { ok: true, result: fail === "rejected"
       ? { accepted: 0, ids: [], errors: [{ index: 0, message: "Browser session required" }] }
@@ -52,8 +58,8 @@ for (const browser of ["chromium", "firefox"]) {
   const context = vm.createContext({ [browser === "firefox" ? "browser" : "chrome"]: api, crypto: { randomUUID }, URL });
   vm.runInContext(await readFile(new URL(`../browser-extension/dist/${browser}/background.js`, import.meta.url), "utf8"), context);
   const reset = (overrides = {}) => {
-    events.length = 0; requests.length = 0; fail = undefined; afterAcceptance = undefined; delete saved.automaticDownloads;
-    current = { id: 42, state: "in_progress", paused: false, incognito: false, danger: "safe",
+    events.length = 0; requests.length = 0; fail = undefined; afterAcceptance = undefined; committed = false; loseReply=false; delete saved.automaticDownloads; delete saved.fetchrailHandoffs;
+    current = { id: nextId++, state: "in_progress", paused: false, incognito: false, danger: "safe",
       url: "https://example.com/redirect", finalUrl: "https://cdn.example.com/file.zip?token=123",
       filename: "C:\\Users\\someone\\Downloads\\file.zip", totalBytes: 8388608, mime: "application/zip", ...overrides };
   };
@@ -67,8 +73,8 @@ for (const browser of ["chromium", "firefox"]) {
   const route = async () => { listener({ ...current }); await settled(); };
   reset();
   listener({ ...current }); listener({ ...current }); await settled();
-  assert.deepEqual(events, ["pause", "search", "addDownloads", "search", "cancel", "erase"]);
-  assert.equal(requests.length, 1, "duplicate events must not create two engine jobs");
+  assert.deepEqual(events, ["pause", "search", "addDownloads", "search", "cancel", "commitHandoff", "erase"]);
+  assert.equal(requests.filter((request) => request.method === "addDownloads").length, 1, "duplicate events must not create two engine jobs");
   assert.equal(requests[0].params.source, "clickMonitor");
   assert.deepEqual(JSON.parse(JSON.stringify(requests[0].params.items[0])), {
     url: current.finalUrl, suggestedFileName: "file.zip", expectedBytes: current.totalBytes, expectedMime: current.mime,
@@ -80,7 +86,7 @@ for (const browser of ["chromium", "firefox"]) {
   }
   for (const failure of ["offline", "rejected"]) {
     reset(); fail = failure; await route();
-    assert.deepEqual(events, ["pause", "search", "addDownloads", "resume"]);
+    assert.deepEqual(events, ["pause", "search", "addDownloads", ...(failure === "offline" ? ["getHandoff"] : []), "resume"]);
   }
   reset(); fail = "pause"; await route(); assert.deepEqual(events, ["pause"]);
   reset(); fail = "missing"; await route(); assert.deepEqual(events, ["pause", "search", "resume"]);
@@ -89,7 +95,7 @@ for (const browser of ["chromium", "firefox"]) {
   assert.equal(requests.at(-1).params.downloadId, engineId);
   assert.equal(requests.at(-1).params.action, "cancel");
   reset(); fail = "erase"; await route();
-  assert.deepEqual(events, ["pause", "search", "addDownloads", "search", "cancel", "erase"]);
+  assert.deepEqual(events, ["pause", "search", "addDownloads", "search", "cancel", "commitHandoff", "erase"]);
   reset({ totalBytes: -1 }); await route(); assert.equal(requests[0].params.items[0].expectedBytes, undefined);
   for (const change of [{ state: "complete" }, { state: "interrupted" }, { paused: false },
     { danger: "content" }, { incognito: true }, { finalUrl: "https://example.com/changed.zip" }]) {
@@ -98,5 +104,11 @@ for (const browser of ["chromium", "firefox"]) {
       ...(current.state === "in_progress" && current.paused ? ["resume"] : [])]);
     assert.equal(requests.at(-1).params.action, "cancel", "A changed browser transfer must roll back the engine job.");
   }
+  reset(); loseReply=true; await route();
+  assert.deepEqual(events,["pause","search","addDownloads","getHandoff","search","cancel","commitHandoff","erase"]);
+  assert.equal(saved.fetchrailHandoffs && Object.keys(saved.fetchrailHandoffs).length,0,"Accepted jobs reconcile after a lost reply.");
+  reset({totalBytes:100}); await route(); assert.equal(events.length,0,"Tiny downloads stay in the browser.");
+  reset(); saved.captureMode="browser"; await route(); assert.equal(events.length,0); delete saved.captureMode;
+  reset(); saved.excludedSites="cdn.example.com"; await route(); assert.equal(events.length,0); delete saved.excludedSites;
   console.log(`PASS: ${browser} automatic routing, redirects, metadata, opt-out, duplicate protection, browser fallback, rollback and changes during verification.`);
 }

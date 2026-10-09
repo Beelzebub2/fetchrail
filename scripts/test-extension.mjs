@@ -6,7 +6,8 @@ import { randomUUID } from "node:crypto";
 const requests = [];
 const titles = [];
 let listener;
-let alarmListener;
+const alarmListeners = [];
+const alarmListener = (alarm) => alarmListeners.forEach((listener) => listener(alarm));
 let openPanels = [];
 let reloads = 0;
 let holdNativeRequest = null;
@@ -31,7 +32,7 @@ const api = {
   },
   alarms: {
     create(name, options) { assert.equal(name, "fetchrail.extensionUpdate"); assert.equal(options.periodInMinutes, 1); },
-    onAlarm: { addListener(value) { alarmListener = value; } },
+    onAlarm: { addListener(value) { alarmListeners.push(value); } },
   },
   storage: { local: {
     async get(key) { return { [key]: stored[key] }; },
@@ -118,6 +119,6 @@ delete api.downloads;
 vm.runInContext(await readFile(new URL("../browser-extension/dist/chromium/background.js", import.meta.url), "utf8"),
   vm.createContext({ browser: api, crypto: { randomUUID }, URL }));
 await new Promise(setImmediate);
-assert.match(titles.at(-1), /reload the extension to enable browser download capture/);
+assert.match(titles.at(-1), /reload the companion to enable capture/);
 assert.equal((await send({ type: "ping" })).ok, true, "Missing capture permission must not break the app connection.");
 console.log("Extension checks passed: sender isolation, URL validation, batches, controls, idle updates, draft protection, busy deferral, reload-loop prevention, Firefox fallback, missing download permission recovery.");

@@ -164,13 +164,29 @@ function renderDownloads() {
     card.querySelector(".rate").textContent = downloading ? [item.speedBps ? bytes(item.speedBps) + "/s" : "", eta(item.etaSeconds)].filter(Boolean).join(" · ") : item.status === "completed" ? bytes(item.totalBytes ?? item.downloadedBytes) : item.totalBytes ? percent.toFixed(0) + "%" : "";
     card.querySelector(".transfer-meta").title = item.connections + " connections. Requested up to " + (item.requestedConnections ?? item.connections) + "; adapted to file size and server support.";
     const error = card.querySelector(".transfer-error");
-    error.hidden = !item.error;
-    error.textContent = item.error ?? "";
+    error.hidden = !(item.error || item.statusDetail);
+    error.textContent = item.error ?? item.statusDetail ?? "";
     const actions = card.querySelector(".transfer-actions");
-    const action = ["paused", "failed", "cancelled"].includes(item.status) ? "resume" : ["connecting", "downloading", "queued", "scheduled"].includes(item.status) ? "pause" : "";
+    const action = ["paused", "failed", "cancelled"].includes(item.status) ? "resume" : ["connecting", "downloading", "queued", "scheduled", "merging"].includes(item.status) ? "pause" : "";
     if (actions.dataset.action !== item.status) {
       actions.dataset.action = item.status;
       actions.replaceChildren();
+      if (["paused","failed","cancelled"].includes(item.status)) {
+        const refreshButton = document.createElement("button"); refreshButton.className="text-button"; refreshButton.textContent="Refresh link";
+        refreshButton.addEventListener("click",() => {
+          const form=document.createElement("form"); form.className="refresh-form";
+          const url=document.createElement("input"); url.type="url"; url.required=true; url.placeholder="Paste the fresh download URL"; url.setAttribute("aria-label","Fresh download URL");
+          const restart=document.createElement("input"); restart.type="checkbox";
+          const label=document.createElement("label"); label.append(restart,document.createTextNode(" Restart and discard saved bytes"));
+          const submit=document.createElement("button"); submit.className="primary"; submit.textContent="Verify and refresh";
+          const dismiss=document.createElement("button"); dismiss.type="button"; dismiss.textContent="Cancel"; dismiss.addEventListener("click",() => form.remove());
+          form.append(url,label,submit,dismiss); card.append(form);
+          form.addEventListener("submit",async (event) => { event.preventDefault(); submit.disabled=true;
+            try { await request("refreshDownload",{downloadId:item.id,url:url.value,expectedSha256:$("#expected-hash").value || null,restart:restart.checked}); form.remove(); await refresh(); }
+            catch(error) { notice(error.message,true); } finally { submit.disabled=false; }
+          }); url.focus();
+        }); actions.append(refreshButton);
+      }
       for (const name of action ? [action, ...(item.status === "cancelled" ? [] : ["cancel"])] : []) {
         const retry = name === "resume" && item.status === "failed";
         const button = document.createElement("button");
@@ -323,7 +339,9 @@ async function add(items, fromSelection = false) {
   $("#add").disabled = true;
   updateSelection();
   try {
-    const result = await request("addDownloads", { items, ...transferOptions() });
+    const expectedSha256 = $("#expected-hash").value.trim();
+    if (expectedSha256 && (items.length !== 1 || !/^[a-fA-F0-9]{64}$/.test(expectedSha256))) throw new Error("Use a valid publisher checksum with one download at a time.");
+    const result = await request("addDownloads", { items:items.map((item) => ({...item,...(expectedSha256 ? {expectedSha256} : {})})), ...transferOptions() });
     notice(`${result.accepted} download${result.accepted === 1 ? "" : "s"} added to Fetchrail.` + (result.rejected ? ` ${result.rejected} rejected: ${result.errors[0]?.message}` : ""), !!result.rejected);
     if (fromSelection) {
       const rejected = new Set(result.errors.map((error) => error.url));
@@ -374,10 +392,28 @@ $("#automatic-downloads").addEventListener("change", async () => {
   finally { input.disabled = false; }
 });
 
+for (const [id,key] of [["capture-mode","captureMode"],["capture-minimum","captureMinimumKb"],["excluded-sites","excludedSites"],["excluded-types","excludedTypes"]]) {
+  $("#"+id).addEventListener("change",() => { void api.storage.local.set({[key]:id === "capture-minimum" ? Math.max(0,Number($("#"+id).value)) : $("#"+id).value}).catch((error) => notice(error.message,true)); });
+}
+$("#enable-session").addEventListener("click",async () => {
+  try {
+    const tab = tabId != null ? await api.tabs.get(tabId) : (await api.tabs.query({active:true,currentWindow:true}))[0];
+    if (!/^https?:\/\//.test(tab?.url ?? "")) throw new Error("Open the companion on the download's website first.");
+    const origin=new URL(tab.url).origin+"/*";
+    if (await api.permissions.request({permissions:["webRequest","cookies"],origins:[origin],...(globalThis.browser ? {data_collection:["authenticationInfo"]} : {})})) {
+      await api.storage.local.set({sessionSupport:true}); notice("Session support enabled for this site. Reload the page, then start the download again.");
+    }
+  } catch(error) { notice(error.message,true); }
+});
+
 async function initialize() {
   try {
-    const saved = await api.storage.local.get(["connections", "queue", "automaticDownloads"]);
+    const saved = await api.storage.local.get(["connections", "queue", "automaticDownloads", "captureMode", "captureMinimumKb", "excludedSites", "excludedTypes"]);
     $("#automatic-downloads").checked = saved.automaticDownloads !== false;
+    $("#capture-mode").value = saved.captureMode ?? "ask";
+    $("#capture-minimum").value = saved.captureMinimumKb ?? 64;
+    $("#excluded-sites").value = saved.excludedSites ?? "";
+    $("#excluded-types").value = saved.excludedTypes ?? "";
     if ([0, 1, 2, 4, 8, 16, 32].includes(saved.connections)) $("#connections").value = String(saved.connections);
     preferredQueue = saved.queue ?? "Default";
     optionsSummary();

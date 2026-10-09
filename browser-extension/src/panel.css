@@ -154,3 +154,5 @@ details[open] summary { margin-bottom: 6px; }
 footer { display: flex; justify-content: space-between; gap: 12px; padding: 6px 16px 8px; color: var(--text-3); font-size: 11.5px; }
 #version { font-family: var(--mono); }
 @media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
+
+.refresh-form { display:grid; gap:8px; padding:12px; grid-column:1 / -1; }

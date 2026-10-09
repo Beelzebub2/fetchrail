@@ -31,10 +31,7 @@ pub async fn start(app: AppHandle, manager: Arc<DownloadManager>) -> Result<(), 
         port,
         token: format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple()),
     };
-    let data_dir = app
-        .path()
-        .app_data_dir()
-        .map_err(|error| format!("Could not locate Fetchrail app data: {error}"))?;
+    let data_dir = crate::data_dir(&app)?;
     tokio::fs::create_dir_all(&data_dir)
         .await
         .map_err(|error| format!("Could not create Fetchrail app data: {error}"))?;
@@ -128,7 +125,8 @@ async fn process_request(
                     "appVersion": env!("CARGO_PKG_VERSION"),
                     "frontendReady": app.state::<crate::FrontendReady>().0.load(std::sync::atomic::Ordering::Relaxed),
                     "frontendUrl": app.get_webview_window("main").and_then(|window| window.url().ok()).map(|url| url.to_string()),
-                    "capabilities": ["addDownloads", "getDownloads", "controlDownload", "showApp", "queues", "scheduling", "connections"],
+                    "build": "reliable-adaptive-local.1",
+                    "capabilities": ["addDownloads", "getDownloads", "controlDownload", "showApp", "queues", "scheduling", "connections", "getHandoff", "commitHandoff", "refreshDownload", "sessionHeaders", "sha256", "adaptive", "directWrite"],
                     "connectionsPerDownload": settings.connections_per_download,
                     "maxConcurrentDownloads": settings.max_concurrent_downloads,
                     "minSegmentSizeMb": settings.min_segment_size_mb,
@@ -155,6 +153,7 @@ async fn process_request(
                 // [downloaded, length] pairs keep a full list of 32-connection transfers within the response limit.
                 "segments": record.segments.iter().map(|part| json!([part.downloaded_bytes, part.length])).collect::<Vec<_>>(),
                 "error": record.error.as_ref().map(|error| error.chars().take(300).collect::<String>())
+                ,"statusDetail": record.status_detail, "sha256": record.sha256, "finalizingBytes": record.finalizing_bytes
             })).collect::<Vec<_>>();
             NativeResponse::success(
                 request.id,
@@ -180,6 +179,62 @@ async fn process_request(
                 Err(error) => NativeResponse::failure(request.id, "CONTROL_FAILED", error),
             }
         }
+        NativeMethod::GetHandoff => {
+            let key = format!("{}:", request.params.handoff_id.as_deref().unwrap());
+            let jobs = manager
+                .list()
+                .await
+                .into_iter()
+                .filter(|record| {
+                    record
+                        .handoff_id
+                        .as_ref()
+                        .is_some_and(|id| id.starts_with(&key))
+                })
+                .collect::<Vec<_>>();
+            NativeResponse::success(
+                request.id,
+                json!({"ids":jobs.iter().map(|record|record.id).collect::<Vec<_>>(),"committed":jobs.iter().any(|record|record.handoff_committed),"statuses":jobs.iter().map(|record|&record.status).collect::<Vec<_>>() }),
+            )
+        }
+        NativeMethod::CommitHandoff => {
+            let key = format!("{}:", request.params.handoff_id.as_deref().unwrap());
+            let result = manager
+                .commit_handoff(&key, request.params.auto_start.unwrap_or(false))
+                .await;
+            match result {
+                Ok(records) => {
+                    if !request.params.auto_start.unwrap_or(false) {
+                        for record in &records {
+                            crate::prompt_for_download(app, record.id);
+                        }
+                    }
+                    NativeResponse::success(
+                        request.id,
+                        json!({"ids":records.iter().map(|record|record.id).collect::<Vec<_>>() }),
+                    )
+                }
+                Err(message) => NativeResponse::failure(request.id, "HANDOFF_FAILED", message),
+            }
+        }
+        NativeMethod::RefreshDownload => {
+            match manager
+                .refresh(
+                    request.params.download_id.unwrap(),
+                    request.params.url.unwrap(),
+                    request.params.expected_sha256,
+                    request.params.request_headers,
+                    request.params.restart.unwrap_or(false),
+                )
+                .await
+            {
+                Ok(record) => NativeResponse::success(
+                    request.id,
+                    json!({"id":record.id,"status":record.status}),
+                ),
+                Err(message) => NativeResponse::failure(request.id, "REFRESH_FAILED", message),
+            }
+        }
         NativeMethod::ShowApp => {
             crate::show_main_window(app);
             NativeResponse::success(request.id, json!({"shown": true}))
@@ -192,12 +247,37 @@ async fn process_request(
             let caught = matches!(request.params.source, Some(BrowserSource::ClickMonitor));
             for (index, item) in request.params.items.into_iter().enumerate() {
                 let result = async {
+                    let key = format!("{request_id}:{index}");
+                    if let Some(existing) = manager
+                        .list()
+                        .await
+                        .into_iter()
+                        .find(|record| record.handoff_id.as_ref() == Some(&key))
+                    {
+                        if existing.status == crate::model::DownloadStatus::Cancelled {
+                            return Err("This handoff was rolled back.".into());
+                        }
+                        if url::Url::parse(&item.url)
+                            .map_err(|_| "Invalid URL.")?
+                            .as_str()
+                            != existing.url
+                        {
+                            return Err("Handoff id already belongs to another URL.".into());
+                        }
+                        if crate::storage::validate_hash(item.expected_sha256.as_deref())?
+                            != existing.expected_sha256
+                        {
+                            return Err("Handoff checksum changed.".into());
+                        }
+                        return Ok(existing);
+                    }
                     if caught {
                         manager
                             .validate_browser_download(
                                 &item.url,
                                 item.expected_bytes,
                                 item.expected_mime.as_deref(),
+                                item.request_headers.as_ref(),
                             )
                             .await?;
                     }
@@ -216,6 +296,9 @@ async fn process_request(
                             },
                             connections: request.params.connections,
                             expected_bytes: item.expected_bytes,
+                            expected_sha256: item.expected_sha256,
+                            request_headers: item.request_headers,
+                            handoff_id: Some(key),
                         })
                         .await
                 }
@@ -224,7 +307,7 @@ async fn process_request(
                     Ok(record) => {
                         accepted += 1;
                         ids.push(record.id);
-                        if caught {
+                        if caught && request.params.handoff_protocol.is_none() {
                             crate::prompt_for_download(app, record.id);
                         }
                     }

@@ -336,3 +336,8 @@ h1, h2, p { margin: 0; }
 @media (prefers-reduced-motion:reduce) {
   *,*::before,*::after { animation: none !important; transition: none !important; }
 }
+
+.refresh-link { display:grid; gap:12px; padding:16px 24px; }
+.refresh-link label,.file-checksum { display:grid; gap:6px; }
+.file-checksum input { width:100%; font-size:12px; }
+.row-detail { margin:6px 24px; color:var(--muted); }

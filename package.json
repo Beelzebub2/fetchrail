@@ -1,7 +1,7 @@
 {
   "name": "fetchrail",
   "private": true,
-  "version": "0.5.0",
+  "version": "0.6.0-local.1",
   "type": "module",
   "scripts": {
     "dev": "vite",
@@ -19,7 +19,8 @@
     "release:package": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/package-release.ps1",
     "icons": "node scripts/make-icons.mjs",
     "preview": "vite preview",
-    "tauri": "tauri"
+    "tauri": "tauri",
+    "browser:package:firefox": "npm run browser:build && powershell -NoProfile -ExecutionPolicy Bypass -File scripts/package-firefox.ps1"
   },
   "dependencies": {
     "@fontsource-variable/bricolage-grotesque": "^5.3.0",

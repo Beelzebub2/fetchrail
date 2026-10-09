@@ -61,6 +61,10 @@ type DownloadRecord = {
   etaSeconds: number | null;
   connections: number;
   requestedConnections: number | null;
+  expectedSha256: string | null;
+  sha256: string | null;
+  statusDetail: string | null;
+  finalizingBytes: number;
   error: string | null;
   createdAt: string;
   finishedAt: string | null;
@@ -100,6 +104,11 @@ type DownloadSettings = Appearance & {
   maxConcurrentDownloads: number;
   connectionsPerDownload: number;
   minSegmentSizeMb: number;
+  adaptiveConnections: boolean;
+  maxRequestsPerOrigin: number;
+  retryAttempts: number;
+  bandwidthLimitKbps: number;
+  directWrite: boolean;
   launchOnStart: boolean;
   minimizeToTray: boolean;
 };
@@ -374,6 +383,7 @@ function App() {
   const [showSettings, setShowSettings] = useState(false);
   const [url, setUrl] = useState("");
   const [directory, setDirectory] = useState("");
+  const [expectedHash, setExpectedHash] = useState("");
   const [selectedQueue, setSelectedQueue] = useState("Default");
   const [startMode, setStartMode] = useState<StartMode>("now");
   const [connections, setConnections] = useState(0);
@@ -486,7 +496,7 @@ function App() {
     () =>
       downloads
         .filter((item) => item.status === "downloading")
-        .reduce((count, item) => count + partsOf(item).filter((part) => part.state !== "done").length, 0),
+        .reduce((count, item) => count + Math.min(item.connections, partsOf(item).filter((part) => part.state !== "done").length), 0),
     [downloads],
   );
 
@@ -510,6 +520,7 @@ function App() {
           url: url.trim(),
           directory: directory.trim() || null,
           fileName: null,
+          expectedSha256: expectedHash.trim() || null,
           queue: selectedQueue,
           scheduledFor,
           startPaused: startMode === "paused",
@@ -517,6 +528,7 @@ function App() {
         },
       });
       setUrl("");
+      setExpectedHash("");
       setStartMode("now");
       setScheduledLocal("");
       setShowAdd(false);
@@ -873,6 +885,7 @@ function App() {
                 </button>
               </div>
             </label>
+            <label>Expected SHA-256 (optional)<input className="mono" value={expectedHash} onChange={(event) => setExpectedHash(event.target.value)} placeholder="Paste the checksum supplied by the publisher" pattern="[a-fA-F0-9]{64}" /></label>
             <fieldset className="choice-field">
               <legend>
                 Connections
@@ -1021,7 +1034,11 @@ function DownloadRow({
   const [editingSchedule, setEditingSchedule] = useState(false);
   const [scheduleDraft, setScheduleDraft] = useState("");
   const running = runningStatuses.has(item.status);
-  const canPause = ["queued", "scheduled", "connecting", "downloading"].includes(item.status);
+  const canPause = ["queued", "scheduled", "connecting", "downloading", "merging"].includes(item.status);
+  const [editingRefresh, setEditingRefresh] = useState(false);
+  const [refreshUrl, setRefreshUrl] = useState(item.url);
+  const [refreshHash, setRefreshHash] = useState(item.expectedSha256 ?? "");
+  const [refreshRestart, setRefreshRestart] = useState(false);
   const canResume = ["paused", "failed", "cancelled"].includes(item.status);
   const canSchedule = ["queued", "scheduled", "paused", "failed", "cancelled"].includes(item.status);
   // Longer endings would be cut mid-word in the badge.
@@ -1038,10 +1055,10 @@ function DownloadRow({
   const summary =
     item.status === "completed"
       ? item.connections > 1
-        ? `Joined from ${item.connections} parts`
+        ? `Completed with up to ${item.connections} workers`
         : "Single connection"
       : item.status === "merging"
-        ? `Joining ${parts.length} parts into one file`
+        ? "Verifying and safely publishing the file"
         : !split
           ? `Opens up to ${requested} connections when it starts`
           : item.status === "downloading"
@@ -1130,10 +1147,10 @@ function DownloadRow({
           <span className="mono">{formatSpeed(item.speedBps)}</span>
           {item.status === "downloading" && (
             <small title={`Requested up to ${requested}; adapted to file size and server support`}>
-              {parts.length - count("done")} of {parts.length} connections
+              {parts.length - count("done")} of {parts.length} range groups remaining
             </small>
           )}
-          {item.status === "merging" && <small>Joining parts</small>}
+          {item.status === "merging" && <small>{item.statusDetail ?? (item.finalizingBytes ? `Finalizing ${formatBytes(item.finalizingBytes)}` : "Verifying and publishing")}</small>}
         </div>
         <div className="col-eta">
           <span className="mono">{running ? formatEta(item.etaSeconds) : "—"}</span>
@@ -1203,7 +1220,8 @@ function DownloadRow({
                 ))}
               </select>
             </label>
-            {!["completed", "cancelled", "merging"].includes(item.status) && (
+            {!running && item.status !== "completed" && <button popoverTarget={menuId} popoverTargetAction="hide" onClick={() => { setRefreshUrl(item.url); setEditingRefresh(true); }}><RotateCw size={15} /> Refresh link / checksum</button>}
+            {!["completed", "cancelled"].includes(item.status) && (
               <button
                 popoverTarget={menuId}
                 popoverTargetAction="hide"
@@ -1223,6 +1241,17 @@ function DownloadRow({
           </div>
         </div>
       </div>
+      {item.statusDetail && <p className="row-detail" role="status">{item.statusDetail}</p>}
+      {editingRefresh && <form className="refresh-link" onSubmit={async (event) => {
+        event.preventDefault();
+        if (await command("refresh_download",item.id,{ url:refreshUrl,expectedSha256:refreshHash || null,restart:refreshRestart })) setEditingRefresh(false);
+      }}>
+        <label>Fresh download URL<input type="url" required value={refreshUrl} onChange={(event) => setRefreshUrl(event.target.value)} /></label>
+        <label>Publisher SHA-256 (optional)<input pattern="[a-fA-F0-9]{64}" value={refreshHash} onChange={(event) => setRefreshHash(event.target.value)} /></label>
+        <label><input type="checkbox" checked={refreshRestart} onChange={(event) => setRefreshRestart(event.target.checked)} /> Restart and discard saved bytes</label>
+        <p className="hint">Progress is kept only when file identity can be verified. Session downloads can be refreshed from the browser companion.</p>
+        <button className="secondary-button">Verify and refresh</button><button type="button" className="ghost-button" onClick={() => setEditingRefresh(false)}>Cancel</button>
+      </form>}
       {editingSchedule && (
         <div className="row-schedule" role="group" aria-label={`Schedule ${item.fileName}`}>
           <input
@@ -1267,6 +1296,7 @@ function DownloadRow({
       <div className="connections" id={panelId} inert={!expanded}>
         <div>
           <div className="connections-body">
+            {item.sha256 && <label className="file-checksum">SHA-256<input className="mono" readOnly value={item.sha256} aria-label="Completed file SHA-256" /></label>}
             <div className="connections-head">
               <span className="overline">Connections</span>
               <span>{summary}</span>
@@ -1439,12 +1469,18 @@ function SettingsPage({
               />
             </label>
           </div>
+          <div className="setting-grid">
+            <label>Requests per site<input type="number" min={1} max={32} value={draft.maxRequestsPerOrigin} onChange={(event) => setDraft({ ...draft,maxRequestsPerOrigin:Number(event.target.value) })} /></label>
+            <label>Retry attempts<input type="number" min={1} max={20} value={draft.retryAttempts} onChange={(event) => setDraft({ ...draft,retryAttempts:Number(event.target.value) })} /></label>
+            <label>Total speed limit (KiB/s; 0 = unlimited)<input type="number" min={0} value={draft.bandwidthLimitKbps} onChange={(event) => setDraft({ ...draft,bandwidthLimitKbps:Number(event.target.value) })} /></label>
+          </div>
+          <label><input type="checkbox" checked={draft.adaptiveConnections} onChange={(event) => setDraft({ ...draft,adaptiveConnections:event.target.checked })} /> Tune workers automatically from measured throughput</label>
+          <label><input type="checkbox" checked={draft.directWrite} onChange={(event) => setDraft({ ...draft,directWrite:event.target.checked })} /> Write directly into a staging file to reduce merge time and disk space</label>
           <div className="strands preview" key={parts} aria-hidden="true">
             {Array.from({ length: parts }, (_, index) => <span key={index} />)}
           </div>
           <p className="hint">
-            Each file is split into up to {parts} {parts === 1 ? "part" : "parts"}. Fetchrail falls back to one connection
-            when a server does not support byte ranges.
+            Up to {parts} workers share queued byte ranges. Automatic mode measures throughput. Servers without strong range identity use a single stream.
           </p>
         </section>
 

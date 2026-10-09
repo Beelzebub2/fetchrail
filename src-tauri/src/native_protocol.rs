@@ -28,6 +28,9 @@ pub enum NativeMethod {
     GetDownloads,
     ControlDownload,
     ShowApp,
+    GetHandoff,
+    CommitHandoff,
+    RefreshDownload,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -42,6 +45,13 @@ pub struct NativeParams {
     pub scheduled_for: Option<DateTime<Utc>>,
     pub download_id: Option<Uuid>,
     pub action: Option<DownloadAction>,
+    pub handoff_id: Option<String>,
+    pub auto_start: Option<bool>,
+    pub url: Option<String>,
+    pub expected_sha256: Option<String>,
+    pub restart: Option<bool>,
+    pub request_headers: Option<std::collections::BTreeMap<String, String>>,
+    pub handoff_protocol: Option<u8>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -68,6 +78,8 @@ pub struct BrowserDownloadItem {
     pub suggested_file_name: Option<String>,
     pub expected_bytes: Option<u64>,
     pub expected_mime: Option<String>,
+    pub expected_sha256: Option<String>,
+    pub request_headers: Option<std::collections::BTreeMap<String, String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -140,6 +152,13 @@ pub fn validate_request(request: &NativeRequest) -> Result<(), String> {
     match request.method {
         NativeMethod::Ping | NativeMethod::GetDownloads | NativeMethod::ShowApp => {}
         NativeMethod::AddDownloads => {
+            if request
+                .params
+                .handoff_protocol
+                .is_some_and(|value| value != 2)
+            {
+                return Err("Unsupported handoff protocol.".into());
+            }
             if request.params.source.is_none() {
                 return Err("Download requests must include their browser source.".into());
             }
@@ -166,6 +185,8 @@ pub fn validate_request(request: &NativeRequest) -> Result<(), String> {
                 return Err("Invalid queue name.".into());
             }
             for item in &request.params.items {
+                crate::network::session_headers(item.request_headers.as_ref())?;
+                crate::storage::validate_hash(item.expected_sha256.as_deref())?;
                 if item
                     .expected_mime
                     .as_ref()
@@ -181,6 +202,11 @@ pub fn validate_request(request: &NativeRequest) -> Result<(), String> {
                 if !matches!(parsed.scheme(), "http" | "https") {
                     return Err("Only HTTP and HTTPS browser downloads are accepted.".into());
                 }
+                if !parsed.username().is_empty() || parsed.password().is_some() {
+                    return Err(
+                        "Use browser session support instead of credentials in a URL.".into(),
+                    );
+                }
                 if item
                     .suggested_file_name
                     .as_ref()
@@ -195,6 +221,37 @@ pub fn validate_request(request: &NativeRequest) -> Result<(), String> {
                 return Err("Download controls require a download id and an action.".into());
             }
         }
+        NativeMethod::GetHandoff | NativeMethod::CommitHandoff => {
+            Uuid::parse_str(
+                request
+                    .params
+                    .handoff_id
+                    .as_deref()
+                    .ok_or("Handoff id is required.")?,
+            )
+            .map_err(|_| "Handoff id must be a UUID.")?;
+        }
+        NativeMethod::RefreshDownload => {
+            if request.params.download_id.is_none() {
+                return Err("Download id is required.".into());
+            }
+            let url = Url::parse(
+                request
+                    .params
+                    .url
+                    .as_deref()
+                    .ok_or("Refresh URL is required.")?,
+            )
+            .map_err(|_| "Invalid URL.")?;
+            if !matches!(url.scheme(), "http" | "https")
+                || !url.username().is_empty()
+                || url.password().is_some()
+            {
+                return Err("Invalid refresh URL.".into());
+            }
+            crate::network::session_headers(request.params.request_headers.as_ref())?;
+            crate::storage::validate_hash(request.params.expected_sha256.as_deref())?;
+        }
     }
     if request.method != NativeMethod::AddDownloads
         && (!request.params.items.is_empty()
@@ -206,10 +263,33 @@ pub fn validate_request(request: &NativeRequest) -> Result<(), String> {
     {
         return Err("Download options are only accepted by addDownloads.".into());
     }
-    if request.method != NativeMethod::ControlDownload
-        && (request.params.download_id.is_some() || request.params.action.is_some())
+    if !matches!(
+        request.method,
+        NativeMethod::ControlDownload | NativeMethod::RefreshDownload
+    ) && (request.params.download_id.is_some() || request.params.action.is_some())
     {
         return Err("Control options are only accepted by controlDownload.".into());
+    }
+    if !matches!(
+        request.method,
+        NativeMethod::GetHandoff | NativeMethod::CommitHandoff
+    ) && request.params.handoff_id.is_some()
+    {
+        return Err("Invalid handoff options.".into());
+    }
+    if request.method != NativeMethod::CommitHandoff && request.params.auto_start.is_some() {
+        return Err("Invalid commit options.".into());
+    }
+    if request.method != NativeMethod::RefreshDownload
+        && (request.params.url.is_some()
+            || request.params.expected_sha256.is_some()
+            || request.params.restart.is_some()
+            || request.params.request_headers.is_some())
+    {
+        return Err("Invalid refresh options.".into());
+    }
+    if request.method != NativeMethod::AddDownloads && request.params.handoff_protocol.is_some() {
+        return Err("Invalid handoff protocol option.".into());
     }
     Ok(())
 }
@@ -230,6 +310,8 @@ mod tests {
                     suggested_file_name: None,
                     expected_bytes: None,
                     expected_mime: None,
+                    expected_sha256: None,
+                    request_headers: None,
                 }],
                 ..NativeParams::default()
             },

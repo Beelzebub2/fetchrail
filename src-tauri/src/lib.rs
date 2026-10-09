@@ -9,6 +9,19 @@ pub mod install;
 mod model;
 pub mod native_host;
 pub mod native_protocol;
+mod network;
+mod storage;
+
+pub(crate) fn data_dir(app: &AppHandle) -> Result<std::path::PathBuf, String> {
+    if let Some(path) = std::env::var_os("FETCHRAIL_DATA_DIR") {
+        let path = std::path::PathBuf::from(path);
+        if !path.is_absolute() {
+            return Err("FETCHRAIL_DATA_DIR must be absolute.".into());
+        }
+        return Ok(path);
+    }
+    app.path().app_data_dir().map_err(|error| error.to_string())
+}
 
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -169,6 +182,20 @@ async fn place_download(
     file_name: String,
 ) -> Result<DownloadRecord, String> {
     manager.place(id, directory, file_name).await
+}
+
+#[tauri::command]
+async fn refresh_download(
+    manager: State<'_, Arc<DownloadManager>>,
+    id: Uuid,
+    url: String,
+    expected_sha256: Option<String>,
+    restart: bool,
+) -> Result<DownloadRecord, String> {
+    manager
+        .inner()
+        .refresh(id, url, expected_sha256, None, restart)
+        .await
 }
 
 #[tauri::command]
@@ -380,8 +407,10 @@ pub fn run() {
             }
             tauri::WebviewWindowBuilder::from_config(app.handle(), &app.config().app.windows[0])?
                 .build()?;
-            if let Err(error) = browser_extension::install(app.handle()) {
-                eprintln!("Fetchrail browser extension: {error}");
+            if std::env::var_os("FETCHRAIL_DATA_DIR").is_none() {
+                if let Err(error) = browser_extension::install(app.handle()) {
+                    eprintln!("Fetchrail browser extension: {error}");
+                }
             }
             let manager =
                 tauri::async_runtime::block_on(DownloadManager::load(app.handle().clone()))
@@ -399,7 +428,9 @@ pub fn run() {
                 tauri::async_runtime::spawn(async move {
                     tokio::time::sleep(std::time::Duration::from_secs(20)).await;
                     loop {
-                        if manager.settings().await.auto_update {
+                        if std::env::var_os("FETCHRAIL_DATA_DIR").is_none()
+                            && manager.settings().await.auto_update
+                        {
                             install::check_for_update(&app).await;
                         }
                         tokio::time::sleep(std::time::Duration::from_secs(6 * 60 * 60)).await;
@@ -492,6 +523,7 @@ pub fn run() {
             cancel_download,
             remove_download,
             place_download,
+            refresh_download,
             reveal_download,
             get_settings,
             open_browser_extension_folder,

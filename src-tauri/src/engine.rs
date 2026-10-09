@@ -8,8 +8,12 @@ use std::{
     time::Instant,
 };
 
+use crate::{
+    network::{Adaptive, Bandwidth, OriginGate},
+    storage,
+};
 use chrono::{DateTime, Utc};
-use futures_util::{future::join_all, StreamExt};
+use futures_util::{stream::FuturesUnordered, StreamExt};
 use reqwest::{
     header::{
         self, HeaderMap, ACCEPT_ENCODING, CONTENT_DISPOSITION, CONTENT_LENGTH, CONTENT_RANGE,
@@ -20,7 +24,7 @@ use reqwest::{
 use tauri::{AppHandle, Emitter, Manager};
 use tokio::{
     fs,
-    io::{AsyncWriteExt, BufWriter},
+    io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufWriter},
     sync::RwLock,
     time::{interval, Duration},
 };
@@ -53,6 +57,10 @@ enum EngineError {
     RangeUnsupported,
     #[error("Server returned HTTP {0}.")]
     Http(StatusCode),
+    #[error("Connection stopped making useful progress; retrying remaining bytes.")]
+    Slow,
+    #[error("Server ended the response early; retrying remaining bytes.")]
+    Incomplete,
     #[error("download was cancelled")]
     Cancelled,
     #[error("{0}")]
@@ -75,12 +83,26 @@ struct ByteRange {
     end: u64,
 }
 
-#[derive(Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 struct PartManifest {
     total_bytes: Option<u64>,
     ranges: Vec<ByteRange>,
     validator: Option<String>,
     accepts_ranges: bool,
+    #[serde(default)]
+    direct_path: Option<PathBuf>,
+    #[serde(default)]
+    committed: Vec<u64>,
+    #[serde(default)]
+    hashes: Vec<Option<String>>,
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct Finalization {
+    stage: PathBuf,
+    destination: PathBuf,
+    bytes: u64,
+    sha256: String,
 }
 
 impl ByteRange {
@@ -103,15 +125,24 @@ fn current_segments(shared: &Mutex<Segments>) -> Segments {
 }
 
 fn segment_progress(segments: &[SegmentCounter], speeds: &[f64]) -> Vec<SegmentProgress> {
+    let group_size = segments.len().div_ceil(32).max(1);
     segments
-        .iter()
+        .chunks(group_size)
         .enumerate()
-        .map(|(index, segment)| SegmentProgress {
-            start: segment.range.start,
-            length: (segment.range.end != u64::MAX).then(|| segment.range.len()),
-            downloaded_bytes: segment.downloaded.load(Ordering::Relaxed),
-            speed_bps: speeds.get(index).copied().unwrap_or(0.0).max(0.0) as u64,
-            active: segment.active.load(Ordering::Relaxed),
+        .map(|(group, parts)| SegmentProgress {
+            start: parts[0].range.start,
+            length: parts
+                .iter()
+                .all(|part| part.range.end != u64::MAX)
+                .then(|| parts.iter().map(|part| part.range.len()).sum()),
+            downloaded_bytes: parts
+                .iter()
+                .map(|part| part.downloaded.load(Ordering::Relaxed))
+                .sum(),
+            speed_bps: (group * group_size..group * group_size + parts.len())
+                .map(|index| speeds.get(index).copied().unwrap_or(0.0).max(0.0) as u64)
+                .sum(),
+            active: parts.iter().any(|part| part.active.load(Ordering::Relaxed)),
         })
         .collect()
 }
@@ -122,6 +153,8 @@ struct DownloadTask {
     cancelled: AtomicBool,
     cancel_token: Mutex<CancellationToken>,
     running: AtomicBool,
+    headers: RwLock<HeaderMap>,
+    checkpoint_lock: tokio::sync::Mutex<Option<(PartManifest, Instant)>>,
 }
 
 impl DownloadTask {
@@ -132,6 +165,8 @@ impl DownloadTask {
             cancelled: AtomicBool::new(false),
             cancel_token: Mutex::new(CancellationToken::new()),
             running: AtomicBool::new(false),
+            headers: RwLock::new(HeaderMap::new()),
+            checkpoint_lock: tokio::sync::Mutex::new(None),
         }
     }
 
@@ -174,14 +209,14 @@ pub struct DownloadManager {
     // ponytail: serialize state writes and final renames; split locks if disk contention matters.
     persist_lock: tokio::sync::Mutex<()>,
     minimize_to_tray: AtomicBool,
+    add_lock: tokio::sync::Mutex<()>,
+    origins: tokio::sync::Mutex<HashMap<String, Arc<OriginGate>>>,
+    bandwidth: Bandwidth,
 }
 
 impl DownloadManager {
     pub async fn load(app: AppHandle) -> Result<Arc<Self>, String> {
-        let data_dir = app
-            .path()
-            .app_data_dir()
-            .map_err(|error| format!("Could not resolve app data directory: {error}"))?;
+        let data_dir = crate::data_dir(&app)?;
         let parts_dir = data_dir.join("parts");
         fs::create_dir_all(&parts_dir)
             .await
@@ -196,20 +231,17 @@ impl DownloadManager {
             .map_err(|error| format!("Could not create default download directory: {error}"))?;
 
         let settings_path = data_dir.join(SETTINGS_FILE);
-        let settings = match fs::read(&settings_path).await {
-            Ok(bytes) => serde_json::from_slice::<DownloadSettings>(&bytes)
-                .unwrap_or_else(|_| default_settings(&default_download_dir))
-                .normalized(),
-            Err(_) => default_settings(&default_download_dir),
-        };
+        let settings = storage::read_json::<DownloadSettings>(&settings_path)
+            .await
+            .map_err(|error| error.to_string())?
+            .unwrap_or_else(|| default_settings(&default_download_dir))
+            .normalized();
 
-        let mut queues = match fs::read(data_dir.join(QUEUES_FILE)).await {
-            Ok(bytes) => serde_json::from_slice::<Vec<QueueRecord>>(&bytes)
-                .ok()
-                .filter(|queues| !queues.is_empty())
-                .unwrap_or_else(default_queues),
-            Err(_) => default_queues(),
-        };
+        let mut queues = storage::read_json::<Vec<QueueRecord>>(&data_dir.join(QUEUES_FILE))
+            .await
+            .map_err(|error| error.to_string())?
+            .filter(|queues| !queues.is_empty())
+            .unwrap_or_else(default_queues);
         if !queues
             .iter()
             .any(|queue| queue.name.eq_ignore_ascii_case("Default"))
@@ -222,7 +254,7 @@ impl DownloadManager {
                 },
             );
         }
-        if settings.launch_on_start {
+        if settings.launch_on_start && std::env::var_os("FETCHRAIL_DATA_DIR").is_none() {
             let _ = sync_startup_registration(true);
         }
 
@@ -238,20 +270,25 @@ impl DownloadManager {
 
         let mut task_map = HashMap::new();
         let state_path = data_dir.join(STATE_FILE);
-        if let Ok(bytes) = fs::read(&state_path).await {
-            if let Ok(records) = serde_json::from_slice::<Vec<DownloadRecord>>(&bytes) {
-                for mut record in records {
-                    if record.status.is_active() {
-                        record.status = DownloadStatus::Paused;
-                        record.speed_bps = 0;
-                        record.eta_seconds = None;
-                    }
-                    for segment in &mut record.segments {
-                        segment.speed_bps = 0;
-                        segment.active = false;
-                    }
-                    task_map.insert(record.id, Arc::new(DownloadTask::new(record)));
+        if let Some(records) = storage::read_json::<Vec<DownloadRecord>>(&state_path)
+            .await
+            .map_err(|error| error.to_string())?
+        {
+            for mut record in records {
+                if record.status.is_active() {
+                    record.status = DownloadStatus::Paused;
+                    record.speed_bps = 0;
+                    record.eta_seconds = None;
                 }
+                for segment in &mut record.segments {
+                    segment.speed_bps = 0;
+                    segment.active = false;
+                }
+                let recovered_dir = parts_dir.join(record.id.to_string());
+                recover_published(&mut record, &recovered_dir)
+                    .await
+                    .map_err(|error| format!("Could not recover finalization: {error}"))?;
+                task_map.insert(record.id, Arc::new(DownloadTask::new(record)));
             }
         }
 
@@ -265,6 +302,9 @@ impl DownloadManager {
             data_dir,
             parts_dir,
             persist_lock: tokio::sync::Mutex::new(()),
+            add_lock: tokio::sync::Mutex::new(()),
+            origins: tokio::sync::Mutex::new(HashMap::new()),
+            bandwidth: Bandwidth::new(),
         });
         manager
             .persist_settings()
@@ -286,9 +326,37 @@ impl DownloadManager {
         self: &Arc<Self>,
         request: AddDownloadRequest,
     ) -> Result<DownloadRecord, String> {
+        let _add = self.add_lock.lock().await;
+        let headers = crate::network::session_headers(request.request_headers.as_ref())?;
+        let expected_sha256 = storage::validate_hash(request.expected_sha256.as_deref())?;
         let parsed = Url::parse(request.url.trim()).map_err(|error| error.to_string())?;
         if !matches!(parsed.scheme(), "http" | "https") {
             return Err("Only HTTP and HTTPS URLs are supported.".into());
+        }
+        if !parsed.username().is_empty() || parsed.password().is_some() {
+            return Err("Use browser session support instead of credentials in a URL.".into());
+        }
+        if let Some(key) = &request.handoff_id {
+            if key.len() > 80 {
+                return Err("Invalid handoff id.".into());
+            }
+            if let Some(record) = self
+                .list()
+                .await
+                .into_iter()
+                .find(|record| record.handoff_id.as_ref() == Some(key))
+            {
+                if record.url != parsed.as_str() {
+                    return Err("Handoff id already belongs to another URL.".into());
+                }
+                if record.status == DownloadStatus::Cancelled {
+                    return Err("This handoff was rolled back.".into());
+                }
+                if record.expected_sha256 != expected_sha256 {
+                    return Err("Handoff checksum changed.".into());
+                }
+                return Ok(record);
+            }
         }
 
         let settings = self.settings.read().await.clone();
@@ -362,13 +430,25 @@ impl DownloadManager {
             scheduled_for,
             segments: Vec::new(),
             name_locked: false,
+            expected_sha256,
+            sha256: None,
+            status_detail: None,
+            finalizing_bytes: 0,
+            handoff_id: request.handoff_id,
+            handoff_committed: false,
+            requires_session: !headers.is_empty(),
         };
 
         let task = Arc::new(DownloadTask::new(record.clone()));
+        // The scheduler cannot start a job until its acceptance is durable.
+        task.paused.store(true, Ordering::Release);
+        *task.headers.write().await = headers;
         self.tasks.write().await.insert(id, task.clone());
-        self.persist_records()
-            .await
-            .map_err(|error| error.to_string())?;
+        if let Err(error) = self.persist_records().await {
+            self.tasks.write().await.remove(&id);
+            return Err(error.to_string());
+        }
+        task.paused.store(start_paused, Ordering::Release);
         self.emit_record(&record);
         Ok(record)
     }
@@ -378,11 +458,20 @@ impl DownloadManager {
         url: &str,
         expected_bytes: Option<u64>,
         expected_mime: Option<&str>,
+        headers: Option<&std::collections::BTreeMap<String, String>>,
     ) -> Result<(), String> {
         // Verify a replayable GET before the extension gives up its browser transfer.
+        let parsed = Url::parse(url).map_err(|error| error.to_string())?;
+        let gate = self.origin(&parsed).await;
+        let cancel = CancellationToken::new();
+        let limit = self.settings.read().await.max_requests_per_origin;
+        let _permit = tokio::time::timeout(Duration::from_secs(15), gate.acquire(limit, &cancel))
+            .await
+            .map_err(|_| "Browser verification is waiting for this site's request budget.")?
+            .ok_or("Verification cancelled.")?;
         let response = tokio::time::timeout(
             Duration::from_secs(15),
-            self.client
+            self.session_client(crate::network::session_headers(headers)?)?
                 .get(url)
                 .header(RANGE, "bytes=0-0")
                 .header(ACCEPT_ENCODING, "identity")
@@ -390,7 +479,24 @@ impl DownloadManager {
         )
         .await
         .map_err(|_| "Browser download verification timed out.".to_string())?
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| error.without_url().to_string())?;
+        validate_encoding(response.headers()).map_err(|error| error.to_string())?;
+        if matches!(
+            response.status(),
+            StatusCode::TOO_MANY_REQUESTS | StatusCode::SERVICE_UNAVAILABLE
+        ) {
+            gate.cool_down(
+                crate::network::retry_after(
+                    response
+                        .headers()
+                        .get(header::RETRY_AFTER)
+                        .and_then(|value| value.to_str().ok()),
+                    Utc::now(),
+                )
+                .unwrap_or(Duration::from_secs(2)),
+            )
+            .await;
+        }
         let total = match response.status() {
             StatusCode::PARTIAL_CONTENT => {
                 let (start, end, total) = parse_content_range(response.headers())
@@ -446,8 +552,153 @@ impl DownloadManager {
         for task in tasks {
             records.push(task.record.read().await.clone());
         }
-        records.sort_by(|left, right| right.created_at.cmp(&left.created_at));
+        records.sort_by_key(|record| std::cmp::Reverse(record.created_at));
         records
+    }
+
+    pub async fn commit_handoff(
+        self: &Arc<Self>,
+        key: &str,
+        auto_start: bool,
+    ) -> Result<Vec<DownloadRecord>, String> {
+        let records = self
+            .list()
+            .await
+            .into_iter()
+            .filter(|record| {
+                record
+                    .handoff_id
+                    .as_ref()
+                    .is_some_and(|id| id.starts_with(key))
+            })
+            .collect::<Vec<_>>();
+        if records.is_empty() {
+            return Err("Handoff has not been accepted yet.".into());
+        }
+        let mut committed = Vec::new();
+        for record in records {
+            if record.status == DownloadStatus::Cancelled {
+                return Err("Handoff was rolled back.".into());
+            }
+            let task = self.task(record.id).await?;
+            {
+                let mut record = task.record.write().await;
+                record.handoff_committed = true;
+                committed.push(record.clone());
+            }
+            if auto_start && record.status == DownloadStatus::Paused {
+                self.resume(record.id).await?;
+            }
+        }
+        self.persist_records()
+            .await
+            .map_err(|error| error.to_string())?;
+        Ok(committed)
+    }
+
+    pub async fn refresh(
+        self: &Arc<Self>,
+        id: Uuid,
+        url: String,
+        expected: Option<String>,
+        headers: Option<std::collections::BTreeMap<String, String>>,
+        restart: bool,
+    ) -> Result<DownloadRecord, String> {
+        let task = self.task(id).await?;
+        if task.running.load(Ordering::Acquire) {
+            return Err("Pause the download before refreshing its link.".into());
+        }
+        let old = task.record.read().await.clone();
+        if old.status == DownloadStatus::Completed {
+            return Err("This download is already complete.".into());
+        }
+        let parsed = Url::parse(&url).map_err(|_| "Invalid refresh URL.")?;
+        if !matches!(parsed.scheme(), "http" | "https")
+            || !parsed.username().is_empty()
+            || parsed.password().is_some()
+        {
+            return Err("Only HTTP/HTTPS URLs without embedded credentials are accepted.".into());
+        }
+        let headers = crate::network::session_headers(headers.as_ref())?;
+        let expected = storage::validate_hash(expected.as_deref())?.or(old.expected_sha256.clone());
+        let client = self.session_client(headers.clone())?;
+        let token = CancellationToken::new();
+        let probe = tokio::time::timeout(
+            Duration::from_secs(25),
+            self.probe(&client, &parsed, &token),
+        )
+        .await
+        .map_err(|_| "Link refresh timed out.")?
+        .map_err(|error| error.to_string())?;
+        let part_dir = self.part_dir(id);
+        let saved: Option<PartManifest> = storage::read_json(&part_dir.join("transfer.json"))
+            .await
+            .map_err(|error| error.to_string())?;
+        let same_resource = old.url == parsed.as_str()
+            && saved.as_ref().is_some_and(|saved| {
+                saved.validator.is_some()
+                    && saved.validator == probe.validator
+                    && saved.total_bytes == probe.total_bytes
+            });
+        let trusted_hash = old.expected_sha256.is_some() && old.expected_sha256 == expected;
+        let has_progress = old.downloaded_bytes > 0
+            || saved
+                .as_ref()
+                .is_some_and(|saved| saved.committed.iter().any(|bytes| *bytes > 0));
+        if has_progress && !same_resource && !trusted_hash && !restart {
+            return Err("Cannot prove that this link is the same file. Choose Restart, or supply the original trusted SHA-256.".into());
+        }
+        if restart {
+            if let Some(saved) = &saved {
+                if let Some(stage) = &saved.direct_path {
+                    if stage.file_name().is_some_and(|name| {
+                        name.to_string_lossy()
+                            .ends_with(&format!(".{id}.fetchrail-part"))
+                    }) {
+                        let _ = fs::remove_file(stage).await;
+                    }
+                }
+            }
+            match fs::remove_dir_all(&part_dir).await {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.to_string()),
+            }
+        } else if trusted_hash && !same_resource {
+            if let Some(mut saved) = saved {
+                saved.validator = probe.validator.clone();
+                saved.total_bytes = probe.total_bytes;
+                saved.accepts_ranges = probe.accepts_ranges;
+                write_json_atomic(&part_dir.join("transfer.json"), &saved)
+                    .await
+                    .map_err(|error| error.to_string())?;
+            }
+        }
+        *task.headers.write().await = headers.clone();
+        let snapshot = {
+            let mut record = task.record.write().await;
+            record.url = parsed.to_string();
+            record.expected_sha256 = expected;
+            record.requires_session = !headers.is_empty();
+            record.status = DownloadStatus::Paused;
+            record.error = None;
+            record.status_detail = Some("Link refreshed; ready to resume.".into());
+            record.finished_at = None;
+            if restart {
+                record.downloaded_bytes = 0;
+                record.segments.clear();
+                record.sha256 = None;
+                record.finalizing_bytes = 0;
+            }
+            record.clone()
+        };
+        task.paused.store(true, Ordering::Release);
+        task.cancelled.store(false, Ordering::Release);
+        self.persist_records()
+            .await
+            .map_err(|error| error.to_string())?;
+        self.emit_record(&snapshot);
+        Ok(snapshot)
     }
 
     pub async fn overview(&self) -> EngineOverview {
@@ -495,15 +746,28 @@ impl DownloadManager {
             let mut record = task.record.write().await;
             if matches!(
                 record.status,
-                DownloadStatus::Completed | DownloadStatus::Cancelled | DownloadStatus::Merging
+                DownloadStatus::Completed | DownloadStatus::Cancelled
             ) {
                 return Err("This download cannot be paused.".into());
             }
             task.paused.store(true, Ordering::Release);
             task.cancel();
             record.status = DownloadStatus::Paused;
+            record.status_detail = Some("Saving paused transfer…".into());
             record.speed_bps = 0;
             record.eta_seconds = None;
+            record.clone()
+        };
+        self.persist_records()
+            .await
+            .map_err(|error| error.to_string())?;
+        self.emit_record(&snapshot);
+        tokio::time::timeout(Duration::from_secs(15),async {
+            while task.running.load(Ordering::Acquire) { tokio::time::sleep(Duration::from_millis(25)).await; }
+        }).await.map_err(|_|"Pause requested; disk cleanup is still finishing. Wait a moment before resuming or refreshing.".to_string())?;
+        let snapshot = {
+            let mut record = task.record.write().await;
+            record.status_detail = None;
             record.clone()
         };
         self.persist_records()
@@ -542,10 +806,7 @@ impl DownloadManager {
         let task = self.task(id).await?;
         let snapshot = {
             let mut record = task.record.write().await;
-            if matches!(
-                record.status,
-                DownloadStatus::Completed | DownloadStatus::Merging
-            ) {
+            if matches!(record.status, DownloadStatus::Completed) {
                 return Err("This download is already complete or being finalized.".into());
             }
             task.cancelled.store(true, Ordering::Release);
@@ -784,7 +1045,9 @@ impl DownloadManager {
         fs::create_dir_all(&path)
             .await
             .map_err(|error| format!("Could not use that download directory: {error}"))?;
-        sync_startup_registration(settings.launch_on_start)?;
+        if std::env::var_os("FETCHRAIL_DATA_DIR").is_none() {
+            sync_startup_registration(settings.launch_on_start)?;
+        }
 
         *self.settings.write().await = settings.clone();
         self.minimize_to_tray
@@ -933,8 +1196,16 @@ impl DownloadManager {
             let record = task.record.read().await;
             Url::parse(&record.url)?
         };
+        if self.finish_staged(&task, &cancel).await? {
+            return Ok(());
+        }
+        let headers = task.headers.read().await.clone();
+        if task.record.read().await.requires_session && headers.is_empty() {
+            return Err(EngineError::Message("Browser session expired after restart. Refresh the link/session from the browser before resuming.".into()));
+        }
+        let client = self.session_client(headers).map_err(EngineError::Message)?;
         let probe = tokio::select! {
-            result = self.probe(&url) => result?,
+            result = self.probe(&client, &url, &cancel) => result?,
             _ = cancel.cancelled() => return Err(EngineError::Cancelled),
         };
 
@@ -945,7 +1216,7 @@ impl DownloadManager {
             .unwrap_or(snapshot.connections)
             .clamp(1, 32);
         let connection_count = if let Some(total) = probe.total_bytes {
-            if probe.accepts_ranges {
+            if probe.accepts_ranges && probe.validator.is_some() {
                 suggested_connection_count(
                     total,
                     requested_connections,
@@ -1003,16 +1274,69 @@ impl DownloadManager {
         let part_dir = self.part_dir(task.record.read().await.id);
 
         let mut ranges = match total {
-            Some(total) => split_ranges(total, connection_count),
+            Some(total) if probe.accepts_ranges => {
+                queued_ranges(total, settings.min_segment_size_mb * 1024 * 1024)
+            }
+            Some(total) => split_ranges(total, 1),
             None => vec![ByteRange {
                 start: 0,
                 end: u64::MAX,
             }],
         };
 
+        if let Some(saved) = matching_manifest(&part_dir, &probe).await? {
+            ranges = saved.ranges;
+        }
         prepare_parts(&part_dir, &probe, &ranges).await?;
+        let destination = PathBuf::from(&task.record.read().await.destination);
+        let parent = destination
+            .parent()
+            .ok_or_else(|| EngineError::Message("Invalid destination.".into()))?;
+        let mut manifest: PartManifest = storage::read_json(&part_dir.join("transfer.json"))
+            .await?
+            .unwrap();
+        let has_legacy = fs::try_exists(part_dir.join("0.part")).await?;
+        if let Some(total) = probe.total_bytes.filter(|total| {
+            *total > 0 && settings.direct_write && manifest.direct_path.is_none() && !has_legacy
+        }) {
+            storage::check_space(parent, total)?;
+            let stage = parent.join(format!(
+                ".{}.{}.fetchrail-part",
+                Uuid::new_v4(),
+                task.record.read().await.id
+            ));
+            let output = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&stage)
+                .await?;
+            output.set_len(total).await?;
+            output.sync_all().await?;
+            manifest.direct_path = Some(stage);
+            manifest.committed = vec![0; ranges.len()];
+            manifest.hashes = vec![None; ranges.len()];
+            write_json_atomic(&part_dir.join("transfer.json"), &manifest).await?;
+        } else if let Some(total) = probe.total_bytes {
+            if manifest.direct_path.is_none() {
+                let existing = task.record.read().await.downloaded_bytes;
+                storage::check_part_space(
+                    &part_dir,
+                    parent,
+                    total.saturating_sub(existing),
+                    total,
+                )?;
+            }
+        }
 
-        let segments = Arc::new(Mutex::new(segment_counters(&part_dir, &ranges).await?));
+        let initial = segment_counters(&part_dir, &ranges).await?;
+        if manifest.committed.is_empty() {
+            manifest.committed = initial
+                .iter()
+                .map(|part| part.downloaded.load(Ordering::Relaxed))
+                .collect();
+        }
+        *task.checkpoint_lock.lock().await = Some((manifest, Instant::now()));
+        let segments = Arc::new(Mutex::new(initial));
         self.update_progress_record(
             &task,
             segment_progress(&current_segments(&segments), &[]),
@@ -1032,6 +1356,7 @@ impl DownloadManager {
                 .download_ranges(
                     &task,
                     &cancel,
+                    &client,
                     &url,
                     &part_dir,
                     &current_segments(&segments),
@@ -1057,9 +1382,15 @@ impl DownloadManager {
                     ..probe.clone()
                 };
                 prepare_parts(&part_dir, &fallback, &ranges).await?;
+                let manifest = storage::read_json(&part_dir.join("transfer.json"))
+                    .await?
+                    .ok_or_else(|| {
+                        EngineError::Message("Transfer checkpoint is missing.".into())
+                    })?;
+                *task.checkpoint_lock.lock().await = Some((manifest, Instant::now()));
                 let single = segment_counters(&part_dir, &ranges).await?;
                 *segments.lock().expect("segments mutex poisoned") = single.clone();
-                self.download_ranges(&task, &cancel, &url, &part_dir, &single, &fallback)
+                self.download_ranges(&task, &cancel, &client, &url, &part_dir, &single, &fallback)
                     .await?;
             } else {
                 first_result?;
@@ -1082,7 +1413,7 @@ impl DownloadManager {
 
         self.set_status(&task, &cancel, DownloadStatus::Merging, None)
             .await?;
-        let destination = self.merge_parts(&task, &part_dir, &ranges).await?;
+        let destination = self.merge_parts(&task, &cancel, &part_dir, &ranges).await?;
         let final_bytes = total.unwrap_or(transferred);
         let snapshot = {
             let mut record = task.record.write().await;
@@ -1101,74 +1432,124 @@ impl DownloadManager {
             record.finished_at = Some(Utc::now());
             record.clone()
         };
-        let _ = fs::remove_dir_all(&part_dir).await;
         self.persist_records().await?;
+        let _ = fs::remove_dir_all(&part_dir).await;
         self.emit_record(&snapshot);
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn download_ranges(
         &self,
         task: &Arc<DownloadTask>,
         cancel: &CancellationToken,
+        client: &Client,
         url: &Url,
         part_dir: &Path,
         segments: &[SegmentCounter],
         probe: &ProbeResult,
     ) -> EngineResult<()> {
-        for attempt in 0..3 {
-            task.check_stopped(cancel)?;
-            let batch_cancel = cancel.child_token();
-            let futures = segments.iter().enumerate().map(|(index, segment)| {
-                let batch_cancel = &batch_cancel;
-                async move {
-                    let result = self
-                        .download_segment(task, batch_cancel, url, part_dir, index, segment, probe)
-                        .await;
-                    if result.is_err() {
-                        batch_cancel.cancel();
-                    }
-                    result
-                }
-            });
-            let results = join_all(futures).await;
-            let mut errors = results
-                .into_iter()
-                .filter_map(Result::err)
-                .collect::<Vec<_>>();
-            if errors.is_empty() {
-                return Ok(());
+        let settings = self.settings.read().await.clone();
+        let maximum = task
+            .record
+            .read()
+            .await
+            .connections
+            .min(settings.max_requests_per_origin)
+            .max(1);
+        let mut auto = Adaptive::new(
+            maximum,
+            settings.adaptive_connections && probe.accepts_ranges,
+        );
+        let mut pending = (0..segments.len()).collect::<std::collections::VecDeque<_>>();
+        let batch = cancel.child_token();
+        let mut active = FuturesUnordered::new();
+        let mut sample = interval(Duration::from_secs(4));
+        sample.tick().await;
+        let mut last_bytes = segments
+            .iter()
+            .map(|part| part.downloaded.load(Ordering::Relaxed))
+            .sum::<u64>();
+        let mut failure = None;
+        loop {
+            while failure.is_none() && active.len() < auto.target {
+                let Some(index) = pending.pop_front() else {
+                    break;
+                };
+                let segment = &segments[index];
+                let batch = &batch;
+                active.push(async move {
+                    self.download_with_retries(
+                        task, batch, client, url, part_dir, index, segment, probe,
+                    )
+                    .await
+                });
             }
-            let index = errors
-                .iter()
-                .position(|error| !matches!(error, EngineError::Cancelled))
-                .unwrap_or(0);
-            let error = errors.swap_remove(index);
-            let transient = match &error {
-                EngineError::Request(error) => {
-                    error.is_timeout() || error.is_connect() || error.is_body()
-                }
-                EngineError::Http(status) => {
-                    status.is_server_error()
-                        || *status == StatusCode::TOO_MANY_REQUESTS
-                        || *status == StatusCode::REQUEST_TIMEOUT
-                }
-                _ => false,
-            };
-            if !transient || attempt == 2 {
-                return Err(error);
+            if active.is_empty() {
+                break;
             }
             tokio::select! {
-                _ = tokio::time::sleep(Duration::from_millis(500 * (attempt + 1))) => {},
-                _ = cancel.cancelled() => return Err(EngineError::Cancelled),
-            }
-            // A stream without ranges cannot append safely after a broken connection.
-            if !probe.accepts_ranges {
-                fs::remove_dir_all(part_dir).await?;
-                fs::create_dir_all(part_dir).await?;
-                for segment in segments {
-                    segment.downloaded.store(0, Ordering::Relaxed);
+                result = active.next() => {
+                    if let Some(Err(error)) = result {
+                        if failure.is_none() { failure = Some(error); batch.cancel(); }
+                    }
+                },
+                _ = sample.tick(), if failure.is_none() => {
+                    let bytes = segments.iter().map(|part| part.downloaded.load(Ordering::Relaxed)).sum::<u64>();
+                    let rate = bytes.saturating_sub(last_bytes) as f64 / 4.0;
+                    let throttled = task.record.read().await.status_detail.as_deref().is_some_and(|value| value.contains("HTTP 429") || value.contains("HTTP 503"));
+                    if !pending.is_empty() { auto.sample(rate, throttled); }
+                    task.record.write().await.connections = auto.target;
+                    last_bytes = bytes;
                 }
+            }
+        }
+        if let Some(error) = failure {
+            return Err(error);
+        }
+        task.check_stopped(cancel)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn download_with_retries(
+        &self,
+        task: &Arc<DownloadTask>,
+        cancel: &CancellationToken,
+        client: &Client,
+        url: &Url,
+        part_dir: &Path,
+        index: usize,
+        segment: &SegmentCounter,
+        probe: &ProbeResult,
+    ) -> EngineResult<()> {
+        let attempts = self.settings.read().await.retry_attempts;
+        for attempt in 0..attempts {
+            task.check_stopped(cancel)?;
+            let result = self
+                .download_segment(task, cancel, client, url, part_dir, index, segment, probe)
+                .await;
+            match result {
+                Ok(()) => return Ok(()),
+                Err(error) if is_transient(&error) && attempt + 1 < attempts => {
+                    let delay = crate::network::backoff(attempt);
+                    task.record.write().await.status_detail =
+                        Some(format!("Retry {}/{}: {}", attempt + 1, attempts, error));
+                    tokio::select! { _ = tokio::time::sleep(delay) => {}, _ = cancel.cancelled() => return Err(EngineError::Cancelled) }
+                    if !probe.accepts_ranges {
+                        let _ = fs::remove_file(part_dir.join(format!("{index}.part"))).await;
+                        segment.downloaded.store(0, Ordering::Relaxed);
+                        let mut guard = task.checkpoint_lock.lock().await;
+                        let mut manifest: PartManifest =
+                            storage::read_json(&part_dir.join("transfer.json"))
+                                .await?
+                                .unwrap();
+                        manifest.committed = vec![0; manifest.ranges.len()];
+                        manifest.hashes = vec![None; manifest.ranges.len()];
+                        write_json_atomic(&part_dir.join("transfer.json"), &manifest).await?;
+                        *guard = Some((manifest, Instant::now()));
+                    }
+                }
+                Err(error) => return Err(error),
             }
         }
         unreachable!()
@@ -1179,134 +1560,238 @@ impl DownloadManager {
         &self,
         task: &Arc<DownloadTask>,
         cancel: &CancellationToken,
+        client: &Client,
         url: &Url,
         part_dir: &Path,
         index: usize,
         segment: &SegmentCounter,
         probe: &ProbeResult,
     ) -> EngineResult<()> {
+        use sha2::{Digest, Sha256};
         let range = segment.range;
-        let part_path = part_dir.join(format!("{index}.part"));
-        let expected_len = if range.end == u64::MAX {
-            None
-        } else {
-            Some(range.len())
-        };
-        let existing = match fs::metadata(&part_path).await {
-            Ok(metadata) => metadata.len(),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
-            Err(error) => return Err(error.into()),
-        };
-
-        if let Some(expected_len) = expected_len {
-            if existing > expected_len {
-                fs::remove_file(&part_path).await?;
+        let manifest = task
+            .checkpoint_lock
+            .lock()
+            .await
+            .as_ref()
+            .ok_or_else(|| EngineError::Message("Transfer checkpoint is missing.".into()))?
+            .0
+            .clone();
+        let direct = manifest.direct_path.is_some();
+        let part_path = manifest
+            .direct_path
+            .clone()
+            .unwrap_or_else(|| part_dir.join(format!("{index}.part")));
+        let expected_len = (range.end != u64::MAX).then(|| range.len());
+        let file_len = fs::metadata(&part_path)
+            .await
+            .map(|metadata| metadata.len())
+            .unwrap_or(0);
+        let mut existing =
+            manifest
+                .committed
+                .get(index)
+                .copied()
+                .unwrap_or(if direct { 0 } else { file_len });
+        if expected_len.is_some_and(|expected| existing > expected)
+            || (!direct && existing > file_len)
+        {
+            existing = 0;
+        }
+        let mut hasher = Sha256::new();
+        if existing > 0 {
+            let mut input = fs::File::open(&part_path).await?;
+            if direct {
+                input.seek(std::io::SeekFrom::Start(range.start)).await?;
+            }
+            let mut left = existing;
+            let mut buffer = vec![0; 128 * 1024];
+            while left > 0 {
+                let capacity = left.min(buffer.len() as u64) as usize;
+                let read = input.read(&mut buffer[..capacity]).await?;
+                if read == 0 {
+                    return Err(EngineError::Message("Saved part is incomplete.".into()));
+                }
+                hasher.update(&buffer[..read]);
+                left -= read as u64;
+            }
+            if let Some(Some(saved)) = manifest.hashes.get(index) {
+                if format!("{:x}", hasher.clone().finalize()) != *saved {
+                    return Err(EngineError::Message(
+                        "Saved part checksum mismatch. Restart this download with a fresh link."
+                            .into(),
+                    ));
+                }
             }
         }
-        let existing = if expected_len.is_some_and(|expected| existing > expected) {
-            0
-        } else {
-            existing
-        };
         segment.downloaded.store(existing, Ordering::Relaxed);
         if expected_len == Some(existing) {
             return Ok(());
         }
-
         task.check_stopped(cancel)?;
+        let gate = self.origin(url).await;
+        let settings = self.settings.read().await.clone();
+        let _permit = gate
+            .acquire(settings.max_requests_per_origin, cancel)
+            .await
+            .ok_or(EngineError::Cancelled)?;
         let absolute_start = range.start.saturating_add(existing);
-        let mut request = self
-            .client
-            .get(url.clone())
-            .header(ACCEPT_ENCODING, "identity");
-        if probe.accepts_ranges && range.end != u64::MAX {
-            request = request.header(RANGE, format!("bytes={absolute_start}-{}", range.end));
-        } else if probe.accepts_ranges && existing > 0 {
-            request = request.header(RANGE, format!("bytes={absolute_start}-"));
-        }
+        let mut request = client.get(url.clone()).header(ACCEPT_ENCODING, "identity");
         if probe.accepts_ranges {
+            request = request.header(
+                RANGE,
+                if range.end == u64::MAX {
+                    format!("bytes={absolute_start}-")
+                } else {
+                    format!("bytes={absolute_start}-{}", range.end)
+                },
+            );
             if let Some(validator) = &probe.validator {
                 request = request.header(IF_RANGE, validator);
             }
         }
-
-        let response = tokio::select! {
-            result = request.send() => result?,
-            _ = cancel.cancelled() => return Err(EngineError::Cancelled),
-        };
-
+        let response = tokio::select! { result = request.send() => result.map_err(|error| EngineError::Request(error.without_url()))?, _ = cancel.cancelled() => return Err(EngineError::Cancelled) };
         if !response.status().is_success() {
+            if response.status() == StatusCode::TOO_MANY_REQUESTS
+                || response.status() == StatusCode::SERVICE_UNAVAILABLE
+            {
+                let duration = crate::network::retry_after(
+                    response
+                        .headers()
+                        .get(header::RETRY_AFTER)
+                        .and_then(|value| value.to_str().ok()),
+                    Utc::now(),
+                )
+                .unwrap_or(Duration::from_secs(2));
+                gate.cool_down(duration).await;
+            }
             return Err(EngineError::Http(response.status()));
+        }
+        validate_encoding(response.headers())?;
+        if let Some(expected) = &probe.validator {
+            if representation_validator(response.headers()).as_ref() != Some(expected) {
+                return Err(EngineError::Message(
+                    "File changed while downloading. Refresh the link and restart safely.".into(),
+                ));
+            }
         }
         if probe.accepts_ranges && response.status() != StatusCode::PARTIAL_CONTENT {
             return Err(EngineError::RangeUnsupported);
         }
         if response.status() == StatusCode::PARTIAL_CONTENT {
-            let (actual_start, actual_end, actual_total) = parse_content_range(response.headers())
-                .ok_or_else(|| {
-                    EngineError::Message("Server returned an invalid Content-Range.".into())
-                })?;
-            let expected_end = if range.end == u64::MAX {
-                actual_end
-            } else {
-                range.end
-            };
-            if actual_start != absolute_start
-                || actual_end != expected_end
-                || actual_total != probe.total_bytes
+            let (start, end, total) = parse_content_range(response.headers()).ok_or_else(|| {
+                EngineError::Message("Server returned an invalid Content-Range.".into())
+            })?;
+            if start != absolute_start
+                || (range.end != u64::MAX && end != range.end)
+                || total != probe.total_bytes
             {
                 return Err(EngineError::Message(
                     "Server returned bytes outside the requested range.".into(),
                 ));
             }
         }
-
-        let mut output = fs::OpenOptions::new()
-            .create(true)
-            .append(existing > 0)
+        let mut file = fs::OpenOptions::new()
+            .create(!direct)
             .write(true)
-            .truncate(existing == 0)
             .open(&part_path)
             .await?;
+        if !direct {
+            file.set_len(existing).await?;
+        }
+        file.seek(std::io::SeekFrom::Start(if direct {
+            range.start + existing
+        } else {
+            existing
+        }))
+        .await?;
+        let mut output = BufWriter::with_capacity(256 * 1024, file);
         let mut stream = response.bytes_stream();
         segment.active.store(true, Ordering::Relaxed);
+        task.record.write().await.status_detail = None;
+        let mut written = existing;
+        let mut checkpoint_at = Instant::now();
+        let started = Instant::now();
         let transfer = async {
-            let mut written = existing;
             loop {
                 task.check_stopped(cancel)?;
-                let item = tokio::select! {
-                    item = stream.next() => item,
-                    _ = cancel.cancelled() => return Err(EngineError::Cancelled),
-                };
-                let Some(chunk) = item else {
-                    break;
-                };
-                let chunk = chunk?;
-                written = written.saturating_add(chunk.len() as u64);
-                if expected_len.is_some_and(|expected| written > expected) {
-                    return Err(EngineError::Message(
-                        "Server sent more bytes than requested.".into(),
-                    ));
+                let item = tokio::select! { item = stream.next() => item, _ = cancel.cancelled() => return Err(EngineError::Cancelled) };
+                let Some(chunk) = item else { break; };
+                let chunk = chunk.map_err(|error| EngineError::Request(error.without_url()))?;
+                if expected_len.is_some_and(|expected| written.saturating_add(chunk.len() as u64) > expected) {
+                    return Err(EngineError::Message("Server sent more bytes than requested.".into()));
                 }
+                let limit = self.settings.read().await.bandwidth_limit_kbps;
+                if !self.bandwidth.consume(chunk.len(), limit, cancel).await { return Err(EngineError::Cancelled); }
+                if expected_len.is_none() { storage::check_space(part_path.parent().unwrap(), chunk.len() as u64)?; }
                 output.write_all(&chunk).await?;
-                segment
-                    .downloaded
-                    .fetch_add(chunk.len() as u64, Ordering::Relaxed);
+                hasher.update(&chunk); written += chunk.len() as u64;
+                segment.downloaded.store(written, Ordering::Relaxed);
+                if checkpoint_at.elapsed().as_secs() >= 5 {
+                    output.flush().await?; if !direct { output.get_ref().sync_all().await?; }
+                    self.checkpoint(task, part_dir, index, written, format!("{:x}", hasher.clone().finalize()),true).await?;
+                    checkpoint_at = Instant::now();
+                }
+                if limit == 0 && started.elapsed().as_secs() >= 30 && (written - existing) as f64 / started.elapsed().as_secs_f64() < 2048.0 {
+                    return Err(EngineError::Slow);
+                }
             }
-            Ok::<(), EngineError>(())
-        }
-        .await;
+            Ok::<(),EngineError>(())
+        }.await;
         segment.active.store(false, Ordering::Relaxed);
         output.flush().await?;
+        if !direct {
+            output.get_ref().sync_all().await?;
+        }
+        self.checkpoint(
+            task,
+            part_dir,
+            index,
+            written,
+            format!("{:x}", hasher.finalize()),
+            transfer.is_err() || expected_len != Some(written) || cancel.is_cancelled(),
+        )
+        .await?;
         transfer?;
+        if expected_len.is_some_and(|expected| written != expected) {
+            return Err(EngineError::Incomplete);
+        }
+        Ok(())
+    }
 
-        if let Some(expected_len) = expected_len {
-            let actual = fs::metadata(&part_path).await?.len();
-            if actual != expected_len {
-                return Err(EngineError::Message(format!(
-                    "Segment {index} ended at {actual} bytes, expected {expected_len}."
-                )));
+    async fn checkpoint(
+        &self,
+        task: &Arc<DownloadTask>,
+        part_dir: &Path,
+        index: usize,
+        written: u64,
+        hash: String,
+        force: bool,
+    ) -> EngineResult<()> {
+        let mut guard = task.checkpoint_lock.lock().await;
+        let path = part_dir.join("transfer.json");
+        let (manifest, last_saved) = guard
+            .as_mut()
+            .ok_or_else(|| EngineError::Message("Transfer checkpoint is missing.".into()))?;
+        manifest.committed.resize(manifest.ranges.len(), 0);
+        manifest.hashes.resize(manifest.ranges.len(), None);
+        manifest.committed[index] = written;
+        manifest.hashes[index] = Some(hash);
+        let complete = manifest.ranges.iter().enumerate().all(|(index, range)| {
+            range.end != u64::MAX && manifest.committed[index] == range.len()
+        });
+        // Range data is synced first; batch ledger writes to avoid an NTFS flush for every tiny range.
+        if force || complete || last_saved.elapsed().as_secs() >= 5 {
+            if let Some(stage) = &manifest.direct_path {
+                fs::OpenOptions::new()
+                    .write(true)
+                    .open(stage)
+                    .await?
+                    .sync_all()
+                    .await?;
             }
+            write_json_atomic(&path, manifest).await?;
+            *last_saved = Instant::now();
         }
         Ok(())
     }
@@ -1392,69 +1877,121 @@ impl DownloadManager {
         self.emit_record(&snapshot);
     }
 
-    async fn probe(&self, url: &Url) -> EngineResult<ProbeResult> {
-        let mut total_bytes = None;
-        let mut accepts_ranges = false;
-        let mut suggested_file_name = None;
-        let mut validator = None;
-
-        if let Ok(response) = self
-            .client
-            .head(url.clone())
-            .header(ACCEPT_ENCODING, "identity")
-            .send()
+    async fn origin(&self, url: &Url) -> Arc<OriginGate> {
+        self.origins
+            .lock()
             .await
-        {
-            if response.status().is_success() {
-                total_bytes = content_length_from_headers(response.headers());
-                accepts_ranges = header_has_bytes(response.headers());
-                suggested_file_name = file_name_from_headers(response.headers());
-                validator = representation_validator(response.headers());
-            }
-        }
+            .entry(url.origin().ascii_serialization())
+            .or_insert_with(|| Arc::new(OriginGate::new()))
+            .clone()
+    }
 
-        if total_bytes.is_none() || !accepts_ranges {
-            let response = self
-                .client
-                .get(url.clone())
-                .header(RANGE, "bytes=0-0")
-                .header(ACCEPT_ENCODING, "identity")
-                .send()
-                .await?;
-            if response.status() == StatusCode::PARTIAL_CONTENT {
-                let (start, end, total) =
-                    parse_content_range(response.headers()).ok_or_else(|| {
-                        EngineError::Message("Server returned an invalid Content-Range.".into())
-                    })?;
-                if start != 0 || end != 0 {
-                    return Err(EngineError::Message(
-                        "Server returned an invalid probe range.".into(),
-                    ));
+    fn session_client(&self, headers: HeaderMap) -> Result<Client, String> {
+        if headers.is_empty() {
+            return Ok(self.client.clone());
+        }
+        let mut builder = Client::builder();
+        if !headers.contains_key(header::USER_AGENT) {
+            builder = builder.user_agent(concat!("Fetchrail/", env!("CARGO_PKG_VERSION")));
+        }
+        builder.default_headers(headers)
+            .redirect(reqwest::redirect::Policy::custom(|attempt| {
+                if attempt.previous().len() >= 10 { return attempt.error("Too many redirects"); }
+                if attempt.previous().first().is_some_and(|first| first.origin() != attempt.url().origin()) {
+                    attempt.error("Browser credentials cannot follow a cross-origin redirect; continue in the browser.")
+                } else { attempt.follow() }
+            })).connect_timeout(Duration::from_secs(15)).read_timeout(Duration::from_secs(30))
+            .build().map_err(|_| "Could not initialize browser session.".into())
+    }
+
+    async fn probe(
+        &self,
+        client: &Client,
+        url: &Url,
+        cancel: &CancellationToken,
+    ) -> EngineResult<ProbeResult> {
+        let settings = self.settings.read().await.clone();
+        for attempt in 0..settings.retry_attempts {
+            let gate = self.origin(url).await;
+            let permit = gate
+                .acquire(settings.max_requests_per_origin, cancel)
+                .await
+                .ok_or(EngineError::Cancelled)?;
+            let result = tokio::select! { result = client.get(url.clone()).header(RANGE,"bytes=0-0").header(ACCEPT_ENCODING,"identity").send() => result.map_err(|error| EngineError::Request(error.without_url())), _ = cancel.cancelled() => return Err(EngineError::Cancelled) };
+            let result: EngineResult<()> = match result {
+                Ok(response)
+                    if response.status() == StatusCode::RANGE_NOT_SATISFIABLE
+                        && response
+                            .headers()
+                            .get(CONTENT_RANGE)
+                            .and_then(|value| value.to_str().ok())
+                            == Some("bytes */0") =>
+                {
+                    return Ok(ProbeResult {
+                        total_bytes: Some(0),
+                        accepts_ranges: false,
+                        suggested_file_name: file_name_from_headers(response.headers()),
+                        validator: representation_validator(response.headers()),
+                    });
                 }
-                accepts_ranges = true;
-                total_bytes = total.or(total_bytes);
-            } else if response.status().is_success() && total_bytes.is_none() {
-                total_bytes = content_length_from_headers(response.headers());
+                Ok(response) if response.status().is_success() => {
+                    validate_encoding(response.headers())?;
+                    let validator = representation_validator(response.headers());
+                    let total_bytes = if response.status() == StatusCode::PARTIAL_CONTENT {
+                        let (start, end, total) = parse_content_range(response.headers())
+                            .ok_or_else(|| EngineError::Message("Invalid probe range.".into()))?;
+                        if start != 0 || end != 0 {
+                            return Err(EngineError::Message("Invalid probe range.".into()));
+                        }
+                        total
+                    } else {
+                        content_length_from_headers(response.headers())
+                    };
+                    return Ok(ProbeResult {
+                        total_bytes,
+                        accepts_ranges: response.status() == StatusCode::PARTIAL_CONTENT
+                            && validator.is_some(),
+                        suggested_file_name: file_name_from_headers(response.headers()),
+                        validator,
+                    });
+                }
+                Ok(response) => {
+                    if matches!(
+                        response.status(),
+                        StatusCode::TOO_MANY_REQUESTS | StatusCode::SERVICE_UNAVAILABLE
+                    ) {
+                        gate.cool_down(
+                            crate::network::retry_after(
+                                response
+                                    .headers()
+                                    .get(header::RETRY_AFTER)
+                                    .and_then(|value| value.to_str().ok()),
+                                Utc::now(),
+                            )
+                            .unwrap_or(Duration::from_secs(2)),
+                        )
+                        .await;
+                    }
+                    Err(EngineError::Http(response.status()))
+                }
+                Err(error) => Err(error),
+            };
+            drop(permit);
+            match result {
+                Err(error) if is_transient(&error) && attempt + 1 < settings.retry_attempts => {
+                    tokio::select! { _ = tokio::time::sleep(crate::network::backoff(attempt)) => {}, _ = cancel.cancelled() => return Err(EngineError::Cancelled) }
+                }
+                Err(error) => return Err(error),
+                _ => unreachable!(),
             }
-            if !response.status().is_success() {
-                return Err(EngineError::Http(response.status()));
-            }
-            validator = representation_validator(response.headers()).or(validator);
-            suggested_file_name =
-                suggested_file_name.or_else(|| file_name_from_headers(response.headers()));
         }
-
-        Ok(ProbeResult {
-            total_bytes,
-            accepts_ranges,
-            suggested_file_name,
-            validator,
-        })
+        unreachable!()
     }
 
     async fn merge_parts(
         &self,
         task: &Arc<DownloadTask>,
+        cancel: &CancellationToken,
         part_dir: &Path,
         ranges: &[ByteRange],
     ) -> EngineResult<PathBuf> {
@@ -1463,32 +2000,164 @@ impl DownloadManager {
         let parent = requested
             .parent()
             .ok_or_else(|| EngineError::Message("Invalid destination path.".into()))?;
-        fs::create_dir_all(parent).await?;
-        let desired_name = requested
-            .file_name()
-            .and_then(|value| value.to_str())
-            .unwrap_or("download");
-        let temp_name = format!(".{}.{}.fetchrail-part", safe_file_name(desired_name), record.id);
-        let temp_path = parent.join(temp_name);
-        let output = fs::File::create(&temp_path).await?;
-        let mut output = BufWriter::with_capacity(1024 * 1024, output);
-
-        for index in 0..ranges.len() {
-            let mut input = fs::File::open(part_dir.join(format!("{index}.part"))).await?;
-            tokio::io::copy(&mut input, &mut output).await?;
+        let manifest: PartManifest = storage::read_json(&part_dir.join("transfer.json"))
+            .await?
+            .unwrap();
+        let stage = if let Some(stage) = manifest.direct_path {
+            stage
+        } else {
+            storage::check_space(parent, record.downloaded_bytes)?;
+            let stage = parent.join(format!(".{}.{}.fetchrail-part", Uuid::new_v4(), record.id));
+            let file = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&stage)
+                .await?;
+            let mut output = BufWriter::with_capacity(1024 * 1024, file);
+            let copied = async {
+                let mut buffer = vec![0; 1024 * 1024];
+                for index in 0..ranges.len() {
+                    let mut input = fs::File::open(part_dir.join(format!("{index}.part"))).await?;
+                    loop {
+                        task.check_stopped(cancel)?;
+                        let count = input.read(&mut buffer).await?;
+                        if count == 0 {
+                            break;
+                        }
+                        output.write_all(&buffer[..count]).await?;
+                        let snapshot = {
+                            let mut record = task.record.write().await;
+                            record.finalizing_bytes += count as u64;
+                            record.clone()
+                        };
+                        self.emit_record(&snapshot);
+                    }
+                }
+                output.flush().await?;
+                output.get_ref().sync_all().await?;
+                Ok::<(), EngineError>(())
+            }
+            .await;
+            drop(output);
+            if let Err(error) = copied {
+                let _ = fs::remove_file(&stage).await;
+                return Err(error);
+            }
+            stage
+        };
+        task.check_stopped(cancel)?;
+        task.record.write().await.status_detail =
+            Some("Applying Windows attachment policy…".into());
+        if let Err(error) = storage::mark_download(&stage, &record.url, &record.file_name).await {
+            return Err(EngineError::Message(format!("Windows attachment processing blocked completion: {error}. File was not published.")));
         }
-        output.flush().await?;
-        output.get_ref().sync_all().await?;
-        drop(output);
-        let _lock = self.persist_lock.lock().await;
-        let destination = unique_destination(parent, desired_name).await;
-        fs::rename(&temp_path, &destination).await?;
+        task.check_stopped(cancel)?;
+        task.record.write().await.status_detail = Some("Verifying file integrity…".into());
+        let hash = tokio::select! { result = storage::sha256(&stage) => result?, _ = cancel.cancelled() => return Err(EngineError::Cancelled) };
+        if record
+            .expected_sha256
+            .as_ref()
+            .is_some_and(|expected| expected != &hash)
+        {
+            return Err(EngineError::Message(
+                "SHA-256 mismatch. The file was not published.".into(),
+            ));
+        }
+        let mut finalization = Finalization {
+            stage,
+            destination: requested.clone(),
+            bytes: record.downloaded_bytes,
+            sha256: hash,
+        };
+        let destination = self
+            .publish_staged(task, cancel, part_dir, &mut finalization)
+            .await?;
+        task.record.write().await.sha256 = Some(finalization.sha256);
         Ok(destination)
+    }
+
+    async fn publish_staged(
+        &self,
+        task: &Arc<DownloadTask>,
+        cancel: &CancellationToken,
+        part_dir: &Path,
+        finalization: &mut Finalization,
+    ) -> EngineResult<PathBuf> {
+        let _guard = self.persist_lock.lock().await;
+        let requested = finalization.destination.clone();
+        let parent = requested
+            .parent()
+            .ok_or_else(|| EngineError::Message("Invalid publication path.".into()))?;
+        let name = requested
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("download");
+        for _ in 0..100 {
+            task.check_stopped(cancel)?;
+            finalization.destination = unique_destination(parent, name).await;
+            let mut record = task.record.write().await;
+            task.check_stopped(cancel)?;
+            write_json_atomic(&part_dir.join("finalization.json"), finalization).await?;
+            match storage::publish(&finalization.stage, &finalization.destination) {
+                Ok(()) => {
+                    apply_publication(&mut record, finalization);
+                    return Ok(finalization.destination.clone());
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Err(EngineError::Message(
+            "Destination keeps changing; resume when it is available.".into(),
+        ))
+    }
+
+    async fn finish_staged(
+        &self,
+        task: &Arc<DownloadTask>,
+        cancel: &CancellationToken,
+    ) -> EngineResult<bool> {
+        let part_dir = self.part_dir(task.record.read().await.id);
+        let Some(mut journal) =
+            storage::read_json::<Finalization>(&part_dir.join("finalization.json")).await?
+        else {
+            return Ok(false);
+        };
+        let already_published = fs::try_exists(&journal.destination).await?
+            && storage::sha256(&journal.destination).await? == journal.sha256;
+        if !already_published {
+            if !fs::try_exists(&journal.stage).await?
+                || storage::sha256(&journal.stage).await? != journal.sha256
+            {
+                return Err(EngineError::Message(
+                    "Finalization staging file changed; manual recovery is required.".into(),
+                ));
+            }
+            self.publish_staged(task, cancel, &part_dir, &mut journal)
+                .await?;
+        }
+        let snapshot = {
+            let mut record = task.record.write().await;
+            apply_publication(&mut record, &journal);
+            record.clone()
+        };
+        self.persist_records().await?;
+        let _ = fs::remove_dir_all(&part_dir).await;
+        self.emit_record(&snapshot);
+        Ok(true)
     }
 
     async fn handle_run_error(&self, task: &Arc<DownloadTask>, error: EngineError) {
         let snapshot = {
             let mut record = task.record.write().await;
+            if record.status == DownloadStatus::Completed {
+                // Publication already succeeded; the journal must recover a failed history write.
+                record.status_detail = Some(format!(
+                    "File published; saved state needs recovery: {error}"
+                ));
+                self.emit_record(&record);
+                return;
+            }
             if record.status == DownloadStatus::Queued && matches!(error, EngineError::Cancelled) {
                 return;
             }
@@ -1499,6 +2168,11 @@ impl DownloadManager {
             } else if task.paused.load(Ordering::Acquire) {
                 record.status = DownloadStatus::Paused;
                 record.error = None;
+            } else if is_transient(&error) {
+                record.status = DownloadStatus::Queued;
+                record.scheduled_for = Some(Utc::now() + chrono::Duration::seconds(60));
+                record.error = None;
+                record.status_detail = Some("Waiting for the network/server; retrying in one minute. You can pause or cancel.".into());
             } else {
                 record.status = DownloadStatus::Failed;
                 record.error = Some(error.to_string());
@@ -1561,7 +2235,7 @@ impl DownloadManager {
         for task in tasks {
             records.push(task.record.read().await.clone());
         }
-        records.sort_by(|left, right| left.created_at.cmp(&right.created_at));
+        records.sort_by_key(|record| record.created_at);
         write_json_atomic(&self.data_dir.join(STATE_FILE), &records).await
     }
 
@@ -1598,6 +2272,11 @@ fn default_settings(download_dir: &Path) -> DownloadSettings {
         accent: Default::default(),
         categories: default_categories(),
         auto_update: true,
+        adaptive_connections: true,
+        max_requests_per_origin: crate::model::default_origin_limit(),
+        retry_attempts: crate::model::default_retries(),
+        bandwidth_limit_kbps: 0,
+        direct_write: true,
     }
 }
 
@@ -1636,7 +2315,7 @@ fn record_is_dispatch_ready(
     if paused_queues.iter().any(|name| name == &record.queue) {
         return false;
     }
-    !record.scheduled_for.is_some_and(|when| when > now)
+    record.scheduled_for.is_none_or(|when| when <= now)
 }
 
 #[cfg(target_os = "windows")]
@@ -1675,11 +2354,7 @@ fn sync_startup_registration(_enabled: bool) -> Result<(), String> {
 }
 
 async fn write_json_atomic<T: serde::Serialize>(path: &Path, value: &T) -> EngineResult<()> {
-    let bytes = serde_json::to_vec_pretty(value)
-        .map_err(|error| EngineError::Message(format!("Could not serialize state: {error}")))?;
-    let temp = path.with_extension(format!("{}.tmp", Uuid::new_v4()));
-    fs::write(&temp, bytes).await?;
-    fs::rename(&temp, path).await?;
+    storage::write_json(path, value).await?;
     Ok(())
 }
 
@@ -1695,7 +2370,7 @@ fn safe_file_name(value: &str) -> String {
 
 fn name_from_url(url: &Url) -> String {
     url.path_segments()
-        .and_then(|segments| segments.filter(|segment| !segment.is_empty()).next_back())
+        .and_then(|mut segments| segments.rfind(|segment| !segment.is_empty()))
         .map(safe_file_name)
         .filter(|name| !name.is_empty())
         .unwrap_or_else(|| "download".to_string())
@@ -1721,13 +2396,6 @@ fn file_name_from_headers(headers: &HeaderMap) -> Option<String> {
     None
 }
 
-fn header_has_bytes(headers: &HeaderMap) -> bool {
-    headers
-        .get(header::ACCEPT_RANGES)
-        .and_then(|value| value.to_str().ok())
-        .is_some_and(|value| value.to_ascii_lowercase().contains("bytes"))
-}
-
 fn content_length_from_headers(headers: &HeaderMap) -> Option<u64> {
     headers
         .get(CONTENT_LENGTH)?
@@ -1739,16 +2407,67 @@ fn content_length_from_headers(headers: &HeaderMap) -> Option<u64> {
 }
 
 fn representation_validator(headers: &HeaderMap) -> Option<String> {
+    // Dates are not necessarily strong validators. Use a strong ETag for segmented resume.
     headers
         .get(header::ETAG)
         .and_then(|value| value.to_str().ok())
-        .filter(|value| value.starts_with('"') && value.ends_with('"'))
-        .or_else(|| {
-            headers
-                .get(header::LAST_MODIFIED)
-                .and_then(|value| value.to_str().ok())
-        })
+        .filter(|value| value.len() >= 2 && value.starts_with('"') && value.ends_with('"'))
         .map(str::to_owned)
+}
+
+fn validate_encoding(headers: &HeaderMap) -> EngineResult<()> {
+    if headers
+        .get(header::CONTENT_ENCODING)
+        .is_some_and(|value| value != "identity")
+    {
+        return Err(EngineError::Message(
+            "Server ignored identity encoding; byte offsets cannot be trusted.".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn is_transient(error: &EngineError) -> bool {
+    match error {
+        EngineError::Request(error) => {
+            error.is_timeout() || error.is_connect() || error.is_body() || error.is_decode()
+        }
+        EngineError::Http(status) => {
+            status.is_server_error()
+                || matches!(
+                    *status,
+                    StatusCode::TOO_MANY_REQUESTS | StatusCode::REQUEST_TIMEOUT
+                )
+        }
+        EngineError::Slow | EngineError::Incomplete => true,
+        _ => false,
+    }
+}
+
+async fn matching_manifest(
+    part_dir: &Path,
+    probe: &ProbeResult,
+) -> EngineResult<Option<PartManifest>> {
+    let stored: Option<PartManifest> = storage::read_json(&part_dir.join("transfer.json")).await?;
+    Ok(stored.filter(|stored| {
+        probe.accepts_ranges
+            && probe.validator.is_some()
+            && stored.validator == probe.validator
+            && stored.total_bytes == probe.total_bytes
+            && stored.accepts_ranges
+            && valid_layout(&stored.ranges, probe.total_bytes.unwrap_or(0))
+    }))
+}
+
+fn valid_layout(ranges: &[ByteRange], total: u64) -> bool {
+    let mut next = 0;
+    for range in ranges {
+        if range.start != next || range.end < range.start || range.end >= total {
+            return false;
+        }
+        next = range.end + 1;
+    }
+    next == total
 }
 
 async fn prepare_parts(
@@ -1756,29 +2475,82 @@ async fn prepare_parts(
     probe: &ProbeResult,
     ranges: &[ByteRange],
 ) -> EngineResult<()> {
-    let manifest = PartManifest {
-        total_bytes: probe.total_bytes,
-        ranges: ranges.to_vec(),
-        validator: probe.validator.clone(),
-        accepts_ranges: probe.accepts_ranges,
-    };
-    let stored = fs::read(part_dir.join("transfer.json"))
-        .await
-        .ok()
-        .and_then(|bytes| serde_json::from_slice::<PartManifest>(&bytes).ok());
-    if !probe.accepts_ranges
-        || probe.validator.is_none()
-        || probe.total_bytes.is_none()
-        || stored.as_ref() != Some(&manifest)
-    {
-        match fs::remove_dir_all(part_dir).await {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error.into()),
+    if let Some(saved) = matching_manifest(part_dir, probe).await? {
+        if saved.ranges == ranges {
+            return Ok(());
         }
     }
+    let stored: Option<PartManifest> = storage::read_json(&part_dir.join("transfer.json")).await?;
+    if let Some(stage) = stored.and_then(|stored| stored.direct_path) {
+        // Only remove files carrying this job's ownership suffix.
+        if part_dir.file_name().is_some_and(|id| {
+            stage.file_name().is_some_and(|name| {
+                name.to_string_lossy()
+                    .ends_with(&format!(".{}.fetchrail-part", id.to_string_lossy()))
+            })
+        }) {
+            let _ = fs::remove_file(stage).await;
+        }
+    }
+    match fs::remove_dir_all(part_dir).await {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
     fs::create_dir_all(part_dir).await?;
-    write_json_atomic(&part_dir.join("transfer.json"), &manifest).await
+    write_json_atomic(
+        &part_dir.join("transfer.json"),
+        &PartManifest {
+            total_bytes: probe.total_bytes,
+            ranges: ranges.to_vec(),
+            validator: probe.validator.clone(),
+            accepts_ranges: probe.accepts_ranges,
+            direct_path: None,
+            committed: vec![],
+            hashes: vec![],
+        },
+    )
+    .await
+}
+
+fn apply_publication(record: &mut DownloadRecord, journal: &Finalization) {
+    record.destination = journal.destination.to_string_lossy().to_string();
+    record.file_name = journal
+        .destination
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_string();
+    record.downloaded_bytes = journal.bytes;
+    record.total_bytes = Some(journal.bytes);
+    record.sha256 = Some(journal.sha256.clone());
+    record.status = DownloadStatus::Completed;
+    record.finished_at = Some(Utc::now());
+    record.speed_bps = 0;
+    record.eta_seconds = Some(0);
+    record.error = None;
+    record.status_detail = None;
+    record.segments.clear();
+    record.finalizing_bytes = journal.bytes;
+}
+
+async fn recover_published(record: &mut DownloadRecord, part_dir: &Path) -> EngineResult<()> {
+    if let Some(journal) =
+        storage::read_json::<Finalization>(&part_dir.join("finalization.json")).await?
+    {
+        if fs::try_exists(&journal.destination).await?
+            && fs::metadata(&journal.destination).await?.len() == journal.bytes
+            && storage::sha256(&journal.destination).await? == journal.sha256
+        {
+            apply_publication(record, &journal);
+        }
+    }
+    Ok(())
+}
+
+fn queued_ranges(total: u64, minimum: u64) -> Vec<ByteRange> {
+    let count = total.div_ceil(minimum.max(1)).clamp(1, 4096) as usize;
+    split_ranges(total, count)
 }
 
 fn parse_content_range(headers: &HeaderMap) -> Option<(u64, u64, Option<u64>)> {
@@ -1806,7 +2578,7 @@ fn suggested_connection_count(total: u64, configured: usize, min_segment: u64) -
     if total == 0 {
         return 1;
     }
-    let by_size = (total / min_segment.max(1)).max(1).min(32) as usize;
+    let by_size = (total / min_segment.max(1)).clamp(1, 32) as usize;
     configured.clamp(1, 32).min(by_size.max(1))
 }
 
@@ -1827,6 +2599,8 @@ fn split_ranges(total: u64, count: usize) -> Vec<ByteRange> {
 }
 
 async fn segment_counters(part_dir: &Path, ranges: &[ByteRange]) -> EngineResult<Segments> {
+    let manifest: Option<PartManifest> =
+        storage::read_json(&part_dir.join("transfer.json")).await?;
     let mut segments = Vec::with_capacity(ranges.len());
     for (index, range) in ranges.iter().enumerate() {
         let path = part_dir.join(format!("{index}.part"));
@@ -1836,6 +2610,11 @@ async fn segment_counters(part_dir: &Path, ranges: &[ByteRange]) -> EngineResult
                 fs::remove_file(&path).await?;
             } else {
                 downloaded = metadata.len();
+            }
+        }
+        if let Some(manifest) = &manifest {
+            if let Some(committed) = manifest.committed.get(index) {
+                downloaded = *committed;
             }
         }
         segments.push(SegmentCounter {
@@ -1965,6 +2744,13 @@ mod tests {
             scheduled_for,
             segments: Vec::new(),
             name_locked: false,
+            expected_sha256: None,
+            sha256: None,
+            status_detail: None,
+            finalizing_bytes: 0,
+            handoff_id: None,
+            handoff_committed: false,
+            requires_session: false,
         }
     }
 

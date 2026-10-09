@@ -1,9 +1,9 @@
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
+import { spawn, execFileSync } from "node:child_process";
 import { randomUUID, createHash } from "node:crypto";
 import { createServer } from "node:http";
 import { connect } from "node:net";
-import { access, readFile, writeFile, mkdtemp, mkdir, rm } from "node:fs/promises";
+import { access, readFile, writeFile, mkdtemp, mkdir, rm, open, rename } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -14,7 +14,9 @@ import vm from "node:vm";
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
 const bin = resolve(root, process.argv[2] ?? "src-tauri/target/release");
 await access(join(bin, "fetchrail.exe"));
-const stateDir = join(process.env.APPDATA, "com.rrmtools.braid");
+const ownedProfile = !process.env.FETCHRAIL_DATA_DIR;
+const stateDir = process.env.FETCHRAIL_DATA_DIR ?? await mkdtemp(join(tmpdir(),"fetchrail-profile-check-"));
+process.env.FETCHRAIL_DATA_DIR = stateDir;
 const read = (name) => readFile(join(stateDir, name));
 const original = Object.fromEntries(await Promise.all(["downloads.json", "settings.json", "queues.json"].map(async (name) => [name, await read(name).catch((error) => { if (error.code === "ENOENT") return null; throw error; })])));
 const records = JSON.parse(original["downloads.json"] ?? "[]");
@@ -39,38 +41,66 @@ const data = Buffer.alloc(8 * 1024 * 1024);
 for (let index = 0; index < data.length; index++) data[index] = (index * 31 + (index >>> 13)) & 255;
 const digest = (bytes) => createHash("sha256").update(bytes).digest("hex");
 const expectedHash = digest(data);
+let benchmarkData;
+if (process.env.FETCHRAIL_BENCHMARK === "1") {
+  const benchmarkMiB=Number(process.env.FETCHRAIL_BENCHMARK_MIB ?? 32);
+  assert.ok(Number.isInteger(benchmarkMiB) && benchmarkMiB>=32 && benchmarkMiB<=512 && benchmarkMiB%8===0,"Benchmark size must be 32..512 MiB in multiples of eight.");
+  benchmarkData=Buffer.alloc(benchmarkMiB*1024*1024);
+  for(let offset=0;offset<benchmarkData.length;offset+=data.length) data.copy(benchmarkData,offset);
+}
 let retryFailed = false;
+let dropped = false;
+let globalActive = 0, globalPeak = 0;
+let cooldownFirst = 0, cooldownNext = 0;
+let leakedCredentials = false;
+const otherOrigin = createServer((request,response) => { leakedCredentials ||= Boolean(request.headers.cookie || request.headers.authorization); response.end("redirect target"); });
+await new Promise((done) => otherOrigin.listen(0,"127.0.0.1",done));
 const server = createServer((request, response) => {
   const name = request.url.slice(1);
+  const payload=name.startsWith("benchmark-") ? benchmarkData : data;
+  if (name==="empty.bin") { response.writeHead(416,{"Content-Range":"bytes */0"}).end(); return; }
   if (name === "auth.bin") { response.writeHead(403).end(); return; }
-  const entry = observed.get(name) ?? { ranges: [], active: 0, peak: 0 };
+  if (name === "session.bin" && request.headers.cookie !== "session=fixture") { response.writeHead(403).end(); return; }
+  if (name === "session-redirect.bin") { response.writeHead(302,{Location:`http://127.0.0.1:${otherOrigin.address().port}/target`}).end(); return; }
+  if (name === "cooldown.bin" && !cooldownFirst) { cooldownFirst=Date.now(); response.writeHead(429,{"Retry-After":"2"}).end(); return; }
+  if (name === "cooldown.bin" && !cooldownNext) cooldownNext=Date.now();
+  const entry = observed.get(name) ?? { ranges: [], active: 0, peak: 0, firstRequest:performance.now() };
   observed.set(name, entry);
   response.setHeader("Content-Type", "application/octet-stream");
   if (name.startsWith("collision-")) response.setHeader("Content-Disposition", 'attachment; filename="same-name.bin"');
   response.setHeader("ETag", '"fetchrail-test-v1"');
   if (name !== "unknown.bin") response.setHeader("Accept-Ranges", "bytes");
   if (request.method === "HEAD") {
-    if (name !== "unknown.bin") response.setHeader("Content-Length", data.length);
+    if (name !== "unknown.bin") response.setHeader("Content-Length", payload.length);
     response.end(); return;
   }
   const match = /^bytes=(\d+)-(\d*)$/.exec(request.headers.range ?? "");
-  let start = 0, end = data.length - 1;
+  if (name === "compressed.bin") response.setHeader("Content-Encoding","gzip");
+  if (name === "changed.bin" && request.headers.range !== "bytes=0-0") response.setHeader("ETag",'"changed-version"');
+  let start = 0, end = payload.length - 1;
   if (match && !["ignore.bin", "unknown.bin"].includes(name)) {
     start = Number(match[1]); end = match[2] ? Number(match[2]) : end;
     entry.ranges.push({ start, end });
     if (name === "retry.bin" && !retryFailed) { retryFailed = true; response.writeHead(503).end(); return; }
-    response.setHeader("Content-Range", `bytes ${name === "invalid.bin" ? start + 1 : start}-${end}/${data.length}`);
+    response.setHeader("Content-Range", `bytes ${name === "invalid.bin" ? start + 1 : start}-${end}/${payload.length}`);
     response.statusCode = 206;
   }
   if (name !== "unknown.bin") response.setHeader("Content-Length", end - start + 1);
   response.flushHeaders();
   entry.active++; entry.peak = Math.max(entry.peak, entry.active);
+  globalActive++; globalPeak=Math.max(globalPeak,globalActive);
+  const disconnect = name === "disconnect.bin" && !dropped && end-start > 1;
+  const tick=name.startsWith("benchmark-tail-") ? (start===0 && end>0 ? 25 : 1) : name.startsWith("benchmark-disk-") ? 1 : 15;
+  const block=name.startsWith("benchmark-") ? 256*1024 : 65536;
+  if (disconnect) dropped=true;
+  let sent = 0;
   const timer = setInterval(() => {
-    const next = Math.min(start + 65536, end + 1);
-    response.write(data.subarray(start, next)); start = next;
+    const next = Math.min(start + block, end + 1);
+    response.write(payload.subarray(start, next)); sent+=next-start; start = next;
+    if (disconnect && sent >= 131072) { clearInterval(timer); response.destroy(); return; }
     if (start > end) { clearInterval(timer); response.end(); }
-  }, 15);
-  response.once("close", () => { clearInterval(timer); entry.active--; });
+  }, tick);
+  response.once("close", () => { clearInterval(timer); entry.active--; globalActive--; });
 });
 await new Promise((done) => server.listen(0, "127.0.0.1", done));
 const base = `http://127.0.0.1:${server.address().port}/`;
@@ -107,8 +137,7 @@ async function launch() {
     } catch { return false; }
   }, "app startup");
 }
-const native = (method, params = {}) => new Promise((done, reject) => {
-  const id = randomUUID();
+const native = (method, params = {}, id = randomUUID()) => new Promise((done, reject) => {
   const payload = Buffer.from(JSON.stringify({ v: 1, id, method, params }));
   const frame = Buffer.alloc(4); frame.writeUInt32LE(payload.length);
   const timeout = setTimeout(() => { pending.delete(id); reject(new Error("Native timeout: " + method)); }, 35000);
@@ -128,15 +157,17 @@ async function complete(id, connections) {
     return item?.status === "completed" && item;
   }, "download completion");
   assert.equal(item.connections, connections);
-  const full = JSON.parse(await read("downloads.json")).find((item) => item.id === id);
+  const full = await waitFor(async () => { const saved=JSON.parse(await read("downloads.json")).find((item)=>item.id===id); return saved?.status === "completed" && saved; },"completion persisted");
   assert.equal(digest(await readFile(full.destination)), expectedHash, "Downloaded bytes must match the original.");
+  const zone=await readFile(full.destination+":Zone.Identifier","utf8");
+  assert.match(zone,/ZoneId=3/); assert.ok(!zone.includes("session=fixture"));
   assert.equal(item.downloadedBytes, data.length);
   return item;
 }
 try {
   await mkdir(stateDir, { recursive: true });
   const settings = { ...JSON.parse(original["settings.json"] ?? "{}"), defaultDownloadDir: out, maxConcurrentDownloads: 2, connectionsPerDownload: 4, minSegmentSizeMb: 1, launchOnStart: false,
-    categories: [{ name: "Archives", extensions: ["zip"], folder: "Sorted" }] };
+    categories: [{ name: "Archives", extensions: ["zip"], folder: "Sorted" }], adaptiveConnections:false, maxRequestsPerOrigin:8, directWrite:true, autoUpdate:false };
   await writeFile(join(stateDir, "settings.json"), JSON.stringify(settings));
   await launch();
   host = spawn(join(bin, "fetchrail.exe"), ["chrome-extension://fkmedfamaoejlhddajndhjemiedmnldh/"], { windowsHide: true, stdio: ["pipe", "pipe", "inherit"] });
@@ -154,6 +185,15 @@ try {
   assert.ok(ping.capabilities.includes("controlDownload"));
   for (let index = 0; index < 100; index++) await native("ping");
   console.log("PASS: 100 rapid native bridge requests");
+  const stableId=randomUUID(), stableParams={source:"clickMonitor",handoffProtocol:2,items:[{url:base+"idempotent.bin"}]};
+  const stableA=await native("addDownloads",stableParams,stableId); ids.push(...stableA.ids);
+  const stableB=await native("addDownloads",stableParams,stableId);
+  assert.deepEqual(stableA.ids,stableB.ids);
+  const changedHandoff=await native("addDownloads",{...stableParams,items:[{url:base+"another-resource.bin"}]},stableId);
+  assert.equal(changedHandoff.accepted,0);
+  await native("controlDownload",{downloadId:stableA.ids[0],action:"cancel"});
+  const rolledBack=await native("addDownloads",stableParams,stableId); assert.equal(rolledBack.accepted,0);
+  console.log("PASS: idempotent acceptance is bound to its original URL and cannot resurrect a rolled-back job");
   await assert.rejects(native("addDownloads", { source: "popup", items: [{ url: "file:///C:/secret" }] }));
   await assert.rejects(native("addDownloads", { source: "popup", items: [{ url: base + "range.bin" }], connections: 33 }));
   const first = await add("range.bin");
@@ -161,6 +201,7 @@ try {
   await waitFor(async () => (await native("getDownloads")).overview.active === 2, "two simultaneous downloads");
   await complete(first, 4); await complete(second, 4);
   assert.ok(observed.get("range.bin").peak >= 4, "Expected four simultaneous byte-range requests.");
+  assert.ok(globalPeak<=8,"All jobs must share the same origin request budget.");
   console.log("PASS: concurrent downloads, four connections, exact SHA-256 output");
   for (const browser of ["chromium", "firefox"]) {
     const name = `captured-${browser}.bin`;
@@ -174,7 +215,7 @@ try {
         onInstalled: { addListener() {} }, onStartup: { addListener() {} }, onMessage: { addListener() {} } },
       alarms: { create() {}, onAlarm: { addListener() {} } },
       contextMenus: { onClicked: { addListener() {} } },
-      storage: { local: { async get() { return {}; } } },
+      storage: { local: { values:{}, async get(key) { return Object.fromEntries((Array.isArray(key)?key:[key]).map((key) => [key,this.values[key]])); }, async set(values) { Object.assign(this.values,values); } } },
       action: { async setBadgeBackgroundColor() {}, async setBadgeText() {}, async setTitle() {} },
       downloads: {
         onCreated: { addListener(value) { listener = value; } },
@@ -191,7 +232,7 @@ try {
     const sendNative = async (hostName, message) => {
       assert.equal(hostName, "com.rrmtools.braid");
       events.push(message.method);
-      const result = await native(message.method, message.params);
+      const result = await native(message.method, message.params, message.id);
       if (result.accepted) { captured = result.ids[0]; ids.push(captured); }
       return { ok: true, result };
     };
@@ -205,13 +246,13 @@ try {
     vm.runInContext(await readFile(join(root, "browser-extension", "dist", browser, "background.js"), "utf8"), context);
     listener({ ...item });
     await waitFor(() => vm.runInContext("activeActions", context) === 0, `${browser} extension capture`);
-    assert.deepEqual(events, ["pause", "search", "addDownloads", "search", "cancel", "erase"]);
+    assert.deepEqual(events, ["pause", "search", "addDownloads", "search", "cancel", "commitHandoff", "erase"]);
     assert.equal((await record(captured)).fileName, name);
     assert.ok(observed.get(name).ranges.some(({ start, end }) => start === 0 && end === 0), "Capture must verify a GET before accepting the browser handoff.");
     await native("controlDownload", { downloadId: captured, action: "resume" });
     await complete(captured, 4);
     events.length = 0;
-    Object.assign(item, { state: "in_progress", paused: false, url: base + "auth.bin" });
+    Object.assign(item, { id:43,state: "in_progress", paused: false, url: base + "auth.bin" });
     listener({ ...item });
     await waitFor(() => vm.runInContext("activeActions", context) === 0, `${browser} authenticated download fallback`);
     assert.deepEqual(events, ["pause", "search", "addDownloads", "resume"]);
@@ -238,7 +279,7 @@ try {
   console.log("PASS: simultaneous server-suggested filename collisions keep both files");
   const paused = await add("pause.bin");
   const live = await waitFor(async () => { const item = await record(paused); return item?.downloadedBytes > 0 && item; }, "pause progress");
-  assert.deepEqual(live.segments.map(([, length]) => length), Array(4).fill(data.length / 4), "Each connection reports its own byte range.");
+  assert.deepEqual(live.segments.map(([, length]) => length), Array(8).fill(data.length / 8), "Workers share queued ranges independently of connection count.");
   assert.equal(live.segments.reduce((sum, [downloaded]) => sum + downloaded, 0), live.downloadedBytes, "Connection progress adds up to the total.");
   await native("controlDownload", { downloadId: paused, action: "pause" });
   await delay(250);
@@ -247,8 +288,20 @@ try {
   await delay(300); assert.equal((await record(paused)).downloadedBytes, snapshot.downloadedBytes);
   await native("controlDownload", { downloadId: paused, action: "resume" });
   await complete(paused, 4);
-  assert.ok(observed.get("pause.bin").ranges.some((range) => range.start % (data.length / 4) !== 0));
+  assert.ok(observed.get("pause.bin").ranges.some((range) => range.start % (data.length / 8) !== 0));
   console.log("PASS: pause stops traffic, resume continues saved segments");
+  const workers=await add("workers.bin");
+  await waitFor(async()=>(await record(workers))?.downloadedBytes>0,"worker change progress");
+  await native("controlDownload",{downloadId:workers,action:"pause"}); await delay(250);
+  const workerManifest=JSON.parse(await readFile(join(stateDir,"parts",workers,"transfer.json"),"utf8"));
+  app.kill(); await new Promise((done)=>app.once("exit",done));
+  const workerRecords=JSON.parse(await read("downloads.json"));
+  Object.assign(workerRecords.find((item)=>item.id===workers),{requestedConnections:2,connections:2});
+  await writeFile(join(stateDir,"downloads.json"),JSON.stringify(workerRecords)); await launch();
+  await native("controlDownload",{downloadId:workers,action:"resume"}); await complete(workers,2);
+  assert.equal(workerManifest.ranges.length,8); assert.ok(workerManifest.committed.some((bytes)=>bytes>0));
+  assert.ok(observed.get("workers.bin").ranges.some(({start})=>start%(1024*1024)!==0));
+  console.log("PASS: a changed worker count reuses the original durable range layout and partial bytes");
   const recovery = await add("restart.bin");
   await waitFor(async () => (await record(recovery))?.downloadedBytes > 0, "restart progress");
   app.kill(); await new Promise((done) => app.once("exit", done));
@@ -271,6 +324,151 @@ try {
   assert.equal((await record(invalid)).speedBps, 0);
   assert.equal((await record(invalid)).downloadedBytes, failed.downloadedBytes);
   console.log("PASS: scheduling, cancellation, invalid ranges, failed-progress cleanup");
+  const empty=await add("empty.bin",{items:[{url:base+"empty.bin",expectedSha256:digest(Buffer.alloc(0))}]});
+  await waitFor(async()=>{const item=await record(empty);if(item?.status==="failed")throw new Error(item.error);return item?.status==="completed";},"empty file completion");
+  const emptyRecord=JSON.parse(await read("downloads.json")).find((item)=>item.id===empty);
+  assert.equal((await readFile(emptyRecord.destination)).length,0);
+  console.log("PASS: legitimate zero-byte files complete with the correct empty digest");
+  for (const name of ["changed.bin","compressed.bin","wrong-hash.bin"]) {
+    const id = await add(name,name === "wrong-hash.bin" ? {items:[{url:base+name,expectedSha256:"0".repeat(64)}]} : {});
+    const item = await waitFor(async () => { const item=await record(id); return item?.status === "failed" && item; },"unsafe representation rejected");
+    const saved=JSON.parse(await read("downloads.json")).find((item)=>item.id===id);
+    await assert.rejects(access(saved.destination),"Unsafe output must never be published.");
+    assert.match(item.error,/changed|encoding|compressed|SHA-256/i);
+  }
+  console.log("PASS: changed validators, compressed byte ranges and incorrect trusted hashes never publish");
+  await complete(await add("disconnect.bin"),4);
+  assert.ok(observed.get("disconnect.bin").ranges.some(({start})=>start % (1024*1024) !== 0),"Only missing bytes should be retried.");
+  await complete(await add("cooldown.bin"),4);
+  assert.ok(cooldownNext-cooldownFirst>=1950,"Retry-After must delay every subsequent request.");
+  console.log("PASS: mid-stream disconnect resumes missing bytes; server Retry-After is respected");
+  const session = await add("session.bin",{items:[{url:base+"session.bin",requestHeaders:{Cookie:"session=fixture"}}]});
+  await complete(session,4);
+  assert.ok(!(await read("downloads.json")).toString().includes("session=fixture"),"Credentials must remain ephemeral.");
+  const blockedRedirect = await add("session-redirect.bin",{items:[{url:base+"session-redirect.bin",requestHeaders:{Cookie:"session=fixture"}}]});
+  await waitFor(async ()=>(await record(blockedRedirect))?.status==="failed","credential redirect rejection");
+  assert.equal(leakedCredentials,false);
+  console.log("PASS: authenticated GET works, secrets stay out of state, cross-origin credential redirects are blocked");
+  const refresh = await add("refresh-old.bin",{items:[{url:base+"refresh-old.bin",expectedSha256:expectedHash}]});
+  await waitFor(async ()=>(await record(refresh))?.downloadedBytes>0,"refresh partial progress");
+  await native("controlDownload",{downloadId:refresh,action:"pause"}); await delay(250);
+  const beforeRefresh=(await record(refresh)).downloadedBytes;
+  await native("refreshDownload",{downloadId:refresh,url:base+"refresh-new.bin",expectedSha256:expectedHash,restart:false});
+  assert.equal((await record(refresh)).downloadedBytes,beforeRefresh);
+  await native("controlDownload",{downloadId:refresh,action:"resume"}); await complete(refresh,4);
+  const unproven = await add("unproven-old.bin");
+  await waitFor(async ()=>(await record(unproven))?.downloadedBytes>0,"unproven partial progress");
+  await native("controlDownload",{downloadId:unproven,action:"pause"}); await delay(250);
+  await assert.rejects(native("refreshDownload",{downloadId:unproven,url:base+"unproven-new.bin",restart:false}),/identity|same|restart|prove|verified/i);
+  await native("controlDownload",{downloadId:unproven,action:"cancel"});
+  console.log("PASS: refreshed links preserve progress only with original trusted content identity");
+  const tamper = await add("tamper.bin");
+  await waitFor(async ()=>(await record(tamper))?.downloadedBytes>0,"tamper partial progress");
+  await native("controlDownload",{downloadId:tamper,action:"pause"}); await delay(250);
+  const savedParts=JSON.parse(await readFile(join(stateDir,"parts",tamper,"transfer.json"),"utf8"));
+  const index=savedParts.committed.findIndex((bytes)=>bytes>0);
+  assert.ok(index>=0);
+  const stage = await open(savedParts.direct_path,"r+");
+  await stage.write(Buffer.from([255]),0,1,savedParts.ranges[index].start); await stage.sync(); await stage.close();
+  await native("controlDownload",{downloadId:tamper,action:"resume"});
+  const damaged=await waitFor(async()=>{const item=await record(tamper);return item?.status==="failed"&&item;},"damaged part rejection");
+  assert.match(damaged.error,/checksum mismatch/i);
+  console.log("PASS: tampered durable partial data is detected before publication");
+  const historyPath=join(stateDir,"downloads.json");
+  const beforeAdmission=(await list()).length;
+  execFileSync("attrib.exe",["+R",historyPath]);
+  try {
+    const failedAdmission=await native("addDownloads",{source:"popup",items:[{url:base+"unpersistable.bin"}]});
+    assert.equal(failedAdmission.accepted,0); assert.equal((await list()).length,beforeAdmission);
+    await delay(500); assert.equal(observed.has("unpersistable.bin"),false);
+  } finally { execFileSync("attrib.exe",["-R",historyPath]); }
+  console.log("PASS: failed acceptance persistence cannot leave an undisclosed job running");
+  for (const published of [false,true]) {
+    const id=await add(`journal-${published}.bin`,{startPaused:true});
+    const saved=JSON.parse(await read("downloads.json")).find((item)=>item.id===id);
+    const stagePath=saved.destination+`.${id}.fetchrail-part`;
+    await writeFile(stagePath,data);
+    await writeFile(stagePath+":Zone.Identifier","[ZoneTransfer]\r\nZoneId=3\r\n");
+    await mkdir(join(stateDir,"parts",id),{recursive:true});
+    await writeFile(join(stateDir,"parts",id,"finalization.json"),JSON.stringify({stage:stagePath,destination:saved.destination,bytes:data.length,sha256:expectedHash}));
+    if (published) await rename(stagePath,saved.destination);
+    app.kill(); await new Promise((done)=>app.once("exit",done)); await launch();
+    if (!published) await native("controlDownload",{downloadId:id,action:"resume"});
+    await complete(id,4);
+    assert.equal(observed.has(`journal-${published}.bin`),false,"Finalization recovery must not make an HTTP request.");
+  }
+  console.log("PASS: crashes before/after publication recover completion without redownloading");
+  app.kill(); await new Promise((done)=>app.once("exit",done));
+  await writeFile(join(stateDir,"settings.json"),JSON.stringify({...settings,bandwidthLimitKbps:2048}));
+  await launch();
+  const limitedStart=performance.now();
+  const limitedA=await add("bandwidth-a.bin"),limitedB=await add("bandwidth-b.bin");
+  await Promise.all([complete(limitedA,4),complete(limitedB,4)]);
+  assert.ok(performance.now()-limitedStart>=7500,"The 2 MiB/s bandwidth budget must be shared across both 8 MiB downloads.");
+  console.log("PASS: the configured global bandwidth limit is shared across concurrent downloads");
+  app.kill(); await new Promise((done)=>app.once("exit",done));
+  await writeFile(join(stateDir,"settings.json"),JSON.stringify(settings)); await launch();
+  if (benchmarkData) {
+    const benchmarkHash=digest(benchmarkData);
+    const measurements={fixture:`${benchmarkData.length/1024/1024} MiB loopback HTTP/1.1, four Fetchrail workers, alternating runs; SHA-256 required`,fixedRangeEngineMs:[],queuedRangeEngineMs:[],directWriteMs:[],legacyMergeMs:[],idmFromFirstRequestMs:[],fetchrailFromFirstRequestMs:[],idmPeakRequests:[]};
+    for (let trial=0;trial<3;trial++) {
+      const fixed=async()=>{
+        const start=performance.now();
+        const size=benchmarkData.length/4;
+        const name=`benchmark-tail-fixed-${trial}.bin`;
+        const id=await add(name,{startPaused:true,items:[{url:base+name,expectedSha256:benchmarkHash}]});
+        await mkdir(join(stateDir,"parts",id),{recursive:true});
+        await writeFile(join(stateDir,"parts",id,"transfer.json"),JSON.stringify({total_bytes:benchmarkData.length,accepts_ranges:true,validator:'"fetchrail-test-v1"',ranges:Array.from({length:4},(_,index)=>({start:index*size,end:(index+1)*size-1})),committed:[0,0,0,0],hashes:[null,null,null,null]}));
+        await native("controlDownload",{downloadId:id,action:"resume"});
+        await waitFor(async()=>{const item=await record(id);if(item?.status==="failed")throw new Error(item.error);return item?.status==="completed";},"fixed benchmark");
+        measurements.fixedRangeEngineMs.push(performance.now()-start);
+        const saved=JSON.parse(await read("downloads.json")).find((record)=>record.id===id);
+        assert.equal(digest(await readFile(saved.destination)),benchmarkHash);
+      };
+      const queued=async()=>{
+        const start=performance.now();
+        const id=await add(`benchmark-tail-queued-${trial}.bin`,{items:[{url:base+`benchmark-tail-queued-${trial}.bin`,expectedSha256:benchmarkHash}]});
+        const item=await waitFor(async()=>{const item=await record(id);if(item?.status==="failed")throw new Error(item.error);return item?.status==="completed"&&item;},"queued benchmark");
+        measurements.queuedRangeEngineMs.push(performance.now()-start);
+        measurements.fetchrailFromFirstRequestMs.push(performance.now()-observed.get(`benchmark-tail-queued-${trial}.bin`).firstRequest);
+        const saved=JSON.parse(await read("downloads.json")).find((record)=>record.id===id);
+        assert.equal(digest(await readFile(saved.destination)),benchmarkHash); assert.equal(item.downloadedBytes,benchmarkData.length);
+      };
+      for(const run of trial%2 ? [queued,fixed] : [fixed,queued]) await run();
+    }
+    for(let trial=0;trial<3;trial++) for(const direct of trial%2 ? [false,true] : [true,false]) {
+      app.kill(); await new Promise((done)=>app.once("exit",done));
+      await writeFile(join(stateDir,"settings.json"),JSON.stringify({...settings,directWrite:direct})); await launch();
+      const name=`benchmark-disk-${direct}-${trial}.bin`;
+      const start=performance.now(); const id=await add(name,{items:[{url:base+name,expectedSha256:benchmarkHash}]});
+      await waitFor(async()=>{const item=await record(id);if(item?.status==="failed")throw new Error(item.error);return item?.status==="completed";},"storage benchmark");
+      measurements[direct?"directWriteMs":"legacyMergeMs"].push(performance.now()-start);
+      const saved=JSON.parse(await read("downloads.json")).find((item)=>item.id===id);
+      assert.equal(digest(await readFile(saved.destination)),benchmarkHash);
+    }
+    if(process.env.FETCHRAIL_IDM_BENCHMARK==="1") {
+      const idmExe="C:\\Program Files (x86)\\Internet Download Manager\\IDMan.exe";
+      for(let trial=0;trial<3;trial++) {
+        let idm;
+        try {
+          execFileSync("powershell.exe",["-NoProfile","-Command","if(Get-Process -Name IDMan -ErrorAction SilentlyContinue){exit 1}"],{windowsHide:true,stdio:"ignore"});
+          const name=`benchmark-tail-idm-${trial}.bin`,file=join(out,name);
+          idm=spawn(idmExe,["/d",base+name,"/p",out,"/f",name,"/n","/q"],{windowsHide:true,stdio:"ignore"});
+          await waitFor(async()=>{try{const bytes=await readFile(file);return bytes.length===benchmarkData.length && digest(bytes)===benchmarkHash;}catch{return false;}},"IDM fixture download",30000);
+          measurements.idmFromFirstRequestMs.push(performance.now()-observed.get(name).firstRequest);
+          assert.equal(digest(await readFile(file)),benchmarkHash);
+          measurements.idmPeakRequests.push(observed.get(name).peak);
+          if(idm.exitCode==null) await waitFor(()=>idm.exitCode!=null,"IDM /q exit",5000);
+        }catch(error){measurements.idmError=error.message;console.log("IDM benchmark unavailable:",error.message);break;}
+        finally { if(idm?.pid && idm.exitCode==null) {idm.kill();await new Promise((done)=>idm.once("exit",done));} }
+      }
+    }
+    const median=(values)=>[...values].sort((a,b)=>a-b)[Math.floor(values.length/2)];
+    measurements.medians=Object.fromEntries(Object.entries(measurements).filter(([,value])=>Array.isArray(value)&&value.length).map(([key,value])=>[key,median(value)]));
+    measurements.limitations="Both range algorithms use this same local engine: a fixture ledger pins four equal ranges for fixed mode; queued mode uses 32 smaller ranges. Times include scheduling, durable checkpoints, antivirus policy, trusted checksum and publication. Storage runs include whole-download time on this PC's SSD. Optional IDM uses installed configuration and measures first HTTP request to full output; Fetchrail uses four workers with the same interval. IDM is a separate sequential sample set, not alternating with Fetchrail, and its request count may differ. No WAN/HDD/network-share or universal product-speed claim.";
+    await writeFile(join(stateDir,"benchmark.json"),JSON.stringify(measurements,null,2));
+    console.log("PASS: repeated alternating algorithm/storage benchmarks with unchanged SHA-256",JSON.stringify(measurements.medians));
+  }
 } catch (error) {
   console.error("Test app state:", { exitCode: app?.exitCode, signalCode: app?.signalCode });
   throw error;
@@ -278,6 +476,7 @@ try {
   host?.kill();
   if (app?.pid && app.exitCode == null && app.signalCode == null) { app.kill(); await new Promise((done) => app.once("exit", done)); }
   server.closeAllConnections(); await new Promise((done) => server.close(done));
+  otherOrigin.closeAllConnections(); await new Promise((done)=>otherOrigin.close(done));
   for (const [name, bytes] of Object.entries(original)) {
     if (bytes) await writeFile(join(stateDir, name), bytes);
     else await rm(join(stateDir, name), { force: true });
@@ -285,4 +484,5 @@ try {
   for (const id of ids) { const target = resolve(stateDir, "parts", id); assert.ok(target.startsWith(resolve(stateDir, "parts") + "\\")); await rm(target, { recursive: true, force: true }); }
   assert.ok(resolve(out).startsWith(resolve(tmpdir()) + "\\fetchrail-download-check-"));
   await rm(out, { recursive: true, force: true });
+  if (ownedProfile) { assert.ok(resolve(stateDir).startsWith(resolve(tmpdir()) + "\\fetchrail-profile-check-")); await rm(stateDir,{recursive:true,force:true}); }
 }

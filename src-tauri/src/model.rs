@@ -1,4 +1,7 @@
-use std::path::{Path, PathBuf};
+use std::{
+    collections::BTreeMap,
+    path::{Path, PathBuf},
+};
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -46,12 +49,26 @@ pub struct DownloadRecord {
     pub queue: String,
     #[serde(default)]
     pub scheduled_for: Option<DateTime<Utc>>,
-    /// One entry per connection of the current transfer; empty before it starts and after it completes.
+    /// Compact range groups for progress; empty before a transfer and after completion.
     #[serde(default)]
     pub segments: Vec<SegmentProgress>,
     /// The user chose this file name; a name suggested by the server must not replace it.
     #[serde(default)]
     pub name_locked: bool,
+    #[serde(default)]
+    pub expected_sha256: Option<String>,
+    #[serde(default)]
+    pub sha256: Option<String>,
+    #[serde(default)]
+    pub status_detail: Option<String>,
+    #[serde(default)]
+    pub finalizing_bytes: u64,
+    #[serde(default)]
+    pub handoff_id: Option<String>,
+    #[serde(default)]
+    pub handoff_committed: bool,
+    #[serde(default)]
+    pub requires_session: bool,
 }
 
 /// File endings that share a download folder.
@@ -115,6 +132,17 @@ pub struct DownloadSettings {
     /// Look for new releases in the background and put them in place.
     #[serde(default = "default_true")]
     pub auto_update: bool,
+    #[serde(default = "default_true")]
+    pub adaptive_connections: bool,
+    #[serde(default = "default_origin_limit")]
+    pub max_requests_per_origin: usize,
+    #[serde(default = "default_retries")]
+    pub retry_attempts: usize,
+    /// Zero means unlimited. Shared by all downloads.
+    #[serde(default)]
+    pub bandwidth_limit_kbps: u64,
+    #[serde(default = "default_true")]
+    pub direct_write: bool,
 }
 
 impl DownloadSettings {
@@ -122,6 +150,9 @@ impl DownloadSettings {
         self.max_concurrent_downloads = self.max_concurrent_downloads.clamp(1, 12);
         self.connections_per_download = self.connections_per_download.clamp(1, 32);
         self.min_segment_size_mb = self.min_segment_size_mb.clamp(1, 128);
+        self.max_requests_per_origin = self.max_requests_per_origin.clamp(1, 32);
+        self.retry_attempts = self.retry_attempts.clamp(1, 20);
+        self.bandwidth_limit_kbps = self.bandwidth_limit_kbps.min(10_000_000);
         for category in &mut self.categories {
             category.name = category.name.trim().to_string();
             category.folder = category.folder.trim().to_string();
@@ -167,6 +198,17 @@ pub struct AddDownloadRequest {
     pub connections: Option<usize>,
     /// The size a browser already saw, shown until the engine has probed the server itself.
     pub expected_bytes: Option<u64>,
+    pub expected_sha256: Option<String>,
+    /// Session headers are deliberately never serialized into download history.
+    pub request_headers: Option<BTreeMap<String, String>>,
+    pub handoff_id: Option<String>,
+}
+
+pub fn default_origin_limit() -> usize {
+    8
+}
+pub fn default_retries() -> usize {
+    6
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -234,6 +276,11 @@ mod tests {
             theme: Theme::default(),
             accent: Accent::default(),
             auto_update: true,
+            adaptive_connections: true,
+            max_requests_per_origin: default_origin_limit(),
+            retry_attempts: default_retries(),
+            bandwidth_limit_kbps: 0,
+            direct_write: true,
             categories: vec![
                 Category {
                     name: " Archives ".into(),

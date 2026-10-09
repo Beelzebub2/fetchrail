@@ -54,7 +54,13 @@
         <label class="option-row">Queue <select id="queue" aria-label="Queue"><option>Default</option></select></label>
         <label class="option-row">Start <select id="start" aria-label="Start"><option value="now">Immediately</option><option value="paused">Paused</option><option value="scheduled">At a scheduled time</option></select></label>
         <label id="schedule-row" class="option-row" hidden>Start time <input id="schedule" type="datetime-local" aria-label="Start time" /></label>
-        <p class="hint" id="engine-hint">Connections adapt to the file size and server support.</p>
+        <label class="option-row">Capture <select id="capture-mode"><option value="ask">Ask before starting</option><option value="auto">Automatically start eligible files</option><option value="browser">Keep in browser</option></select></label>
+        <label class="option-row">Minimum capture size (KiB)<input id="capture-minimum" type="number" min="0" value="64" /></label>
+        <label class="option-row">Excluded sites<input id="excluded-sites" placeholder="example.com, another.site" /></label>
+        <label class="option-row">Excluded file types<input id="excluded-types" placeholder="png, jpg, html" /></label>
+        <label class="option-row">Expected SHA-256<input id="expected-hash" placeholder="Optional publisher checksum" pattern="[a-fA-F0-9]{64}" /></label>
+        <button type="button" id="enable-session" class="text-button">Enable login/session downloads for this site</button>
+        <p class="hint" id="engine-hint">Site access is optional. Login credentials stay in memory and are never saved in download history.</p>
       </details>
       <button id="download-selected" class="primary" disabled hidden>Download selected</button>
     </div>
