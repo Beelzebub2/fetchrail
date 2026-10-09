@@ -14,6 +14,8 @@ Use Windows with:
 ## Run locally
 
 ```powershell
+git clone https://github.com/Beelzebub2/fetchrail.git
+cd fetchrail
 npm ci
 npm run tauri dev
 ```
