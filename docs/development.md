@@ -14,6 +14,8 @@ Use Windows with:
 ## Run locally
 
 ```powershell
+git clone https://github.com/Beelzebub2/fetchrail.git
+cd fetchrail
 npm ci
 npm run tauri dev
 ```
@@ -34,15 +36,25 @@ cargo check --manifest-path src-tauri/Cargo.toml --all-targets --locked
 
 `npm run build` builds both extension variants, type-checks the frontend, and creates its production bundle. `npm run browser:build` builds just the extensions. `npm run browser:check` verifies extension sender checks, URL handling, batching, deduplication, options, and automatic routing.
 
-After building the release executable, close Fetchrail before running:
+The progress-window interaction check runs against the built frontend with mocked native commands and Microsoft Edge. With Playwright available, run `node scripts/test-download-progress.mjs`; optionally pass an absolute path to a Playwright module as its first argument. It checks the tabs, live updates, connection details, controls, speed limits, completion settings, themes, and the transition from the file-info prompt, and saves screenshots to a temporary folder.
+
+For the real download-engine check, close Fetchrail before running:
 
 ```powershell
 npm run engine:test
 ```
 
-This local HTTP-server check covers simultaneous downloads, four parallel ranges, exact SHA-256 output, browser-handoff verification, pause/resume, restart recovery, unsupported ranges, unknown lengths, transient retries, scheduling, cancellation, and invalid-range rejection.
+This local HTTP-server check covers simultaneous downloads, global and per-file speed caps across parallel ranges, queue start/stop windows, exact SHA-256 output, cookie/referrer handoff and restart, HTML landing-page rejection, pause/resume, unsupported ranges, unknown lengths, transient retries, scheduling, cancellation, and invalid-range rejection. `npm run browser:check` also covers multi-step batches, automatic button selection, popup tracking, worker suspension, session forwarding and browser fallback using isolated extension fixtures.
 
-Finish or pause existing transfers first. The check uses a test destination and restores the original settings and history, including an installation with no previous state. It refuses to run while an app bridge is already available.
+Finish or pause existing transfers first and close Fetchrail, including any legacy Braid copy. The check creates and removes an isolated profile and destination, without changing installed settings or history. It refuses to run while either application process or an app bridge is already available. On this PC, launch native tests from ordinary Windows context as described in [local build notes](../LOCAL-BUILD.md).
+
+Rust unit tests cover parsers, durable storage, safe model migration, cancellation-aware bandwidth limits and buffered merging. HTTP, retry, resume, authentication and publication checks run through the real application in `engine:test`. To run its optional repeated algorithm/storage measurements:
+
+```powershell
+npm run engine:bench
+```
+
+This uses the real engine against a local HTTP/1.1 server, comparing four fixed ranges with smaller queued ranges and direct staging with legacy merging. Outputs are digest-checked and include final verification/publication. `FETCHRAIL_BENCHMARK_MIB` selects 32..512 MiB in multiples of eight (default 32). It does not predict remote-host speed or universal superiority over another downloader. See [local build notes](../LOCAL-BUILD.md) for the separately enabled IDM comparison.
 
 ## Browser integration from source
 
@@ -80,6 +92,8 @@ npm run release:package
 ```
 
 The optimized executable is `src-tauri/target/release/fetchrail.exe`. Packaged setup and its SHA-256 checksum are written to `release-artifacts/`.
+
+The desktop build produces only the Rust library needed by the executable, avoiding unused static and shared library outputs. Release optimization settings stay enabled.
 
 Release builds enable `tauri/custom-protocol` to embed the frontend. A release build without this feature fails compilation instead of shipping an executable that requires the development server. `npm run tauri build -- --no-bundle` also enables it automatically.
 
@@ -124,6 +138,8 @@ npm run release:check
 Pass a specific tag after `--` to validate it explicitly.
 
 The Windows runner builds the frontend, companions, and executable; checks Rust formatting; runs Rust and browser checks; verifies the bundled interface and bridge; and tests real multi-connection downloads, silent setup, and removal before publishing.
+
+Pushes to `main` run the same build and checks and cache compiled Rust dependencies. Tag builds reuse the cache from `main`; only tags package, sign, and publish releases. A new Rust toolchain or changed dependencies can require rebuilding the cache.
 
 Release assets are:
 

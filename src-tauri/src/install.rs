@@ -21,9 +21,13 @@ use tauri_plugin_updater::UpdaterExt;
 use windows::{
     core::{Interface, GUID, HSTRING},
     Win32::{
-        System::Com::{
-            CoCreateInstance, CoInitializeEx, CoTaskMemFree, IPersistFile, CLSCTX_INPROC_SERVER,
-            COINIT_APARTMENTTHREADED,
+        Foundation::{CloseHandle, ERROR_INVALID_PARAMETER, WAIT_OBJECT_0, WAIT_TIMEOUT},
+        System::{
+            Com::{
+                CoCreateInstance, CoInitializeEx, CoTaskMemFree, IPersistFile,
+                CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED,
+            },
+            Threading::{OpenProcess, WaitForSingleObject, PROCESS_SYNCHRONIZE},
         },
         UI::Shell::{
             FOLDERID_Desktop, FOLDERID_LocalAppData, FOLDERID_Programs, FOLDERID_RoamingAppData,
@@ -334,6 +338,56 @@ pub fn launch(launch_on_start: bool) -> Result<(), String> {
         .map_err(|error| format!("Could not start Fetchrail: {error}"))
 }
 
+pub fn restart(app: &AppHandle) -> Result<(), String> {
+    // Tauri caches the launch path, even after the updater parks the running EXE as .old.exe.
+    let exe = tauri::process::current_binary(&app.env()).map_err(|error| error.to_string())?;
+    Command::new(exe)
+        .args(["--restart-after", &std::process::id().to_string()])
+        .spawn()
+        .map_err(|error| format!("Could not restart Fetchrail: {error}"))?;
+    app.exit(0);
+    Ok(())
+}
+
+pub fn wait_for_restart() -> Result<(), String> {
+    let mut args = std::env::args().skip(1);
+    if args.next().as_deref() == Some("--restart-after") {
+        let pid = args
+            .next()
+            .and_then(|pid| pid.parse::<u32>().ok())
+            .ok_or("Invalid restart process ID.")?;
+        wait_for_process(pid)?;
+    }
+    Ok(())
+}
+
+fn wait_for_process(pid: u32) -> Result<(), String> {
+    if pid == 0 || pid == std::process::id() {
+        return Err("Invalid restart process ID.".into());
+    }
+    // SAFETY: request only wait access; close the owned handle after waiting for its process.
+    unsafe {
+        let process = match OpenProcess(PROCESS_SYNCHRONIZE, false, pid) {
+            Ok(process) => process,
+            Err(error)
+                if error.code()
+                    == windows::core::HRESULT::from_win32(ERROR_INVALID_PARAMETER.0) =>
+            {
+                return Ok(()); // The old process already exited before the new one started.
+            }
+            Err(error) => return Err(format!("Could not wait for Fetchrail to exit: {error}")),
+        };
+        let result = WaitForSingleObject(process, 30_000);
+        let error = windows::core::Error::from_thread();
+        let _ = CloseHandle(process);
+        match result {
+            WAIT_OBJECT_0 => Ok(()),
+            WAIT_TIMEOUT => Err("Timed out waiting for Fetchrail to exit.".into()),
+            _ => Err(format!("Could not wait for Fetchrail to exit: {error}")),
+        }
+    }
+}
+
 /// Run by the installed app at start: clears the executable an update parked and keeps the
 /// version Windows shows in step with the one that is running.
 pub fn tidy_after_update() {
@@ -458,6 +512,30 @@ pub async fn check_for_update(app: &AppHandle) -> UpdateStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn restart_waits_for_the_old_process_to_exit() {
+        let mut old = Command::new("powershell.exe")
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "Start-Sleep -Milliseconds 300",
+            ])
+            .creation_flags(CREATE_NO_WINDOW)
+            .spawn()
+            .unwrap();
+        assert!(old.try_wait().unwrap().is_none());
+        wait_for_process(old.id()).unwrap();
+        assert!(
+            old.try_wait().unwrap().is_some(),
+            "The single-instance owner must exit before startup."
+        );
+        old.wait().unwrap();
+        wait_for_process(u32::MAX).unwrap();
+        assert!(wait_for_process(0).is_err());
+        assert!(wait_for_process(std::process::id()).is_err());
+    }
 
     #[test]
     fn existing_installations_keep_working_after_the_rename() {

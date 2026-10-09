@@ -1,6 +1,8 @@
 # Fetchrail local reliability build
 
-This branch is based on upstream `f43d099e8660537489d48185a9ab48bfba5f791c` and identifies the application as `0.6.0-local.1`. It keeps the existing installation and profile identity. Do not publish this as an upstream release.
+This branch integrates upstream `0b2138b8ab1b7da495beb738fcd203ecba35f013` (Fetchrail 0.5.2) with the local reliability work in `9276416`. The application is `0.6.1-local.1` and the companion is `0.6.1`. It keeps the existing installation and profile identity. Do not publish this as an upstream release.
+
+The upstream interface, progress windows, completion options, batch browsing, per-file/global byte-per-second limits and queue start/stop windows are retained. Durable checkpoints, direct staging, no-replace publication and idempotent browser handoff keep the local implementation. Existing settings survive migration; the new upstream settings use safe defaults. If both the existing KiB/s limit and new byte-per-second limit are configured, both apply. Browser credentials remain session-only: after desktop restart, refresh the link/session before resuming an authenticated download.
 
 The HTTP engine uses a fresh range GET, strong ETag checks and identity encoding. Every resumable range has a durable byte count and SHA-256 checkpoint. A supplied trusted SHA-256 is checked before publication. An unverified or changing representation is rejected or uses one stream. Refreshed URLs can retain bytes only with the original trusted digest or the same resource's strong validator; otherwise select Restart.
 
@@ -20,7 +22,7 @@ npm run build
 npm run browser:check
 npm run release:check
 cargo test --manifest-path src-tauri/Cargo.toml --features tauri/custom-protocol --lib --locked
-cargo clippy --manifest-path src-tauri/Cargo.toml --features tauri/custom-protocol --lib --locked -- -D warnings
+cargo clippy --manifest-path src-tauri/Cargo.toml --features tauri/custom-protocol --all-targets --locked -- -D warnings
 cargo build --manifest-path src-tauri/Cargo.toml --release --features tauri/custom-protocol --bin fetchrail --locked
 npm run browser:package:firefox
 ```

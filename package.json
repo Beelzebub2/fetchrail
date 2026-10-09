@@ -1,7 +1,7 @@
 {
   "name": "fetchrail",
   "private": true,
-  "version": "0.6.0-local.1",
+  "version": "0.6.1-local.1",
   "type": "module",
   "scripts": {
     "dev": "vite",
@@ -11,8 +11,9 @@
     "browser:install": "powershell -ExecutionPolicy Bypass -File scripts/install-browser-host.ps1",
     "browser:uninstall": "powershell -ExecutionPolicy Bypass -File scripts/uninstall-browser-host.ps1",
     "browser:test": "node scripts/test-native-host.mjs",
-    "browser:check": "node scripts/test-extension.mjs && node scripts/test-extension-routing.mjs",
+    "browser:check": "node scripts/test-extension.mjs && node scripts/test-extension-routing.mjs && node scripts/test-browser-batch.mjs",
     "engine:test": "node scripts/test-downloads.mjs",
+    "engine:bench": "node scripts/benchmark-downloads.mjs",
     "setup:test": "node scripts/test-setup.mjs",
     "release:check": "node scripts/check-release.mjs",
     "release:build": "cargo build --manifest-path src-tauri/Cargo.toml --release --bin fetchrail --features tauri/custom-protocol --locked",

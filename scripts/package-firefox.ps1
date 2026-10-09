@@ -30,7 +30,10 @@ try {
     if ($taskZip.Entries | Where-Object { $_.FullName.Contains('\') }) { throw 'ZIP entry names must use forward slashes for Mozilla signing.' }
     if (-not $taskZip.GetEntry('fonts/bricolage-grotesque.woff2')) { throw 'Extension fonts are missing from their portable ZIP paths.' }
 } finally { $taskZip.Dispose() }
-"$((Get-FileHash -LiteralPath $taskArchive -Algorithm SHA256).Hash.ToLowerInvariant())  $([IO.Path]::GetFileName($taskArchive))" | Set-Content -LiteralPath "$taskArchive.sha256" -Encoding ascii
+$taskHasher = [Security.Cryptography.SHA256]::Create()
+try { $taskHash = [BitConverter]::ToString($taskHasher.ComputeHash([IO.File]::ReadAllBytes($taskArchive))).Replace('-','').ToLowerInvariant() }
+finally { $taskHasher.Dispose() }
+"$taskHash  $([IO.Path]::GetFileName($taskArchive))" | Set-Content -LiteralPath "$taskArchive.sha256" -Encoding ascii
 Write-Host "Prepared private signing upload: $taskArchive"
 Write-Host 'Sign in at https://addons.mozilla.org/developers/addon/submit/distribution'
 Write-Host 'Choose On your own (self-distribution), upload this ZIP, then download the signed XPI.'

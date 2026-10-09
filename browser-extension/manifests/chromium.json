@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "minimum_chrome_version": "116",
   "name": "Fetchrail Browser Integration",
-  "version": "0.6.0",
+  "version": "0.6.1",
   "description": "Send browser downloads to the Fetchrail download manager.",
   "icons": {
     "16": "icons/16.png",
@@ -18,7 +18,12 @@
     "downloads",
     "nativeMessaging",
     "scripting",
-    "storage"
+    "storage",
+    "webRequest"
+  ],
+  "optional_host_permissions": [
+    "http://*/*",
+    "https://*/*"
   ],
   "background": {
     "service_worker": "background.js"
@@ -33,11 +38,6 @@
   },
   "options_page": "panel.html",
   "optional_permissions": [
-    "webRequest",
     "cookies"
-  ],
-  "optional_host_permissions": [
-    "http://*/*",
-    "https://*/*"
   ]
 }

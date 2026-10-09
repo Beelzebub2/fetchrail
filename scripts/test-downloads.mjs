@@ -60,6 +60,8 @@ const server = createServer((request, response) => {
   const payload=name.startsWith("benchmark-") ? benchmarkData : data;
   if (name==="empty.bin") { response.writeHead(416,{"Content-Range":"bytes */0"}).end(); return; }
   if (name === "auth.bin") { response.writeHead(403).end(); return; }
+  if (name === "landing.html") { response.writeHead(200, { "Content-Type": "text/html" }).end("<button>Download</button>"); return; }
+  if (name === "session-context.bin" && (request.headers.cookie !== "session=fetchrail-test" || request.headers.referer !== base + "step/5")) { response.writeHead(403).end(); return; }
   if (name === "session.bin" && request.headers.cookie !== "session=fixture") { response.writeHead(403).end(); return; }
   if (name === "session-redirect.bin") { response.writeHead(302,{Location:`http://127.0.0.1:${otherOrigin.address().port}/target`}).end(); return; }
   if (name === "cooldown.bin" && !cooldownFirst) { cooldownFirst=Date.now(); response.writeHead(429,{"Retry-After":"2"}).end(); return; }
@@ -68,6 +70,9 @@ const server = createServer((request, response) => {
   observed.set(name, entry);
   response.setHeader("Content-Type", "application/octet-stream");
   if (name.startsWith("collision-")) response.setHeader("Content-Disposition", 'attachment; filename="same-name.bin"');
+  // File hosts can expose a URL ID and send the real filename only on GET.
+  if (request.method !== "HEAD" && name.startsWith("opaque-")) response.setHeader("Content-Disposition",
+    `attachment; filename="fallback.bin"; filename*=UTF-8''${name}.rar`);
   response.setHeader("ETag", '"fetchrail-test-v1"');
   if (name !== "unknown.bin") response.setHeader("Accept-Ranges", "bytes");
   if (request.method === "HEAD") {
@@ -162,13 +167,20 @@ async function complete(id, connections) {
   const zone=await readFile(full.destination+":Zone.Identifier","utf8");
   assert.match(zone,/ZoneId=3/); assert.ok(!zone.includes("session=fixture"));
   assert.equal(item.downloadedBytes, data.length);
+  assert.equal(item.mergedBytes, data.length, "Direct staging and copied parts must both report all bytes ready for publication.");
   return item;
 }
 try {
   await mkdir(stateDir, { recursive: true });
   const settings = { ...JSON.parse(original["settings.json"] ?? "{}"), defaultDownloadDir: out, maxConcurrentDownloads: 2, connectionsPerDownload: 4, minSegmentSizeMb: 1, launchOnStart: false,
-    categories: [{ name: "Archives", extensions: ["zip"], folder: "Sorted" }], adaptiveConnections:false, maxRequestsPerOrigin:8, directWrite:true, autoUpdate:false };
+    speedLimitBps: 4 * 1024 * 1024, bandwidthLimitKbps: 0, categories: [{ name: "Archives", extensions: ["zip"], folder: "Sorted" }], adaptiveConnections:false, maxRequestsPerOrigin:8, directWrite:true, autoUpdate:false };
   await writeFile(join(stateDir, "settings.json"), JSON.stringify(settings));
+  const windowStart = Date.now() + 20000;
+  const windowStop = windowStart + 3500;
+  await writeFile(join(stateDir, "queues.json"), JSON.stringify([
+    { name: "Default", paused: false },
+    { name: "Window", paused: false, startsAt: new Date(windowStart).toISOString(), stopsAt: new Date(windowStop).toISOString() },
+  ]));
   await launch();
   host = spawn(join(bin, "fetchrail.exe"), ["chrome-extension://fkmedfamaoejlhddajndhjemiedmnldh/"], { windowsHide: true, stdio: ["pipe", "pipe", "inherit"] });
   let buffer = Buffer.alloc(0);
@@ -196,15 +208,55 @@ try {
   console.log("PASS: idempotent acceptance is bound to its original URL and cannot resurrect a rolled-back job");
   await assert.rejects(native("addDownloads", { source: "popup", items: [{ url: "file:///C:/secret" }] }));
   await assert.rejects(native("addDownloads", { source: "popup", items: [{ url: base + "range.bin" }], connections: 33 }));
+  const transferStarted = Date.now();
   const first = await add("range.bin");
   const second = await add("parallel.bin");
   await waitFor(async () => (await native("getDownloads")).overview.active === 2, "two simultaneous downloads");
   await complete(first, 4); await complete(second, 4);
+  assert.ok(Date.now() - transferStarted >= 3600, "The global 4 MiB/s cap must be shared by both 8 MiB files and all eight connections.");
   assert.ok(observed.get("range.bin").peak >= 4, "Expected four simultaneous byte-range requests.");
   assert.ok(globalPeak<=8,"All jobs must share the same origin request budget.");
   console.log("PASS: concurrent downloads, four connections, exact SHA-256 output");
+  console.log("PASS: global speed limit caps the combined throughput of simultaneous downloads");
+  const windowed = await add("windowed.bin", { queue: "Window", speedLimitBps: 128 * 1024 });
+  await waitFor(async () => (await record(windowed))?.downloadedBytes > 0, "queue window starts automatically", 45000);
+  await waitFor(async () => { const item = await record(windowed); return Date.now() >= windowStop && item?.status === "queued"; }, "queue window stops automatically", 15000);
+  await delay(400);
+  const stoppedBytes = (await record(windowed)).downloadedBytes;
+  assert.ok(stoppedBytes > 0 && stoppedBytes < data.length);
+  await delay(400);
+  assert.equal((await record(windowed)).downloadedBytes, stoppedBytes, "A closed queue window must stop active network progress.");
+  assert.equal((await record(windowed)).speedLimitBps, 128 * 1024);
+  console.log("PASS: queue start/stop windows gate active transfers and retain partial bytes");
+  const limitedStarted = Date.now();
+  const limited = await add("limited.bin", { speedLimitBps: 2 * 1024 * 1024 });
+  await complete(limited, 4);
+  assert.ok(Date.now() - limitedStarted >= 3600, "The per-file 2 MiB/s cap must be shared by its four connections.");
+  console.log("PASS: per-file speed limits apply across parallel connections");
+  const browserSession = await native("addDownloads", { source: "browserBatch", startPaused: true, items: [{
+    url: base + "session-context.bin", expectedBytes: data.length, expectedMime: "application/octet-stream",
+    requestContext: { cookie: "session=fetchrail-test", referer: base + "step/5", userAgent: "Fetchrail browser fixture" },
+  }] });
+  assert.equal(session.accepted, 1);
+  ids.push(browserSession.ids[0]);
+  assert.equal((await record(browserSession.ids[0])).requestContext, undefined, "Browser session headers must never be exposed in the bridge response.");
+  app.kill(); await new Promise((done) => app.once("exit", done));
+  await launch();
+  await native("controlDownload", { downloadId: browserSession.ids[0], action: "resume" });
+  await waitFor(async () => (await record(browserSession.ids[0]))?.status === "failed", "browser session expires after app restart");
+  assert.match((await record(browserSession.ids[0])).error, /session expired/i);
+  assert.ok(!(await read("downloads.json")).toString().includes("session=fetchrail-test"), "Credentials must not be saved in history.");
+  await native("refreshDownload", { downloadId: browserSession.ids[0], url: base + "session-context.bin", requestHeaders: { cookie: "session=fetchrail-test", referer: base + "step/5", "user-agent": "Fetchrail browser fixture" } });
+  await native("controlDownload", { downloadId: browserSession.ids[0], action: "resume" });
+  await complete(browserSession.ids[0], 4);
+  console.log("PASS: cookie/referrer downloads verify and refresh after restart without saving credentials to disk");
+  const landing = await add("landing.html");
+  await waitFor(async () => (await record(landing))?.status === "failed", "HTML intermediate page rejection");
+  assert.match((await record(landing)).error, /opens a web page/);
+  console.log("PASS: intermediate download pages are rejected instead of saved as files");
   for (const browser of ["chromium", "firefox"]) {
-    const name = `captured-${browser}.bin`;
+    const name = `opaque-${browser}`;
+    const detectedName = `${name}.rar`;
     let listener;
     let captured;
     const events = [];
@@ -223,6 +275,7 @@ try {
         async search() { events.push("search"); return [{ ...item }]; },
         async cancel() {
           assert.equal((await record(captured)).status, "paused", "The engine must own the download before browser cancellation.");
+          assert.equal((await record(captured)).fileName, detectedName, "Resolve the server filename before opening the paused download prompt.");
           events.push("cancel"); item.state = "interrupted";
         },
         async erase() { events.push("erase"); },
@@ -264,6 +317,9 @@ try {
     assert.equal(rejected.accepted, 0); assert.equal(rejected.ids.length, 0); assert.equal(rejected.rejected, 1);
   }
   console.log("PASS: browser capture reaches the engine; authentication, size/type mismatches and invalid ranges reject before handoff");
+  const opaque = await add("opaque-manual");
+  assert.equal((await complete(opaque, 4)).fileName, "opaque-manual.rar", "GET filename must also be detected when HEAD advertises ranges without a name.");
+  console.log("PASS: server filenames replace URL IDs before capture prompts and for manually added downloads");
   const sorted = await add("sorted.zip");
   await complete(sorted, 4);
   await waitFor(async () => JSON.parse(await read("downloads.json")).find((item) => item.id === sorted).destination === join(out, "Sorted", "sorted.zip"), "category folder", 5000);

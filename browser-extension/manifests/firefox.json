@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Fetchrail Local Companion",
-  "version": "0.6.0",
+  "version": "0.6.1",
   "description": "Send browser downloads to the Fetchrail download manager.",
   "icons": {
     "16": "icons/16.png",
@@ -16,7 +16,12 @@
     "downloads",
     "nativeMessaging",
     "scripting",
-    "storage"
+    "storage",
+    "webRequest"
+  ],
+  "optional_host_permissions": [
+    "http://*/*",
+    "https://*/*"
   ],
   "background": {
     "scripts": [
@@ -40,18 +45,21 @@
       "id": "{bb4d3986-35bd-4e55-bbcb-bb7f67894086}",
       "strict_min_version": "140.0",
       "data_collection_permissions": {
-        "required": ["browsingActivity", "websiteContent", "websiteActivity"],
-        "optional": ["authenticationInfo"]
+        "required": [
+          "browsingActivity",
+          "websiteContent",
+          "websiteActivity"
+        ],
+        "optional": [
+          "authenticationInfo"
+        ]
       }
     },
-    "gecko_android": { "strict_min_version": "142.0" }
+    "gecko_android": {
+      "strict_min_version": "142.0"
+    }
   },
   "optional_permissions": [
-    "webRequest",
     "cookies"
-  ],
-  "optional_host_permissions": [
-    "http://*/*",
-    "https://*/*"
   ]
 }

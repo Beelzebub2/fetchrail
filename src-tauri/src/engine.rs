@@ -21,6 +21,8 @@ use reqwest::{
     },
     Client, StatusCode,
 };
+#[cfg(test)]
+use std::io::{Read, Write};
 use tauri::{AppHandle, Emitter, Manager};
 use tokio::{
     fs,
@@ -33,9 +35,11 @@ use url::Url;
 use uuid::Uuid;
 
 use crate::model::{
-    default_categories, default_queue_name, AddDownloadRequest, DownloadRecord, DownloadSettings,
-    DownloadStatus, EngineOverview, QueueRecord, SegmentProgress,
+    default_categories, default_queue_name, AddDownloadRequest, BatchDownloadError,
+    BatchDownloadResult, BrowserRequestContext, DownloadRecord, DownloadSettings, DownloadStatus,
+    EngineOverview, QueueRecord, SegmentProgress,
 };
+use crate::rate_limit::RateLimiter;
 
 const DOWNLOAD_EVENT: &str = "fetchrail://download-updated";
 const SETTINGS_EVENT: &str = "fetchrail://settings-updated";
@@ -44,6 +48,19 @@ const SETTINGS_FILE: &str = "settings.json";
 const QUEUES_FILE: &str = "queues.json";
 const QUEUES_EVENT: &str = "fetchrail://queues-updated";
 const REMOVED_EVENT: &str = "fetchrail://download-removed";
+const MERGE_BUFFER_SIZE: usize = 4 * 1024 * 1024;
+const TRANSFER_BUFFER_SIZE: usize = 1024 * 1024;
+
+fn download_client_builder() -> reqwest::ClientBuilder {
+    Client::builder()
+        .user_agent(concat!("Fetchrail/", env!("CARGO_PKG_VERSION")))
+        .redirect(reqwest::redirect::Policy::limited(10))
+        .pool_max_idle_per_host(32)
+        .tcp_nodelay(true)
+        .http2_adaptive_window(true)
+        .connect_timeout(Duration::from_secs(15))
+        .read_timeout(Duration::from_secs(30))
+}
 
 #[derive(Debug, thiserror::Error)]
 enum EngineError {
@@ -155,11 +172,13 @@ struct DownloadTask {
     running: AtomicBool,
     headers: RwLock<HeaderMap>,
     checkpoint_lock: tokio::sync::Mutex<Option<(PartManifest, Instant)>>,
+    limiter: RateLimiter,
 }
 
 impl DownloadTask {
     fn new(record: DownloadRecord) -> Self {
         Self {
+            limiter: RateLimiter::new(record.speed_limit_bps),
             paused: AtomicBool::new(record.status == DownloadStatus::Paused),
             record: RwLock::new(record),
             cancelled: AtomicBool::new(false),
@@ -212,6 +231,8 @@ pub struct DownloadManager {
     add_lock: tokio::sync::Mutex<()>,
     origins: tokio::sync::Mutex<HashMap<String, Arc<OriginGate>>>,
     bandwidth: Bandwidth,
+    limiter: RateLimiter,
+    dispatch_lock: tokio::sync::Mutex<()>,
 }
 
 impl DownloadManager {
@@ -251,6 +272,8 @@ impl DownloadManager {
                 QueueRecord {
                     name: default_queue_name(),
                     paused: false,
+                    starts_at: None,
+                    stops_at: None,
                 },
             );
         }
@@ -258,13 +281,7 @@ impl DownloadManager {
             let _ = sync_startup_registration(true);
         }
 
-        let client = Client::builder()
-            .user_agent(concat!("Fetchrail/", env!("CARGO_PKG_VERSION")))
-            .redirect(reqwest::redirect::Policy::limited(10))
-            .pool_max_idle_per_host(32)
-            .tcp_nodelay(true)
-            .connect_timeout(Duration::from_secs(15))
-            .read_timeout(Duration::from_secs(30))
+        let client = download_client_builder()
             .build()
             .map_err(|error| format!("Could not initialize HTTP client: {error}"))?;
 
@@ -297,6 +314,8 @@ impl DownloadManager {
             client,
             tasks: RwLock::new(task_map),
             minimize_to_tray: AtomicBool::new(settings.minimize_to_tray),
+            limiter: RateLimiter::new(settings.speed_limit_bps),
+            dispatch_lock: tokio::sync::Mutex::new(()),
             settings: RwLock::new(settings),
             queues: RwLock::new(queues),
             data_dir,
@@ -326,8 +345,20 @@ impl DownloadManager {
         self: &Arc<Self>,
         request: AddDownloadRequest,
     ) -> Result<DownloadRecord, String> {
+        self.add_inner(request, true).await
+    }
+
+    async fn add_inner(
+        self: &Arc<Self>,
+        request: AddDownloadRequest,
+        persist: bool,
+    ) -> Result<DownloadRecord, String> {
         let _add = self.add_lock.lock().await;
-        let headers = crate::network::session_headers(request.request_headers.as_ref())?;
+        let mut headers =
+            context_headers(request.request_context.as_ref()).map_err(|error| error.to_string())?;
+        headers.extend(crate::network::session_headers(
+            request.request_headers.as_ref(),
+        )?);
         let expected_sha256 = storage::validate_hash(request.expected_sha256.as_deref())?;
         let parsed = Url::parse(request.url.trim()).map_err(|error| error.to_string())?;
         if !matches!(parsed.scheme(), "http" | "https") {
@@ -413,6 +444,7 @@ impl DownloadManager {
             status,
             total_bytes: request.expected_bytes,
             downloaded_bytes: 0,
+            merged_bytes: 0,
             speed_bps: 0,
             eta_seconds: None,
             connections: request
@@ -437,6 +469,10 @@ impl DownloadManager {
             handoff_id: request.handoff_id,
             handoff_committed: false,
             requires_session: !headers.is_empty(),
+            speed_limit_bps: request.speed_limit_bps.unwrap_or(0),
+            resume_supported: None,
+            completion_options: Default::default(),
+            progress_requested: false,
         };
 
         let task = Arc::new(DownloadTask::new(record.clone()));
@@ -444,13 +480,74 @@ impl DownloadManager {
         task.paused.store(true, Ordering::Release);
         *task.headers.write().await = headers;
         self.tasks.write().await.insert(id, task.clone());
+        if persist {
+            if let Err(error) = self.persist_records().await {
+                self.tasks.write().await.remove(&id);
+                return Err(error.to_string());
+            }
+            task.paused.store(start_paused, Ordering::Release);
+            self.emit_record(&record);
+        }
+        Ok(record)
+    }
+
+    pub async fn add_batch(
+        self: &Arc<Self>,
+        requests: Vec<AddDownloadRequest>,
+    ) -> Result<BatchDownloadResult, String> {
+        if requests.is_empty() || requests.len() > 1000 {
+            return Err("Choose between 1 and 1,000 downloads.".into());
+        }
+        // Keep dispatch from observing a partially added batch.
+        let _dispatch = self.dispatch_lock.lock().await;
+        let mut result = BatchDownloadResult {
+            accepted: Vec::new(),
+            errors: Vec::new(),
+        };
+        let mut seen = std::collections::HashSet::new();
+        for (index, mut request) in requests.into_iter().enumerate() {
+            if let Ok(mut url) = Url::parse(request.url.trim()) {
+                url.set_fragment(None);
+                request.url = url.to_string();
+                if !seen.insert(request.url.clone()) {
+                    continue;
+                }
+            }
+            match self.add_inner(request, false).await {
+                Ok(record) => result.accepted.push(record),
+                Err(message) => result.errors.push(BatchDownloadError { index, message }),
+            }
+        }
         if let Err(error) = self.persist_records().await {
-            self.tasks.write().await.remove(&id);
+            let mut tasks = self.tasks.write().await;
+            for record in &result.accepted {
+                tasks.remove(&record.id);
+            }
             return Err(error.to_string());
         }
-        task.paused.store(start_paused, Ordering::Release);
-        self.emit_record(&record);
-        Ok(record)
+        for record in &result.accepted {
+            self.task(record.id)
+                .await?
+                .paused
+                .store(record.status == DownloadStatus::Paused, Ordering::Release);
+            self.emit_record(record);
+        }
+        Ok(result)
+    }
+
+    pub async fn set_speed_limit(&self, id: Uuid, limit: u64) -> Result<DownloadRecord, String> {
+        let task = self.task(id).await?;
+        let snapshot = {
+            let mut record = task.record.write().await;
+            record.speed_limit_bps = limit;
+            task.limiter.set_limit(limit);
+            record.clone()
+        };
+        self.persist_records()
+            .await
+            .map_err(|error| error.to_string())?;
+        self.emit_record(&snapshot);
+        Ok(snapshot)
     }
 
     pub async fn validate_browser_download(
@@ -459,7 +556,7 @@ impl DownloadManager {
         expected_bytes: Option<u64>,
         expected_mime: Option<&str>,
         headers: Option<&std::collections::BTreeMap<String, String>>,
-    ) -> Result<(), String> {
+    ) -> Result<Option<String>, String> {
         // Verify a replayable GET before the extension gives up its browser transfer.
         let parsed = Url::parse(url).map_err(|error| error.to_string())?;
         let gate = self.origin(&parsed).await;
@@ -537,7 +634,7 @@ impl DownloadManager {
                 );
             }
         }
-        Ok(())
+        Ok(file_name_from_headers(response.headers()))
     }
 
     pub async fn list(&self) -> Vec<DownloadRecord> {
@@ -908,6 +1005,8 @@ impl DownloadManager {
         queues.push(QueueRecord {
             name,
             paused: false,
+            starts_at: None,
+            stops_at: None,
         });
         let snapshot = queues.clone();
         drop(queues);
@@ -973,6 +1072,32 @@ impl DownloadManager {
                 .find(|queue| queue.name.eq_ignore_ascii_case(name.trim()))
                 .ok_or_else(|| "Queue not found.".to_string())?;
             queue.paused = paused;
+            queues.clone()
+        };
+        self.persist_queues()
+            .await
+            .map_err(|error| error.to_string())?;
+        let _ = self.app.emit(QUEUES_EVENT, &snapshot);
+        Ok(snapshot)
+    }
+
+    pub async fn schedule_queue(
+        &self,
+        name: String,
+        starts_at: Option<DateTime<Utc>>,
+        stops_at: Option<DateTime<Utc>>,
+    ) -> Result<Vec<QueueRecord>, String> {
+        if stops_at.is_some_and(|stop| stop <= starts_at.unwrap_or_else(Utc::now)) {
+            return Err("The queue stop time must be after its start time.".into());
+        }
+        let snapshot = {
+            let mut queues = self.queues.write().await;
+            let queue = queues
+                .iter_mut()
+                .find(|queue| queue.name.eq_ignore_ascii_case(name.trim()))
+                .ok_or("Queue not found.")?;
+            queue.starts_at = starts_at;
+            queue.stops_at = stops_at;
             queues.clone()
         };
         self.persist_queues()
@@ -1050,6 +1175,7 @@ impl DownloadManager {
         }
 
         *self.settings.write().await = settings.clone();
+        self.limiter.set_limit(settings.speed_limit_bps);
         self.minimize_to_tray
             .store(settings.minimize_to_tray, Ordering::Release);
         self.persist_settings()
@@ -1061,6 +1187,50 @@ impl DownloadManager {
 
     pub fn minimize_to_tray_enabled(&self) -> bool {
         self.minimize_to_tray.load(Ordering::Acquire)
+    }
+
+    pub async fn get_download(&self, id: Uuid) -> Result<DownloadRecord, String> {
+        let task = self.task(id).await?;
+        let record = task.record.read().await.clone();
+        Ok(record)
+    }
+
+    pub async fn watch_progress(&self, id: Uuid) -> Result<DownloadRecord, String> {
+        let task = self.task(id).await?;
+        let record = {
+            let mut record = task.record.write().await;
+            if record.progress_requested {
+                return Ok(record.clone());
+            }
+            record.progress_requested = true;
+            record.clone()
+        };
+        self.persist_records()
+            .await
+            .map_err(|error| error.to_string())?;
+        Ok(record)
+    }
+
+    pub async fn set_completion_options(
+        &self,
+        id: Uuid,
+        mut options: crate::model::CompletionOptions,
+    ) -> Result<DownloadRecord, String> {
+        let task = self.task(id).await?;
+        let snapshot = {
+            let mut record = task.record.write().await;
+            if record.status == DownloadStatus::Completed {
+                return Err("This download has already completed.".into());
+            }
+            options.force_shutdown &= options.turn_off_computer;
+            record.completion_options = options;
+            record.clone()
+        };
+        self.persist_records()
+            .await
+            .map_err(|error| error.to_string())?;
+        self.emit_record(&snapshot);
+        Ok(snapshot)
     }
 
     pub async fn reveal(&self, id: Uuid) -> Result<(), String> {
@@ -1126,6 +1296,7 @@ impl DownloadManager {
     }
 
     async fn dispatch_ready_downloads(self: &Arc<Self>) {
+        let _dispatch = self.dispatch_lock.lock().await;
         let max_concurrent = self.settings.read().await.max_concurrent_downloads;
         let tasks = self
             .tasks
@@ -1138,19 +1309,35 @@ impl DownloadManager {
             .iter()
             .filter(|task| task.running.load(Ordering::Acquire))
             .count();
-        if running >= max_concurrent {
-            return;
-        }
-
+        let now = Utc::now();
         let paused_queues = self
             .queues
             .read()
             .await
             .iter()
-            .filter(|queue| queue.paused)
+            .filter(|queue| !queue.allows_downloads(now))
             .map(|queue| queue.name.clone())
             .collect::<Vec<_>>();
-        let now = Utc::now();
+        // Stop active network work at the end of a queue window; keep pending work queued.
+        for task in &tasks {
+            let mut record = task.record.write().await;
+            if task.running.load(Ordering::Acquire)
+                && paused_queues.contains(&record.queue)
+                && matches!(
+                    record.status,
+                    DownloadStatus::Connecting | DownloadStatus::Downloading
+                )
+            {
+                record.status = DownloadStatus::Queued;
+                record.speed_bps = 0;
+                record.eta_seconds = None;
+                task.cancel();
+                self.emit_record(&record);
+            }
+        }
+        if running >= max_concurrent {
+            return;
+        }
         let mut candidates = Vec::new();
         for task in tasks {
             if task.running.load(Ordering::Acquire)
@@ -1233,6 +1420,7 @@ impl DownloadManager {
             let mut record = task.record.write().await;
             task.check_stopped(&cancel)?;
             record.total_bytes = probe.total_bytes;
+            record.resume_supported = Some(probe.accepts_ranges);
             record.connections = connection_count;
             record.requested_connections = Some(requested_connections);
             if let Some(name) = &probe.suggested_file_name {
@@ -1368,6 +1556,7 @@ impl DownloadManager {
                 {
                     let mut record = task.record.write().await;
                     record.connections = 1;
+                    record.resume_supported = Some(false);
                     record.downloaded_bytes = 0;
                 }
                 ranges = match total {
@@ -1435,6 +1624,7 @@ impl DownloadManager {
         self.persist_records().await?;
         let _ = fs::remove_dir_all(&part_dir).await;
         self.emit_record(&snapshot);
+        crate::download_window::on_completion(&self.app, &snapshot).await;
         Ok(())
     }
 
@@ -1705,7 +1895,7 @@ impl DownloadManager {
             existing
         }))
         .await?;
-        let mut output = BufWriter::with_capacity(256 * 1024, file);
+        let mut output = BufWriter::with_capacity(TRANSFER_BUFFER_SIZE, file);
         let mut stream = response.bytes_stream();
         segment.active.store(true, Ordering::Relaxed);
         task.record.write().await.status_detail = None;
@@ -1724,15 +1914,20 @@ impl DownloadManager {
                 let limit = self.settings.read().await.bandwidth_limit_kbps;
                 if !self.bandwidth.consume(chunk.len(), limit, cancel).await { return Err(EngineError::Cancelled); }
                 if expected_len.is_none() { storage::check_space(part_path.parent().unwrap(), chunk.len() as u64)?; }
-                output.write_all(&chunk).await?;
-                hasher.update(&chunk); written += chunk.len() as u64;
+                for bytes in chunk.chunks(self.limiter.quantum().min(task.limiter.quantum())) {
+                    self.limiter.acquire(bytes.len(), cancel).await.map_err(|_| EngineError::Cancelled)?;
+                    task.limiter.acquire(bytes.len(), cancel).await.map_err(|_| EngineError::Cancelled)?;
+                    output.write_all(bytes).await?;
+                    hasher.update(bytes); written += bytes.len() as u64;
+                    segment.downloaded.store(written, Ordering::Relaxed);
+                }
                 segment.downloaded.store(written, Ordering::Relaxed);
                 if checkpoint_at.elapsed().as_secs() >= 5 {
                     output.flush().await?; if !direct { output.get_ref().sync_all().await?; }
                     self.checkpoint(task, part_dir, index, written, format!("{:x}", hasher.clone().finalize()),true).await?;
                     checkpoint_at = Instant::now();
                 }
-                if limit == 0 && started.elapsed().as_secs() >= 30 && (written - existing) as f64 / started.elapsed().as_secs_f64() < 2048.0 {
+                if limit == 0 && started.elapsed().as_secs() >= 30 && self.settings.read().await.speed_limit_bps == 0 && task.record.read().await.speed_limit_bps == 0 && (written - existing) as f64 / started.elapsed().as_secs_f64() < 2048.0 {
                     return Err(EngineError::Slow);
                 }
             }
@@ -1935,6 +2130,7 @@ impl DownloadManager {
                     });
                 }
                 Ok(response) if response.status().is_success() => {
+                    reject_html_page(response.headers())?;
                     validate_encoding(response.headers())?;
                     let validator = representation_validator(response.headers());
                     let total_bytes = if response.status() == StatusCode::PARTIAL_CONTENT {
@@ -2004,6 +2200,12 @@ impl DownloadManager {
             .await?
             .unwrap();
         let stage = if let Some(stage) = manifest.direct_path {
+            let snapshot = {
+                let mut record = task.record.write().await;
+                record.merged_bytes = record.downloaded_bytes;
+                record.clone()
+            };
+            self.emit_record(&snapshot);
             stage
         } else {
             storage::check_space(parent, record.downloaded_bytes)?;
@@ -2013,9 +2215,9 @@ impl DownloadManager {
                 .create_new(true)
                 .open(&stage)
                 .await?;
-            let mut output = BufWriter::with_capacity(1024 * 1024, file);
+            let mut output = BufWriter::with_capacity(MERGE_BUFFER_SIZE, file);
             let copied = async {
-                let mut buffer = vec![0; 1024 * 1024];
+                let mut buffer = vec![0; MERGE_BUFFER_SIZE];
                 for index in 0..ranges.len() {
                     let mut input = fs::File::open(part_dir.join(format!("{index}.part"))).await?;
                     loop {
@@ -2028,6 +2230,7 @@ impl DownloadManager {
                         let snapshot = {
                             let mut record = task.record.write().await;
                             record.finalizing_bytes += count as u64;
+                            record.merged_bytes += count as u64;
                             record.clone()
                         };
                         self.emit_record(&snapshot);
@@ -2196,6 +2399,9 @@ impl DownloadManager {
             let mut record = task.record.write().await;
             task.check_stopped(cancel)?;
             record.status = status;
+            record.merged_bytes = 0;
+            record.speed_bps = 0;
+            record.eta_seconds = None;
             record.error = error;
             record.clone()
         };
@@ -2262,6 +2468,7 @@ impl DownloadManager {
 
 fn default_settings(download_dir: &Path) -> DownloadSettings {
     DownloadSettings {
+        speed_limit_bps: 0,
         default_download_dir: download_dir.to_string_lossy().to_string(),
         max_concurrent_downloads: 3,
         connections_per_download: 8,
@@ -2280,10 +2487,64 @@ fn default_settings(download_dir: &Path) -> DownloadSettings {
     }
 }
 
+fn context_headers(context: Option<&BrowserRequestContext>) -> EngineResult<HeaderMap> {
+    let mut headers = HeaderMap::new();
+    if let Some(context) = context {
+        for (name, value) in [
+            (header::COOKIE, context.cookie.as_deref()),
+            (header::AUTHORIZATION, context.authorization.as_deref()),
+            (header::REFERER, context.referer.as_deref()),
+            (header::USER_AGENT, context.user_agent.as_deref()),
+        ] {
+            if let Some(value) = value {
+                if value.len() > 16 * 1024 {
+                    return Err(EngineError::Message("Browser header is too long.".into()));
+                }
+                let mut value = header::HeaderValue::from_str(value)
+                    .map_err(|_| EngineError::Message("Invalid browser request header.".into()))?;
+                value.set_sensitive(true);
+                headers.insert(name, value);
+            }
+        }
+    }
+    Ok(headers)
+}
+
+fn reject_html_page(headers: &HeaderMap) -> EngineResult<()> {
+    let mime = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("")
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim();
+    let attachment = headers
+        .get(CONTENT_DISPOSITION)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| {
+            value
+                .split(';')
+                .next()
+                .unwrap_or("")
+                .trim()
+                .eq_ignore_ascii_case("attachment")
+        });
+    if !attachment
+        && (mime.eq_ignore_ascii_case("text/html")
+            || mime.eq_ignore_ascii_case("application/xhtml+xml"))
+    {
+        return Err(EngineError::Message("This link opens a web page. Use the browser companion's Browse download pages mode to complete its download steps.".into()));
+    }
+    Ok(())
+}
+
 fn default_queues() -> Vec<QueueRecord> {
     vec![QueueRecord {
         name: default_queue_name(),
         paused: false,
+        starts_at: None,
+        stops_at: None,
     }]
 }
 
@@ -2378,22 +2639,48 @@ fn name_from_url(url: &Url) -> String {
 
 fn file_name_from_headers(headers: &HeaderMap) -> Option<String> {
     let value = headers.get(CONTENT_DISPOSITION)?.to_str().ok()?;
-    for part in value.split(';').map(str::trim) {
-        if let Some(name) = part.strip_prefix("filename*=") {
-            let name = name.trim_matches('"');
-            let encoded = name
-                .split_once("''")
-                .map(|(_, right)| right)
-                .unwrap_or(name);
-            if let Ok(decoded) = percent_encoding::percent_decode_str(encoded).decode_utf8() {
-                return Some(safe_file_name(&decoded));
-            }
+    let mut quoted = false;
+    let mut escaped = false;
+    let mut plain_name = None;
+    // Semicolons inside a quoted filename are part of the name.
+    for part in value.split(|character| {
+        if escaped {
+            escaped = false;
+        } else if character == '\\' && quoted {
+            escaped = true;
+        } else if character == '"' {
+            quoted = !quoted;
         }
-        if let Some(name) = part.strip_prefix("filename=") {
-            return Some(safe_file_name(name.trim_matches('"')));
+        character == ';' && !quoted
+    }) {
+        let Some((parameter, name)) = part.trim().split_once('=') else {
+            continue;
+        };
+        let name = name.trim().trim_matches('"');
+        if name.is_empty() {
+            continue;
+        }
+        if parameter.trim().eq_ignore_ascii_case("filename*") {
+            let mut parts = name.splitn(3, '\'');
+            if parts
+                .next()
+                .is_some_and(|charset| charset.eq_ignore_ascii_case("UTF-8"))
+            {
+                let _language = parts.next();
+                if let Some(encoded) = parts.next() {
+                    if let Ok(decoded) = percent_encoding::percent_decode_str(encoded).decode_utf8()
+                    {
+                        if !decoded.trim().is_empty() {
+                            return Some(safe_file_name(&decoded));
+                        }
+                    }
+                }
+            }
+        } else if parameter.trim().eq_ignore_ascii_case("filename") {
+            plain_name = Some(safe_file_name(name));
         }
     }
-    None
+    plain_name
 }
 
 fn content_length_from_headers(headers: &HeaderMap) -> Option<u64> {
@@ -2522,6 +2809,7 @@ fn apply_publication(record: &mut DownloadRecord, journal: &Finalization) {
         .to_string_lossy()
         .to_string();
     record.downloaded_bytes = journal.bytes;
+    record.merged_bytes = journal.bytes;
     record.total_bytes = Some(journal.bytes);
     record.sha256 = Some(journal.sha256.clone());
     record.status = DownloadStatus::Completed;
@@ -2652,16 +2940,113 @@ async fn unique_destination(directory: &Path, file_name: &str) -> PathBuf {
 }
 
 #[cfg(test)]
+fn join_parts(
+    part_dir: &Path,
+    temp_path: &Path,
+    ranges: &[ByteRange],
+    total: u64,
+    merged: &AtomicU64,
+) -> EngineResult<()> {
+    let mut output = std::fs::File::create(temp_path)?;
+    let mut buffer = vec![0; MERGE_BUFFER_SIZE];
+    let mut joined = 0;
+    for (index, range) in ranges.iter().enumerate() {
+        let mut input = std::fs::File::open(part_dir.join(format!("{index}.part")))?;
+        let expected = if range.end == u64::MAX {
+            total
+        } else {
+            range.len()
+        };
+        if input.metadata()?.len() != expected {
+            return Err(EngineError::Message(format!(
+                "Part {index} has an unexpected size. Retry the download."
+            )));
+        }
+        let mut copied = 0;
+        loop {
+            let read = match input.read(&mut buffer) {
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                result => result?,
+            };
+            if read == 0 {
+                break;
+            }
+            copied += read as u64;
+            if copied > expected || joined + read as u64 > total {
+                return Err(EngineError::Message(
+                    "Part size changed while joining.".into(),
+                ));
+            }
+            output.write_all(&buffer[..read])?;
+            joined += read as u64;
+            merged.store(joined, Ordering::Relaxed);
+        }
+        if copied != expected {
+            return Err(EngineError::Message(
+                "Part size changed while joining.".into(),
+            ));
+        }
+    }
+    if joined != total {
+        return Err(EngineError::Message(
+            "Joined file has an unexpected size.".into(),
+        ));
+    }
+    output.sync_all()?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod transfer_tests;
+
+#[cfg(test)]
 mod tests {
+    use super::{context_headers, reject_html_page};
+    use crate::model::BrowserRequestContext;
     use chrono::{Duration as ChronoDuration, Utc};
-    use reqwest::header::{HeaderMap, HeaderValue, CONTENT_LENGTH, CONTENT_RANGE};
+    use reqwest::header::{
+        HeaderMap, HeaderValue, CONTENT_DISPOSITION, CONTENT_LENGTH, CONTENT_RANGE,
+    };
     use uuid::Uuid;
 
     use super::{
-        content_length_from_headers, parse_content_range, record_is_dispatch_ready, safe_file_name,
-        split_ranges, suggested_connection_count,
+        content_length_from_headers, file_name_from_headers, parse_content_range,
+        record_is_dispatch_ready, safe_file_name, split_ranges, suggested_connection_count,
     };
     use crate::model::{DownloadRecord, DownloadStatus};
+
+    #[test]
+    fn html_landing_pages_are_rejected_but_html_attachments_are_downloadable() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            reqwest::header::CONTENT_TYPE,
+            HeaderValue::from_static("text/html; charset=utf-8"),
+        );
+        assert!(reject_html_page(&headers).is_err());
+        headers.insert(
+            reqwest::header::CONTENT_DISPOSITION,
+            HeaderValue::from_static("attachment; filename=report.html"),
+        );
+        assert!(reject_html_page(&headers).is_ok());
+    }
+
+    #[test]
+    fn browser_headers_are_validated_and_kept_out_of_public_records() {
+        let context = BrowserRequestContext {
+            cookie: Some("session=secret".into()),
+            ..Default::default()
+        };
+        let headers = context_headers(Some(&context)).unwrap();
+        assert!(headers[reqwest::header::COOKIE].is_sensitive());
+        let record = queued_record(DownloadStatus::Scheduled, "Default", None);
+        let disk = serde_json::to_string(&record).unwrap();
+        assert!(!disk.contains("secret"));
+        assert!(context_headers(Some(&BrowserRequestContext {
+            referer: Some("bad\r\nheader".into()),
+            ..Default::default()
+        }))
+        .is_err());
+    }
 
     #[test]
     fn ranges_cover_file_without_overlap() {
@@ -2693,6 +3078,22 @@ mod tests {
     fn unsafe_file_names_are_sanitized() {
         assert_eq!(safe_file_name("  report?.zip  "), "report.zip");
         assert_eq!(safe_file_name("..."), "download");
+    }
+
+    #[test]
+    fn server_file_names_support_encoded_names_and_quoted_parameters() {
+        let mut headers = HeaderMap::new();
+        for (value, expected) in [
+            ("attachment; filename=\"Palworld-SteamRIP.com.rar\"", Some("Palworld-SteamRIP.com.rar")),
+            ("attachment; filename=\"fallback.rar\"; filename*=UTF-8'en'Palworld-SteamRIP.com.rar", Some("Palworld-SteamRIP.com.rar")),
+            ("attachment; FILENAME* = UTF-8''caf%C3%A9%20archive.rar; filename=fallback.rar", Some("café archive.rar")),
+            ("attachment; filename=\"report; final.zip\"", Some("report; final.zip")),
+            ("attachment; filename*=UTF-8''%FF; filename=fallback.rar", Some("fallback.rar")),
+            ("attachment; filename=\"\"", None),
+        ] {
+            headers.insert(CONTENT_DISPOSITION, HeaderValue::from_str(value).unwrap());
+            assert_eq!(file_name_from_headers(&headers).as_deref(), expected, "{value}");
+        }
     }
 
     #[test]
@@ -2733,6 +3134,7 @@ mod tests {
             status,
             total_bytes: None,
             downloaded_bytes: 0,
+            merged_bytes: 0,
             speed_bps: 0,
             eta_seconds: None,
             connections: 8,
@@ -2751,6 +3153,10 @@ mod tests {
             handoff_id: None,
             handoff_committed: false,
             requires_session: false,
+            speed_limit_bps: 0,
+            resume_supported: None,
+            completion_options: Default::default(),
+            progress_requested: false,
         }
     }
 
@@ -2818,6 +3224,77 @@ mod tests {
         }];
         let counters = super::segment_counters(&dir, &unknown).await.unwrap();
         assert_eq!(super::segment_progress(&counters, &[])[0].length, None);
+        tokio::fs::remove_dir_all(dir).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn joining_preserves_order_and_counts_bytes_across_buffers() {
+        let dir = std::env::temp_dir().join(format!("fetchrail-join-test-{}", Uuid::new_v4()));
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let total = (super::MERGE_BUFFER_SIZE * 3 + 123) as u64;
+        let ranges = split_ranges(total, 2);
+        for (index, range) in ranges.iter().enumerate() {
+            tokio::fs::write(
+                dir.join(format!("{index}.part")),
+                vec![index as u8 + 1; range.len() as usize],
+            )
+            .await
+            .unwrap();
+        }
+        let output = dir.join("joined");
+        let merged = std::sync::atomic::AtomicU64::new(0);
+        super::join_parts(&dir, &output, &ranges, total, &merged).unwrap();
+        let bytes = tokio::fs::read(&output).await.unwrap();
+        assert_eq!(bytes.len() as u64, total);
+        assert!(bytes[..ranges[0].len() as usize]
+            .iter()
+            .all(|byte| *byte == 1));
+        assert!(bytes[ranges[0].len() as usize..]
+            .iter()
+            .all(|byte| *byte == 2));
+        assert_eq!(merged.load(std::sync::atomic::Ordering::Relaxed), total);
+        assert!(
+            dir.join("0.part").exists(),
+            "Keep parts until the final rename succeeds"
+        );
+        tokio::fs::remove_dir_all(dir).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn joining_handles_unknown_lengths_empty_files_and_rejects_bad_parts() {
+        let dir = std::env::temp_dir().join(format!("fetchrail-join-test-{}", Uuid::new_v4()));
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let output = dir.join("joined");
+        let merged = std::sync::atomic::AtomicU64::new(0);
+        let unknown = [super::ByteRange {
+            start: 0,
+            end: u64::MAX,
+        }];
+        tokio::fs::write(dir.join("0.part"), b"single stream")
+            .await
+            .unwrap();
+        super::join_parts(&dir, &output, &unknown, 13, &merged).unwrap();
+        assert_eq!(tokio::fs::read(&output).await.unwrap(), b"single stream");
+        assert_eq!(merged.load(std::sync::atomic::Ordering::Relaxed), 13);
+
+        merged.store(0, std::sync::atomic::Ordering::Relaxed);
+        super::join_parts(&dir, &output, &[], 0, &merged).unwrap();
+        assert_eq!(tokio::fs::metadata(&output).await.unwrap().len(), 0);
+        for invalid_size in [12, 14] {
+            assert!(super::join_parts(&dir, &output, &unknown, invalid_size, &merged).is_err());
+            assert_eq!(merged.load(std::sync::atomic::Ordering::Relaxed), 0);
+        }
+        assert!(super::join_parts(&dir, &output, &split_ranges(26, 2), 26, &merged).is_err());
+        assert!(super::join_parts(&dir, &output, &[], 1, &merged).is_err());
+        let mut old_record =
+            serde_json::to_value(queued_record(DownloadStatus::Paused, "Default", None)).unwrap();
+        old_record.as_object_mut().unwrap().remove("mergedBytes");
+        assert_eq!(
+            serde_json::from_value::<DownloadRecord>(old_record)
+                .unwrap()
+                .merged_bytes,
+            0
+        );
         tokio::fs::remove_dir_all(dir).await.unwrap();
     }
 

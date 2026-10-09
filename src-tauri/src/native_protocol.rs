@@ -1,3 +1,4 @@
+use crate::model::BrowserRequestContext;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -52,6 +53,7 @@ pub struct NativeParams {
     pub restart: Option<bool>,
     pub request_headers: Option<std::collections::BTreeMap<String, String>>,
     pub handoff_protocol: Option<u8>,
+    pub speed_limit_bps: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -69,6 +71,7 @@ pub enum BrowserSource {
     DownloadAll,
     ClickMonitor,
     Popup,
+    BrowserBatch,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -80,6 +83,7 @@ pub struct BrowserDownloadItem {
     pub expected_mime: Option<String>,
     pub expected_sha256: Option<String>,
     pub request_headers: Option<std::collections::BTreeMap<String, String>>,
+    pub request_context: Option<BrowserRequestContext>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -187,6 +191,30 @@ pub fn validate_request(request: &NativeRequest) -> Result<(), String> {
             for item in &request.params.items {
                 crate::network::session_headers(item.request_headers.as_ref())?;
                 crate::storage::validate_hash(item.expected_sha256.as_deref())?;
+                if let Some(context) = &item.request_context {
+                    if !matches!(
+                        request.params.source,
+                        Some(BrowserSource::ClickMonitor | BrowserSource::BrowserBatch)
+                    ) {
+                        return Err(
+                            "Session headers are only accepted for a captured browser download."
+                                .into(),
+                        );
+                    }
+                    for value in [
+                        &context.cookie,
+                        &context.authorization,
+                        &context.referer,
+                        &context.user_agent,
+                    ]
+                    .into_iter()
+                    .flatten()
+                    {
+                        if value.len() > 16 * 1024 || value.chars().any(char::is_control) {
+                            return Err("Invalid browser request header.".into());
+                        }
+                    }
+                }
                 if item
                     .expected_mime
                     .as_ref()
@@ -259,7 +287,8 @@ pub fn validate_request(request: &NativeRequest) -> Result<(), String> {
             || request.params.connections.is_some()
             || request.params.queue.is_some()
             || request.params.start_paused.is_some()
-            || request.params.scheduled_for.is_some())
+            || request.params.scheduled_for.is_some()
+            || request.params.speed_limit_bps.is_some())
     {
         return Err("Download options are only accepted by addDownloads.".into());
     }
@@ -312,6 +341,7 @@ mod tests {
                     expected_mime: None,
                     expected_sha256: None,
                     request_headers: None,
+                    request_context: None,
                 }],
                 ..NativeParams::default()
             },

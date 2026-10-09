@@ -38,10 +38,23 @@ Click the toolbar icon to see live transfers and pause, resume, retry, or cancel
 - Paste one or several HTTP(S) URLs.
 - Choose **This page** to scan links and media on demand, then search, filter, and select downloads.
 - Use **Transfer options** to choose up to 32 connections, an existing queue, a paused start, or a future start time. Fetchrail adapts ranges to file size and server support.
+- Set a per-file speed limit in KiB/s in **Transfer options**; zero means unlimited. The desktop app's total limit also applies.
 - Right-click a link and choose **Download with Fetchrail**, or right-click a page and choose **Choose downloads with Fetchrail**.
 - Choose **Open in a tab** to keep the companion available while browsing.
 
 Connection and queue preferences are saved locally in the browser. The companion follows the desktop app's theme and accent and shows each transfer's individual connections when expanded.
+
+## Multi-step download pages
+
+Choose **Browse download pages**, paste page URLs and click **Browse pages**. You can also select page links in **This page** and click **Browse selected download pages**. Grant the optional HTTP(S) browser access when prompted so the companion can associate the final file request with the batch's tab, including popups and redirects.
+
+The batch opens one page at a time. **Follow a single clear download button automatically** follows visible controls such as Download, Free download and Generate download link, waiting for disabled countdown buttons to become available. It pauses automation when there are several candidates or a CAPTCHA and stops after 20 automatic steps per item. Continue those steps manually; the companion captures the final file regardless of how many pages you visited.
+
+Captured batch files inherit the queue, connections, speed cap and start time chosen before the batch started. Successful verification advances the batch without opening a separate confirmation window. A failed handoff resumes the browser transfer and keeps the current item available for retry or skipping. **Reopen page**, **Skip item** and **Stop batch** are in the companion. A stopped batch leaves its accepted transfers in Fetchrail.
+
+Enable **Use browser session for captured files** for cookie-dependent downloads. This forwards only the observed final GET's Cookie, Referer, User-Agent and Authorization headers when the browser exposes them. This local build keeps credentials in memory and omits them from history, UI events and bridge responses. Authenticated transfers need a refreshed browser link/session after desktop restart. Credential-bearing requests cannot follow cross-origin redirects. Temporary request observations remain in browser session storage and expire after two minutes.
+
+The companion needs one reload to pick up its new `webRequest` permission. Optional website access is requested by the Browse pages action or session switch. Regular page scanning continues to use `activeTab`.
 
 ## Automatic download routing
 
@@ -51,8 +64,9 @@ For an eligible browser download, the companion:
 
 1. Pauses the browser's HTTP(S) transfer.
 2. Asks Fetchrail to verify a GET request against the browser's known size and content type.
-3. Hands the accepted transfer to Fetchrail's default queue and cancels the browser copy.
-4. Opens **Download file info** so you can confirm the category, folder, and filename, then start, keep for later, or cancel the download.
+3. Durably records a paused, idempotent engine transfer, then cancels the browser copy.
+4. Commits the ownership handoff; interrupted or lost replies are reconciled from the browser journal.
+5. Opens **Download file info** so you can confirm the category, folder, and filename, then start, keep for later, or cancel the download.
 
 The caught transfer waits paused for that confirmation. Closing its information window cancels it.
 
@@ -62,7 +76,7 @@ Host errors, rejected verification, and cancellation failures restore the browse
 
 Blob/data URLs, private downloads, browser-flagged unsafe files, and downloads initiated by other extensions stay in the browser.
 
-The integration does not forward cookies, Authorization, Referrer, POST bodies, or browser session credentials. Downloads requiring them often fail verification and continue in the browser. For sites with one-time links or session-dependent requests, disable automatic routing.
+Session support is off until explicitly enabled. POST bodies, blob/data files, protected streams and credentials hidden by the browser cannot be replayed. One-time links can fail verification or expire before a scheduled start; those transfers remain in the browser or require reopening their download page. The batch follows clear download controls; it cannot infer arbitrary site-specific buttons or bypass login/CAPTCHA steps.
 
 Size and content type are compatibility checks, not cryptographic identity checks. A one-time URL or resource that changes after verification can still fail in the engine. Page scanning does not provide support for protected streaming formats.
 
