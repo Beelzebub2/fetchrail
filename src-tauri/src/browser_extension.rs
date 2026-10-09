@@ -10,7 +10,8 @@ use winreg::{enums::HKEY_CURRENT_USER, RegKey};
 
 #[cfg(windows)]
 use crate::native_host::{
-    CHROMIUM_EXTENSION_ID, FIREFOX_EXTENSION_ID, LEGACY_FIREFOX_EXTENSION_ID,
+    CHROMIUM_EXTENSION_ID, CHROMIUM_STORE_EXTENSION_ID, FIREFOX_EXTENSION_ID,
+    LEGACY_FIREFOX_EXTENSION_ID,
 };
 
 // These files travel inside fetchrail.exe, so the companion does not depend on a checkout.
@@ -66,7 +67,10 @@ fn native_host_manifests(executable: &Path) -> [serde_json::Value; 2] {
             "description": "Fetchrail browser integration",
             "path": executable,
             "type": "stdio",
-            "allowed_origins": [format!("chrome-extension://{CHROMIUM_EXTENSION_ID}/")]
+            "allowed_origins": [
+                format!("chrome-extension://{CHROMIUM_EXTENSION_ID}/"),
+                format!("chrome-extension://{CHROMIUM_STORE_EXTENSION_ID}/")
+            ]
         }),
         json!({
             "name": NATIVE_HOST_NAME,
@@ -282,9 +286,15 @@ mod tests {
         assert_eq!(chromium["path"], r"C:\Apps\Fetchrail.exe");
         assert_eq!(firefox["path"], r"C:\Apps\Fetchrail.exe");
         assert_eq!(
-            chromium["allowed_origins"][0],
-            format!("chrome-extension://{CHROMIUM_EXTENSION_ID}/")
+            chromium["allowed_origins"],
+            serde_json::json!([
+                format!("chrome-extension://{CHROMIUM_EXTENSION_ID}/"),
+                format!("chrome-extension://{CHROMIUM_STORE_EXTENSION_ID}/")
+            ])
         );
-        assert_eq!(firefox["allowed_extensions"][0], FIREFOX_EXTENSION_ID);
+        assert_eq!(
+            firefox["allowed_extensions"],
+            serde_json::json!([FIREFOX_EXTENSION_ID, LEGACY_FIREFOX_EXTENSION_ID])
+        );
     }
 }
