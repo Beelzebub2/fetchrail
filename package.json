@@ -1,0 +1,43 @@
+{
+  "name": "braid",
+  "private": true,
+  "version": "0.5.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "node browser-extension/build.mjs && tsc && vite build",
+    "browser:build": "node browser-extension/build.mjs",
+    "browser:host": "npm run build && cargo build --manifest-path src-tauri/Cargo.toml --release --bin braid --features tauri/custom-protocol --locked",
+    "browser:install": "powershell -ExecutionPolicy Bypass -File scripts/install-browser-host.ps1",
+    "browser:uninstall": "powershell -ExecutionPolicy Bypass -File scripts/uninstall-browser-host.ps1",
+    "browser:test": "node scripts/test-native-host.mjs",
+    "browser:check": "node scripts/test-extension.mjs && node scripts/test-extension-routing.mjs",
+    "engine:test": "node scripts/test-downloads.mjs",
+    "setup:test": "node scripts/test-setup.mjs",
+    "release:check": "node scripts/check-release.mjs",
+    "release:build": "cargo build --manifest-path src-tauri/Cargo.toml --release --bin braid --features tauri/custom-protocol --locked",
+    "release:package": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/package-release.ps1",
+    "icons": "node scripts/make-icons.mjs",
+    "preview": "vite preview",
+    "tauri": "tauri"
+  },
+  "dependencies": {
+    "@fontsource-variable/bricolage-grotesque": "^5.3.0",
+    "@fontsource-variable/geist": "^5.3.0",
+    "@fontsource-variable/geist-mono": "^5.3.0",
+    "@tauri-apps/api": "^2",
+    "@tauri-apps/plugin-dialog": "^2",
+    "@tauri-apps/plugin-opener": "^2",
+    "lucide-react": "^0.548.0",
+    "react": "^19.1.0",
+    "react-dom": "^19.1.0"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2",
+    "@types/react": "^19.1.8",
+    "@types/react-dom": "^19.1.6",
+    "@vitejs/plugin-react": "^6.0.2",
+    "typescript": "~6.0.3",
+    "vite": "^8.0.16"
+  }
+}

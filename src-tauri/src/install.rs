@@ -1,0 +1,473 @@
+//! Installing, updating and removing Braid.
+//!
+//! The setup program is this same executable: under a file name containing "setup" (or with
+//! `--setup`) it copies itself into place and adds shortcuts and an uninstall entry; with
+//! `--uninstall` it takes all of that away again. The installed copy replaces itself with
+//! signed updates.
+
+use std::{
+    fs,
+    net::TcpStream,
+    os::windows::process::CommandExt,
+    path::{Path, PathBuf},
+    process::Command,
+    sync::Mutex,
+    time::{Duration, Instant},
+};
+
+use serde::{Deserialize, Serialize};
+use tauri::{AppHandle, Emitter, Manager};
+use tauri_plugin_updater::UpdaterExt;
+use windows::{
+    core::{Interface, GUID, HSTRING},
+    Win32::{
+        System::Com::{
+            CoCreateInstance, CoInitializeEx, CoTaskMemFree, IPersistFile, CLSCTX_INPROC_SERVER,
+            COINIT_APARTMENTTHREADED,
+        },
+        UI::Shell::{
+            FOLDERID_Desktop, FOLDERID_LocalAppData, FOLDERID_Programs, FOLDERID_RoamingAppData,
+            FOLDERID_UserProgramFiles, IShellLinkW, SHGetKnownFolderPath, ShellLink,
+            KF_FLAG_DEFAULT,
+        },
+    },
+};
+use winreg::{
+    enums::{HKEY_CURRENT_USER, KEY_SET_VALUE},
+    RegKey,
+};
+
+const EXE_NAME: &str = "Braid.exe";
+const APP_DATA_FOLDER: &str = "com.rrmtools.braid";
+const UNINSTALL_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Uninstall\Braid";
+const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
+const UPDATE_EVENT: &str = "braid://update-status";
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SetupMode {
+    Install,
+    Uninstall,
+}
+
+/// Whether this launch is the setup program rather than the app.
+pub fn setup_mode() -> Option<SetupMode> {
+    setup_mode_for(&std::env::current_exe().ok()?, std::env::args().skip(1))
+}
+
+fn setup_mode_for(exe: &Path, args: impl IntoIterator<Item = String>) -> Option<SetupMode> {
+    let args = args.into_iter().collect::<Vec<_>>();
+    let has = |flag: &str| args.iter().any(|argument| argument == flag);
+    // `--quit` is a message for a running app, whichever file sends it.
+    if has("--quit") {
+        return None;
+    }
+    if has("--uninstall") {
+        return Some(SetupMode::Uninstall);
+    }
+    let named_setup = exe
+        .file_stem()?
+        .to_string_lossy()
+        .to_ascii_lowercase()
+        .contains("setup");
+    (named_setup || has("--setup")).then_some(SetupMode::Install)
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InstallOptions {
+    pub dir: String,
+    pub desktop_shortcut: bool,
+}
+
+fn known_folder(id: &GUID) -> Result<PathBuf, String> {
+    // SAFETY: the shell allocates the returned string; it is copied and then freed exactly once.
+    unsafe {
+        let raw =
+            SHGetKnownFolderPath(id, KF_FLAG_DEFAULT, None).map_err(|error| error.to_string())?;
+        let path = raw.to_string().map_err(|error| error.to_string());
+        CoTaskMemFree(Some(raw.as_ptr().cast()));
+        path.map(PathBuf::from)
+    }
+}
+
+pub fn default_dir() -> Result<PathBuf, String> {
+    Ok(known_folder(&FOLDERID_UserProgramFiles)?.join("Braid"))
+}
+
+/// Where setup last installed Braid, if it did.
+pub fn installed_dir() -> Option<PathBuf> {
+    RegKey::predef(HKEY_CURRENT_USER)
+        .open_subkey(UNINSTALL_KEY)
+        .ok()?
+        .get_value::<String, _>("InstallLocation")
+        .ok()
+        .map(PathBuf::from)
+}
+
+/// Only a copy that setup put in place replaces itself with updates.
+pub fn is_installed_copy() -> bool {
+    let exe = std::env::current_exe().ok();
+    let folder = exe.as_deref().and_then(Path::parent);
+    folder.is_some() && folder == installed_dir().as_deref()
+}
+
+pub fn has_desktop_shortcut() -> bool {
+    known_folder(&FOLDERID_Desktop).is_ok_and(|desktop| desktop.join("Braid.lnk").exists())
+}
+
+fn create_shortcut(link: &Path, target: &Path) -> Result<(), String> {
+    // SAFETY: ordinary COM calls on objects created and released inside this block.
+    let saved: windows::core::Result<()> = unsafe {
+        // Another caller may have set this thread up already; either way COM is usable after this.
+        let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+        (|| {
+            let shortcut: IShellLinkW = CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER)?;
+            shortcut.SetPath(&HSTRING::from(target.as_os_str()))?;
+            if let Some(folder) = target.parent() {
+                shortcut.SetWorkingDirectory(&HSTRING::from(folder.as_os_str()))?;
+            }
+            shortcut.SetDescription(&HSTRING::from("Braid download manager"))?;
+            shortcut
+                .cast::<IPersistFile>()?
+                .Save(&HSTRING::from(link.as_os_str()), true)
+        })()
+    };
+    saved.map_err(|error| format!("Could not create {}: {error}", link.display()))
+}
+
+fn register(dir: &Path) -> std::io::Result<()> {
+    let exe = dir.join(EXE_NAME);
+    let (key, _) = RegKey::predef(HKEY_CURRENT_USER).create_subkey(UNINSTALL_KEY)?;
+    key.set_value("DisplayName", &"Braid")?;
+    key.set_value("DisplayVersion", &env!("CARGO_PKG_VERSION"))?;
+    key.set_value("Publisher", &"RRMTools")?;
+    key.set_value("DisplayIcon", &exe.to_string_lossy().as_ref())?;
+    key.set_value("InstallLocation", &dir.to_string_lossy().as_ref())?;
+    key.set_value(
+        "UninstallString",
+        &format!("\"{}\" --uninstall", exe.display()),
+    )?;
+    key.set_value(
+        "QuietUninstallString",
+        &format!("\"{}\" --uninstall --silent", exe.display()),
+    )?;
+    key.set_value("NoModify", &1u32)?;
+    key.set_value("NoRepair", &1u32)?;
+    let kilobytes = fs::metadata(&exe).map_or(0, |file| file.len() / 1024);
+    key.set_value("EstimatedSize", &(kilobytes as u32))
+}
+
+/// Puts a new executable in place. A running executable cannot be overwritten, but it can be
+/// renamed aside, so the old one is parked next to it until the next start removes it.
+fn replace_file(
+    target: &Path,
+    write: impl FnOnce(&Path) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    let fresh = target.with_extension("new.exe");
+    let parked = target.with_extension("old.exe");
+    write(&fresh)?;
+    if target.exists() {
+        let _ = fs::remove_file(&parked);
+        fs::rename(target, &parked)?;
+    }
+    fs::rename(&fresh, target).inspect_err(|_| {
+        let _ = fs::rename(&parked, target);
+    })
+}
+
+/// Asks a running Braid to quit and waits until its browser bridge stops answering.
+fn stop_running() -> Result<(), String> {
+    let running = || {
+        crate::native_host::bridge_port().is_some_and(|port| {
+            TcpStream::connect_timeout(&([127, 0, 0, 1], port).into(), Duration::from_millis(300))
+                .is_ok()
+        })
+    };
+    if !running() {
+        return Ok(());
+    }
+    let exe = std::env::current_exe().map_err(|error| error.to_string())?;
+    let _ = Command::new(exe).arg("--quit").spawn();
+    let deadline = Instant::now() + Duration::from_secs(8);
+    while running() {
+        if Instant::now() > deadline {
+            return Err(
+                "Braid is still running. Quit it from its tray icon, then try again.".into(),
+            );
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    Ok(())
+}
+
+/// Copies this executable into `options.dir` and registers it with Windows. Returns the installed executable.
+pub fn install(options: &InstallOptions) -> Result<PathBuf, String> {
+    let dir = PathBuf::from(options.dir.trim());
+    if !dir.is_absolute() {
+        return Err("Choose a full folder path.".into());
+    }
+    let source = std::env::current_exe().map_err(|error| error.to_string())?;
+    let target = dir.join(EXE_NAME);
+    stop_running()?;
+    fs::create_dir_all(&dir).map_err(|error| format!("Could not create the folder: {error}"))?;
+    if source != target {
+        replace_file(&target, |fresh| fs::copy(&source, fresh).map(drop))
+            .map_err(|error| format!("Could not copy Braid into place: {error}"))?;
+    }
+    create_shortcut(
+        &known_folder(&FOLDERID_Programs)?.join("Braid.lnk"),
+        &target,
+    )?;
+    let desktop = known_folder(&FOLDERID_Desktop)?.join("Braid.lnk");
+    if options.desktop_shortcut {
+        create_shortcut(&desktop, &target)?;
+    } else {
+        let _ = fs::remove_file(desktop);
+    }
+    register(&dir).map_err(|error| format!("Could not register Braid with Windows: {error}"))?;
+    Ok(target)
+}
+
+/// Removes what `install` added. Downloads are never touched; history and settings only on request.
+pub fn uninstall(remove_data: bool) -> Result<(), String> {
+    let dir = installed_dir().ok_or("Braid is not installed.")?;
+    stop_running()?;
+    for folder in [&FOLDERID_Programs, &FOLDERID_Desktop] {
+        if let Ok(folder) = known_folder(folder) {
+            let _ = fs::remove_file(folder.join("Braid.lnk"));
+        }
+    }
+    let current_user = RegKey::predef(HKEY_CURRENT_USER);
+    if let Ok(run) = current_user.open_subkey_with_flags(RUN_KEY, KEY_SET_VALUE) {
+        let _ = run.delete_value("Braid");
+    }
+    crate::browser_extension::remove_native_host();
+    let _ = current_user.delete_subkey(UNINSTALL_KEY);
+
+    // A running program cannot delete itself, so a detached shell finishes a moment after this
+    // process has gone. It removes only what setup wrote: a folder shared with other files survives.
+    let mut script = format!(
+        "ping -n 5 127.0.0.1 >nul & del /f /q \"{0}\\Braid.exe\" \"{0}\\Braid.old.exe\" \"{0}\\Braid.new.exe\" & rmdir \"{0}\"",
+        dir.display()
+    );
+    if remove_data {
+        for folder in [&FOLDERID_RoamingAppData, &FOLDERID_LocalAppData] {
+            let data = known_folder(folder)?.join(APP_DATA_FOLDER);
+            script.push_str(&format!(" & rmdir /s /q \"{}\"", data.display()));
+        }
+    }
+    Command::new("cmd")
+        .raw_arg(format!("/c \"{script}\""))
+        .creation_flags(CREATE_NO_WINDOW)
+        .spawn()
+        .map_err(|error| format!("Could not finish removing Braid: {error}"))?;
+    Ok(())
+}
+
+/// Setup without a window, for scripts: `--silent`, optionally `--dir <folder>`.
+pub fn run_silent(mode: SetupMode) -> Result<(), String> {
+    match mode {
+        SetupMode::Install => {
+            let mut args = std::env::args().skip_while(|argument| argument != "--dir");
+            let dir = match args.nth(1) {
+                Some(dir) => PathBuf::from(dir),
+                None => installed_dir().map_or_else(default_dir, Ok)?,
+            };
+            install(&InstallOptions {
+                dir: dir.to_string_lossy().into_owned(),
+                // Nobody is asked, so an existing shortcut stays and none is added.
+                desktop_shortcut: has_desktop_shortcut(),
+            })
+            .map(drop)
+        }
+        SetupMode::Uninstall => uninstall(false),
+    }
+}
+
+/// Starts the installed app once setup is done.
+pub fn launch(launch_on_start: bool) -> Result<(), String> {
+    let exe = installed_dir()
+        .ok_or("Braid is not installed.")?
+        .join(EXE_NAME);
+    let mut command = Command::new(exe);
+    if launch_on_start {
+        command.arg("--launch-on-start");
+    }
+    command
+        .spawn()
+        .map(drop)
+        .map_err(|error| format!("Could not start Braid: {error}"))
+}
+
+/// Run by the installed app at start: clears the executable an update parked and keeps the
+/// version Windows shows in step with the one that is running.
+pub fn tidy_after_update() {
+    let (Ok(exe), Some(dir)) = (std::env::current_exe(), installed_dir()) else {
+        return;
+    };
+    if exe.parent() == Some(dir.as_path()) {
+        let _ = fs::remove_file(exe.with_extension("old.exe"));
+        let _ = register(&dir);
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "state", rename_all = "camelCase")]
+pub enum UpdateStatus {
+    /// This copy was not put in place by setup, so it does not replace itself.
+    Unmanaged,
+    Idle,
+    Checking,
+    Downloading {
+        version: String,
+        percent: u8,
+    },
+    /// The new version is in place and runs from the next start.
+    Ready {
+        version: String,
+    },
+    Current,
+    Failed {
+        message: String,
+    },
+}
+
+pub struct Updates(Mutex<UpdateStatus>);
+
+impl Updates {
+    pub fn new() -> Self {
+        Self(Mutex::new(if is_installed_copy() {
+            UpdateStatus::Idle
+        } else {
+            UpdateStatus::Unmanaged
+        }))
+    }
+
+    pub fn status(&self) -> UpdateStatus {
+        self.0.lock().expect("update status poisoned").clone()
+    }
+}
+
+fn publish(app: &AppHandle, status: UpdateStatus) {
+    *app.state::<Updates>()
+        .0
+        .lock()
+        .expect("update status poisoned") = status.clone();
+    let _ = app.emit(UPDATE_EVENT, status);
+}
+
+/// Looks for a newer signed release and, when there is one, downloads it and swaps it in.
+pub async fn check_for_update(app: &AppHandle) -> UpdateStatus {
+    let current = app.state::<Updates>().status();
+    if matches!(
+        current,
+        UpdateStatus::Unmanaged
+            | UpdateStatus::Checking
+            | UpdateStatus::Downloading { .. }
+            | UpdateStatus::Ready { .. }
+    ) {
+        return current;
+    }
+    publish(app, UpdateStatus::Checking);
+    let outcome = async {
+        let updater = app.updater().map_err(|error| error.to_string())?;
+        let Some(update) = updater.check().await.map_err(|error| error.to_string())? else {
+            return Ok(UpdateStatus::Current);
+        };
+        let version = update.version.clone();
+        let (mut received, mut shown) = (0u64, u8::MAX);
+        // The plugin checks the download against the release signature before handing it over.
+        let bytes = update
+            .download(
+                |chunk, total| {
+                    received += chunk as u64;
+                    let percent = total
+                        .filter(|total| *total > 0)
+                        .map_or(0, |total| (received * 100 / total).min(100) as u8);
+                    if percent != shown {
+                        shown = percent;
+                        publish(
+                            app,
+                            UpdateStatus::Downloading {
+                                version: version.clone(),
+                                percent,
+                            },
+                        );
+                    }
+                },
+                || {},
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        let exe = std::env::current_exe().map_err(|error| error.to_string())?;
+        tauri::async_runtime::spawn_blocking(move || {
+            replace_file(&exe, |fresh| fs::write(fresh, &bytes))
+        })
+        .await
+        .map_err(|error| error.to_string())?
+        .map_err(|error| format!("Could not put the update in place: {error}"))?;
+        Ok(UpdateStatus::Ready { version })
+    }
+    .await;
+    let status = outcome.unwrap_or_else(|message: String| UpdateStatus::Failed { message });
+    publish(app, status.clone());
+    status
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn setup_is_chosen_by_file_name_and_flags() {
+        let mode = |exe: &str, args: &[&str]| {
+            setup_mode_for(Path::new(exe), args.iter().map(|a| a.to_string()))
+        };
+        assert_eq!(mode(r"C:\Apps\Braid.exe", &[]), None);
+        assert_eq!(mode(r"C:\Apps\Braid.exe", &["--background"]), None);
+        assert_eq!(
+            mode(r"C:\Downloads\Braid-Setup-v0.5.0-windows-x64.exe", &[]),
+            Some(SetupMode::Install)
+        );
+        assert_eq!(
+            mode(r"C:\Apps\Braid.exe", &["--setup"]),
+            Some(SetupMode::Install)
+        );
+        assert_eq!(
+            mode(r"C:\Apps\Braid.exe", &["--uninstall", "--silent"]),
+            Some(SetupMode::Uninstall)
+        );
+        assert_eq!(
+            mode(r"C:\Downloads\Braid-Setup.exe", &["--quit"]),
+            None,
+            "a quit request goes to the running app, not to setup"
+        );
+    }
+
+    #[test]
+    fn a_new_executable_replaces_the_old_one_and_parks_it() {
+        let dir = std::env::temp_dir().join(format!("braid-swap-test-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        let target = dir.join(EXE_NAME);
+        replace_file(&target, |fresh| fs::write(fresh, b"one")).unwrap();
+        assert_eq!(fs::read(&target).unwrap(), b"one");
+        assert!(!dir.join("Braid.old.exe").exists());
+
+        replace_file(&target, |fresh| fs::write(fresh, b"two")).unwrap();
+        replace_file(&target, |fresh| fs::write(fresh, b"three")).unwrap();
+        assert_eq!(fs::read(&target).unwrap(), b"three");
+        assert_eq!(fs::read(dir.join("Braid.old.exe")).unwrap(), b"two");
+
+        let failed = replace_file(&target, |_| Err(std::io::Error::other("disk full")));
+        assert!(failed.is_err());
+        assert_eq!(
+            fs::read(&target).unwrap(),
+            b"three",
+            "a failed download leaves the working executable alone"
+        );
+        assert!(!dir.join("Braid.new.exe").exists());
+        fs::remove_dir_all(dir).unwrap();
+    }
+}

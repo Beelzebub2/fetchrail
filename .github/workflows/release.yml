@@ -1,0 +1,89 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  windows:
+    name: Windows x64
+    runs-on: windows-2022
+    timeout-minutes: 45
+    permissions:
+      contents: write
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '24'
+          cache: npm
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
+        with:
+          toolchain: stable
+          components: rustfmt
+      - name: Check release version
+        run: node scripts/check-release.mjs "$env:GITHUB_REF_NAME"
+      - name: Install frontend dependencies
+        run: npm ci
+      - name: Build frontend and extensions
+        run: npm run build
+      - name: Check extension behaviour
+        run: npm run browser:check
+      - name: Check Rust formatting
+        run: cargo fmt --manifest-path src-tauri/Cargo.toml -- --check
+      - name: Run Rust tests
+        run: cargo test --manifest-path src-tauri/Cargo.toml --locked
+      - name: Build Windows executable
+        run: npm run release:build
+      - name: Check bundled interface and native bridge
+        run: |
+          $app = Start-Process -FilePath "$PWD/src-tauri/target/release/braid.exe" -ArgumentList '--background' -WindowStyle Hidden -PassThru
+          try {
+            $config = Join-Path $env:APPDATA 'com.rrmtools.braid/browser-bridge.json'
+            $deadline = (Get-Date).AddSeconds(45)
+            while (-not (Test-Path -LiteralPath $config)) {
+              if ($app.HasExited -or (Get-Date) -ge $deadline) { throw 'Braid did not start its browser bridge.' }
+              Start-Sleep -Milliseconds 250
+            }
+            npm run browser:test -- --frontend
+            if ($LASTEXITCODE -ne 0) { throw 'Bundled interface startup check failed.' }
+          } finally {
+            if (-not $app.HasExited) { Stop-Process -Id $app.Id -Force; $app.WaitForExit() }
+          }
+      - name: Test real multi-connection transfers
+        run: npm run engine:test
+      - name: Test setup and removal
+        run: npm run setup:test
+      - name: Package and sign release
+        env:
+          # Installed copies only accept updates signed with this key.
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+        run: |
+          if (-not $env:TAURI_SIGNING_PRIVATE_KEY) { throw 'The TAURI_SIGNING_PRIVATE_KEY secret is missing.' }
+          ./scripts/package-release.ps1 -Tag "$env:GITHUB_REF_NAME"
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $tag = $env:GITHUB_REF_NAME
+          $assets = @("release-artifacts/Braid-Setup-$tag-windows-x64.exe", "release-artifacts/Braid-Setup-$tag-windows-x64.sha256", "release-artifacts/latest.json")
+          gh release view $tag --repo "$env:GITHUB_REPOSITORY" *> $null
+          if ($LASTEXITCODE -eq 0) {
+            gh release upload $tag @assets --clobber --repo "$env:GITHUB_REPOSITORY"
+          } else {
+            gh release create $tag @assets --verify-tag --title "Braid $tag" --generate-notes --repo "$env:GITHUB_REPOSITORY"
+          }
+          if ($LASTEXITCODE -ne 0) { throw 'Release publication failed.' }

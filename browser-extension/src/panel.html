@@ -1,0 +1,80 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Braid · Download companion</title>
+  <link rel="icon" href="icon.svg" />
+  <link rel="stylesheet" href="panel.css" />
+</head>
+<body>
+  <main class="shell">
+    <header>
+      <img src="icon.svg" width="28" height="28" alt="" />
+      <h1>Braid</h1>
+      <button id="connection" class="connection" title="Check connection"><span class="dot"></span><span id="connection-text">Connecting…</span></button>
+      <button id="open-app" class="text-button">Open app <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 7h10v10M7 17 17 7"/></svg></button>
+      <button id="expand" class="icon-button" title="Open in a tab" aria-label="Open in a tab"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M15 3h6v6M21 3l-7 7M3 21l7-7M9 21H3v-6"/></svg></button>
+    </header>
+    <p id="notice" role="status" hidden></p>
+    <section id="offline" hidden>
+      <img class="offline-mark" src="icon.svg" width="64" height="64" alt="" />
+      <h2>Can't reach Braid</h2>
+      <p>Trying again starts the desktop app if it is installed.</p>
+      <button id="retry" class="primary">Try again</button>
+    </section>
+    <nav class="tabs" aria-label="Companion views">
+      <button data-view="downloads" aria-pressed="true">Downloads <span id="download-count">0</span></button>
+      <button data-view="links" aria-pressed="false">This page <span id="link-count">0</span></button>
+    </nav>
+    <section id="downloads-view">
+      <form id="add-form" class="add-field">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M10 13a5 5 0 0 0 7.5.5l3-3a5 5 0 0 0-7-7l-1.8 1.7M14 11a5 5 0 0 0-7.5-.5l-3 3a5 5 0 0 0 7 7l1.7-1.7"/></svg>
+        <textarea id="urls" rows="1" placeholder="Paste one or more links" aria-label="Download URLs, one per line" required spellcheck="false"></textarea>
+        <button id="add" class="primary" type="submit">Download</button>
+      </form>
+      <div class="stats" aria-label="Download statistics">
+        <div><span class="caption">Downloading now</span><div class="hero"><strong id="speed">0</strong><span id="speed-unit">MB/s</span></div></div>
+        <div class="stats-side"><span><span id="active">0</span> running · <span id="queued">0</span> waiting</span><select id="status-filter" aria-label="Filter downloads"><option value="all">Recent</option><option value="active">Active</option><option value="paused">Paused</option><option value="failed">Failed</option><option value="completed">Completed</option></select></div>
+      </div>
+      <div id="downloads" class="scroll"><p class="empty">Connect to Braid to see your downloads.</p></div>
+      <p id="list-note" class="list-note" hidden></p>
+    </section>
+    <section id="links-view" hidden>
+      <div class="section-head"><h2>Links on this page</h2><button id="scan" class="text-button"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M21 12a9 9 0 1 1-2.6-6.4L21 8M21 3v5h-5"/></svg> Rescan</button></div>
+      <div class="link-tools"><input id="link-search" type="search" placeholder="Search links or file types" aria-label="Search page links" /><select id="link-filter" aria-label="Filter page links"><option value="files">Files & media</option><option value="all">All links</option></select></div>
+      <div class="selection-row"><label><input id="select-all" type="checkbox" /> Select visible</label><span id="selection-count">0 selected</span></div>
+      <div id="links" class="scroll"><p class="empty">Scan a page to choose files to download.</p></div>
+    </section>
+    <div class="action-bar">
+      <label class="capture"><span>Send browser downloads to Braid</span><input id="automatic-downloads" class="switch" type="checkbox" checked /></label>
+      <details class="transfer-options">
+        <summary><span id="options-summary">Default queue · default connections · starts now</span><b></b></summary>
+        <label class="option-row">Connections <select id="connections" aria-label="Connections"><option value="0">App default</option><option value="1">Up to 1</option><option value="2">Up to 2</option><option value="4">Up to 4</option><option value="8">Up to 8</option><option value="16">Up to 16</option><option value="32">Up to 32</option></select></label>
+        <label class="option-row">Queue <select id="queue" aria-label="Queue"><option>Default</option></select></label>
+        <label class="option-row">Start <select id="start" aria-label="Start"><option value="now">Immediately</option><option value="paused">Paused</option><option value="scheduled">At a scheduled time</option></select></label>
+        <label id="schedule-row" class="option-row" hidden>Start time <input id="schedule" type="datetime-local" aria-label="Start time" /></label>
+        <p class="hint" id="engine-hint">Connections adapt to the file size and server support.</p>
+      </details>
+      <button id="download-selected" class="primary" disabled hidden>Download selected</button>
+    </div>
+    <footer><span>Local engine · No cloud required</span><span id="version">Braid</span></footer>
+  </main>
+  <template id="download-template">
+    <article class="transfer">
+      <button class="icon-button toggle" aria-expanded="false"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m9 6 6 6-6 6"/></svg></button>
+      <span class="file-badge" aria-hidden="true"></span>
+      <div class="transfer-name"><strong></strong><div class="transfer-meta"><span class="transfer-state"></span><span class="rate"></span></div></div>
+      <div class="transfer-actions"></div>
+      <div class="strands" role="progressbar" aria-label="Download progress" aria-valuemin="0" aria-valuemax="100"></div>
+      <div class="lanes" hidden></div>
+      <p class="transfer-error" hidden></p>
+    </article>
+  </template>
+  <template id="icon-pause"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 5v14M16 5v14"/></svg></template>
+  <template id="icon-resume"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 4l12 8-12 8z"/></svg></template>
+  <template id="icon-retry"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M21 12a9 9 0 1 1-2.6-6.4L21 8M21 3v5h-5"/></svg></template>
+  <template id="icon-cancel"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6L6 18"/></svg></template>
+  <script src="panel.js"></script>
+</body>
+</html>
