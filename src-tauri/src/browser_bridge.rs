@@ -149,6 +149,7 @@ async fn process_request(
                 "etaSeconds": record.eta_seconds,
                 "connections": record.connections,
                 "requestedConnections": record.requested_connections,
+                "activeConnections": record.segments.iter().map(|part| part.active_connections).sum::<usize>(),
                 "queue": record.queue,
                 "scheduledFor": record.scheduled_for,
                 "speedLimitBps": record.speed_limit_bps,

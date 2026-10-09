@@ -60,6 +60,7 @@ pub fn backoff(attempt: usize) -> Duration {
 
 pub struct OriginGate {
     active: AtomicUsize,
+    throttles: AtomicUsize,
     changed: Notify,
     cooldown: Mutex<Instant>,
 }
@@ -76,6 +77,7 @@ impl OriginGate {
     pub fn new() -> Self {
         Self {
             active: AtomicUsize::new(0),
+            throttles: AtomicUsize::new(0),
             changed: Notify::new(),
             cooldown: Mutex::new(Instant::now()),
         }
@@ -115,12 +117,16 @@ impl OriginGate {
         }
     }
     pub async fn cool_down(&self, duration: Duration) {
+        self.throttles.fetch_add(1, Ordering::Relaxed);
         let mut deadline = self.cooldown.lock().await;
         // An unrepresentable server delay must not cause an early retry or a panic.
         let next = Instant::now()
             .checked_add(duration)
             .unwrap_or_else(|| Instant::now() + Duration::from_secs(100 * 365 * 86_400));
         *deadline = (*deadline).max(next);
+    }
+    pub fn throttles(&self) -> usize {
+        self.throttles.load(Ordering::Relaxed)
     }
 }
 
@@ -142,32 +148,86 @@ impl Bandwidth {
 pub struct Adaptive {
     pub target: usize,
     max: usize,
-    last_rate: f64,
-    settled: bool,
+    enabled: bool,
+    baseline_target: usize,
+    baseline_rate: f64,
+    rate_sum: f64,
+    samples: usize,
+    hold_windows: usize,
+    probe_more: bool,
 }
 impl Adaptive {
     pub fn new(max: usize, enabled: bool) -> Self {
+        let max = max.max(1);
+        let target = if enabled { max.min(4) } else { max };
         Self {
-            target: if enabled { max.min(2) } else { max },
+            target,
             max,
-            last_rate: 0.0,
-            settled: !enabled,
+            enabled,
+            baseline_target: target,
+            baseline_rate: 0.0,
+            rate_sum: 0.0,
+            samples: 0,
+            hold_windows: 0,
+            probe_more: true,
         }
     }
     pub fn sample(&mut self, rate: f64, throttled: bool) {
+        if !self.enabled {
+            return;
+        }
         if throttled {
             self.target = (self.target / 2).max(1);
-            self.settled = true;
-        } else if !self.settled && rate > 0.0 {
-            if self.last_rate > 0.0 && rate < self.last_rate * 1.10 {
-                self.target = (self.target / 2).max(1);
-                self.settled = true;
+            self.baseline_target = self.target;
+            self.baseline_rate = 0.0;
+            self.rate_sum = 0.0;
+            self.samples = 0;
+            self.hold_windows = 3;
+            self.probe_more = true;
+            return;
+        }
+        if !rate.is_finite() || rate <= 0.0 {
+            return;
+        }
+        // Compare two full sampling intervals; one noisy interval must not settle the count.
+        self.rate_sum += rate;
+        self.samples += 1;
+        if self.samples < 2 {
+            return;
+        }
+        let rate = self.rate_sum / self.samples as f64;
+        self.rate_sum = 0.0;
+        self.samples = 0;
+        if self.hold_windows > 0 {
+            self.baseline_rate = rate;
+            self.hold_windows -= 1;
+            return;
+        }
+        if self.target != self.baseline_target {
+            let useful = if self.target > self.baseline_target {
+                rate >= self.baseline_rate * 1.10
             } else {
-                self.last_rate = rate;
-                self.settled = self.target == self.max;
-                self.target = (self.target * 2).min(self.max);
+                rate >= self.baseline_rate * 0.95
+            };
+            if !useful {
+                self.target = self.baseline_target;
+                self.probe_more = !self.probe_more;
+                self.hold_windows = 3;
+                return;
             }
         }
+        self.baseline_target = self.target;
+        self.baseline_rate = rate;
+        if (self.probe_more && self.target == self.max) || (!self.probe_more && self.target == 1) {
+            self.probe_more = !self.probe_more;
+            self.hold_windows = 3;
+            return;
+        }
+        self.target = if self.probe_more {
+            (self.target * 2).min(self.max)
+        } else {
+            self.target.div_ceil(2)
+        };
     }
 }
 
@@ -219,6 +279,7 @@ mod tests {
         );
         drop(first);
         gate.cool_down(Duration::from_millis(50)).await;
+        assert_eq!(gate.throttles(), 1);
         assert!(
             tokio::time::timeout(Duration::from_millis(10), gate.acquire(1, &cancel))
                 .await
@@ -255,19 +316,78 @@ mod tests {
             "a=b\r\nX: bad".into()
         )])))
         .is_err());
-        let mut auto = Adaptive::new(8, true);
+    }
+    #[test]
+    fn adaptive_compares_stable_windows_and_reverts_to_the_tested_count() {
+        let mut auto = Adaptive::new(7, true);
+        assert_eq!(auto.target, 4);
         auto.sample(100.0, false);
         assert_eq!(auto.target, 4);
-        auto.sample(103.0, false);
-        assert_eq!(auto.target, 2);
-        let mut auto = Adaptive::new(8, true);
         auto.sample(100.0, false);
-        auto.sample(200.0, false);
-        auto.sample(205.0, false);
+        assert_eq!(auto.target, 7);
+        auto.sample(20.0, false);
+        assert_eq!(
+            auto.target, 7,
+            "One noisy sample must not reduce the count."
+        );
+        auto.sample(180.0, false);
+        assert_eq!(auto.target, 4, "Revert to four, not half of seven.");
+        for rate in [0.0, f64::NAN, f64::INFINITY, -1.0] {
+            auto.sample(rate, false);
+            assert_eq!(auto.target, 4);
+        }
+    }
+    #[test]
+    fn adaptive_reduces_waste_and_rechecks_when_capacity_changes() {
+        let mut auto = Adaptive::new(8, true);
+        let mut reached_one = false;
+        for _ in 0..100 {
+            auto.sample(100.0, false);
+            reached_one |= auto.target == 1;
+            assert!((1..=8).contains(&auto.target));
+        }
+        assert!(
+            reached_one,
+            "A capped source needs fewer connections at equal speed."
+        );
+        let mut reached_maximum = false;
+        for _ in 0..100 {
+            auto.sample(auto.target as f64 * 100.0, false);
+            reached_maximum |= auto.target == 8;
+        }
+        assert!(
+            reached_maximum,
+            "A former plateau must not permanently prevent growth."
+        );
+    }
+    #[test]
+    fn adaptive_recovers_from_throttling_and_honors_manual_limits() {
+        let mut auto = Adaptive::new(8, true);
+        auto.sample(100.0, true);
+        assert_eq!(auto.target, 2);
+        auto.sample(0.0, false);
+        assert_eq!(auto.target, 2);
+        for _ in 0..8 {
+            auto.sample(auto.target as f64 * 100.0, false);
+        }
         assert_eq!(
             auto.target, 4,
-            "The highest connection count must also prove a useful gain."
+            "Resume probing after a stable cooldown recovery."
         );
+        auto.sample(400.0, false);
+        auto.sample(400.0, false);
+        assert_eq!(auto.target, 8);
+        for max in [1, 3, 32] {
+            let mut manual = Adaptive::new(max, false);
+            manual.sample(1.0, true);
+            manual.sample(1000.0, false);
+            assert_eq!(manual.target, max);
+        }
+        let mut single = Adaptive::new(1, true);
+        for _ in 0..30 {
+            single.sample(100.0, false);
+            assert_eq!(single.target, 1);
+        }
     }
     #[tokio::test]
     async fn an_extended_server_cooldown_delays_existing_waiters() {
