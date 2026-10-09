@@ -131,6 +131,7 @@ jobs:
         run: |
           node scripts/check-release.mjs "$GITHUB_REF_NAME"
           npm ci
+          npm run cws:test
           npm run browser:build
       - name: Prepare production extension package
         run: |
