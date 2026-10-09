@@ -237,7 +237,7 @@ try {
     url: base + "session-context.bin", expectedBytes: data.length, expectedMime: "application/octet-stream",
     requestContext: { cookie: "session=fetchrail-test", referer: base + "step/5", userAgent: "Fetchrail browser fixture" },
   }] });
-  assert.equal(session.accepted, 1);
+  assert.equal(browserSession.accepted, 1);
   ids.push(browserSession.ids[0]);
   assert.equal((await record(browserSession.ids[0])).requestContext, undefined, "Browser session headers must never be exposed in the bridge response.");
   app.kill(); await new Promise((done) => app.once("exit", done));
@@ -300,7 +300,7 @@ try {
     listener({ ...item });
     await waitFor(() => vm.runInContext("activeActions", context) === 0, `${browser} extension capture`);
     assert.deepEqual(events, ["pause", "search", "addDownloads", "search", "cancel", "commitHandoff", "erase"]);
-    assert.equal((await record(captured)).fileName, name);
+    assert.equal((await record(captured)).fileName, detectedName);
     assert.ok(observed.get(name).ranges.some(({ start, end }) => start === 0 && end === 0), "Capture must verify a GET before accepting the browser handoff.");
     await native("controlDownload", { downloadId: captured, action: "resume" });
     await complete(captured, 4);
@@ -463,6 +463,7 @@ try {
   assert.ok(performance.now()-limitedStart>=7500,"The 2 MiB/s bandwidth budget must be shared across both 8 MiB downloads.");
   console.log("PASS: the configured global bandwidth limit is shared across concurrent downloads");
   app.kill(); await new Promise((done)=>app.once("exit",done));
+  if (benchmarkData) settings.speedLimitBps = 0;
   await writeFile(join(stateDir,"settings.json"),JSON.stringify(settings)); await launch();
   if (benchmarkData) {
     const benchmarkHash=digest(benchmarkData);

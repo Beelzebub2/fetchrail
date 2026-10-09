@@ -125,7 +125,7 @@ async fn process_request(
                     "appVersion": env!("CARGO_PKG_VERSION"),
                     "frontendReady": app.state::<crate::FrontendReady>().0.load(std::sync::atomic::Ordering::Relaxed),
                     "frontendUrl": app.get_webview_window("main").and_then(|window| window.url().ok()).map(|url| url.to_string()),
-                    "build": "upstream-0.5.2-local.1",
+                    "build": "upstream-0.5.3-local.1",
                     "capabilities": ["addDownloads", "getDownloads", "controlDownload", "showApp", "queues", "scheduling", "connections", "getHandoff", "commitHandoff", "refreshDownload", "sessionHeaders", "sha256", "adaptive", "directWrite", "browserSessions", "speedLimits", "browserBatch"],
                     "connectionsPerDownload": settings.connections_per_download,
                     "maxConcurrentDownloads": settings.max_concurrent_downloads,

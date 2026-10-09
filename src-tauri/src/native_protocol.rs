@@ -283,7 +283,7 @@ pub fn validate_request(request: &NativeRequest) -> Result<(), String> {
     }
     if request.method != NativeMethod::AddDownloads
         && (!request.params.items.is_empty()
-            || request.params.source.is_some()
+            || (request.params.source.is_some() && request.method != NativeMethod::CommitHandoff)
             || request.params.connections.is_some()
             || request.params.queue.is_some()
             || request.params.start_paused.is_some()
@@ -291,6 +291,16 @@ pub fn validate_request(request: &NativeRequest) -> Result<(), String> {
             || request.params.speed_limit_bps.is_some())
     {
         return Err("Download options are only accepted by addDownloads.".into());
+    }
+    if request.method == NativeMethod::CommitHandoff
+        && request.params.source.as_ref().is_some_and(|source| {
+            !matches!(
+                source,
+                BrowserSource::ClickMonitor | BrowserSource::BrowserBatch
+            )
+        })
+    {
+        return Err("Invalid handoff source.".into());
     }
     if !matches!(
         request.method,
@@ -351,6 +361,33 @@ mod tests {
     #[test]
     fn accepts_http_downloads() {
         assert!(validate_request(&request("https://example.com/file.zip")).is_ok());
+    }
+
+    #[test]
+    fn commit_accepts_capture_sources_without_other_download_options() {
+        let mut req = request("https://example.com/file.zip");
+        req.method = NativeMethod::CommitHandoff;
+        req.params = NativeParams {
+            handoff_id: Some(Uuid::new_v4().to_string()),
+            auto_start: Some(false),
+            ..NativeParams::default()
+        };
+        for source in [
+            None,
+            Some(BrowserSource::ClickMonitor),
+            Some(BrowserSource::BrowserBatch),
+        ] {
+            req.params.source = source;
+            assert!(validate_request(&req).is_ok());
+        }
+        req.params.queue = Some("Default".into());
+        assert!(validate_request(&req).is_err());
+        req.params.queue = None;
+        req.params.source = Some(BrowserSource::Popup);
+        assert!(validate_request(&req).is_err());
+        req.params.source = Some(BrowserSource::ClickMonitor);
+        req.method = NativeMethod::Ping;
+        assert!(validate_request(&req).is_err());
     }
 
     #[test]
