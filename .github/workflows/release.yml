@@ -114,6 +114,9 @@ jobs:
     name: Chrome Web Store
     needs: windows
     if: startsWith(github.ref, 'refs/tags/')
+    concurrency:
+      group: chrome-web-store-publish
+      cancel-in-progress: false
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     permissions:
