@@ -6,6 +6,11 @@ on:
       - main
     tags:
       - 'v*'
+    paths-ignore:
+      - '**/*.md'
+      - 'website/**'
+      - '.gitignore'
+      - '.claude/**'
 
 permissions:
   contents: read
