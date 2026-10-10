@@ -1,6 +1,12 @@
 # Fetchrail local reliability build
 
-This branch integrates upstream `fddef19` (Fetchrail 0.5.3, including release automation) with the local reliability work in `9276416`. The application is `0.6.3-local.5` and the companion is `0.6.3`. It keeps the existing installation and profile identity. Do not publish this as an upstream release.
+This branch integrates upstream `fddef19` (Fetchrail 0.5.3, including release automation) with the local reliability work in `9276416`. The application is `0.6.3-local.6` and the companion is `0.6.3`. It keeps the existing installation and profile identity. Do not publish this as an upstream release.
+
+New direct-write staging files use sparse allocation on supported Windows volumes, avoiding physical zero-fill before high-offset writes. Unwritten regions still read as zeros; unsupported volumes retain ordinary allocation, and existing partial files retain their layout. Free-space checks, durable range hashes, full-file checksum verification and Windows attachment checks remain in place. See [Microsoft's sparse-file operations](https://learn.microsoft.com/en-us/windows/win32/fileio/sparse-file-operations).
+
+Sparse staging allocates physical space as data arrives rather than reserving the full file upfront. Concurrent downloads or other programs can fill the disk after the initial check; write errors still prevent publication, and space must be freed before resuming.
+
+Durable JSON creation, writing, syncing and metadata replacement run together on the blocking pool, so a slow Windows metadata move cannot block the async task polling the range workers. Backup-before-primary ordering is retained. Destination collision checks also use asynchronous metadata operations; final publication still refuses to overwrite existing files. See [Tokio's filesystem guidance](https://docs.rs/tokio/1.53.1/tokio/fs/index.html).
 
 The upstream interface, progress windows, completion options, batch browsing, per-file/global byte-per-second limits, queue start/stop windows and Chrome Web Store host support are retained. Durable checkpoints, direct staging, no-replace publication and idempotent browser handoff keep the local implementation. Existing settings survive migration; the new upstream settings use safe defaults. If both the existing KiB/s limit and new byte-per-second limit are configured, both apply. Browser credentials remain session-only: after desktop restart, refresh the link/session before resuming an authenticated download.
 

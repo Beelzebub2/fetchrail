@@ -1512,13 +1512,7 @@ impl DownloadManager {
                 Uuid::new_v4(),
                 task.record.read().await.id
             ));
-            let output = fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&stage)
-                .await?;
-            output.set_len(total).await?;
-            output.sync_all().await?;
+            storage::create_stage(&stage, total).await?;
             manifest.direct_path = Some(stage);
             manifest.committed = vec![0; ranges.len()];
             manifest.hashes = vec![None; ranges.len()];
@@ -3026,7 +3020,7 @@ async fn segment_counters(part_dir: &Path, ranges: &[ByteRange]) -> EngineResult
 
 async fn unique_destination(directory: &Path, file_name: &str) -> PathBuf {
     let candidate = directory.join(file_name);
-    if !candidate.exists() {
+    if !fs::try_exists(&candidate).await.unwrap_or(false) {
         return candidate;
     }
 
@@ -3042,7 +3036,7 @@ async fn unique_destination(directory: &Path, file_name: &str) -> PathBuf {
             None => format!("{stem} ({index})"),
         };
         let candidate = directory.join(name);
-        if !candidate.exists() {
+        if !fs::try_exists(&candidate).await.unwrap_or(false) {
             return candidate;
         }
     }
