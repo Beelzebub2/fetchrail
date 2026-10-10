@@ -1681,6 +1681,9 @@ impl DownloadManager {
         let mut last_waits = origin.waits();
         let mut pending = (0..segments.len()).collect::<std::collections::VecDeque<_>>();
         let batch = cancel.child_token();
+        let tail_rate = AtomicU64::new(0);
+        let mut previous_peer_rate = 0.0_f64;
+        let mut best_peer_rate = 0.0_f64;
         let mut active = FuturesUnordered::new();
         let mut sample = interval(Duration::from_secs(4));
         sample.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -1701,6 +1704,7 @@ impl DownloadManager {
                 let mut client = clients[slot].clone();
                 let segment = &segments[index];
                 let batch = &batch;
+                let tail_rate = &tail_rate;
                 active.push(async move {
                     let result = self
                         .download_with_retries(
@@ -1712,6 +1716,7 @@ impl DownloadManager {
                             index,
                             segment,
                             probe,
+                            tail_rate,
                         )
                         .await;
                     (slot, client, result)
@@ -1739,6 +1744,15 @@ impl DownloadManager {
                     let throttles = origin.throttles();
                     let throttled = throttles != last_throttles;
                     let waits = origin.waits();
+                    let uncontended = !throttled && waits == last_waits && !origin.is_waiting();
+                    let receiving = segments.iter().filter(|part| part.active.load(Ordering::Relaxed)).count();
+                    // Two full peer windows expose a final request that was slow from its first byte.
+                    if sample_ready && uncontended && receiving >= 4 {
+                        let peer_rate = rate / receiving as f64;
+                        best_peer_rate = best_peer_rate.max(previous_peer_rate.min(peer_rate));
+                        previous_peer_rate = peer_rate;
+                    } else { previous_peer_rate = 0.0; }
+                    tail_rate.store(if pending.is_empty() && active.len() == 1 && receiving == 1 && uncontended { best_peer_rate as u64 } else { 0 }, Ordering::Relaxed);
                     // Shared-budget waits must not look like a slower connection-count trial.
                     if !pending.is_empty() && (throttled || (sample_ready && waits == last_waits && !origin.is_waiting())) { auto.sample(rate, throttled); }
                     task.record.write().await.connections = auto.target;
@@ -1767,12 +1781,13 @@ impl DownloadManager {
         index: usize,
         segment: &SegmentCounter,
         probe: &ProbeResult,
+        tail_rate: &AtomicU64,
     ) -> EngineResult<()> {
         let attempts = self.settings.read().await.retry_attempts;
         for attempt in 0..attempts {
             task.check_stopped(cancel)?;
             let result = self
-                .download_segment(task, cancel, client, url, part_dir, index, segment, probe)
+                .download_segment(task, cancel, client, url, part_dir, index, segment, probe, tail_rate)
                 .await;
             match result {
                 Ok(()) => return Ok(()),
@@ -1817,6 +1832,7 @@ impl DownloadManager {
         index: usize,
         segment: &SegmentCounter,
         probe: &ProbeResult,
+        tail_rate: &AtomicU64,
     ) -> EngineResult<()> {
         use sha2::{Digest, Sha256};
         let range = segment.range;
@@ -1993,7 +2009,7 @@ impl DownloadManager {
                 }
                 if progress_at.elapsed().as_secs() >= 10 {
                     if limit == 0 && self.settings.read().await.speed_limit_bps == 0 && task.record.read().await.speed_limit_bps == 0 {
-                        let slow = crate::network::slow_progress(written - progress_bytes, progress_at.elapsed(), &mut best_rate);
+                        let slow = crate::network::slow_progress(written - progress_bytes, progress_at.elapsed(), &mut best_rate, tail_rate.load(Ordering::Relaxed));
                         // Initial fast bytes must not hide a trickling tail indefinitely.
                         if slow && started.elapsed().as_secs() >= 30 { return Err(EngineError::Slow); }
                     } else { best_rate = 0.0; }

@@ -106,8 +106,9 @@ const server = createServer((request, response) => {
   if (disconnect) dropped=true;
   let sent = 0;
   const trickle = name === "slow-tail.bin" && start === 0 && end > 0;
+  const steadyTail = name === "adaptive-large-steady-tail.bin" && start === 0 && end > 0;
   const timer = setInterval(() => {
-    const next = Math.min(start + (trickle && sent >= 786432 ? 48 : block), end + 1);
+    const next = Math.min(start + (steadyTail ? 1024 : trickle && sent >= 786432 ? 48 : block), end + 1);
     response.write(payload.subarray(start, next)); sent+=next-start; start = next;
     if (disconnect && sent >= 131072) { clearInterval(timer); response.destroy(); return; }
     if (start > end) { clearInterval(timer); response.end(); }
@@ -534,6 +535,16 @@ try {
   assert.ok(globalPeak<=8);
   await Promise.all(sharedIds.map(async id=>complete(id,(await record(id)).connections,adaptiveData)));
   console.log("PASS: two adaptive downloads share eight host requests fairly without false connection-count reductions or changed output");
+  const steadyTail = await add("adaptive-large-steady-tail.bin",{connections:8});
+  await waitFor(async()=>{
+    const item=await record(steadyTail);
+    if(item?.status==="failed")throw new Error(item.error);
+    return item?.status==="completed";
+  },"a final request that trickles from its first byte",90000);
+  await complete(steadyTail,8,adaptiveData);
+  const firstSlowRange = observed.get("adaptive-large-steady-tail.bin").ranges.find(range=>range.start===0&&range.end>0);
+  assert.ok(observed.get("adaptive-large-steady-tail.bin").ranges.some(range=>range.start>0&&range.end===firstSlowRange.end),"A uniformly slow outlier must retry only its verified missing suffix.");
+  console.log("PASS: a final request slow from its first byte retries against sustained peer speed and publishes identical bytes");
   const slowTail = await add("slow-tail.bin",{connections:1});
   await waitFor(async()=>{
     const item=await record(slowTail);
