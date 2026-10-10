@@ -51,6 +51,7 @@ if (process.env.FETCHRAIL_BENCHMARK === "1") {
 }
 let retryFailed = false;
 let dropped = false;
+let headerDisconnects = 0;
 let globalActive = 0, globalPeak = 0;
 let cooldownFirst = 0, cooldownNext = 0;
 let leakedCredentials = false;
@@ -81,6 +82,10 @@ const server = createServer((request, response) => {
     response.end(); return;
   }
   const match = /^bytes=(\d+)-(\d*)$/.exec(request.headers.range ?? "");
+  if (name === "header-disconnect.bin" && request.headers.range !== "bytes=0-0" && headerDisconnects < 2) {
+    headerDisconnects++;
+    request.socket.destroy(); return;
+  }
   if (name === "compressed.bin") response.setHeader("Content-Encoding","gzip");
   if (name === "changed.bin" && request.headers.range !== "bytes=0-0") response.setHeader("ETag",'"changed-version"');
   let start = 0, end = payload.length - 1;
@@ -376,6 +381,9 @@ try {
   for (const [name, count] of [["ignore.bin", 1], ["unknown.bin", 1], ["retry.bin", 4]]) await complete(await add(name), count);
   assert.ok(retryFailed);
   console.log("PASS: range fallback, unknown lengths, automatic transient retry");
+  await complete(await add("header-disconnect.bin"),4);
+  assert.equal(headerDisconnects,2);
+  console.log("PASS: connections reset before response headers retry with identical verified output");
   const scheduled = await add("scheduled.bin", { scheduledFor: new Date(Date.now() + 1000).toISOString() });
   assert.equal((await record(scheduled)).status, "scheduled"); await complete(scheduled, 4);
   const cancel = await add("cancel.bin", { startPaused: true });
@@ -470,6 +478,21 @@ try {
   assert.ok(performance.now()-limitedStart>=7500,"The 2 MiB/s bandwidth budget must be shared across both 8 MiB downloads.");
   console.log("PASS: the configured global bandwidth limit is shared across concurrent downloads");
   app.kill(); await new Promise((done) => app.once("exit", done));
+  await writeFile(join(stateDir,"settings.json"),JSON.stringify({...settings,adaptiveConnections:false,speedLimitBps:0,maxRequestsPerOrigin:16}));
+  await launch();
+  const ledger = await add("adaptive-large-ledger.bin",{connections:16});
+  await waitFor(async()=>(await record(ledger))?.downloadedBytes>=32*1024*1024,"concurrent checkpoint progress");
+  await native("controlDownload",{downloadId:ledger,action:"pause"});
+  const checkpoint=JSON.parse(await readFile(join(stateDir,"parts",ledger,"transfer.json")));
+  assert.ok(checkpoint.committed.reduce((sum,bytes)=>sum+bytes,0)>=32*1024*1024);
+  assert.ok(checkpoint.committed.filter(bytes=>bytes>0).length>1);
+  for(const [index,bytes] of checkpoint.committed.entries()) {
+    if(bytes) assert.equal(checkpoint.hashes[index],digest(adaptiveData.subarray(checkpoint.ranges[index].start,checkpoint.ranges[index].start+bytes)),"Forced pause saves every worker's exact prefix and digest.");
+  }
+  await native("controlDownload",{downloadId:ledger,action:"resume"});
+  await complete(ledger,16,adaptiveData);
+  console.log("PASS: sixteen concurrent writers force durable coalesced checkpoints on pause and resume identical 192 MiB output");
+  app.kill(); await new Promise((done)=>app.once("exit",done));
   await writeFile(join(stateDir,"settings.json"), JSON.stringify({ ...settings, adaptiveConnections: true, speedLimitBps: 0, maxRequestsPerOrigin: 16 }));
   await launch();
   const adaptive = await add("adaptive-large.bin", { connections: 16 });
