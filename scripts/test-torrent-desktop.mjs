@@ -68,7 +68,13 @@ try {
   const metadata = await seed.call({ op: "inspect", path: torrent }), seedId = randomUUID();
   await seed.call({ op: "add", id: seedId, source: torrent, destination: join(root, "seed"), config: localTorrentConfig, start: true });
   await until(async () => (await seed.call({ op: "poll" })).states.find(s => s.finished), "seed verification");
-  const peerPort = await until(async () => { await seed.call({ op: "poll" }); return (await seed.call({ op: "details", id: seedId })).port || false; }, "seeder listening");
+  let peerPort;
+  try {
+    peerPort = await until(async () => { await seed.call({ op: "poll" }); return (await seed.call({ op: "details", id: seedId })).port || false; }, "seeder listening");
+  } catch (error) {
+    console.error("Seeder listener diagnostics:", JSON.stringify(await seed.call({ op: "details", id: seedId, view: "activity" })));
+    throw error;
+  }
   await launch();
   let settings = await invoke("get_settings");
   settings.autoUpdate = false; settings.maxConcurrentDownloads = 2; settings.speedLimitBps = 2 * 1024 * 1024;

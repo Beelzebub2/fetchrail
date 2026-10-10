@@ -225,7 +225,7 @@ try {
     let captured;
     const events = [];
     const item = { id: 42, state: "in_progress", paused: false, incognito: false, danger: "safe",
-      url: base + name, filename: join(out, name), totalBytes: data.length, mime: "application/octet-stream" };
+      url: base + name, filename: join(out, name), totalBytes: data.length, bytesReceived: 1024, mime: "application/octet-stream" };
     const api = {
       runtime: { id: "capture-test", getURL: (path) => "chrome-extension://capture-test/" + path,
         onInstalled: { addListener() {} }, onStartup: { addListener() {} }, onMessage: { addListener() {} } },

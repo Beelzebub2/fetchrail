@@ -7,16 +7,19 @@ mod download_window;
 mod engine;
 #[cfg(windows)]
 pub mod install;
+mod integrity;
 #[cfg(target_os = "linux")]
 mod linux_updates;
 mod model;
 pub mod native_host;
 pub mod native_protocol;
+mod network;
 mod organize;
 pub mod platform;
 #[cfg(target_os = "linux")]
 mod power_events;
 mod rate_limit;
+mod staging;
 pub mod torrent;
 
 use std::sync::{

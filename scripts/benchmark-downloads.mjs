@@ -22,6 +22,7 @@ const server = createServer((request, response) => {
   response.writeHead(range ? 206 : 200, {
     "Content-Type": "application/octet-stream", "Content-Length": end - start + 1,
     "Content-Range": `bytes ${start}-${end}/${total}`,
+    "ETag": '"fixture"',
   });
   if (request.method === "HEAD") { response.end(); return; }
   let remaining = end - start + 1;

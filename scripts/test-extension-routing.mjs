@@ -13,6 +13,7 @@ for (const browser of ["chromium", "firefox"]) {
   let fail;
   let current;
   let afterAcceptance;
+  let firstBytesOnTimer;
   const engineId = randomUUID();
   const api = {
     runtime: {
@@ -25,7 +26,8 @@ for (const browser of ["chromium", "firefox"]) {
     action: { async setBadgeBackgroundColor() {}, async setBadgeText() {}, async setTitle() {} },
     downloads: {
       onCreated: { addListener(value) { listener = value; } },
-      async pause(id) { events.push("pause"); if (fail === "pause") throw new Error("Already completed"); current.paused = true; },
+      async pause(id) { events.push("pause"); if (fail === "pause") throw new Error("Already completed"); current.paused = true;
+        if (fail === "firefoxPause") Object.assign(current, { state: "interrupted", canResume: true, error: "USER_CANCELED" }); },
       async search({ id }) { events.push("search"); return fail === "missing" ? [] : [{ ...current }]; },
       async cancel(id) { events.push("cancel"); if (fail === "cancel") throw new Error("Cannot cancel"); },
       async erase({ id }) { events.push("erase"); if (fail === "erase") throw new Error("Cannot erase"); },
@@ -50,16 +52,17 @@ for (const browser of ["chromium", "firefox"]) {
       api.runtime.lastError = { message: error.message }; callback(); delete api.runtime.lastError;
     });
   };
-  const context = vm.createContext({ [browser === "firefox" ? "browser" : "chrome"]: api, crypto: { randomUUID }, URL });
+  const context = vm.createContext({ [browser === "firefox" ? "browser" : "chrome"]: api, crypto: { randomUUID }, URL,
+    setTimeout(callback) { if (firstBytesOnTimer) current.bytesReceived = 1024; return setImmediate(callback); } });
   vm.runInContext(await readFile(new URL(`../browser-extension/dist/${browser}/background.js`, import.meta.url), "utf8"), context);
   const reset = (overrides = {}) => {
-    events.length = 0; requests.length = 0; fail = undefined; afterAcceptance = undefined; delete saved.automaticDownloads;
+    events.length = 0; requests.length = 0; fail = undefined; afterAcceptance = undefined; firstBytesOnTimer = false; delete saved.automaticDownloads;
     current = { id: 42, state: "in_progress", paused: false, incognito: false, danger: "safe",
       url: "https://example.com/redirect", finalUrl: "https://cdn.example.com/file.zip?token=123",
-      filename: "C:\\Users\\someone\\Downloads\\file.zip", totalBytes: 8388608, mime: "application/zip", ...overrides };
+      filename: "C:\\Users\\someone\\Downloads\\file.zip", totalBytes: 8388608, bytesReceived: 1024, canResume: false, mime: "application/zip", ...overrides };
   };
   const settled = async () => {
-    for (let attempt = 0; attempt < 100; attempt++) {
+    for (let attempt = 0; attempt < 2000; attempt++) {
       await new Promise(setImmediate);
       if (vm.runInContext("activeActions", context) === 0) return;
     }
@@ -75,6 +78,16 @@ for (const browser of ["chromium", "firefox"]) {
     url: current.finalUrl, suggestedFileName: "file.zip", expectedBytes: current.totalBytes, expectedMime: current.mime,
   });
   reset(); saved.automaticDownloads = false; await route(); assert.equal(events.length, 0);
+  if (browser === "firefox") {
+    reset(); fail = "firefoxPause"; await route();
+    assert.deepEqual(events, ["pause", "search", "addDownloads", "search", "cancel", "erase"]);
+    reset({ bytesReceived: 0 }); firstBytesOnTimer = true; await route();
+    assert.deepEqual(events, ["search", "pause", "search", "addDownloads", "search", "cancel", "erase"]);
+    reset({ bytesReceived: 0 }); await route();
+    assert.equal(requests.length, 0); assert.ok(!events.includes("pause"));
+    reset(); fail = "firefoxPause"; afterAcceptance = { finalUrl: "https://example.com/changed.zip" }; await route();
+    assert.ok(events.includes("resume"));
+  }
   reset({ finalUrl: "https://example.com/source.torrent", filename: "C:\\Downloads\\source.torrent" }); await route();
   assert.deepEqual(events, ["pause", "search", "addTorrents", "search", "cancel", "erase"]);
   assert.equal(requests[0].params.items[0].requestContext, undefined);
@@ -99,7 +112,7 @@ for (const browser of ["chromium", "firefox"]) {
     { danger: "content" }, { incognito: true }, { finalUrl: "https://example.com/changed.zip" }]) {
     reset(); afterAcceptance = change; await route();
     assert.deepEqual(events, ["pause", "search", "addDownloads", "search", "controlDownload",
-      ...(current.state === "in_progress" && current.paused ? ["resume"] : [])]);
+      ...((current.state === "in_progress" || (browser === "firefox" && current.state === "interrupted")) && current.paused ? ["resume"] : [])]);
     assert.equal(requests.at(-1).params.action, "cancel", "A changed browser transfer must roll back the engine job.");
   }
   console.log(`PASS: ${browser} automatic routing, redirects, metadata, opt-out, duplicate protection, browser fallback, rollback and changes during verification.`);
