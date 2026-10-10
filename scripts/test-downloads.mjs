@@ -59,7 +59,8 @@ const otherOrigin = createServer((request,response) => { leakedCredentials ||= B
 await new Promise((done) => otherOrigin.listen(0,"127.0.0.1",done));
 const server = createServer((request, response) => {
   const name = request.url.slice(1);
-  const payload=name.startsWith("adaptive-large") ? adaptiveData : name.startsWith("benchmark-") ? benchmarkData : data;
+  const peerLimited = name.startsWith("adaptive-large-peer-limited-");
+  const payload=peerLimited ? adaptiveData.subarray(0,64*1024*1024) : name.startsWith("adaptive-large") ? adaptiveData : name.startsWith("benchmark-") ? benchmarkData : data;
   if (name==="empty.bin") { response.writeHead(416,{"Content-Range":"bytes */0"}).end(); return; }
   if (name === "auth.bin") { response.writeHead(403).end(); return; }
   if (name === "landing.html") { response.writeHead(200, { "Content-Type": "text/html" }).end("<button>Download</button>"); return; }
@@ -92,6 +93,10 @@ const server = createServer((request, response) => {
   if (match && !["ignore.bin", "unknown.bin"].includes(name)) {
     start = Number(match[1]); end = match[2] ? Number(match[2]) : end;
     entry.ranges.push({ start, end });
+    if (name.startsWith("adaptive-large-peer-")) {
+      entry.transfers ??= [];
+      if (end > start) entry.transfers.push({ start, end, at: performance.now() });
+    }
     if (name === "retry.bin" && !retryFailed) { retryFailed = true; response.writeHead(503).end(); return; }
     response.setHeader("Content-Range", `bytes ${name === "invalid.bin" ? start + 1 : start}-${end}/${payload.length}`);
     response.statusCode = 206;
@@ -107,8 +112,12 @@ const server = createServer((request, response) => {
   let sent = 0;
   const trickle = name === "slow-tail.bin" && start === 0 && end > 0;
   const steadyTail = name === "adaptive-large-steady-tail.bin" && start === 0 && end > 0;
+  const weakPeer = name.startsWith("adaptive-large-peer-") && !name.endsWith("pause.bin") && start === 0 && end > 0;
   const timer = setInterval(() => {
-    const next = Math.min(start + (steadyTail ? 1024 : trickle && sent >= 786432 ? 48 : block), end + 1);
+    const pausedHost = name === "adaptive-large-peer-pause.bin" && entry.transfers.length ? performance.now() - entry.transfers[0].at : 0;
+    if (pausedHost >= 2500 && pausedHost < 14500) return;
+    if (weakPeer && name.endsWith("stall.bin") && sent >= 262144) return;
+    const next = Math.min(start + (weakPeer && sent >= 262144 && (!peerLimited || performance.now()-entry.transfers[0].at<18000) ? 1024 : steadyTail ? 1024 : trickle && sent >= 786432 ? 48 : block), end + 1);
     response.write(payload.subarray(start, next)); sent+=next-start; start = next;
     if (disconnect && sent >= 131072) { clearInterval(timer); response.destroy(); return; }
     if (start > end) { clearInterval(timer); response.end(); }
@@ -535,6 +544,56 @@ try {
   assert.ok(globalPeak<=8);
   await Promise.all(sharedIds.map(async id=>complete(id,(await record(id)).connections,adaptiveData)));
   console.log("PASS: two adaptive downloads share eight host requests fairly without false connection-count reductions or changed output");
+  app.kill(); await new Promise((done)=>app.once("exit",done));
+  await writeFile(join(stateDir,"settings.json"),JSON.stringify({...settings,adaptiveConnections:false,speedLimitBps:0,maxRequestsPerOrigin:4}));
+  await launch();
+  for (const mode of ["stall", "trickle", "pause"]) {
+    const name = `adaptive-large-peer-${mode}.bin`;
+    const id = await add(name,{connections:4});
+    await waitFor(async()=>{
+      const item=await record(id);
+      if(item?.status==="failed")throw new Error(item.error);
+      return item?.status==="completed";
+    },`${mode} response recovery`,75000);
+    await complete(id,4,adaptiveData);
+    const transfers=observed.get(name).transfers;
+    assert.ok(observed.get(name).peak<=4,"Recovery preserves the origin request limit.");
+    if(mode==="pause") {
+      const sorted=transfers.toSorted((a,b)=>a.start-b.start);
+      assert.equal(sorted[0].start,0);
+      for(let i=1;i<sorted.length;i++) assert.equal(sorted[i].start,sorted[i-1].end+1,"A host-wide pause must not create speculative retries.");
+      assert.equal(sorted.at(-1).end,adaptiveData.length-1);
+    } else {
+      const initial=transfers.find(part=>part.start===0);
+      const retry=transfers.find(part=>part.start>0&&part.end===initial.end);
+      assert.ok(retry,"Retry must preserve the exact missing suffix of the weak range.");
+      assert.ok(retry.start>=262144&&retry.start<initial.end);
+      assert.ok(retry.at-initial.at>=9000&&retry.at-initial.at<25000,"Two sustained weak windows must recover before the ordinary 30-second timeout.");
+      console.log(`PASS: ${mode} peer recovery timing`,JSON.stringify({retrySeconds:(retry.at-initial.at)/1000,savedBytes:retry.start,peak:observed.get(name).peak}));
+    }
+  }
+  console.log("PASS: silent and trickling peers recover early with verified suffixes; a server-wide pause preserves every range");
+  for(const limit of ["global", "file", "legacy", "single"]) {
+    app.kill(); await new Promise((done)=>app.once("exit",done));
+    await writeFile(join(stateDir,"settings.json"),JSON.stringify({...settings,adaptiveConnections:false,speedLimitBps:limit==="global"?16*1024*1024:0,bandwidthLimitKbps:limit==="legacy"?16384:0,maxRequestsPerOrigin:4,retryAttempts:limit==="single"?1:4}));
+    await launch();
+    const name=`adaptive-large-peer-limited-${limit}.bin`;
+    const id=await add(name,{connections:4,speedLimitBps:limit==="file"?16*1024*1024:0});
+    await waitFor(async()=>{
+      const item=await record(id);
+      if(item?.status==="failed")throw new Error(item.error);
+      return item?.status==="completed";
+    },`${limit} recovery guard`,35000);
+    await complete(id,4,adaptiveData.subarray(0,64*1024*1024));
+    const sorted=observed.get(name).transfers.toSorted((a,b)=>a.start-b.start);
+    assert.equal(sorted[0].start,0);
+    for(let i=1;i<sorted.length;i++)assert.equal(sorted[i].start,sorted[i-1].end+1,"Manual limits and a one-attempt budget must disable speculative peer retries.");
+    assert.equal(sorted.at(-1).end,64*1024*1024-1);
+  }
+  console.log("PASS: global, per-file, legacy KiB/s limits and one-attempt budgets disable early recovery even with a weak peer");
+  app.kill(); await new Promise((done)=>app.once("exit",done));
+  await writeFile(join(stateDir,"settings.json"),JSON.stringify({...settings,adaptiveConnections:true,speedLimitBps:0,maxRequestsPerOrigin:8}));
+  await launch();
   const steadyTail = await add("adaptive-large-steady-tail.bin",{connections:8});
   await waitFor(async()=>{
     const item=await record(steadyTail);

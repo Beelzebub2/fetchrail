@@ -1689,6 +1689,7 @@ impl DownloadManager {
         let mut pending = (0..segments.len()).collect::<std::collections::VecDeque<_>>();
         let batch = cancel.child_token();
         let tail_rate = AtomicU64::new(0);
+        let peer_rate = AtomicU64::new(0);
         let mut previous_peer_rate = 0.0_f64;
         let mut best_peer_rate = 0.0_f64;
         let mut active = FuturesUnordered::new();
@@ -1712,6 +1713,7 @@ impl DownloadManager {
                 let segment = &segments[index];
                 let batch = &batch;
                 let tail_rate = &tail_rate;
+                let peer_rate = &peer_rate;
                 active.push(async move {
                     let result = self
                         .download_with_retries(
@@ -1724,6 +1726,7 @@ impl DownloadManager {
                             segment,
                             probe,
                             tail_rate,
+                            peer_rate,
                         )
                         .await;
                     (slot, client, result)
@@ -1753,10 +1756,12 @@ impl DownloadManager {
                     let waits = origin.waits();
                     let uncontended = !throttled && waits == last_waits && !origin.is_waiting();
                     let receiving = segments.iter().filter(|part| part.active.load(Ordering::Relaxed)).count();
+                    // Use current peers for recovery; a host-wide slowdown must lower the reference.
+                    peer_rate.store(if sample_ready && uncontended && receiving >= 2 { previous_peer_rate.min(rate / receiving as f64) as u64 } else { 0 }, Ordering::Relaxed);
                     // Two full peer windows expose a final request that was slow from its first byte.
-                    if sample_ready && uncontended && receiving >= 4 {
+                    if sample_ready && uncontended && receiving >= 2 {
                         let peer_rate = rate / receiving as f64;
-                        best_peer_rate = best_peer_rate.max(previous_peer_rate.min(peer_rate));
+                        if receiving >= 4 { best_peer_rate = best_peer_rate.max(previous_peer_rate.min(peer_rate)); }
                         previous_peer_rate = peer_rate;
                     } else { previous_peer_rate = 0.0; }
                     tail_rate.store(if pending.is_empty() && active.len() == 1 && receiving == 1 && uncontended { best_peer_rate as u64 } else { 0 }, Ordering::Relaxed);
@@ -1789,13 +1794,24 @@ impl DownloadManager {
         segment: &SegmentCounter,
         probe: &ProbeResult,
         tail_rate: &AtomicU64,
+        peer_rate: &AtomicU64,
     ) -> EngineResult<()> {
         let attempts = self.settings.read().await.retry_attempts;
         for attempt in 0..attempts {
             task.check_stopped(cancel)?;
             let result = self
                 .download_segment(
-                    task, cancel, client, url, part_dir, index, segment, probe, tail_rate,
+                    task,
+                    cancel,
+                    client,
+                    url,
+                    part_dir,
+                    index,
+                    segment,
+                    probe,
+                    tail_rate,
+                    peer_rate,
+                    attempt == 0 && attempts > 1 && probe.accepts_ranges && probe.validator.is_some(),
                 )
                 .await;
             match result {
@@ -1842,6 +1858,8 @@ impl DownloadManager {
         segment: &SegmentCounter,
         probe: &ProbeResult,
         tail_rate: &AtomicU64,
+        peer_rate: &AtomicU64,
+        recover_peer: bool,
     ) -> EngineResult<()> {
         use sha2::{Digest, Sha256};
         let range = segment.range;
@@ -1991,10 +2009,33 @@ impl DownloadManager {
         let mut progress_at = started;
         let mut progress_bytes = written;
         let mut best_rate = 0.0;
+        let mut peer_wait = Duration::ZERO;
+        let mut peer_bytes = written;
+        let mut weak_windows = 0;
         let transfer = async {
             loop {
                 task.check_stopped(cancel)?;
-                let item = tokio::select! { item = stream.next() => item, _ = cancel.cancelled() => return Err(EngineError::Cancelled) };
+                let waiting_at = Instant::now();
+                let mut window_expired = false;
+                let item = tokio::select! {
+                    item = stream.next() => item,
+                    _ = tokio::time::sleep(Duration::from_secs(5).saturating_sub(peer_wait)), if recover_peer => { window_expired = true; None },
+                    _ = cancel.cancelled() => return Err(EngineError::Cancelled),
+                };
+                // Disk writes, checkpoint flushes and limiter waits are not network stalls.
+                peer_wait += waiting_at.elapsed();
+                if recover_peer && peer_wait >= Duration::from_secs(5) {
+                    let globally_limited = { let settings = self.settings.read().await; settings.bandwidth_limit_kbps != 0 || settings.speed_limit_bps != 0 };
+                    let limited = globally_limited || task.record.read().await.speed_limit_bps != 0;
+                    if !limited {
+                        let weak = crate::network::weak_peer(written - peer_bytes, peer_wait, peer_rate.load(Ordering::Relaxed), &mut weak_windows);
+                        // Only one speculative recovery per range; ordinary retries keep their budget.
+                        if weak { return Err(EngineError::Slow); }
+                    } else { weak_windows = 0; }
+                    peer_wait = Duration::ZERO;
+                    peer_bytes = written;
+                }
+                if window_expired { continue; }
                 let Some(chunk) = item else { break; };
                 let chunk = chunk.map_err(|error| EngineError::Request(error.without_url()))?;
                 if expected_len.is_some_and(|expected| written.saturating_add(chunk.len() as u64) > expected) {
