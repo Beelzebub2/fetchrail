@@ -545,19 +545,27 @@ fn publish(app: &AppHandle, status: UpdateStatus) {
 
 /// Looks for a newer signed release and, when there is one, downloads it and swaps it in.
 pub async fn check_for_update(app: &AppHandle) -> UpdateStatus {
-    let current = app.state::<Updates>().status();
-    if matches!(
-        current,
-        UpdateStatus::Unmanaged
-            | UpdateStatus::Checking
-            | UpdateStatus::Downloading { .. }
-            | UpdateStatus::Ready { .. }
-    ) {
-        return current;
+    {
+        let updates = app.state::<Updates>();
+        let mut current = updates.0.lock().expect("update status poisoned");
+        if matches!(
+            *current,
+            UpdateStatus::Unmanaged
+                | UpdateStatus::Checking
+                | UpdateStatus::Downloading { .. }
+                | UpdateStatus::Ready { .. }
+        ) {
+            return current.clone();
+        }
+        *current = UpdateStatus::Checking;
     }
     publish(app, UpdateStatus::Checking);
     let outcome = async {
-        let updater = app.updater().map_err(|error| error.to_string())?;
+        let updater = app
+            .updater_builder()
+            .timeout(std::time::Duration::from_secs(15))
+            .build()
+            .map_err(|error| error.to_string())?;
         let Some(update) = updater.check().await.map_err(|error| error.to_string())? else {
             return Ok(UpdateStatus::Current);
         };

@@ -98,7 +98,11 @@ pub async fn check(app: &AppHandle) -> Status {
         if owner() != "appimage" {
             return Err("The AppImage is no longer writable.".to_string());
         }
-        let updater = app.updater().map_err(|e| e.to_string())?;
+        let updater = app
+            .updater_builder()
+            .timeout(std::time::Duration::from_secs(15))
+            .build()
+            .map_err(|e| e.to_string())?;
         let Some(update) = updater.check().await.map_err(|e| e.to_string())? else {
             return Ok(Status::Current);
         };
