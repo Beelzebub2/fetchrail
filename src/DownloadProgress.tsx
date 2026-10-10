@@ -184,10 +184,10 @@ export function DownloadProgress({ id }: { id: string }) {
 
       {item && (
         <>
-          <div className={"transfer-progress " + item.status + (item.totalBytes == null ? " unknown" : "")} role="progressbar" aria-label={item.status === "merging" ? "Joining downloaded parts" : "Download progress"} aria-valuemin={0} aria-valuemax={100} aria-valuenow={item.totalBytes || complete ? Math.floor(progress) : undefined} aria-valuetext={item.totalBytes || complete ? `${progress.toFixed(1)}%` : `${formatBytes(item.downloadedBytes)} downloaded; total size unknown`}>
+          <div className={"transfer-progress " + item.status + (item.totalBytes == null ? " unknown" : "")} role="progressbar" aria-label={item.status === "merging" ? "Finalizing downloaded file" : "Download progress"} aria-valuemin={0} aria-valuemax={100} aria-valuenow={item.totalBytes || complete ? Math.floor(progress) : undefined} aria-valuetext={item.totalBytes || complete ? `${progress.toFixed(1)}%` : `${formatBytes(item.downloadedBytes)} downloaded; total size unknown`}>
             <i style={{ width: `${progress}%` }} />
           </div>
-          <div className="transfer-progress-caption"><span>{item.status === "merging" ? "Joining parts" : complete ? "File saved" : "Overall progress"}</span><strong className="mono">{item.totalBytes || complete ? `${progress.toFixed(1)}%` : formatBytes(item.downloadedBytes)}</strong></div>
+          <div className="transfer-progress-caption"><span>{item.status === "merging" ? item.statusDetail ?? "Finalizing file" : complete ? "File saved" : "Overall progress"}</span><strong className="mono">{item.totalBytes || complete ? `${progress.toFixed(1)}%` : formatBytes(item.downloadedBytes)}</strong></div>
           <div className="transfer-actions">
             <button type="button" className="ghost-button" aria-expanded={details} aria-controls="transfer-connections" onClick={() => setDetails(!details)}>{details ? <ChevronUp size={16} /> : <ChevronDown size={16} />}{details ? "Hide details" : "Show details"}</button>
             <div>

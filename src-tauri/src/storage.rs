@@ -97,9 +97,8 @@ pub async fn sha256(path: &Path) -> io::Result<String> {
 pub async fn sha256_cancellable(path: &Path, cancel: &CancellationToken) -> io::Result<String> {
     let path = path.to_owned();
     let cancel = cancel.clone();
-    // Batch sequential I/O and hashing off the runtime; finish the read before releasing the file.
+    // Overlap sequential I/O and hashing off the runtime; join before releasing the file.
     tokio::task::spawn_blocking(move || {
-        use std::io::Read;
         let mut options = std::fs::OpenOptions::new();
         options.read(true);
         #[cfg(windows)]
@@ -107,26 +106,55 @@ pub async fn sha256_cancellable(path: &Path, cancel: &CancellationToken) -> io::
             use std::os::windows::fs::OpenOptionsExt;
             options.custom_flags(windows::Win32::Storage::FileSystem::FILE_FLAG_SEQUENTIAL_SCAN.0);
         }
-        let mut input = options.open(path)?;
-        let mut buffer = vec![0; 8 * 1024 * 1024];
-        let mut hash = Sha256::new();
-        loop {
-            if cancel.is_cancelled() {
-                return Err(io::Error::from(io::ErrorKind::Interrupted));
-            }
-            let count = match input.read(&mut buffer) {
-                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-                result => result?,
-            };
-            if count == 0 {
-                break;
-            }
-            hash.update(&buffer[..count]);
-        }
-        Ok(format!("{:x}", hash.finalize()))
+        sha256_reader(options.open(path)?, &cancel)
     })
     .await
     .map_err(io::Error::other)?
+}
+
+fn sha256_reader(mut input: impl io::Read + Send, cancel: &CancellationToken) -> io::Result<String> {
+    let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
+    let (free_tx, free_rx) = std::sync::mpsc::sync_channel(1);
+    free_tx.send(vec![0; 8 * 1024 * 1024]).map_err(io::Error::other)?;
+    std::thread::scope(|scope| {
+        let reader = std::thread::Builder::new().spawn_scoped(scope, move || -> io::Result<()> {
+            let mut buffer = vec![0; 8 * 1024 * 1024];
+            loop {
+                if cancel.is_cancelled() {
+                    return Err(io::Error::from(io::ErrorKind::Interrupted));
+                }
+                let count = match input.read(&mut buffer) {
+                    Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                    result => result?,
+                };
+                if count == 0 || ready_tx.send((buffer, count)).is_err() {
+                    return Ok(());
+                }
+                buffer = match free_rx.recv() {
+                    Ok(buffer) => buffer,
+                    Err(_) => return Ok(()),
+                };
+            }
+        })?;
+        let mut hash = Sha256::new();
+        while let Ok((buffer, count)) = ready_rx.recv() {
+            if cancel.is_cancelled() {
+                break;
+            }
+            hash.update(&buffer[..count]);
+            if free_tx.send(buffer).is_err() {
+                break;
+            }
+        }
+        // Disconnect both waits before joining, including cancellation and read errors.
+        drop(ready_rx);
+        drop(free_tx);
+        reader.join().map_err(|_| io::Error::other("Integrity reader panicked"))??;
+        if cancel.is_cancelled() {
+            return Err(io::Error::from(io::ErrorKind::Interrupted));
+        }
+        Ok(format!("{:x}", hash.finalize()))
+    })
 }
 
 pub async fn create_stage(path: &Path, length: u64) -> io::Result<()> {
@@ -395,12 +423,40 @@ mod tests {
         let path = root.join("file");
         fs::write(&path, b"abc").await.unwrap();
         assert_eq!(sha256(&path).await.unwrap(), "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
-        let bytes = vec![7; 8 * 1024 * 1024 + 3];
+        fs::write(&path, []).await.unwrap();
+        assert_eq!(sha256(&path).await.unwrap(), format!("{:x}", Sha256::digest([])));
+        let bytes: Vec<u8> = (0..24 * 1024 * 1024 + 3).map(|i| (i / (8 * 1024 * 1024)) as u8).collect();
         fs::write(&path, &bytes).await.unwrap();
         assert_eq!(sha256(&path).await.unwrap(), format!("{:x}", Sha256::digest(&bytes)));
         fs::remove_file(&path).await.unwrap();
         assert_eq!(sha256(&path).await.unwrap_err().kind(), io::ErrorKind::NotFound);
         fs::remove_dir(root).await.unwrap();
+    }
+
+    #[test]
+    fn hashing_retries_short_reads_and_propagates_reader_errors() {
+        struct Reader { position: usize, interrupted: bool, fail: bool }
+        impl io::Read for Reader {
+            fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+                if !self.interrupted {
+                    self.interrupted = true;
+                    return Err(io::ErrorKind::Interrupted.into());
+                }
+                if self.fail && self.position > 0 {
+                    return Err(io::ErrorKind::PermissionDenied.into());
+                }
+                let bytes = b"abcdefghijk";
+                let count = 3.min(bytes.len() - self.position);
+                buffer[..count].copy_from_slice(&bytes[self.position..self.position + count]);
+                self.position += count;
+                Ok(count)
+            }
+        }
+        let cancel = CancellationToken::new();
+        assert_eq!(sha256_reader(Reader {position: 0, interrupted: false, fail: false}, &cancel).unwrap(), format!("{:x}", Sha256::digest(b"abcdefghijk")));
+        assert_eq!(sha256_reader(Reader {position: 0, interrupted: false, fail: true}, &cancel).unwrap_err().kind(), io::ErrorKind::PermissionDenied);
+        cancel.cancel();
+        assert_eq!(sha256_reader(&b"abc"[..], &cancel).unwrap_err().kind(), io::ErrorKind::Interrupted);
     }
 
     #[tokio::test]

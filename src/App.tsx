@@ -311,7 +311,7 @@ export function statusLabel(status: DownloadStatus) {
     connecting: "Connecting",
     downloading: "Downloading",
     paused: "Paused",
-    merging: "Joining parts",
+    merging: "Finalizing",
     completed: "Completed",
     failed: "Failed",
     cancelled: "Cancelled",
@@ -1182,17 +1182,17 @@ function DownloadRow({
           ) : item.status === "merging" ? (
             <>
               <div className="progress-line">
-                <span><RotateCw size={14} className="merge-spinner" />{progress < 100 ? "Joining parts" : "Saving file…"}</span>
+                <span><RotateCw size={14} className="merge-spinner" />{progress < 100 ? "Joining parts" : "Finalizing file…"}</span>
                 <span className="mono">{Math.floor(progress)}%</span>
               </div>
               <div
                 className="merge-progress"
                 role="progressbar"
-                aria-label={`Joining parts for ${item.fileName}`}
+                aria-label={`Finalizing ${item.fileName}`}
                 aria-valuemin={0}
                 aria-valuemax={100}
                 aria-valuenow={Math.floor(progress)}
-                aria-valuetext={`${Math.floor(progress)}% joined${progress === 100 ? ", saving file" : ""}`}
+                aria-valuetext={`${Math.floor(progress)}% joined${progress === 100 ? ", finalizing file" : ""}`}
               >
                 <i className="merge-fill" style={{ width: `${progress}%` }} />
               </div>
@@ -1230,7 +1230,7 @@ function DownloadRow({
               {parts.length - count("done")} of {parts.length} range groups remaining
             </small>
           )}
-          {item.status === "merging" && <small>Disk write</small>}
+          {item.status === "merging" && <small>Finalizing</small>}
         </div>
         <div className="col-eta">
           <span className="mono">{running ? formatEta(item.etaSeconds) : "—"}</span>
