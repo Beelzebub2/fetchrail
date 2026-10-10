@@ -1,6 +1,6 @@
 [package]
 name = "fetchrail"
-version = "0.6.3-local.9"
+version = "0.6.3-local.10"
 description = "Fetchrail high-performance download manager"
 authors = ["RRMTools"]
 edition = "2021"
