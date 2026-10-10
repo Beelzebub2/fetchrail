@@ -52,5 +52,6 @@ Linux packaging targets Ubuntu/Mint/Kali/Debian (`.deb`), Fedora (`.rpm`), Arch 
 - [Linux support plan](docs/linux-support-plan.md) — distro coverage, feature parity, packaging, performance, and Windows regression gates.
 - [Linux guide and qualification](docs/linux.md) — packages, desktop/browser integration, source builds and evidence.
 - [Download engine integration](docs/download-engine-integration.md) — contributor review, recovery safeguards and measured completion performance.
+- [Update feed](docs/update-feed.md) — authenticated release notifications, website/app detection, signature checks and repair.
 
 To report a problem, [open an issue](https://github.com/Beelzebub2/fetchrail/issues) with your Fetchrail version, browser if relevant, steps to reproduce, and the error shown by the app. Remove private URLs or credentials from anything you share.

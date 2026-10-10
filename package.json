@@ -39,6 +39,7 @@
     "release:test": "node scripts/test-release-aggregation.mjs && node scripts/test-release-downloads.mjs",
     "release:signatures": "node scripts/test-signatures.mjs",
     "website:sync-downloads": "node scripts/sync-website-downloads.mjs",
+    "updates:test": "npm test --prefix update-service",
     "ui:test": "node scripts/test-download-progress.mjs"
   },
   "dependencies": {

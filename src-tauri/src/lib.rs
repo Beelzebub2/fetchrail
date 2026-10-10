@@ -578,7 +578,7 @@ pub fn run() {
                         if manager.settings().await.auto_update {
                             install::check_for_update(&app).await;
                         }
-                        tokio::time::sleep(std::time::Duration::from_secs(6 * 60 * 60)).await;
+                        tokio::time::sleep(std::time::Duration::from_secs(30 * 60)).await;
                     }
                 });
             }
@@ -591,7 +591,7 @@ pub fn run() {
                         if manager.settings().await.auto_update {
                             linux_updates::check(&app).await;
                         }
-                        tokio::time::sleep(std::time::Duration::from_secs(6 * 60 * 60)).await;
+                        tokio::time::sleep(std::time::Duration::from_secs(30 * 60)).await;
                     }
                 });
             }
