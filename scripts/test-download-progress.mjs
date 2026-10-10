@@ -20,7 +20,7 @@ const server = createServer(async (request, response) => {
 });
 await new Promise((done) => server.listen(0, "127.0.0.1", done));
 const base = `http://127.0.0.1:${server.address().port}/`;
-const browser = await chromium.launch({ headless: true, channel: "msedge" });
+const browser = await chromium.launch({ headless: true, ...(process.env.PLAYWRIGHT_CHANNEL ? { channel: process.env.PLAYWRIGHT_CHANNEL } : process.platform === "win32" ? { channel: "msedge" } : {}) });
 try {
   const page = await browser.newPage({ viewport: { width: 640, height: 800 } });
   const errors = [];
@@ -38,7 +38,8 @@ try {
       resumeSupported: true, completionOptions: { showCompleteDialog: true, hangUp: false, exitApp: false, turnOffComputer: false, forceShutdown: false },
       segments: [0, 1, 2, 3].map((part) => ({ start: part * 8 * 1024 ** 3, length: 8 * 1024 ** 3, downloadedBytes: 1024 ** 3, speedBps: 75 * 1024 ** 2 / 4, active: true })),
     };
-    window.testSettings = { theme: "dark", accent: "ember", speedLimitBps: 0, autoUpdate: false, categories: [{ name: "Compressed", extensions: ["rar"], folder: "Compressed" }], defaultDownloadDir: "C:\\Downloads", maxConcurrentDownloads: 3, connectionsPerDownload: 4, minSegmentSizeMb: 1, launchOnStart: false, minimizeToTray: true };
+    window.testSettings = { theme: "dark", accent: "ember", speedLimitBps: 0, autoUpdate: false, categories: [{ name: "Compressed", extensions: ["rar"], folder: "Compressed" }], sortIntoCategoryFolders: true, defaultDownloadDir: "C:\\Downloads", maxConcurrentDownloads: 3, connectionsPerDownload: 4, minSegmentSizeMb: 1, launchOnStart: false, minimizeToTray: true };
+    window.testSettings.torrent = { uploadLimitBps: 0, maxSeeds: 3, ratioLimit: 1, seedTimeLimit: 86400, dht: true, lsd: true, upnp: true, connections: 200, listenInterfaces: "0.0.0.0:6881,[::]:6881", outgoingInterfaces: "", encryption: 1, proxyType: 0, proxyHost: "", proxyPort: 0, proxyUsername: "", proxyPassword: "" };
     window.testEmit = (event, payload) => {
       for (const [id, name] of listeners) if (name === event) callbacks.get(id)?.({ event, payload });
     };
@@ -53,6 +54,8 @@ try {
         if (name === "get_download") return structuredClone(window.testRecord);
         if (name === "list_downloads") return [structuredClone(window.testRecord)];
         if (name === "get_settings") return structuredClone(window.testSettings);
+        if (window.testOpenError === name) throw new Error("Could not open destination");
+        if (name === "platform_capabilities") return window.testCapabilities ?? (location.search.includes("platform=linux") ? { os: "linux", startup: { available: true, reason: "XDG startup" }, tray: { available: false, reason: "No watcher" }, shutdown: { available: false, reason: "Shutdown denied by policy" }, forceShutdown: { available: false, reason: "Old logind" }, disconnect: { available: true, reason: "Allowed" }, connections: [{ id: "connection-uuid", name: "Test connection" }], updateOwner: "package-manager", browserIntegration: { available: true, reason: "Native browser" } } : { os: "windows", startup: { available: true, reason: "Startup enabled" }, tray: { available: true, reason: "Tray available" }, shutdown: { available: true, reason: "Allowed" }, forceShutdown: { available: true, reason: "Allowed" }, disconnect: { available: true, reason: "Allowed" }, connections: [], updateOwner: "setup", browserIntegration: { available: true, reason: "Native browser" } });
         if (name === "get_overview") return { active: 0, queued: 0, completed: 1, failed: 0, currentSpeedBps: 0 };
         if (name === "list_queues") return [{ name: "Default", paused: false, startsAt: null, stopsAt: null }];
         if (name === "plugin:app|version") return "0.5.2";
@@ -128,12 +131,28 @@ try {
     window.testRecord.segments = [];
     window.testEmit("fetchrail://download-updated", structuredClone(window.testRecord));
   });
+  await page.waitForFunction(() => window.testCalls.some(call => call.name === "plugin:window|set_title" && call.args.value === "100% · example-archive.rar"));
+  const beforeOpen = await page.evaluate(() => window.testCalls.length);
   await page.getByRole("button", { name: "Open file", exact: true }).click();
+  await page.waitForFunction((index) => window.testCalls.slice(index).some((call) => call.name === "plugin:window|destroy"), beforeOpen);
+  assert.deepEqual(await page.evaluate((index) => window.testCalls.slice(index).map((call) => call.name), beforeOpen),
+    ["open_download", "plugin:window|destroy"], "Opening a completed file must dismiss its progress window.");
+
+  await page.evaluate(() => { window.testOpenError = "reveal_download"; });
+  const beforeFailedOpen = await page.evaluate(() => window.testCalls.length);
   await page.getByRole("button", { name: "Open folder", exact: true }).click();
+  await page.getByRole("alert").filter({ hasText: "Could not open destination" }).waitFor();
+  assert.deepEqual(await page.evaluate((index) => window.testCalls.slice(index).map((call) => call.name), beforeFailedOpen),
+    ["reveal_download"], "A failed folder open must keep the completion window visible.");
+
+  await page.evaluate(() => { window.testOpenError = null; });
+  const beforeFolderOpen = await page.evaluate(() => window.testCalls.length);
+  await page.getByRole("button", { name: "Open folder", exact: true }).click();
+  await page.waitForFunction((index) => window.testCalls.slice(index).some((call) => call.name === "plugin:window|destroy"), beforeFolderOpen);
+  assert.deepEqual(await page.evaluate((index) => window.testCalls.slice(index).map((call) => call.name), beforeFolderOpen),
+    ["reveal_download", "plugin:window|destroy"], "Opening the containing folder must dismiss its progress window.");
   await page.getByRole("button", { name: "Close", exact: true }).click();
   const calls = await page.evaluate(() => window.testCalls);
-  assert.ok(calls.some((call) => call.name === "open_download"));
-  assert.ok(calls.some((call) => call.name === "reveal_download"));
   assert.equal(calls.at(-1).name, "plugin:window|destroy");
   assert.equal(calls.filter((call) => call.name === "cancel_download").length, 1, "Closing must not cancel the transfer.");
   await page.evaluate(() => { window.testRecord.status = "paused"; window.testCalls = []; });
@@ -181,10 +200,42 @@ try {
   await page.getByRole("alert").filter({ hasText: "Could not restart Fetchrail: test launch failure" }).waitFor();
   assert.equal(await page.getByRole("heading", { name: "Background behavior" }).isVisible(), true, "A failed relaunch must keep the app open and explain the error.");
   await page.getByRole("button", { name: "Dismiss error" }).click();
-  await page.locator(".sidebar").getByRole("button", { name: /Restart to update/ }).click();
+  await page.locator(".top-rail").getByRole("button", { name: /Restart to update/ }).click();
   await page.getByRole("alert").filter({ hasText: "Could not restart Fetchrail: test launch failure" }).waitFor();
   assert.equal(await page.evaluate(() => window.testCalls.filter((call) => call.name === "restart_app").length), 2);
+  await page.goto(base + "?progress=test-download&platform=linux");
+  await page.getByRole("tab", { name: "Options on completion", exact: true }).click();
+  const disconnect = page.getByLabel("Disconnect selected connection when done");
+  assert.equal(await disconnect.isDisabled(), true, "Linux disconnect requires an explicit connection");
+  assert.equal(await page.getByLabel("Turn off computer when done").isDisabled(), true);
+  assert.equal(await page.getByLabel("Ignore shutdown inhibitors").isDisabled(), true);
+  await page.getByText("Shutdown denied by policy", { exact: false }).waitFor();
+  await page.getByLabel("Connection to disconnect").selectOption("connection-uuid");
+  await disconnect.check();
+  assert.equal(await page.evaluate(() => window.testRecord.completionOptions.connectionId), "connection-uuid");
+  assert.equal(await page.evaluate(() => window.testRecord.completionOptions.hangUp), true);
+  await page.evaluate(() => {
+    window.testCapabilities = { os: "linux", startup: { available: true, reason: "XDG" }, tray: { available: false, reason: "No watcher" }, shutdown: { available: false, reason: "Denied" }, forceShutdown: { available: false, reason: "Denied" }, disconnect: { available: false, reason: "NetworkManager unavailable" }, connections: [], updateOwner: "package-manager", browserIntegration: { available: true, reason: "Native browser" } };
+    window.dispatchEvent(new Event("focus"));
+  });
+  await page.getByText("NetworkManager unavailable", { exact: false }).waitFor();
+  assert.equal(await disconnect.isEnabled(), true, "A saved action must remain clearable after permission or service loss");
+  await disconnect.uncheck();
+  await page.waitForFunction(() => window.testRecord.completionOptions.hangUp === false);
+  assert.equal(await disconnect.isDisabled(), true);
+  await page.evaluate(() => {
+    window.testRecord.completionOptions.turnOffComputer = true;
+    window.testRecord.completionOptions.forceShutdown = true;
+    window.testEmit("fetchrail://download-updated", structuredClone(window.testRecord));
+  });
+  await page.getByLabel("Ignore shutdown inhibitors").uncheck();
+  await page.waitForFunction(() => window.testRecord.completionOptions.forceShutdown === false);
+  await page.getByLabel("Turn off computer when done").uncheck();
+  await page.waitForFunction(() => window.testRecord.completionOptions.turnOffComputer === false);
+  assert.equal(await page.getByLabel("Turn off computer when done").isDisabled(), true);
+  assert.equal(await page.getByLabel("Ignore shutdown inhibitors").isDisabled(), true);
   assert.deepEqual(errors, []);
+  console.log("PASS: Linux policy restrictions and connection selection block unsupported actions; saved actions remain clearable after capability loss");
   console.log("PASS: live progress, connection details, pause/resume/cancel, speed limits, completion settings, keyboard tabs, themes, completion actions, close behavior, and prompt handoff");
   console.log("PASS: settings contain switches, update buttons and long error text; both restart actions report launch failures");
   console.log("Screenshots: " + output);

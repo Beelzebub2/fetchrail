@@ -72,6 +72,17 @@ assert.equal((await send({ type: "unknown" })).ok, false);
 const partial = await send({ type: "addDownloads", items: [{ url: 'https://example.com/ok.zip' }, { url: 'https://example.com/reject.zip' }] });
 assert.equal(partial.result.accepted, 1);
 assert.equal(partial.result.errors[0].url, 'https://example.com/reject.zip');
+const torrentStart = requests.length;
+const torrentBatch = await send({ type: "addDownloads", items: [
+  { url: 'https://example.com/ok.zip' },
+  { url: 'magnet:?xt=urn:btih:abcdef0123456789abcdef0123456789abcdef0123', requestContext: { cookie: 'private' } },
+  { url: 'https://example.com/source.torrent', requestContext: { authorization: 'private' } },
+] });
+assert.equal(torrentBatch.result.accepted, 3);
+const torrentRequests = requests.slice(torrentStart);
+assert.deepEqual(torrentRequests.map(request => request.method), ['addDownloads', 'addTorrents']);
+assert.equal(torrentRequests[1].params.items.length, 2);
+assert.ok(torrentRequests[1].params.items.every(item => !item.requestContext), 'Torrent handoff must omit browser credentials');
 const checkUpdate = () => vm.runInContext("checkForExtensionUpdate()", context);
 await new Promise(setImmediate); // Let the completed message handlers release their busy counters.
 await checkUpdate();

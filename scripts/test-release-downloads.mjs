@@ -1,0 +1,12 @@
+import assert from "node:assert/strict";
+import { selectAsset } from "./release-downloads.mjs";
+const repo = "Beelzebub2/fetchrail", tag_name = "v1.2.3";
+const names = ["Fetchrail-Setup-v1.2.3-windows-x64.exe", ...["x64", "arm64"].flatMap(arch => ["deb", "rpm", "AppImage", "tar.gz"].map(format => `Fetchrail-v1.2.3-linux-${arch}.${format}`))];
+const release = { tag_name, assets: names.map(name => ({ name, browser_download_url: `https://github.com/${repo}/releases/download/${tag_name}/${name}`, size: 100 })) };
+assert.match(selectAsset(release, repo, "windows", "x64", "exe").name, /Setup/);
+for (const arch of ["x64", "arm64"]) for (const format of ["deb", "rpm", "AppImage", "tar.gz"]) assert.equal(selectAsset(release, repo, "linux", arch, format).name, `Fetchrail-${tag_name}-linux-${arch}.${format}`);
+assert.equal(selectAsset(release, repo, "windows", "arm64", "exe"), null);
+assert.equal(selectAsset({ tag_name, assets: [] }, repo, "linux", "x64", "deb"), null);
+release.assets[0].browser_download_url = "https://malicious.example/setup.exe";
+assert.equal(selectAsset(release, repo, "windows", "x64", "exe"), null);
+console.log("PASS: explicit OS/architecture/format selection, missing assets, and trusted download URLs.");

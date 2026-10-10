@@ -3,8 +3,6 @@ use std::{
     fs,
     io::{self, BufRead, BufReader, Read, Write},
     net::TcpStream,
-    path::PathBuf,
-    process::Command,
     thread,
     time::Duration,
 };
@@ -139,12 +137,7 @@ fn send_to_bridge(
 }
 
 fn read_bridge_config() -> Result<BrowserBridgeConfig, String> {
-    let appdata = std::env::var_os("APPDATA")
-        .map(PathBuf::from)
-        .ok_or_else(|| "APPDATA is unavailable.".to_string())?;
-    let path = appdata
-        .join("com.rrmtools.braid")
-        .join("browser-bridge.json");
+    let path = crate::platform::app_data_dir()?.join("browser-bridge.json");
     let bytes =
         fs::read(path).map_err(|error| format!("Browser bridge state is unavailable: {error}"))?;
     serde_json::from_slice(&bytes)
@@ -152,18 +145,13 @@ fn read_bridge_config() -> Result<BrowserBridgeConfig, String> {
 }
 
 /// The port of a running app's bridge, as last published.
+#[cfg(windows)]
 pub(crate) fn bridge_port() -> Option<u16> {
     read_bridge_config().ok().map(|config| config.port)
 }
 
 fn launch_fetchrail() -> Result<(), String> {
-    let app =
-        std::env::current_exe().map_err(|error| format!("Could not locate Fetchrail: {error}"))?;
-    Command::new(app)
-        .arg("--background")
-        .spawn()
-        .map_err(|error| format!("Could not launch Fetchrail: {error}"))?;
-    Ok(())
+    crate::platform::launch(&["--background"])
 }
 
 fn read_native_message(reader: &mut impl Read) -> Result<Option<Vec<u8>>, String> {

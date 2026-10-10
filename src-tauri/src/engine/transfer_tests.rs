@@ -1,6 +1,7 @@
 use super::*;
 use std::{
     net::{Shutdown, TcpListener, TcpStream},
+    sync::Weak,
     thread,
 };
 
@@ -9,6 +10,7 @@ struct TestServer {
     url: Url,
     requests: Arc<Mutex<Vec<(u64, u64)>>>,
     stop: Arc<AtomicBool>,
+    sockets: Arc<Mutex<Vec<Weak<TcpStream>>>>,
     worker: Option<thread::JoinHandle<()>>,
 }
 
@@ -18,20 +20,25 @@ impl TestServer {
         let address = listener.local_addr().unwrap();
         let requests = Arc::new(Mutex::new(Vec::new()));
         let stop = Arc::new(AtomicBool::new(false));
+        let sockets = Arc::new(Mutex::new(Vec::new()));
         let failed = Arc::new(AtomicBool::new(false));
         let worker = thread::spawn({
             let requests = requests.clone();
             let stop = stop.clone();
+            let sockets = sockets.clone();
             move || {
                 let mut workers = Vec::new();
                 for stream in listener.incoming() {
                     if stop.load(Ordering::Relaxed) {
                         break;
                     }
-                    let mut stream = stream.unwrap();
+                    let socket = Arc::new(stream.unwrap());
+                    sockets.lock().unwrap().push(Arc::downgrade(&socket));
                     let requests = requests.clone();
                     let failed = failed.clone();
                     workers.push(thread::spawn(move || {
+                        let mut stream = socket.as_ref();
+                        stream.set_nodelay(true).unwrap();
                         stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
                         stream.set_write_timeout(Some(Duration::from_secs(60))).unwrap();
                         let mut headers = Vec::new();
@@ -93,6 +100,7 @@ impl TestServer {
             url: Url::parse(&format!("http://{address}/file.bin")).unwrap(),
             requests,
             stop,
+            sockets,
             worker: Some(worker),
         }
     }
@@ -101,6 +109,17 @@ impl TestServer {
 impl Drop for TestServer {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
+        // Drop runs on Tokio's test thread. Wake blocked writers before joining;
+        // they must not need Hyper cleanup tasks on that same thread to make progress.
+        for stream in self
+            .sockets
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(Weak::upgrade)
+        {
+            let _ = stream.shutdown(Shutdown::Both);
+        }
         let _ = TcpStream::connect(("127.0.0.1", self.url.port().unwrap()));
         self.worker.take().unwrap().join().unwrap();
     }
@@ -352,7 +371,12 @@ async fn buffered_connections_still_share_live_speed_limits() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "512 MiB disk/network throughput benchmark; run with npm run engine:bench"]
 async fn transfer_throughput() {
-    let total = 512 * 1024 * 1024;
+    let total = std::env::var("FETCHRAIL_BENCH_BYTES")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(512 * 1024 * 1024);
+    let expected = std::env::var("FETCHRAIL_BENCH_SHA256")
+        .expect("The fixture must provide the final SHA-256.");
     let url = Url::parse(
         &std::env::var("FETCHRAIL_BENCH_URL")
             .expect("Run npm run engine:bench to start the benchmark server."),
@@ -366,7 +390,7 @@ async fn transfer_throughput() {
         .split(',')
         .map(|count| count.parse::<usize>().unwrap())
     {
-        for run in 1..=3 {
+        for run in 0..=5 {
             let (dir, segments, probe) = parts(total, connections).await;
             let started = Instant::now();
             DownloadManager::download_ranges(
@@ -381,10 +405,15 @@ async fn transfer_throughput() {
             )
             .await
             .unwrap();
+            let network_seconds = started.elapsed().as_secs_f64();
+            let joined = dir.join("complete.bin");
+            let ranges = segments.iter().map(|s| s.range).collect::<Vec<_>>();
+            join_parts(&dir, &joined, &ranges, total, &AtomicU64::new(0), None).unwrap();
             let seconds = started.elapsed().as_secs_f64();
+            verify_file_hash(&joined, &expected).unwrap();
             eprintln!(
-                "THROUGHPUT connections={connections} run={run} MB/s={:.1} seconds={seconds:.3}",
-                total as f64 / seconds / 1_000_000.0
+                "BENCHMARK {}",
+                serde_json::json!({"connections":connections,"run":run,"warmup":run==0,"bytes":total,"seconds":seconds,"networkSeconds":network_seconds,"finalizationSeconds":seconds-network_seconds,"mbps":total as f64/seconds/1_000_000.0,"sha256":expected})
             );
             for (index, segment) in segments.iter().enumerate() {
                 assert_eq!(

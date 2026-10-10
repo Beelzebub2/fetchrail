@@ -1,0 +1,22 @@
+pkgname=fetchrail-bin
+pkgver=@VERSION@
+pkgrel=1
+pkgdesc='Fetchrail download manager with parallel HTTP transfers and torrents'
+arch=('x86_64' 'aarch64')
+url='https://github.com/Beelzebub2/fetchrail'
+license=('custom')
+options=('!strip' '!debug')
+depends=('webkit2gtk-4.1' 'gtk3' 'xdotool' 'xdg-utils' 'ca-certificates')
+optdepends=('libappindicator: desktop tray' 'networkmanager: selected connection disconnection' 'systemd: shutdown after completion')
+provides=('fetchrail')
+conflicts=('fetchrail')
+source_x86_64=("Fetchrail-v${pkgver}-linux-x64.tar.gz::${url}/releases/download/v${pkgver}/Fetchrail-v${pkgver}-linux-x64.tar.gz")
+source_aarch64=("Fetchrail-v${pkgver}-linux-arm64.tar.gz::${url}/releases/download/v${pkgver}/Fetchrail-v${pkgver}-linux-arm64.tar.gz")
+sha256sums_x86_64=('@X64_SHA256@')
+sha256sums_aarch64=('@ARM64_SHA256@')
+package() {
+  install -Dm755 "$srcdir/fetchrail" "$pkgdir/usr/bin/fetchrail"
+  install -Dm644 "$srcdir/fetchrail.desktop" "$pkgdir/usr/share/applications/fetchrail.desktop"
+  install -Dm644 "$srcdir/fetchrail.png" "$pkgdir/usr/share/icons/hicolor/128x128/apps/fetchrail.png"
+  install -Dm644 "$srcdir/THIRD_PARTY_NOTICES.txt" "$pkgdir/usr/share/licenses/$pkgname/THIRD_PARTY_NOTICES.txt"
+}

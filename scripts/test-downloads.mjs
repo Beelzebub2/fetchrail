@@ -1,25 +1,22 @@
 import assert from "node:assert/strict";
-import { spawn, execFile } from "node:child_process";
-import { promisify } from "node:util";
+import { spawn } from "node:child_process";
 import { randomUUID, createHash } from "node:crypto";
 import { createServer } from "node:http";
 import { connect } from "node:net";
 import { access, readFile, writeFile, mkdtemp, mkdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join, resolve, dirname } from "node:path";
+import { join, resolve, dirname, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { setTimeout as delay } from "node:timers/promises";
 import vm from "node:vm";
+import { createFixture, executableName } from "./test-runtime.mjs";
 
-// Run with Fetchrail closed. Original settings and history are restored in finally.
+// The app and native helper share a unique identity and never touch real user state.
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
 const bin = resolve(root, process.argv[2] ?? "src-tauri/target/release");
-await access(join(bin, "fetchrail.exe"));
-if (process.platform === "win32") {
-  const { stdout } = await promisify(execFile)("tasklist", ["/FO", "CSV", "/NH"], { windowsHide: true });
-  assert.equal(/(?:^|\n)"(?:fetchrail|braid)\.exe",/i.test(stdout), false, "Close Fetchrail and legacy Braid before running the download check.");
-}
-const stateDir = join(process.env.APPDATA, "com.rrmtools.braid");
+await access(join(bin, executableName("fetchrail")));
+const fixture = await createFixture("download-check");
+const { stateDir } = fixture;
 const read = (name) => readFile(join(stateDir, name));
 const original = Object.fromEntries(await Promise.all(["downloads.json", "settings.json", "queues.json"].map(async (name) => [name, await read(name).catch((error) => { if (error.code === "ENOENT") return null; throw error; })])));
 const records = JSON.parse(original["downloads.json"] ?? "[]");
@@ -45,8 +42,14 @@ for (let index = 0; index < data.length; index++) data[index] = (index * 31 + (i
 const digest = (bytes) => createHash("sha256").update(bytes).digest("hex");
 const expectedHash = digest(data);
 let retryFailed = false;
+let probeCooldown = 0;
+const probeTimes = [];
 const server = createServer((request, response) => {
   const name = request.url.slice(1);
+  if (name === "probe-cooldown.bin" && request.method === "HEAD") {
+    probeTimes.push(Date.now());
+    if (probeCooldown++ === 0) { response.writeHead(429, { "Retry-After": "1" }).end(); return; }
+  }
   if (name === "auth.bin") { response.writeHead(403).end(); return; }
   if (name === "landing.html") { response.writeHead(200, { "Content-Type": "text/html" }).end("<button>Download</button>"); return; }
   if (name === "session.bin" && (request.headers.cookie !== "session=fetchrail-test" || request.headers.referer !== base + "step/5")) { response.writeHead(403).end(); return; }
@@ -92,7 +95,7 @@ async function waitFor(fn, label, timeout = 20000) {
 async function launch() {
   let previousToken;
   try { previousToken = JSON.parse(await read("browser-bridge.json")).token; } catch {}
-  app = spawn(join(bin, "fetchrail.exe"), ["--background"], { windowsHide: true, stdio: ["ignore", "ignore", "pipe"] });
+  app = spawn(join(bin, executableName("fetchrail")), ["--background"], { env: fixture.env, windowsHide: true, stdio: ["ignore", "ignore", "pipe"] });
   app.stderr.on("data", (chunk) => process.stderr.write(chunk));
   let startupError;
   app.once("error", (error) => { startupError = error; });
@@ -148,14 +151,14 @@ try {
   const settings = { ...JSON.parse(original["settings.json"] ?? "{}"), autoUpdate: false, speedLimitBps: 4 * 1024 * 1024, defaultDownloadDir: out, maxConcurrentDownloads: 2, connectionsPerDownload: 4, minSegmentSizeMb: 1, launchOnStart: false,
     categories: [{ name: "Archives", extensions: ["zip"], folder: "Sorted" }] };
   await writeFile(join(stateDir, "settings.json"), JSON.stringify(settings));
-  const windowStart = Date.now() + 7000;
-  const windowStop = windowStart + 1400;
+  const windowStart = Date.now() + 30000;
+  const windowStop = windowStart + 3000;
   await writeFile(join(stateDir, "queues.json"), JSON.stringify([
     { name: "Default", paused: false },
     { name: "Window", paused: false, startsAt: new Date(windowStart).toISOString(), stopsAt: new Date(windowStop).toISOString() },
   ]));
   await launch();
-  host = spawn(join(bin, "fetchrail.exe"), ["chrome-extension://fkmedfamaoejlhddajndhjemiedmnldh/"], { windowsHide: true, stdio: ["pipe", "pipe", "inherit"] });
+  host = spawn(join(bin, executableName("fetchrail")), ["chrome-extension://fkmedfamaoejlhddajndhjemiedmnldh/"], { env: fixture.env, windowsHide: true, stdio: ["pipe", "pipe", "inherit"] });
   let buffer = Buffer.alloc(0);
   host.stdout.on("data", (chunk) => {
     buffer = Buffer.concat([buffer, chunk]);
@@ -168,6 +171,18 @@ try {
   });
   const ping = await native("ping");
   assert.ok(ping.capabilities.includes("controlDownload"));
+  // Exercise the window before unrelated transfers can consume its start/stop interval.
+  assert.ok(Date.now() < windowStart, "Desktop startup must finish before the fixture's queue window");
+  const windowed = await add("windowed.bin", { queue: "Window", speedLimitBps: 128 * 1024 });
+  await waitFor(async () => (await record(windowed))?.downloadedBytes > 0, "queue window starts automatically", 40000);
+  await waitFor(async () => { const item = await record(windowed); return Date.now() >= windowStop && item?.status === "queued"; }, "queue window stops automatically", 15000);
+  await delay(400);
+  const stoppedBytes = (await record(windowed)).downloadedBytes;
+  assert.ok(stoppedBytes > 0 && stoppedBytes < data.length);
+  await delay(400);
+  assert.equal((await record(windowed)).downloadedBytes, stoppedBytes, "A closed queue window must stop active network progress.");
+  assert.equal((await record(windowed)).speedLimitBps, 128 * 1024);
+  console.log("PASS: queue start/stop windows gate active transfers and retain partial bytes");
   for (let index = 0; index < 100; index++) await native("ping");
   console.log("PASS: 100 rapid native bridge requests");
   await assert.rejects(native("addDownloads", { source: "popup", items: [{ url: "file:///C:/secret" }] }));
@@ -181,16 +196,6 @@ try {
   assert.ok(observed.get("range.bin").peak >= 4, "Expected four simultaneous byte-range requests.");
   console.log("PASS: concurrent downloads, four connections, exact SHA-256 output");
   console.log("PASS: global speed limit caps the combined throughput of simultaneous downloads");
-  const windowed = await add("windowed.bin", { queue: "Window", speedLimitBps: 128 * 1024 });
-  await waitFor(async () => (await record(windowed))?.downloadedBytes > 0, "queue window starts automatically", 15000);
-  await waitFor(async () => { const item = await record(windowed); return Date.now() >= windowStop && item?.status === "queued"; }, "queue window stops automatically", 15000);
-  await delay(400);
-  const stoppedBytes = (await record(windowed)).downloadedBytes;
-  assert.ok(stoppedBytes > 0 && stoppedBytes < data.length);
-  await delay(400);
-  assert.equal((await record(windowed)).downloadedBytes, stoppedBytes, "A closed queue window must stop active network progress.");
-  assert.equal((await record(windowed)).speedLimitBps, 128 * 1024);
-  console.log("PASS: queue start/stop windows gate active transfers and retain partial bytes");
   const limitedStarted = Date.now();
   const limited = await add("limited.bin", { speedLimitBps: 2 * 1024 * 1024 });
   await complete(limited, 4);
@@ -316,6 +321,15 @@ try {
   for (const [name, count] of [["ignore.bin", 1], ["unknown.bin", 1], ["retry.bin", 4]]) await complete(await add(name), count);
   assert.ok(retryFailed);
   console.log("PASS: range fallback, unknown lengths, automatic transient retry");
+  await complete(await add("probe-cooldown.bin"), 4);
+  assert.ok(probeTimes[1] - probeTimes[0] >= 950, "Metadata probes must respect the server cooldown");
+  const checked = await add("sha256.bin", { items: [{ url: base + "sha256.bin", expectedSha256: expectedHash }] });
+  await complete(checked, 4);
+  const corrupted = await add("sha256-failure.bin", { items: [{ url: base + "sha256-failure.bin", expectedSha256: "0".repeat(64) }] });
+  const failed = await waitFor(async () => { const item = await record(corrupted); return item?.status === "failed" && item; }, "SHA-256 mismatch rejection");
+  assert.match(failed.error, /SHA-256/);
+  await assert.rejects(access(join(out, "sha256-failure.bin")), { code: "ENOENT" });
+  console.log("PASS: server probe cooldown and SHA-256 verification before file publication");
   const scheduled = await add("scheduled.bin", { scheduledFor: new Date(Date.now() + 1000).toISOString() });
   assert.equal((await record(scheduled)).status, "scheduled"); await complete(scheduled, 4);
   const cancel = await add("cancel.bin", { startPaused: true });
@@ -323,22 +337,31 @@ try {
   assert.equal((await record(cancel)).status, "cancelled");
   const invalid = await add("invalid.bin");
   await waitFor(async () => (await record(invalid))?.status === "failed", "invalid Content-Range rejection");
-  await delay(300); const failed = await record(invalid); await delay(350);
+  await delay(300); const invalidSnapshot = await record(invalid); await delay(350);
   assert.equal((await record(invalid)).speedBps, 0);
-  assert.equal((await record(invalid)).downloadedBytes, failed.downloadedBytes);
+  assert.equal((await record(invalid)).downloadedBytes, invalidSnapshot.downloadedBytes);
   console.log("PASS: scheduling, cancellation, invalid ranges, failed-progress cleanup");
 } catch (error) {
   console.error("Test app state:", { exitCode: app?.exitCode, signalCode: app?.signalCode });
+  // Keep only fixture counters/statuses; never copy stored browser credentials.
+  const diagnosis = { recordedAt: new Date().toISOString(), error: error.message,
+    app: { exitCode: app?.exitCode, signalCode: app?.signalCode },
+    sourceArchiveSha256: process.env.FETCHRAIL_SOURCE_ARCHIVE_SHA256 ?? null };
+  try { diagnosis.downloads = JSON.parse(await read("downloads.json")).map(item => ({ id: item.id, status: item.status,
+    queue: item.queue, downloadedBytes: item.downloadedBytes, totalBytes: item.totalBytes, mergedBytes: item.mergedBytes,
+    scheduledFor: item.scheduledFor, error: item.error })); } catch {}
+  try { diagnosis.queues = JSON.parse(await read("queues.json")); } catch {}
+  diagnosis.server = [...observed].map(([name, entry]) => ({ name, active: entry.active, peak: entry.peak, rangeRequests: entry.ranges.length }));
+  const evidence = join(root, "artifacts/linux-qualification");
+  await mkdir(evidence, { recursive: true });
+  await writeFile(join(evidence, `${Date.now()}-http-failure.json`), JSON.stringify(diagnosis, null, 2) + "\n");
+  console.error("Fixture download states:", diagnosis.downloads);
   throw error;
 } finally {
   host?.kill();
   if (app?.pid && app.exitCode == null && app.signalCode == null) { app.kill(); await new Promise((done) => app.once("exit", done)); }
   server.closeAllConnections(); await new Promise((done) => server.close(done));
-  for (const [name, bytes] of Object.entries(original)) {
-    if (bytes) await writeFile(join(stateDir, name), bytes);
-    else await rm(join(stateDir, name), { force: true });
-  }
-  for (const id of ids) { const target = resolve(stateDir, "parts", id); assert.ok(target.startsWith(resolve(stateDir, "parts") + "\\")); await rm(target, { recursive: true, force: true }); }
-  assert.ok(resolve(out).startsWith(resolve(tmpdir()) + "\\fetchrail-download-check-"));
+  await fixture.cleanup();
+  assert.ok(resolve(out).startsWith(resolve(tmpdir()) + sep + "fetchrail-download-check-"));
   await rm(out, { recursive: true, force: true });
 }

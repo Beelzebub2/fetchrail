@@ -12,6 +12,7 @@ dist
 dist-ssr
 release-artifacts/
 artifacts/
+/.native-vcpkg/
 # Hosted separately on Cloudflare Workers
 /website/
 *.local

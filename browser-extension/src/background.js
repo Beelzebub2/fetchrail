@@ -252,7 +252,7 @@ async function addItems(source, items, options = {}) {
   const seen = new Set();
   const safeItems = items.map((item) => {
     const url = new URL(item.url);
-    if (!["http:", "https:"].includes(url.protocol)) throw new Error("Only HTTP and HTTPS links are supported.");
+    if (!["http:", "https:", "magnet:"].includes(url.protocol)) throw new Error("Only HTTP, HTTPS and magnet links are supported.");
     url.hash = "";
     return { url: url.href, ...(item.suggestedFileName ? { suggestedFileName: item.suggestedFileName } : {}),
       ...(item.expectedBytes != null ? { expectedBytes: item.expectedBytes } : {}),
@@ -261,21 +261,28 @@ async function addItems(source, items, options = {}) {
   }).filter((item) => !seen.has(item.url) && seen.add(item.url));
   let accepted = 0;
   const ids = [];
+  let pendingConfirmation = false;
   const errors = [];
   // Small batches stay below native messaging limits even with long signed URLs.
   for (let offset = 0; offset < safeItems.length; offset += 25) {
     try {
-      const result = await nativeRequest("addDownloads", { source, items: safeItems.slice(offset, offset + 25), ...options });
-      accepted += result.accepted;
-      ids.push(...(result.ids ?? []));
-      errors.push(...result.errors.map((error) => ({ ...error, index: error.index + offset, url: safeItems[offset + error.index].url })));
+      const batch = safeItems.slice(offset, offset + 25).map((item, index) => ({ item, index: offset + index }));
+      const torrent = ({ item }) => item.url.startsWith("magnet:") || new URL(item.url).pathname.toLowerCase().endsWith(".torrent");
+      for (const [method, group] of [["addDownloads", batch.filter(entry => !torrent(entry))], ["addTorrents", batch.filter(torrent)]]) {
+        if (!group.length) continue;
+        const result = await nativeRequest(method, { source, items: group.map(({ item }) => method === "addTorrents" ? { url: item.url } : item), ...options });
+        accepted += result.accepted;
+        pendingConfirmation ||= result.pendingConfirmation === true;
+        ids.push(...(result.ids ?? []));
+        errors.push(...result.errors.map((error) => ({ ...error, index: group[error.index].index, url: group[error.index].item.url })));
+      }
     } catch (error) {
       await setBadge("!", "Fetchrail: " + error.message);
       throw new Error(`${accepted ? accepted + " downloads were already accepted. " : ""}${error.message}`);
     }
   }
   await setBadge(errors.length ? "!" : String(accepted), `Fetchrail: ${accepted} downloads accepted`);
-  return { accepted, rejected: errors.length, errors, ids };
+  return { accepted, rejected: errors.length, errors, ids, pendingConfirmation };
 }
 
 async function routeBrowserDownload(item) {
@@ -317,7 +324,7 @@ async function routeBrowserDownload(item) {
       ...(Object.keys(context).length ? { requestContext: context } : {}),
     }], batchOptions ?? {});
     engineId = result.ids[0];
-    if (result.accepted !== 1 || !engineId) throw new Error(result.errors[0]?.message ?? "Fetchrail did not accept the download.");
+    if (result.accepted !== 1 || (!engineId && !result.pendingConfirmation)) throw new Error(result.errors[0]?.message ?? "Fetchrail did not accept the download.");
     const [latest] = await api.downloads.search({ id: item.id });
     paused = latest?.state === "in_progress" && latest.paused;
     // Verification can outlast a user action or the browser's safety verdict.
@@ -373,7 +380,7 @@ async function collectLinks(tabId) {
       for (const element of document.querySelectorAll("a[href], area[href], video[src], audio[src], source[src], img[src]")) {
         try {
           const url = new URL(element.href || element.currentSrc || element.src, document.baseURI);
-          if (!["http:", "https:"].includes(url.protocol)) continue;
+          if (!["http:", "https:", "magnet:"].includes(url.protocol)) continue;
           url.hash = "";
           if (seen.has(url.href)) continue;
           seen.add(url.href);
@@ -382,7 +389,7 @@ async function collectLinks(tabId) {
           links.push({
             url: url.href,
             title: (element.textContent?.trim() || element.alt || name || url.pathname.split("/").pop() || url.host).slice(0, 200),
-            kind: media ? "media" : /\.(zip|7z|rar|exe|msi|pdf|iso|dmg|apk|bin|tar|gz|mp4|mp3|webm|wav|png|jpe?g|webp|csv|docx|xlsx)$/i.test(url.pathname) || element.hasAttribute("download") ? "file" : "link",
+            kind: media ? "media" : url.protocol === "magnet:" || /\.(torrent|zip|7z|rar|exe|msi|pdf|iso|dmg|apk|bin|tar|gz|mp4|mp3|webm|wav|png|jpe?g|webp|csv|docx|xlsx)$/i.test(url.pathname) || element.hasAttribute("download") ? "file" : "link",
             ...(name ? { suggestedFileName: name } : {}),
           });
           if (links.length === 1000) break;

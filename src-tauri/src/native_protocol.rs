@@ -26,6 +26,7 @@ pub struct NativeRequest {
 pub enum NativeMethod {
     Ping,
     AddDownloads,
+    AddTorrents,
     GetDownloads,
     ControlDownload,
     ShowApp,
@@ -67,6 +68,7 @@ pub enum BrowserSource {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct BrowserDownloadItem {
+    pub expected_sha256: Option<String>,
     pub url: String,
     pub suggested_file_name: Option<String>,
     pub expected_bytes: Option<u64>,
@@ -143,7 +145,7 @@ pub fn validate_request(request: &NativeRequest) -> Result<(), String> {
     Uuid::parse_str(&request.id).map_err(|_| "Request id must be a UUID.".to_string())?;
     match request.method {
         NativeMethod::Ping | NativeMethod::GetDownloads | NativeMethod::ShowApp => {}
-        NativeMethod::AddDownloads => {
+        NativeMethod::AddDownloads | NativeMethod::AddTorrents => {
             if request.params.source.is_none() {
                 return Err("Download requests must include their browser source.".into());
             }
@@ -206,7 +208,21 @@ pub fn validate_request(request: &NativeRequest) -> Result<(), String> {
                 }
                 let parsed =
                     Url::parse(&item.url).map_err(|_| "Invalid download URL.".to_string())?;
-                if !matches!(parsed.scheme(), "http" | "https") {
+                if request.method == NativeMethod::AddTorrents {
+                    if item.request_context.is_some() {
+                        return Err(
+                            "Torrent handoff does not accept browser session headers.".into()
+                        );
+                    }
+                    if parsed.scheme() != "magnet"
+                        && !(matches!(parsed.scheme(), "http" | "https")
+                            && parsed.path().to_lowercase().ends_with(".torrent"))
+                    {
+                        return Err(
+                            "Torrent handoff requires a magnet or an HTTP(S) .torrent URL.".into(),
+                        );
+                    }
+                } else if !matches!(parsed.scheme(), "http" | "https") {
                     return Err("Only HTTP and HTTPS browser downloads are accepted.".into());
                 }
                 if item
@@ -224,14 +240,16 @@ pub fn validate_request(request: &NativeRequest) -> Result<(), String> {
             }
         }
     }
-    if request.method != NativeMethod::AddDownloads
-        && (!request.params.items.is_empty()
-            || request.params.source.is_some()
-            || request.params.connections.is_some()
-            || request.params.queue.is_some()
-            || request.params.start_paused.is_some()
-            || request.params.scheduled_for.is_some()
-            || request.params.speed_limit_bps.is_some())
+    if !matches!(
+        request.method,
+        NativeMethod::AddDownloads | NativeMethod::AddTorrents
+    ) && (!request.params.items.is_empty()
+        || request.params.source.is_some()
+        || request.params.connections.is_some()
+        || request.params.queue.is_some()
+        || request.params.start_paused.is_some()
+        || request.params.scheduled_for.is_some()
+        || request.params.speed_limit_bps.is_some())
     {
         return Err("Download options are only accepted by addDownloads.".into());
     }
@@ -255,6 +273,7 @@ mod tests {
             params: NativeParams {
                 source: Some(BrowserSource::ContextMenu),
                 items: vec![BrowserDownloadItem {
+                    expected_sha256: None,
                     url: url.to_string(),
                     suggested_file_name: None,
                     expected_bytes: None,
@@ -269,6 +288,27 @@ mod tests {
     #[test]
     fn accepts_http_downloads() {
         assert!(validate_request(&request("https://example.com/file.zip")).is_ok());
+    }
+
+    #[test]
+    fn torrent_handoff_requires_its_own_method_and_does_not_accept_credentials() {
+        let magnet = "magnet:?xt=urn:btih:abcdef0123456789abcdef0123456789abcdef0123";
+        assert!(validate_request(&request(magnet)).is_err());
+        for url in [magnet, "https://example.com/file.torrent?token=1"] {
+            let mut req = request(url);
+            req.method = NativeMethod::AddTorrents;
+            assert!(validate_request(&req).is_ok());
+            req.params.items[0].request_context = Some(crate::model::BrowserRequestContext {
+                cookie: Some("session=secret".into()),
+                ..Default::default()
+            });
+            assert!(validate_request(&req).is_err());
+        }
+        let mut req = request("file:///C:/secret.torrent");
+        req.method = NativeMethod::AddTorrents;
+        assert!(validate_request(&req).is_err());
+        req.params.items[0].url = "https://example.com/file.zip".into();
+        assert!(validate_request(&req).is_err());
     }
 
     #[test]

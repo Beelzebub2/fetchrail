@@ -11,6 +11,10 @@ pub enum DownloadStatus {
     Scheduled,
     Connecting,
     Downloading,
+    Metadata,
+    Checking,
+    Stalled,
+    Seeding,
     Paused,
     Merging,
     Completed,
@@ -20,13 +24,26 @@ pub enum DownloadStatus {
 
 impl DownloadStatus {
     pub fn is_active(&self) -> bool {
-        matches!(self, Self::Connecting | Self::Downloading | Self::Merging)
+        matches!(
+            self,
+            Self::Connecting
+                | Self::Downloading
+                | Self::Merging
+                | Self::Metadata
+                | Self::Checking
+                | Self::Stalled
+                | Self::Seeding
+        )
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct DownloadRecord {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub torrent: Option<crate::torrent::TorrentSummary>,
     pub id: Uuid,
     pub url: String,
     pub file_name: String,
@@ -75,6 +92,7 @@ pub struct CompletionOptions {
     pub exit_app: bool,
     pub turn_off_computer: bool,
     pub force_shutdown: bool,
+    pub connection_id: Option<String>,
 }
 
 impl Default for CompletionOptions {
@@ -85,6 +103,7 @@ impl Default for CompletionOptions {
             exit_app: false,
             turn_off_computer: false,
             force_shutdown: false,
+            connection_id: None,
         }
     }
 }
@@ -133,6 +152,8 @@ pub enum Accent {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DownloadSettings {
+    #[serde(default)]
+    pub torrent: crate::torrent::TorrentSettings,
     /// Shared by all downloads and connections; zero is unlimited.
     #[serde(default)]
     pub speed_limit_bps: u64,
@@ -150,16 +171,32 @@ pub struct DownloadSettings {
     pub accent: Accent,
     #[serde(default = "default_categories")]
     pub categories: Vec<Category>,
+    /// Place new downloads in category folders unless a destination was chosen explicitly.
+    #[serde(default = "default_true")]
+    pub sort_into_category_folders: bool,
     /// Look for new releases in the background and put them in place.
     #[serde(default = "default_true")]
     pub auto_update: bool,
+    /// Whether removing a download from the list also deletes its file; unset asks each time.
+    #[serde(default)]
+    pub delete_files_on_remove: Option<bool>,
 }
 
 impl DownloadSettings {
     pub fn normalized(mut self) -> Self {
+        if self.speed_limit_bps > 0 {
+            self.speed_limit_bps = self.speed_limit_bps.max(2);
+        }
         self.max_concurrent_downloads = self.max_concurrent_downloads.clamp(1, 12);
         self.connections_per_download = self.connections_per_download.clamp(1, 32);
         self.min_segment_size_mb = self.min_segment_size_mb.clamp(1, 128);
+        self.torrent.max_seeds = self.torrent.max_seeds.clamp(1, 100);
+        self.torrent.connections = self.torrent.connections.clamp(20, 2000);
+        self.torrent.encryption = self.torrent.encryption.min(2);
+        self.torrent.protocol = self.torrent.protocol.min(2);
+        if !self.torrent.ratio_limit.is_finite() || self.torrent.ratio_limit < 0.0 {
+            self.torrent.ratio_limit = 1.0;
+        }
         for category in &mut self.categories {
             category.name = category.name.trim().to_string();
             category.folder = category.folder.trim().to_string();
@@ -174,8 +211,8 @@ impl DownloadSettings {
         self
     }
 
-    /// Where a file lands when no folder was chosen for it: its category's folder, else the default one.
-    pub fn folder_for(&self, file_name: &str) -> PathBuf {
+    /// Category destination regardless of automatic sorting; used by the manual organizer.
+    pub fn category_folder_for(&self, file_name: &str) -> Option<PathBuf> {
         let base = Path::new(&self.default_download_dir);
         let ending = Path::new(file_name)
             .extension()
@@ -186,16 +223,24 @@ impl DownloadSettings {
             .iter()
             .find(|category| category.extensions.contains(&ending))
             // Joining an absolute folder replaces the base.
-            .map_or_else(
-                || base.to_path_buf(),
-                |category| base.join(&category.folder),
-            )
+            .map(|category| base.join(&category.folder))
+    }
+
+    /// Where an ordinary new download lands without an explicitly chosen folder.
+    pub fn folder_for(&self, file_name: &str) -> PathBuf {
+        let base = Path::new(&self.default_download_dir);
+        if !self.sort_into_category_folders {
+            return base.to_path_buf();
+        }
+        self.category_folder_for(file_name)
+            .unwrap_or_else(|| base.to_path_buf())
     }
 }
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AddDownloadRequest {
+    pub expected_sha256: Option<String>,
     pub url: String,
     pub directory: Option<String>,
     pub file_name: Option<String>,
@@ -255,6 +300,8 @@ pub struct BatchDownloadError {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EngineOverview {
+    pub upload_speed_bps: u64,
+    pub seeding: usize,
     pub active: usize,
     pub queued: usize,
     pub completed: usize,
@@ -275,7 +322,14 @@ pub fn default_categories() -> Vec<Category> {
         ),
         ("Documents", "pdf doc docx xls xlsx ppt pptx pps odt"),
         ("Music", "mp3 wav wma mpa ram ra aac aif m4a flac opus"),
-        ("Programs", "exe msi"),
+        (
+            "Programs",
+            if cfg!(target_os = "linux") {
+                "exe msi deb rpm appimage run sh"
+            } else {
+                "exe msi"
+            },
+        ),
         (
             "Video",
             "avi mpg mpe mpeg asf wmv mov qt rm mp4 flv m4v webm ogv ogg mkv ts",
@@ -333,9 +387,20 @@ mod tests {
 
     #[test]
     fn files_are_sorted_into_category_folders() {
+        let download_root = if cfg!(windows) {
+            r"D:\Downloads"
+        } else {
+            "/tmp/Downloads"
+        };
+        let films = if cfg!(windows) {
+            r"E:\Films"
+        } else {
+            "/tmp/Films"
+        };
         let settings = DownloadSettings {
+            torrent: Default::default(),
             speed_limit_bps: 0,
-            default_download_dir: r"D:\Downloads".into(),
+            default_download_dir: download_root.into(),
             max_concurrent_downloads: 3,
             connections_per_download: 8,
             min_segment_size_mb: 4,
@@ -344,6 +409,8 @@ mod tests {
             theme: Theme::default(),
             accent: Accent::default(),
             auto_update: true,
+            delete_files_on_remove: None,
+            sort_into_category_folders: true,
             categories: vec![
                 Category {
                     name: " Archives ".into(),
@@ -353,7 +420,7 @@ mod tests {
                 Category {
                     name: "Films".into(),
                     extensions: vec!["mkv".into()],
-                    folder: r"E:\Films".into(),
+                    folder: films.into(),
                 },
                 Category {
                     name: " ".into(),
@@ -369,11 +436,28 @@ mod tests {
             "nameless categories are dropped"
         );
         assert_eq!(settings.categories[0].extensions, ["zip", "7z"]);
-        let base = Path::new(r"D:\Downloads");
+        let base = Path::new(download_root);
         assert_eq!(settings.folder_for("Setup.Zip"), base.join("Compressed"));
-        assert_eq!(settings.folder_for("film.mkv"), Path::new(r"E:\Films"));
+        assert_eq!(settings.folder_for("film.mkv"), Path::new(films));
         assert_eq!(settings.folder_for("data.bin"), base);
         assert_eq!(settings.folder_for("README"), base);
+        let flat = DownloadSettings {
+            sort_into_category_folders: false,
+            ..settings.clone()
+        };
+        assert_eq!(flat.folder_for("Setup.Zip"), base);
+        assert_eq!(
+            flat.category_folder_for("Setup.Zip"),
+            Some(base.join("Compressed"))
+        );
+        let serialized = serde_json::to_value(&settings).unwrap();
+        let mut legacy = serialized.as_object().unwrap().clone();
+        legacy.remove("sortIntoCategoryFolders");
+        legacy.remove("deleteFilesOnRemove");
+        let restored: DownloadSettings =
+            serde_json::from_value(serde_json::Value::Object(legacy)).unwrap();
+        assert!(restored.sort_into_category_folders);
+        assert_eq!(restored.delete_files_on_remove, None);
         assert!(default_categories()
             .iter()
             .any(|category| category.name == "Programs"

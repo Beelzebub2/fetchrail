@@ -31,28 +31,26 @@ pub async fn start(app: AppHandle, manager: Arc<DownloadManager>) -> Result<(), 
         port,
         token: format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple()),
     };
-    let data_dir = app
-        .path()
-        .app_data_dir()
-        .map_err(|error| format!("Could not locate Fetchrail app data: {error}"))?;
-    tokio::fs::create_dir_all(&data_dir)
-        .await
-        .map_err(|error| format!("Could not create Fetchrail app data: {error}"))?;
+    let data_dir = crate::platform::app_data_dir()?;
     let config_bytes = serde_json::to_vec(&config)
         .map_err(|error| format!("Could not serialize browser bridge state: {error}"))?;
-    tokio::fs::write(data_dir.join(BRIDGE_CONFIG_FILE), config_bytes)
-        .await
+    crate::platform::write_private_atomic(&data_dir.join(BRIDGE_CONFIG_FILE), &config_bytes)
         .map_err(|error| format!("Could not publish browser bridge state: {error}"))?;
 
+    let connections = Arc::new(tokio::sync::Semaphore::new(64));
     tauri::async_runtime::spawn(async move {
         loop {
             let Ok((stream, _)) = listener.accept().await else {
                 break;
             };
+            let Ok(permit) = connections.clone().try_acquire_owned() else {
+                continue;
+            };
             let app = app.clone();
             let manager = manager.clone();
             let token = config.token.clone();
             tauri::async_runtime::spawn(async move {
+                let _permit = permit;
                 if let Err(error) = handle_connection(stream, app, manager, &token).await {
                     eprintln!("Fetchrail browser bridge: {error}");
                 }
@@ -122,13 +120,19 @@ async fn process_request(
     match request.method {
         NativeMethod::Ping => {
             let settings = manager.settings().await;
+            // WebView URL getters synchronously wait for the UI event loop.
+            // Startup pings must not occupy runtime workers while setup uses it.
+            let ready = app.state::<crate::FrontendReady>();
+            let frontend_url = ready.1.lock().expect("frontend URL poisoned").clone();
+            let frontend_ready =
+                ready.0.load(std::sync::atomic::Ordering::Relaxed) && frontend_url.is_some();
             NativeResponse::success(
                 request.id,
                 json!({
                     "appVersion": env!("CARGO_PKG_VERSION"),
-                    "frontendReady": app.state::<crate::FrontendReady>().0.load(std::sync::atomic::Ordering::Relaxed),
-                    "frontendUrl": app.get_webview_window("main").and_then(|window| window.url().ok()).map(|url| url.to_string()),
-                    "capabilities": ["addDownloads", "getDownloads", "controlDownload", "showApp", "queues", "scheduling", "connections", "speedLimits", "browserSessions"],
+                    "frontendReady": frontend_ready,
+                    "frontendUrl": frontend_url,
+                    "capabilities": ["addDownloads", "addTorrents", "getDownloads", "controlDownload", "showApp", "queues", "scheduling", "connections", "speedLimits", "browserSessions"],
                     "speedLimitBps": settings.speed_limit_bps,
                     "connectionsPerDownload": settings.connections_per_download,
                     "maxConcurrentDownloads": settings.max_concurrent_downloads,
@@ -183,6 +187,29 @@ async fn process_request(
                 Err(error) => NativeResponse::failure(request.id, "CONTROL_FAILED", error),
             }
         }
+        NativeMethod::AddTorrents => {
+            let sources = request
+                .params
+                .items
+                .iter()
+                .map(|item| item.url.clone())
+                .collect::<Vec<_>>();
+            let count = sources.len();
+            let ready = app
+                .state::<crate::FrontendReady>()
+                .0
+                .load(std::sync::atomic::Ordering::Relaxed);
+            match manager.offer_torrent_sources(sources, ready) {
+                Ok(()) => {
+                    crate::show_main_window(app);
+                    NativeResponse::success(
+                        request.id,
+                        json!({"accepted":count,"rejected":0,"ids":[],"errors":[],"pendingConfirmation":true}),
+                    )
+                }
+                Err(error) => NativeResponse::failure(request.id, "TORRENT_HANDOFF_FAILED", error),
+            }
+        }
         NativeMethod::ShowApp => {
             crate::show_main_window(app);
             NativeResponse::success(request.id, json!({"shown": true}))
@@ -212,6 +239,7 @@ async fn process_request(
                     };
                     manager
                         .add(AddDownloadRequest {
+                            expected_sha256: item.expected_sha256,
                             url: item.url,
                             directory: None,
                             file_name,

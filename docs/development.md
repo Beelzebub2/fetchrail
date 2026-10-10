@@ -9,6 +9,7 @@ Use Windows with:
 - Node.js 24, matching the release workflow.
 - Rust stable with the MSVC target.
 - Microsoft C++ Build Tools.
+- CMake and vcpkg at revision `96d5fb3de135b86d7222c53f2352ca92827a156b`.
 - Microsoft Edge WebView2 Runtime.
 
 ## Run locally
@@ -17,6 +18,7 @@ Use Windows with:
 git clone https://github.com/Beelzebub2/fetchrail.git
 cd fetchrail
 npm ci
+npm run torrent:deps
 npm run tauri dev
 ```
 
@@ -54,7 +56,23 @@ The Rust transfer tests use isolated temporary files and a local HTTP server wit
 npm run engine:bench
 ```
 
-This benchmark starts a standard Node HTTP/1.1 server, builds the release transfer tests, and measures network-to-file throughput including final buffer flushes. It excludes merging and does not predict a remote host's speed. Set `FETCHRAIL_BENCH_CONNECTIONS` to a comma-separated list to limit the connection counts tested. The benchmark is ignored during normal test runs and removes its temporary files after successful runs.
+This benchmark starts a standard Node HTTP/1.1 server, builds the release transfer tests, and measures completion through finalization and file sync. Every output then passes exact SHA-256 verification outside the timer, including the comparator clients. It records network and finalization time separately and does not predict a remote host's speed. Set `FETCHRAIL_BENCH_CONNECTIONS` to a comma-separated list to limit the connection counts tested. The benchmark is ignored during normal test runs and removes its temporary files after successful runs.
+
+## Torrent validation
+
+Set `VCPKG_ROOT` to the pinned vcpkg checkout before `npm run torrent:deps`. This builds libtorrent 2.1.2, Boost and OpenSSL 3.5.9 using the committed overlay ports and verifies the pinned JSON header. Windows uses static native libraries and the static C++ runtime; no separate torrent daemon is installed.
+
+```powershell
+cargo build --manifest-path src-tauri/Cargo.toml --release --bins --features tauri/custom-protocol,test-tools --locked
+npm run torrent:test
+npm run torrent:ui
+npm run torrent:desktop
+npm run torrent:bench
+```
+
+The swarm tests use private temporary directories, local peers, and v1/v2/hybrid fixtures. The UI stress test uses a mock IPC boundary with 1,000 records and 10,000 files. The Windows desktop test uses the real packaged WebView2 and Tauri commands, with a 60-second mixed HTTP/torrent speed-cap measurement, file hashes, restart recovery and storage actions. The benchmark needs qBittorrent and uses a fresh isolated profile, matched TCP v1 transfers, three alternating runs and SHA-256 verification. Run performance checks without other builds or downloads. It writes measurements into `artifacts/`; local results do not predict WAN throughput.
+
+The tests use the release Rust-linked `torrent-harness` by default. For a native baseline, build the CMake fixture with `FETCHRAIL_BUILD_TORRENT_FIXTURE=ON`; pass its path as the benchmark's fourth argument after the Rust harness and qBittorrent paths. See [torrent validation](torrent-validation.md) for coverage and remaining qualification.
 
 ## Browser integration from source
 

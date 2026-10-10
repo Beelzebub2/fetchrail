@@ -1,4 +1,4 @@
-param([string]$Tag = "")
+param([string]$Tag = "", [switch]$FragmentOnly)
 
 $ErrorActionPreference = "Stop"
 $projectRoot = Split-Path -Parent $PSScriptRoot
@@ -38,7 +38,7 @@ try {
 Write-Host "Setup executable: $artifact"
 
 # Installed copies read latest.json and accept the download only if it matches this signature.
-$manifest = Join-Path $outputDir "latest.json"
+$manifest = Join-Path $outputDir $(if ($FragmentOnly) { 'windows.json' } else { 'latest.json' })
 if (-not ($env:TAURI_SIGNING_PRIVATE_KEY -or $env:TAURI_SIGNING_PRIVATE_KEY_PATH)) {
     if (Test-Path -LiteralPath $manifest) { Remove-Item -LiteralPath $manifest -Force -Confirm:$false }
     Write-Warning "No signing key in TAURI_SIGNING_PRIVATE_KEY(_PATH): packaged without latest.json, so this build cannot be published as an update."
@@ -59,5 +59,7 @@ $json = [ordered]@{
 } | ConvertTo-Json -Depth 4
 # Written without a byte-order mark: the updater's JSON parser rejects one.
 [System.IO.File]::WriteAllText($manifest, $json)
-Remove-Item -LiteralPath "$artifact.sig" -Force -Confirm:$false
+$fragment = $json | ConvertFrom-Json
+$fragment | Add-Member -NotePropertyName files -NotePropertyValue @(@{ name = $artifactName; sha256 = $hash; signature = (Get-Content -LiteralPath "$artifact.sig" -Raw).Trim(); size = (Get-Item -LiteralPath $artifact).Length })
+[System.IO.File]::WriteAllText((Join-Path $outputDir 'windows.json'), ($fragment | ConvertTo-Json -Depth 6))
 Write-Host "Update manifest: $manifest"

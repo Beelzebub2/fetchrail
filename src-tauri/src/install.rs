@@ -130,9 +130,24 @@ fn installed_executable(dir: &Path) -> PathBuf {
     if renamed.exists() {
         renamed
     } else {
-        // Signed updates replace the executable at its existing installed path.
+        // Existing installations can still use the old name before migration.
         dir.join(LEGACY_EXE_NAME)
     }
+}
+
+fn is_legacy_executable(exe: &Path, dir: &Path) -> bool {
+    exe.parent() == Some(dir)
+        && exe
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.eq_ignore_ascii_case(LEGACY_EXE_NAME))
+}
+
+fn update_executable(exe: &Path, dir: Option<&Path>) -> PathBuf {
+    if dir.is_some_and(|dir| is_legacy_executable(exe, dir)) {
+        return exe.with_file_name(EXE_NAME);
+    }
+    exe.to_path_buf()
 }
 
 fn create_shortcut(link: &Path, target: &Path) -> Result<(), String> {
@@ -153,6 +168,37 @@ fn create_shortcut(link: &Path, target: &Path) -> Result<(), String> {
         })()
     };
     saved.map_err(|error| format!("Could not create {}: {error}", link.display()))
+}
+
+fn refresh_startup_registration(target: &Path) -> Result<(), String> {
+    let current_user = RegKey::predef(HKEY_CURRENT_USER);
+    if let Ok(run) = current_user.open_subkey_with_flags(RUN_KEY, KEY_QUERY_VALUE | KEY_SET_VALUE) {
+        if run.get_value::<String, _>("Braid").is_ok()
+            || run.get_value::<String, _>("Fetchrail").is_ok()
+        {
+            run.set_value(
+                "Fetchrail",
+                &format!("\"{}\" --background", target.display()),
+            )
+            .map_err(|error| format!("Could not update launch at sign-in: {error}"))?;
+            let _ = run.delete_value("Braid");
+        }
+    }
+    Ok(())
+}
+
+fn refresh_existing_shortcuts(target: &Path) -> Result<(), String> {
+    for folder in [&FOLDERID_Programs, &FOLDERID_Desktop] {
+        if let Ok(folder) = known_folder(folder) {
+            let old = folder.join("Braid.lnk");
+            let current = folder.join("Fetchrail.lnk");
+            if old.exists() || current.exists() {
+                create_shortcut(&current, target)?;
+                let _ = fs::remove_file(old);
+            }
+        }
+    }
+    Ok(())
 }
 
 fn register(dir: &Path) -> std::io::Result<()> {
@@ -249,19 +295,7 @@ pub fn install(options: &InstallOptions) -> Result<PathBuf, String> {
             let _ = fs::remove_file(folder.join("Braid.lnk"));
         }
     }
-    let current_user = RegKey::predef(HKEY_CURRENT_USER);
-    if let Ok(run) = current_user.open_subkey_with_flags(RUN_KEY, KEY_QUERY_VALUE | KEY_SET_VALUE) {
-        if run.get_value::<String, _>("Braid").is_ok()
-            || run.get_value::<String, _>("Fetchrail").is_ok()
-        {
-            run.set_value(
-                "Fetchrail",
-                &format!("\"{}\" --background", target.display()),
-            )
-            .map_err(|error| format!("Could not update launch at sign-in: {error}"))?;
-            let _ = run.delete_value("Braid");
-        }
-    }
+    refresh_startup_registration(&target)?;
     register(&dir)
         .map_err(|error| format!("Could not register Fetchrail with Windows: {error}"))?;
     Ok(target)
@@ -341,6 +375,11 @@ pub fn launch(launch_on_start: bool) -> Result<(), String> {
 pub fn restart(app: &AppHandle) -> Result<(), String> {
     // Tauri caches the launch path, even after the updater parks the running EXE as .old.exe.
     let exe = tauri::process::current_binary(&app.env()).map_err(|error| error.to_string())?;
+    let exe = if is_installed_copy() {
+        installed_dir().map_or(exe.clone(), |dir| installed_executable(&dir))
+    } else {
+        exe
+    };
     Command::new(exe)
         .args(["--restart-after", &std::process::id().to_string()])
         .spawn()
@@ -396,8 +435,67 @@ pub fn tidy_after_update() {
     };
     if exe.parent() == Some(dir.as_path()) {
         let _ = fs::remove_file(exe.with_extension("old.exe"));
-        let _ = register(&dir);
+        if exe
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.eq_ignore_ascii_case(EXE_NAME))
+        {
+            if let Err(error) =
+                refresh_existing_shortcuts(&exe).and_then(|()| refresh_startup_registration(&exe))
+            {
+                eprintln!("Fetchrail installation migration: {error}");
+            }
+            // The previous binary has exited before --restart-after returns. If another
+            // process still uses it, Windows keeps it and we retry on the next launch.
+            for name in [LEGACY_EXE_NAME, "Braid.old.exe", "Braid.new.exe"] {
+                let _ = fs::remove_file(dir.join(name));
+            }
+        }
+        if let Err(error) = register(&dir) {
+            eprintln!("Could not refresh Fetchrail installation details: {error}");
+        }
     }
+}
+
+/// A release installed by the old updater may start once as Braid.exe. Move the
+/// current binary to the new name and restart so Discord sees the actual app.
+/// The old filename remains intact until its process has exited.
+pub fn redirect_legacy_install() -> Result<bool, String> {
+    if std::env::args().any(|argument| argument == "--quit") {
+        return Ok(false);
+    }
+    let exe = std::env::current_exe().map_err(|error| error.to_string())?;
+    let Some(dir) = installed_dir() else {
+        return Ok(false);
+    };
+    if !is_legacy_executable(&exe, &dir) {
+        return Ok(false);
+    }
+
+    let target = dir.join(EXE_NAME);
+    // Do not overwrite a newer Fetchrail copy when an old Braid shortcut was used.
+    let copy = match (fs::metadata(&exe), fs::metadata(&target)) {
+        (Ok(source), Ok(existing)) => source.modified().ok() > existing.modified().ok(),
+        (_, Err(error)) if error.kind() == std::io::ErrorKind::NotFound => true,
+        (_, Err(error)) => return Err(format!("Could not check the installed Fetchrail: {error}")),
+        (Err(error), _) => return Err(format!("Could not check the legacy executable: {error}")),
+    };
+    if copy {
+        replace_file(&target, |fresh| fs::copy(&exe, fresh).map(drop))
+            .map_err(|error| format!("Could not migrate Fetchrail.exe: {error}"))?;
+    }
+
+    let mut args = std::env::args_os().skip(1).collect::<Vec<_>>();
+    if args.first().is_some_and(|arg| arg == "--restart-after") && args.len() >= 2 {
+        args.drain(..2);
+    }
+    Command::new(target)
+        .arg("--restart-after")
+        .arg(std::process::id().to_string())
+        .args(args)
+        .spawn()
+        .map_err(|error| format!("Could not launch migrated Fetchrail: {error}"))?;
+    Ok(true)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -489,8 +587,9 @@ pub async fn check_for_update(app: &AppHandle) -> UpdateStatus {
             .await
             .map_err(|error| error.to_string())?;
         let exe = std::env::current_exe().map_err(|error| error.to_string())?;
+        let target = update_executable(&exe, installed_dir().as_deref());
         tauri::async_runtime::spawn_blocking(move || {
-            replace_file(&exe, |fresh| fs::write(fresh, &bytes))
+            replace_file(&target, |fresh| fs::write(fresh, &bytes))
         })
         .await
         .map_err(|error| error.to_string())?
@@ -538,6 +637,19 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         fs::write(dir.join(LEGACY_EXE_NAME), b"legacy").unwrap();
         assert_eq!(installed_executable(&dir), dir.join(LEGACY_EXE_NAME));
+        let legacy = dir.join(LEGACY_EXE_NAME);
+        assert_eq!(update_executable(&legacy, Some(&dir)), dir.join(EXE_NAME));
+        assert_eq!(update_executable(&legacy, None), legacy);
+        assert_eq!(
+            update_executable(&dir.join("Braid-helper.exe"), Some(&dir)),
+            dir.join("Braid-helper.exe")
+        );
+        replace_file(&update_executable(&legacy, Some(&dir)), |fresh| {
+            fs::write(fresh, b"signed update")
+        })
+        .unwrap();
+        assert_eq!(fs::read(&legacy).unwrap(), b"legacy");
+        assert_eq!(fs::read(dir.join(EXE_NAME)).unwrap(), b"signed update");
         fs::write(dir.join(EXE_NAME), b"renamed").unwrap();
         assert_eq!(installed_executable(&dir), dir.join(EXE_NAME));
         fs::remove_dir_all(dir).unwrap();

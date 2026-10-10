@@ -8,6 +8,8 @@ import {
   formatEta, formatSpeed, Logo, partsOf, progressOf, statusLabel, Strands,
 } from "./App";
 import "./DownloadProgress.css";
+import { usePlatformCapabilities } from "./platform";
+import { TorrentInspector, TorrentRow } from "./Torrents";
 
 const tabs = ["Download status", "Speed limiter", "Options on completion"] as const;
 type Tab = typeof tabs[number];
@@ -23,6 +25,7 @@ export function DownloadProgress({ id }: { id: string }) {
   const [unit, setUnit] = useState(1024);
   const [globalLimit, setGlobalLimit] = useState(0);
   const tabList = useRef<HTMLDivElement>(null);
+  const capabilities = usePlatformCapabilities();
 
   useEffect(() => {
     let disposed = false;
@@ -36,6 +39,7 @@ export function DownloadProgress({ id }: { id: string }) {
       await subscribe<DownloadRecord>("fetchrail://download-updated", (record) => {
         if (record.id === id) setItem(record);
       });
+      await subscribe<DownloadRecord[]>("fetchrail://torrent-updated", records => { const record = records.find(record => record.id === id); if (record) setItem(record); });
       await subscribe<string>("fetchrail://download-removed", (removed) => {
         if (removed === id) void getCurrentWindow().destroy();
       });
@@ -80,6 +84,12 @@ export function DownloadProgress({ id }: { id: string }) {
     setMessage(null);
     try {
       const record = await invoke<DownloadRecord | null>(name, { id, ...extra });
+      if (name === "open_download" || name === "reveal_download") {
+        // Both commands return only after the file or folder has been opened.
+        // Keep this window visible on failure so its error can be shown.
+        await getCurrentWindow().destroy();
+        return;
+      }
       if (record) setItem(record);
     } catch (error) {
       setMessage(String(error));
@@ -97,6 +107,11 @@ export function DownloadProgress({ id }: { id: string }) {
   const canPause = item && ["queued", "scheduled", "connecting", "downloading"].includes(item.status);
   const canResume = item && ["paused", "failed", "cancelled"].includes(item.status);
   const canCancel = item && !["completed", "cancelled", "merging"].includes(item.status);
+
+  if (item?.torrent) {
+    const torrentCommand = async (name: string, torrentId: string, extra: Record<string, unknown> = {}) => { try { await invoke(name, { id: torrentId, ...extra }); return true; } catch (e) { setMessage(String(e)); return false; } };
+    return <main className="transfer-window"><header className="transfer-head"><Logo size={36} /><h1>{item.fileName}</h1></header><div className="download-list"><TorrentRow item={item} selected onSelect={() => {}} command={torrentCommand} /></div><TorrentInspector item={item} onClose={() => void getCurrentWindow().destroy()} command={torrentCommand} onError={setMessage} />{message && <p className="error-text" role="alert">{message}</p>}</main>;
+  }
 
   return (
     <main className="transfer-window form">
@@ -171,11 +186,13 @@ export function DownloadProgress({ id }: { id: string }) {
             <div className="transfer-option-title"><Check size={18} /><h2>When this download finishes</h2></div>
             <fieldset className="transfer-checks" disabled={busy || complete}>
               <label className="check"><input type="checkbox" checked={item.completionOptions.showCompleteDialog} onChange={(event) => void saveCompletion({ ...item.completionOptions, showCompleteDialog: event.target.checked })} />Show download complete dialog</label>
-              <label className="check"><input type="checkbox" checked={item.completionOptions.hangUp} onChange={(event) => void saveCompletion({ ...item.completionOptions, hangUp: event.target.checked })} />Hang up modem when done</label>
+              {capabilities?.os === "linux" && <label>Connection to disconnect<select value={item.completionOptions.connectionId ?? ""} disabled={!capabilities.disconnect.available} onChange={event => void saveCompletion({ ...item.completionOptions, connectionId: event.target.value || null, hangUp: false })}><option value="">Choose an active connection</option>{capabilities.connections.map(connection => <option value={connection.id} key={connection.id}>{connection.name}</option>)}</select></label>}
+              <label className="check" title={capabilities?.disconnect.reason}><input type="checkbox" checked={item.completionOptions.hangUp} disabled={!item.completionOptions.hangUp && (!capabilities?.disconnect.available || (capabilities.os === "linux" && !capabilities.connections.some(connection => connection.id === item.completionOptions.connectionId)))} onChange={(event) => void saveCompletion({ ...item.completionOptions, hangUp: event.target.checked })} />{capabilities?.os === "linux" ? "Disconnect selected connection when done" : "Hang up modem when done"}</label>
               <label className="check"><input type="checkbox" checked={item.completionOptions.exitApp} onChange={(event) => void saveCompletion({ ...item.completionOptions, exitApp: event.target.checked })} />Exit Fetchrail when done</label>
-              <label className="check"><input type="checkbox" checked={item.completionOptions.turnOffComputer} onChange={(event) => void saveCompletion({ ...item.completionOptions, turnOffComputer: event.target.checked, forceShutdown: event.target.checked && item.completionOptions.forceShutdown })} />Turn off computer when done</label>
-              <label className="check transfer-suboption"><input type="checkbox" checked={item.completionOptions.forceShutdown} disabled={!item.completionOptions.turnOffComputer} onChange={(event) => void saveCompletion({ ...item.completionOptions, forceShutdown: event.target.checked })} />Force processes to terminate</label>
+              <label className="check" title={capabilities?.shutdown.reason}><input type="checkbox" checked={item.completionOptions.turnOffComputer} disabled={!item.completionOptions.turnOffComputer && !capabilities?.shutdown.available} onChange={(event) => void saveCompletion({ ...item.completionOptions, turnOffComputer: event.target.checked, forceShutdown: event.target.checked && item.completionOptions.forceShutdown })} />Turn off computer when done</label>
+              <label className="check transfer-suboption" title={capabilities?.forceShutdown.reason}><input type="checkbox" checked={item.completionOptions.forceShutdown} disabled={!item.completionOptions.forceShutdown && (!item.completionOptions.turnOffComputer || !capabilities?.forceShutdown.available)} onChange={(event) => void saveCompletion({ ...item.completionOptions, forceShutdown: event.target.checked })} />{capabilities?.os === "linux" ? "Ignore shutdown inhibitors" : "Force processes to terminate"}</label>
             </fieldset>
+            {(!capabilities?.shutdown.available || !capabilities?.disconnect.available) && <p className="hint">{!capabilities?.shutdown.available && capabilities?.shutdown.reason} {!capabilities?.disconnect.available && capabilities?.disconnect.reason}</p>}
             <p className="hint">Options are saved for this download and run only after the file is successfully saved. Closing this window keeps the download and its options running.</p>
             {(item.completionOptions.exitApp || item.completionOptions.turnOffComputer) && <p className="hint">Exiting or turning off the computer also stops other downloads.{item.completionOptions.forceShutdown ? " Forced shutdown can discard unsaved work." : ""}</p>}
           </div>

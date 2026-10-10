@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     io::{Read, Write},
     path::{Path, PathBuf},
     sync::{
@@ -18,6 +18,7 @@ use reqwest::{
     },
     Client, StatusCode,
 };
+use sha2::{Digest, Sha256};
 use tauri::{AppHandle, Emitter, Manager};
 use tokio::{
     fs,
@@ -34,7 +35,12 @@ use crate::model::{
     BatchDownloadResult, BrowserRequestContext, DownloadRecord, DownloadSettings, DownloadStatus,
     EngineOverview, QueueRecord, SegmentProgress,
 };
+use crate::organize::{self, OrganizeMode, OrganizeReport};
 use crate::rate_limit::RateLimiter;
+use crate::torrent::{
+    TorrentCommitRequest, TorrentEngine, TorrentImportRequest, TorrentMetadata, TorrentSummary,
+};
+use serde_json::json;
 
 const DOWNLOAD_EVENT: &str = "fetchrail://download-updated";
 const SETTINGS_EVENT: &str = "fetchrail://settings-updated";
@@ -57,6 +63,50 @@ fn download_client_builder() -> reqwest::ClientBuilder {
         .read_timeout(Duration::from_secs(30))
 }
 
+fn global_budget() -> &'static tokio::sync::Semaphore {
+    static BUDGET: std::sync::OnceLock<tokio::sync::Semaphore> = std::sync::OnceLock::new();
+    BUDGET.get_or_init(|| tokio::sync::Semaphore::new(64))
+}
+
+fn origin_budget(url: &Url) -> Arc<tokio::sync::Semaphore> {
+    type Origins = Mutex<HashMap<String, std::sync::Weak<tokio::sync::Semaphore>>>;
+    static ORIGINS: std::sync::OnceLock<Origins> = std::sync::OnceLock::new();
+    let mut origins = ORIGINS
+        .get_or_init(Mutex::default)
+        .lock()
+        .expect("origin budget poisoned");
+    if origins.len() > 128 {
+        origins.retain(|_, value| value.strong_count() > 0);
+    }
+    let key = url.origin().ascii_serialization();
+    if let Some(budget) = origins.get(&key).and_then(std::sync::Weak::upgrade) {
+        return budget;
+    }
+    let budget = Arc::new(tokio::sync::Semaphore::new(32));
+    origins.insert(key, Arc::downgrade(&budget));
+    budget
+}
+
+fn retry_after(headers: &HeaderMap, now: DateTime<Utc>) -> Option<Duration> {
+    let value = headers.get(header::RETRY_AFTER)?.to_str().ok()?.trim();
+    let seconds = value.parse::<u64>().ok().or_else(|| {
+        DateTime::parse_from_rfc2822(value)
+            .ok()
+            .map(|date| (date.with_timezone(&Utc) - now).num_seconds().max(0) as u64)
+    })?;
+    Some(Duration::from_millis(seconds.saturating_mul(1000).max(250)))
+}
+
+fn normalize_sha256(value: Option<&str>) -> Result<Option<String>, String> {
+    let Some(value) = value.map(str::trim).filter(|v| !v.is_empty()) else {
+        return Ok(None);
+    };
+    if value.len() != 64 || !value.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err("Expected SHA-256 must contain exactly 64 hexadecimal characters.".into());
+    }
+    Ok(Some(value.to_ascii_lowercase()))
+}
+
 #[derive(Debug, thiserror::Error)]
 enum EngineError {
     #[error("request failed: {0}")]
@@ -69,6 +119,8 @@ enum EngineError {
     RangeUnsupported,
     #[error("Server returned HTTP {0}.")]
     Http(StatusCode),
+    #[error("Server returned HTTP {status} (retry after {delay:?}).")]
+    RetryAfter { status: StatusCode, delay: Duration },
     #[error("download was cancelled")]
     Cancelled,
     #[error("{0}")]
@@ -97,6 +149,14 @@ struct PartManifest {
     ranges: Vec<ByteRange>,
     validator: Option<String>,
     accepts_ranges: bool,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct MergeCheckpoint {
+    file_name: String,
+    total: u64,
+    fingerprint: String,
+    expected_sha256: Option<String>,
 }
 
 impl ByteRange {
@@ -145,6 +205,8 @@ struct DownloadTask {
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct StoredDownload {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    torrent_priorities: Option<Arc<Vec<u8>>>,
     #[serde(flatten)]
     record: DownloadRecord,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -193,6 +255,13 @@ impl DownloadTask {
 }
 
 pub struct DownloadManager {
+    torrent_engine: TorrentEngine,
+    torrent_imports: RwLock<HashMap<Uuid, (String, Option<TorrentMetadata>, Instant)>>,
+    torrent_checkpoint: Mutex<Instant>,
+    torrent_configuration: tokio::sync::Mutex<serde_json::Value>,
+    torrent_import_lock: tokio::sync::Mutex<()>,
+    bandwidth_broker: Mutex<(Instant, u64, (bool, bool), (u64, u64))>,
+    pending_torrent_sources: Mutex<Vec<String>>,
     app: AppHandle,
     client: Client,
     tasks: RwLock<HashMap<Uuid, Arc<DownloadTask>>>,
@@ -205,23 +274,26 @@ pub struct DownloadManager {
     minimize_to_tray: AtomicBool,
     limiter: RateLimiter,
     dispatch_lock: tokio::sync::Mutex<()>,
+    dispatch_suspended: AtomicBool,
 }
 
 impl DownloadManager {
     pub async fn load(app: AppHandle) -> Result<Arc<Self>, String> {
-        let data_dir = app
-            .path()
-            .app_data_dir()
-            .map_err(|error| format!("Could not resolve app data directory: {error}"))?;
+        let data_dir = crate::platform::app_data_dir()?;
+        crate::platform::private_dir(&data_dir)
+            .map_err(|error| format!("Could not protect app data directory: {error}"))?;
         let parts_dir = data_dir.join("parts");
         fs::create_dir_all(&parts_dir)
             .await
             .map_err(|error| format!("Could not create app data directory: {error}"))?;
 
-        let default_download_dir = app
-            .path()
-            .download_dir()
-            .unwrap_or_else(|_| data_dir.join("downloads"));
+        let default_download_dir = if let Some(root) = crate::platform::test_root()? {
+            root.join("downloads")
+        } else {
+            app.path()
+                .download_dir()
+                .unwrap_or_else(|_| data_dir.join("downloads"))
+        };
         fs::create_dir_all(&default_download_dir)
             .await
             .map_err(|error| format!("Could not create default download directory: {error}"))?;
@@ -269,6 +341,11 @@ impl DownloadManager {
             if let Ok(records) = serde_json::from_slice::<Vec<StoredDownload>>(&bytes) {
                 for stored in records {
                     let mut record = stored.record;
+                    if let (Some(torrent), Some(priorities)) =
+                        (&mut record.torrent, stored.torrent_priorities)
+                    {
+                        torrent.priorities = priorities;
+                    }
                     if record.status.is_active() {
                         record.status = DownloadStatus::Paused;
                         record.speed_bps = 0;
@@ -288,12 +365,20 @@ impl DownloadManager {
         }
 
         let manager = Arc::new(Self {
+            torrent_engine: TorrentEngine::new(&data_dir.join("torrents"))?,
+            torrent_imports: RwLock::new(HashMap::new()),
+            torrent_checkpoint: Mutex::new(Instant::now()),
+            torrent_configuration: tokio::sync::Mutex::new(serde_json::Value::Null),
+            pending_torrent_sources: Mutex::new(Vec::new()),
             app,
             client,
             tasks: RwLock::new(task_map),
             minimize_to_tray: AtomicBool::new(settings.minimize_to_tray),
             limiter: RateLimiter::new(settings.speed_limit_bps),
             dispatch_lock: tokio::sync::Mutex::new(()),
+            torrent_import_lock: tokio::sync::Mutex::new(()),
+            bandwidth_broker: Mutex::new((Instant::now(), 0, (false, false), (0, 0))),
+            dispatch_suspended: AtomicBool::new(false),
             settings: RwLock::new(settings),
             queues: RwLock::new(queues),
             data_dir,
@@ -312,6 +397,23 @@ impl DownloadManager {
             .persist_queues()
             .await
             .map_err(|error| error.to_string())?;
+        for record in manager.list().await {
+            if let Some(torrent) = &record.torrent {
+                let result = manager.torrent_engine.call(json!({"op":"add", "id":record.id,
+                    "source":torrent.metadata_path, "restore":true, "destination":record.destination,
+                    "priorities":torrent.priorities, "config":manager.settings.read().await.torrent})).await;
+                if result.is_ok() {
+                    manager.torrent_engine.call(json!({"op":"limit", "id":record.id, "downloadLimit":record.speed_limit_bps.min(i32::MAX as u64)})).await?;
+                    manager.torrent_engine.call(json!({"op":"sequential", "id":record.id, "enabled":torrent.sequential})).await?;
+                }
+                if let Err(error) = result {
+                    let task = manager.task(record.id).await?;
+                    let mut record = task.record.write().await;
+                    record.status = DownloadStatus::Failed;
+                    record.error = Some(error);
+                }
+            }
+        }
         manager.start_scheduler();
         Ok(manager)
     }
@@ -320,7 +422,760 @@ impl DownloadManager {
         self: &Arc<Self>,
         request: AddDownloadRequest,
     ) -> Result<DownloadRecord, String> {
+        let _dispatch = self.dispatch_lock.lock().await;
         self.add_inner(request, true).await
+    }
+
+    pub async fn import_torrent(
+        &self,
+        request: TorrentImportRequest,
+    ) -> Result<serde_json::Value, String> {
+        let _import = self.torrent_import_lock.lock().await;
+        if self.torrent_imports.read().await.len() >= 4 {
+            return Err("Finish or cancel an open torrent import first.".into());
+        }
+        let id = Uuid::new_v4();
+        let source = request.source.trim();
+        let path = self.data_dir.join("torrents").join(format!("{id}.torrent"));
+        let metadata = if source.starts_with("magnet:") {
+            let staging = self.data_dir.join("torrent-imports").join(id.to_string());
+            self.torrent_engine.call(json!({"op":"add", "id":id, "source":source,
+                "destination":staging, "importing":true, "config":self.settings.read().await.torrent})).await?;
+            None
+        } else {
+            let bytes = if source.starts_with("http://") || source.starts_with("https://") {
+                let response = self
+                    .client
+                    .get(source)
+                    .send()
+                    .await
+                    .map_err(|e| e.to_string())?
+                    .error_for_status()
+                    .map_err(|e| e.to_string())?;
+                if response
+                    .content_length()
+                    .is_some_and(|size| size > 32 * 1024 * 1024)
+                {
+                    return Err("Torrent metadata exceeds 32 MiB.".into());
+                }
+                let mut bytes = Vec::new();
+                let mut stream = response.bytes_stream();
+                while let Some(chunk) = stream.next().await {
+                    let chunk = chunk.map_err(|e| e.to_string())?;
+                    if bytes.len() + chunk.len() > 32 * 1024 * 1024 {
+                        return Err("Torrent metadata exceeds 32 MiB.".into());
+                    }
+                    bytes.extend_from_slice(&chunk);
+                }
+                bytes
+            } else {
+                let info = fs::metadata(source).await.map_err(|e| e.to_string())?;
+                if info.len() > 32 * 1024 * 1024 {
+                    return Err("Torrent metadata exceeds 32 MiB.".into());
+                }
+                fs::read(source).await.map_err(|e| e.to_string())?
+            };
+            fs::write(&path, bytes).await.map_err(|e| e.to_string())?;
+            let inspected = self
+                .torrent_engine
+                .call(json!({"op":"inspect", "path":path}))
+                .await;
+            let value = match inspected {
+                Ok(value) => value,
+                Err(error) => {
+                    let _ = fs::remove_file(&path).await;
+                    return Err(error);
+                }
+            };
+            let metadata: TorrentMetadata =
+                serde_json::from_value(value).map_err(|e| e.to_string())?;
+            if let Err(error) = self.check_torrent_duplicate(&metadata.hashes).await {
+                let _ = fs::remove_file(&path).await;
+                return Err(error);
+            }
+            Some(metadata)
+        };
+        self.torrent_imports
+            .write()
+            .await
+            .insert(id, (source.to_owned(), metadata.clone(), Instant::now()));
+        Ok(json!({"id":id, "metadata":metadata}))
+    }
+
+    pub fn offer_torrent_sources(
+        &self,
+        sources: Vec<String>,
+        frontend_ready: bool,
+    ) -> Result<(), String> {
+        let mut pending = self
+            .pending_torrent_sources
+            .lock()
+            .map_err(|e| e.to_string())?;
+        if sources.len() + pending.len() > 100 {
+            return Err("At most 100 torrent sources can wait for import.".into());
+        }
+        pending.extend(sources);
+        if frontend_ready && !pending.is_empty() {
+            self.app
+                .emit("fetchrail://torrent-sources", &*pending)
+                .map_err(|e| e.to_string())?;
+            pending.clear();
+        }
+        Ok(())
+    }
+
+    async fn check_torrent_duplicate(&self, hashes: &[String]) -> Result<(), String> {
+        if self
+            .list()
+            .await
+            .iter()
+            .filter_map(|r| r.torrent.as_ref())
+            .any(|t| t.hashes.iter().any(|hash| hashes.contains(hash)))
+        {
+            return Err("This torrent is already in Fetchrail.".into());
+        }
+        Ok(())
+    }
+
+    pub async fn torrent_import_status(&self, id: Uuid) -> Result<serde_json::Value, String> {
+        let imports = self.torrent_imports.read().await;
+        let (_, metadata, _) = imports
+            .get(&id)
+            .ok_or("Torrent import expired or was cancelled.")?;
+        if metadata.is_none() {
+            self.torrent_engine
+                .call(json!({"op":"details", "id":id}))
+                .await?;
+        }
+        Ok(json!({"id":id, "metadata":metadata}))
+    }
+
+    pub async fn cancel_torrent_import(&self, id: Uuid) -> Result<(), String> {
+        let _dispatch = self.dispatch_lock.lock().await;
+        let entry = self.torrent_imports.read().await.get(&id).cloned();
+        if entry
+            .as_ref()
+            .is_some_and(|(source, _, _)| source.starts_with("magnet:"))
+        {
+            self.torrent_engine
+                .call(json!({"op":"remove", "id":id}))
+                .await?;
+        }
+        self.torrent_imports.write().await.remove(&id);
+        let _ = fs::remove_file(self.data_dir.join("torrents").join(format!("{id}.torrent"))).await;
+        // The engine never downloads payload in the private staging directory.
+        Ok(())
+    }
+
+    pub async fn commit_torrent(
+        &self,
+        request: TorrentCommitRequest,
+    ) -> Result<DownloadRecord, String> {
+        let _dispatch = self.dispatch_lock.lock().await;
+        let (source, metadata, _) = self
+            .torrent_imports
+            .read()
+            .await
+            .get(&request.id)
+            .cloned()
+            .ok_or("Torrent import is not available.")?;
+        let metadata = metadata.ok_or("Wait for torrent metadata before starting.")?;
+        self.check_torrent_duplicate(&metadata.hashes).await?;
+        if request.priorities.len() != metadata.file_count
+            || request.priorities.iter().any(|p| ![0, 1, 4, 7].contains(p))
+        {
+            return Err("Invalid torrent file priorities.".into());
+        }
+        let wanted = metadata
+            .files
+            .iter()
+            .filter(|f| request.priorities[f.index] > 0)
+            .map(|f| f.size)
+            .sum::<u64>();
+        if wanted == 0 {
+            return Err("Select at least one nonempty file.".into());
+        }
+        let queue = self
+            .canonical_queue_name(&request.queue)
+            .await
+            .ok_or("Queue not found.")?;
+        let directory = PathBuf::from(request.directory.trim());
+        if !directory.is_absolute() {
+            return Err("Choose a full destination folder path.".into());
+        }
+        self.validate_torrent_storage(&directory, &metadata, request.verify_existing)
+            .await?;
+        fs::create_dir_all(&directory)
+            .await
+            .map_err(|e| e.to_string())?;
+        let directory = fs::canonicalize(directory)
+            .await
+            .map_err(|e| e.to_string())?;
+        self.validate_torrent_storage(&directory, &metadata, request.verify_existing)
+            .await?;
+        let id = request.id;
+        let path = self.data_dir.join("torrents").join(format!("{id}.torrent"));
+        if source.starts_with("magnet:") {
+            self.torrent_engine
+                .call(json!({"op":"remove", "id":id}))
+                .await?;
+        }
+        let settings = self.settings.read().await.clone();
+        self.torrent_engine
+            .call(
+                json!({"op":"add", "id":id, "source":path, "destination":directory,
+            "priorities":request.priorities, "config":settings.torrent}),
+            )
+            .await?;
+        let record = DownloadRecord {
+            id,
+            expected_sha256: None,
+            url: source,
+            file_name: metadata.name,
+            destination: directory.to_string_lossy().into_owned(),
+            status: if request.start_paused {
+                DownloadStatus::Paused
+            } else if request.scheduled_for.is_some_and(|t| t > Utc::now()) {
+                DownloadStatus::Scheduled
+            } else {
+                DownloadStatus::Queued
+            },
+            total_bytes: Some(wanted),
+            downloaded_bytes: 0,
+            merged_bytes: 0,
+            speed_bps: 0,
+            eta_seconds: None,
+            connections: 0,
+            requested_connections: None,
+            error: None,
+            created_at: Utc::now(),
+            finished_at: None,
+            queue,
+            scheduled_for: request.scheduled_for,
+            segments: Vec::new(),
+            name_locked: true,
+            speed_limit_bps: 0,
+            resume_supported: Some(true),
+            completion_options: Default::default(),
+            progress_requested: false,
+            torrent: Some(TorrentSummary {
+                hashes: metadata.hashes,
+                ratio_limit: settings.torrent.ratio_limit,
+                seed_time_limit: settings.torrent.seed_time_limit,
+                priorities: Arc::new(request.priorities),
+                metadata_path: path.to_string_lossy().into_owned(),
+                ..Default::default()
+            }),
+        };
+        self.tasks
+            .write()
+            .await
+            .insert(id, Arc::new(DownloadTask::new(record.clone(), None)));
+        if let Err(error) = self.persist_records().await {
+            self.tasks.write().await.remove(&id);
+            let _ = self
+                .torrent_engine
+                .call(json!({"op":"remove", "id":id}))
+                .await;
+            return Err(error.to_string());
+        }
+        self.torrent_imports.write().await.remove(&id);
+        self.apply_torrent_budget().await?;
+        self.emit_record(&record);
+        Ok(record)
+    }
+
+    pub async fn torrent_command(
+        &self,
+        id: Uuid,
+        mut request: serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        // Details do not take the scheduler lock; mutating storage/selection does.
+        let _dispatch = if request["op"] != "details" {
+            Some(self.dispatch_lock.lock().await)
+        } else {
+            None
+        };
+        let task = self.task(id).await?;
+        if task.record.read().await.torrent.is_none() {
+            return Err("This transfer is not a torrent.".into());
+        }
+        let op = request["op"]
+            .as_str()
+            .ok_or("Missing torrent command.")?
+            .to_owned();
+        request["id"] = json!(id);
+        if op == "goals" {
+            let ratio = request["ratioLimit"]
+                .as_f64()
+                .ok_or("Invalid ratio limit.")?;
+            if !ratio.is_finite() || ratio < 0.0 {
+                return Err("Ratio must be zero (unlimited) or positive.".into());
+            }
+            let time = request["seedTimeLimit"]
+                .as_u64()
+                .ok_or("Invalid sharing time.")?;
+            let mut record = task.record.write().await;
+            let t = record.torrent.as_mut().unwrap();
+            t.ratio_limit = ratio;
+            t.seed_time_limit = time;
+            drop(record);
+            self.persist_records().await.map_err(|e| e.to_string())?;
+            self.emit_record(&*task.record.read().await);
+            return Ok(json!({}));
+        }
+        if ![
+            "details",
+            "recheck",
+            "priorities",
+            "sequential",
+            "move",
+            "announce",
+            "tracker",
+            "removeTracker",
+            "peer",
+        ]
+        .contains(&op.as_str())
+        {
+            return Err("Unsupported torrent action.".into());
+        }
+        if op == "priorities" {
+            let priorities: Vec<u8> =
+                serde_json::from_value(request["priorities"].clone()).map_err(|e| e.to_string())?;
+            let record = task.record.read().await;
+            if priorities.len() != record.torrent.as_ref().unwrap().priorities.len()
+                || priorities.iter().any(|p| ![0, 1, 4, 7].contains(p))
+                || !priorities.iter().any(|p| *p > 0)
+            {
+                return Err("Select valid priorities and at least one wanted file.".into());
+            }
+        }
+        if op == "move" {
+            if task.running.load(Ordering::Acquire) {
+                return Err("Pause the torrent before moving its files.".into());
+            }
+            let directory = PathBuf::from(request["path"].as_str().ok_or("Missing folder.")?);
+            if !directory.is_absolute() {
+                return Err("Choose a full destination folder path.".into());
+            }
+            let details = self
+                .torrent_engine
+                .call(json!({"op":"details", "id":id}))
+                .await?;
+            let metadata: TorrentMetadata =
+                serde_json::from_value(details["metadata"].clone()).map_err(|e| e.to_string())?;
+            self.validate_torrent_storage(&directory, &metadata, false)
+                .await?;
+            fs::create_dir_all(&directory)
+                .await
+                .map_err(|e| e.to_string())?;
+        }
+        let value = self.torrent_engine.call(request.clone()).await?;
+        if op == "sequential" || op == "priorities" {
+            let mut record = task.record.write().await;
+            let t = record.torrent.as_mut().unwrap();
+            if op == "sequential" {
+                t.sequential = request["enabled"].as_bool().unwrap_or(false);
+            } else {
+                t.priorities = serde_json::from_value(request["priorities"].clone())
+                    .map_err(|e| e.to_string())?;
+            }
+            drop(record);
+            self.persist_records().await.map_err(|e| e.to_string())?;
+            self.emit_record(&*task.record.read().await);
+        }
+        Ok(value)
+    }
+
+    async fn check_torrent_path(&self, path: &Path) -> Result<(), String> {
+        let available = self
+            .torrent_engine
+            .call(json!({"op":"pathAvailable", "path":path}))
+            .await?;
+        if available != json!(true) {
+            return Err("A torrent owns this payload path. Choose another name or folder.".into());
+        }
+        Ok(())
+    }
+
+    async fn validate_torrent_storage(
+        &self,
+        root: &Path,
+        metadata: &TorrentMetadata,
+        allow_existing: bool,
+    ) -> Result<(), String> {
+        validate_torrent_destination(root, metadata, allow_existing).await?;
+        let http_paths = self
+            .list()
+            .await
+            .into_iter()
+            .filter(|r| r.torrent.is_none())
+            .map(|r| storage_path_key(Path::new(&r.destination)))
+            .collect::<std::collections::BTreeSet<_>>();
+        if metadata.files.iter().any(|file| {
+            let path = root.join(&file.path);
+            let key = storage_path_key(&path);
+            let prefix = format!("{key}/");
+            path.ancestors()
+                .any(|ancestor| http_paths.contains(&storage_path_key(ancestor)))
+                || http_paths
+                    .range(prefix.clone()..)
+                    .next()
+                    .is_some_and(|path| path.starts_with(&prefix))
+        }) {
+            return Err("An HTTP transfer owns this payload path. Choose another folder.".into());
+        }
+        Ok(())
+    }
+
+    async fn remove_torrent(&self, id: Uuid, delete_file: bool) -> Result<(), String> {
+        let _dispatch = self.dispatch_lock.lock().await;
+        let task = self.task(id).await?;
+        let record = task.record.read().await.clone();
+        self.torrent_engine
+            .call(json!({"op":"pause", "id":id}))
+            .await?;
+        task.running.store(false, Ordering::Release);
+        task.paused.store(true, Ordering::Release);
+        {
+            let mut paused = task.record.write().await;
+            paused.status = DownloadStatus::Paused;
+            paused.speed_bps = 0;
+            paused.torrent.as_mut().unwrap().upload_speed_bps = 0;
+            self.emit_record(&paused);
+        }
+        let details = self
+            .torrent_engine
+            .call(json!({"op":"details", "id":id}))
+            .await?;
+        let metadata: TorrentMetadata =
+            serde_json::from_value(details["metadata"].clone()).map_err(|e| e.to_string())?;
+        let root = PathBuf::from(&record.destination);
+        if delete_file {
+            validate_torrent_destination(&root, &metadata, true).await?;
+        }
+        self.torrent_engine
+            .call(json!({"op":"remove", "id":id}))
+            .await?;
+        if delete_file {
+            for file in &metadata.files {
+                let path = root.join(&file.path);
+                match fs::remove_file(&path).await {
+                    Ok(_) => (),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => (),
+                    Err(e) => {
+                        let error = format!("Could not delete {}: {e}", file.path);
+                        // Keep a recoverable paused job if a file is locked or read-only.
+                        // Recheck storage: preceding files may already have been deleted.
+                        let torrent = record.torrent.as_ref().unwrap();
+                        let restored: Result<(), String> = async {
+                            self.torrent_engine.call(json!({"op":"add", "id":id,
+                                "source":torrent.metadata_path, "destination":record.destination,
+                                "priorities":torrent.priorities, "config":self.settings.read().await.torrent})).await?;
+                            self.torrent_engine.call(json!({"op":"limit", "id":id,
+                                "downloadLimit":record.speed_limit_bps.min(i32::MAX as u64)})).await?;
+                            self.torrent_engine.call(json!({"op":"sequential", "id":id,
+                                "enabled":torrent.sequential})).await?;
+                            Ok(())
+                        }.await;
+                        let mut paused = task.record.write().await;
+                        paused.error = Some(match restored {
+                            Ok(_) => error.clone(),
+                            Err(e) => format!("{error}. Reload failed: {e}"),
+                        });
+                        self.emit_record(&paused);
+                        drop(paused);
+                        self.persist_records().await.map_err(|e| e.to_string())?;
+                        return Err(error);
+                    }
+                }
+            }
+        }
+        self.tasks.write().await.remove(&id);
+        self.persist_records().await.map_err(|e| e.to_string())?;
+        let _ = fs::remove_file(&record.torrent.as_ref().unwrap().metadata_path).await;
+        let _ = fs::remove_file(self.data_dir.join("torrents").join(format!("{id}.resume"))).await;
+        let _ = self.app.emit(REMOVED_EVENT, id);
+        Ok(())
+    }
+
+    async fn apply_torrent_budget(&self) -> Result<(), String> {
+        let settings = self.settings.read().await.clone();
+        let records = self.list().await;
+        let demand = |r: &&DownloadRecord| {
+            matches!(
+                r.status,
+                DownloadStatus::Connecting
+                    | DownloadStatus::Downloading
+                    | DownloadStatus::Stalled
+                    | DownloadStatus::Checking
+            )
+        };
+        let http = records.iter().filter(demand).any(|r| r.torrent.is_none());
+        let torrent = records
+            .iter()
+            .filter(demand)
+            .any(|r| r.torrent.as_ref().is_some_and(|t| !t.selected_ready))
+            || !self.torrent_imports.read().await.is_empty();
+        let (http_budget, torrent_budget) = {
+            let mut broker = self.bandwidth_broker.lock().unwrap();
+            let limit = settings.speed_limit_bps;
+            if broker.1 != limit || broker.2 != (http, torrent) {
+                *broker = (
+                    Instant::now(),
+                    limit,
+                    (http, torrent),
+                    download_budgets(limit, http, torrent),
+                );
+            } else if limit > 0 && http && torrent && broker.0.elapsed() >= Duration::from_secs(2) {
+                let rate = |native: bool| {
+                    records
+                        .iter()
+                        .filter(|r| r.torrent.is_some() == native)
+                        .map(|r| r.speed_bps)
+                        .sum()
+                };
+                broker.3 = rebalance_download_budgets(limit, broker.3, (rate(false), rate(true)));
+                broker.0 = Instant::now();
+            }
+            broker.3
+        };
+        self.limiter.set_limit(http_budget);
+        if !records.iter().any(|r| r.torrent.is_some())
+            && self.torrent_imports.read().await.is_empty()
+        {
+            return Ok(());
+        }
+        let mut config = serde_json::to_value(&settings.torrent).map_err(|e| e.to_string())?;
+        config["op"] = json!("configure");
+        config["downloadLimit"] = json!(torrent_budget.min(i32::MAX as u64));
+        config["uploadLimit"] = json!(settings.torrent.upload_limit_bps.min(i32::MAX as u64));
+        let mut previous = self.torrent_configuration.lock().await;
+        if *previous != config {
+            self.torrent_engine.call(config.clone()).await?;
+            *previous = config;
+        }
+        Ok(())
+    }
+
+    async fn poll_torrents(&self) -> Result<(), String> {
+        if !self.tasks.read().await.values().any(|t| {
+            t.record
+                .try_read()
+                .ok()
+                .is_some_and(|r| r.torrent.is_some())
+        }) && self.torrent_imports.read().await.is_empty()
+        {
+            return Ok(());
+        }
+        let poll = self.torrent_engine.call(json!({"op":"poll"})).await?;
+        let mut structural = false;
+        for event in poll["events"].as_array().into_iter().flatten() {
+            let Some(id) = event["id"].as_str().and_then(|s| Uuid::parse_str(s).ok()) else {
+                continue;
+            };
+            if event["type"] == "metadata" {
+                let metadata: TorrentMetadata =
+                    serde_json::from_value(event["metadata"].clone()).map_err(|e| e.to_string())?;
+                if let Some(import) = self.torrent_imports.write().await.get_mut(&id) {
+                    import.1 = Some(metadata);
+                }
+            } else if let Ok(task) = self.task(id).await {
+                let mut record = task.record.write().await;
+                if event["type"] == "error" {
+                    record.status = DownloadStatus::Failed;
+                    record.error = event["message"].as_str().map(str::to_owned);
+                    task.running.store(false, Ordering::Release);
+                    let _ = self
+                        .torrent_engine
+                        .call(json!({"op":"pause", "id":id}))
+                        .await;
+                } else if event["type"] == "moved" {
+                    record.destination = event["path"]
+                        .as_str()
+                        .unwrap_or(&record.destination)
+                        .to_owned();
+                }
+                self.emit_record(&record);
+                structural = true;
+            }
+        }
+        let mut updates = Vec::new();
+        for s in poll["states"].as_array().into_iter().flatten() {
+            let Some(id) = s["id"].as_str().and_then(|s| Uuid::parse_str(s).ok()) else {
+                continue;
+            };
+            let Ok(task) = self.task(id).await else {
+                continue;
+            };
+            let mut record = task.record.write().await;
+            let old = record.status.clone();
+            let before = record.clone();
+            let number = |key: &str| s[key].as_u64().unwrap_or(0);
+            let verified = s["verified"].as_bool().unwrap_or(true);
+            if verified {
+                record.total_bytes = Some(number("wanted"));
+                record.downloaded_bytes = number("downloaded");
+            }
+            record.speed_bps = if task.running.load(Ordering::Acquire) {
+                number("downloadSpeed")
+            } else {
+                0
+            };
+            record.connections = number("peers") as usize;
+            record.eta_seconds = if record.speed_bps > 0 {
+                Some(number("wanted").saturating_sub(number("downloaded")) / record.speed_bps)
+            } else {
+                None
+            };
+            let t = record.torrent.as_mut().unwrap();
+            t.uploaded_bytes = number("uploaded");
+            t.all_downloaded_bytes = number("allDownloaded");
+            t.upload_speed_bps = if task.running.load(Ordering::Acquire) {
+                number("uploadSpeed")
+            } else {
+                0
+            };
+            t.peers = number("peers") as usize;
+            t.seeds = number("seeds") as usize;
+            t.active_seconds = number("activeSeconds");
+            t.seed_seconds = number("seedSeconds");
+            let ready = if verified {
+                s["finished"].as_bool().unwrap_or(false)
+            } else {
+                t.selected_ready
+            };
+            structural |= ready != t.selected_ready;
+            t.selected_ready = ready;
+            let goal = ready
+                && ((t.ratio_limit > 0.0
+                    && t.uploaded_bytes as f64
+                        >= t.all_downloaded_bytes.max(number("wanted")).max(1) as f64
+                            * t.ratio_limit)
+                    || (t.seed_time_limit > 0 && t.seed_seconds >= t.seed_time_limit));
+            if task.running.load(Ordering::Acquire) {
+                if goal {
+                    self.torrent_engine
+                        .call(json!({"op":"pause", "id":id}))
+                        .await?;
+                    task.running.store(false, Ordering::Release);
+                    task.paused.store(true, Ordering::Release);
+                    record.status = DownloadStatus::Completed;
+                    record.speed_bps = 0;
+                    record.torrent.as_mut().unwrap().upload_speed_bps = 0;
+                } else {
+                    record.status = match s["state"].as_str().unwrap_or("downloading") {
+                        "checking" => DownloadStatus::Checking,
+                        "metadata" => DownloadStatus::Metadata,
+                        "stalled" => DownloadStatus::Stalled,
+                        "seeding" => DownloadStatus::Seeding,
+                        "failed" => {
+                            record.error = s["error"].as_str().map(str::to_owned);
+                            DownloadStatus::Failed
+                        }
+                        "paused" => record.status.clone(),
+                        _ => DownloadStatus::Downloading,
+                    };
+                }
+            }
+            if ready && record.finished_at.is_none() {
+                record.finished_at = Some(Utc::now());
+                structural = true;
+            }
+            structural |= record.status != old;
+            if *record != before {
+                updates.push(record.clone());
+            }
+        }
+        if !updates.is_empty() {
+            let _ = self.app.emit("fetchrail://torrent-updated", &updates);
+        }
+        let checkpoint = {
+            let mut last = self.torrent_checkpoint.lock().unwrap();
+            if last.elapsed() > Duration::from_secs(30) {
+                *last = Instant::now();
+                true
+            } else {
+                false
+            }
+        };
+        if checkpoint {
+            let _ = self.torrent_engine.call(json!({"op":"checkpoint"})).await;
+        }
+        if structural || checkpoint {
+            self.persist_records().await.map_err(|e| e.to_string())?;
+        }
+        let expired = self
+            .torrent_imports
+            .read()
+            .await
+            .iter()
+            .filter(|(_, (_, _, when))| when.elapsed() > Duration::from_secs(600))
+            .map(|(id, _)| *id)
+            .collect::<Vec<_>>();
+        for id in expired {
+            self.cancel_torrent_import(id).await?;
+        }
+        Ok(())
+    }
+
+    pub async fn shutdown(&self) {
+        self.dispatch_suspended.store(true, Ordering::Release);
+        let _dispatch = self.dispatch_lock.lock().await;
+        let tasks = self
+            .tasks
+            .read()
+            .await
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut active_http = Vec::new();
+        for task in &tasks {
+            let mut record = task.record.write().await;
+            if record.torrent.is_none() && record.status.is_active() {
+                active_http.push(task.clone());
+            }
+            if record.torrent.is_some() && record.status.is_active() {
+                task.running.store(false, Ordering::Release);
+                task.paused.store(true, Ordering::Release);
+                record.status = DownloadStatus::Paused;
+                record.speed_bps = 0;
+            } else if record.torrent.is_none()
+                && record.status.is_active()
+                && record.status != DownloadStatus::Merging
+            {
+                task.paused.store(true, Ordering::Release);
+                task.cancel();
+                record.status = DownloadStatus::Paused;
+                record.speed_bps = 0;
+                record.eta_seconds = None;
+            }
+        }
+        // Cancellation flushes buffered part bytes before the final persisted snapshot.
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while active_http
+            .iter()
+            .any(|task| task.running.load(Ordering::Acquire))
+            && Instant::now() < deadline
+        {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let records = self.list().await;
+        for record in records.iter().filter(|r| r.torrent.is_some()) {
+            let _ = self
+                .torrent_engine
+                .call(json!({"op":"pause", "id":record.id}))
+                .await;
+        }
+        if let Err(error) = self
+            .torrent_engine
+            .call(json!({"op":"checkpoint", "wait":true}))
+            .await
+        {
+            eprintln!("Torrent shutdown checkpoint: {error}");
+        }
+        let _ = self.torrent_engine.call(json!({"op":"poll"})).await;
+        let _ = self.persist_records().await;
     }
 
     async fn add_inner(
@@ -333,6 +1188,7 @@ impl DownloadManager {
             return Err("Only HTTP and HTTPS URLs are supported.".into());
         }
         context_headers(request.request_context.as_ref()).map_err(|error| error.to_string())?;
+        let expected_sha256 = normalize_sha256(request.expected_sha256.as_deref())?;
 
         let settings = self.settings.read().await.clone();
         if request
@@ -362,10 +1218,12 @@ impl DownloadManager {
             .filter(|value| !value.trim().is_empty())
             .map(PathBuf::from)
             .unwrap_or_else(|| settings.folder_for(&file_name));
+        self.check_torrent_path(&directory.join(&file_name)).await?;
         fs::create_dir_all(&directory)
             .await
             .map_err(|error| format!("Could not create destination directory: {error}"))?;
         let destination = unique_destination(&directory, &file_name).await;
+        self.check_torrent_path(&destination).await?;
         let id = Uuid::new_v4();
         let start_paused = request.start_paused.unwrap_or(false);
         let scheduled_for = request.scheduled_for;
@@ -377,7 +1235,9 @@ impl DownloadManager {
             DownloadStatus::Queued
         };
         let record = DownloadRecord {
+            torrent: None,
             id,
+            expected_sha256,
             url: parsed.to_string(),
             file_name: destination
                 .file_name()
@@ -466,6 +1326,11 @@ impl DownloadManager {
 
     pub async fn set_speed_limit(&self, id: Uuid, limit: u64) -> Result<DownloadRecord, String> {
         let task = self.task(id).await?;
+        if task.record.read().await.torrent.is_some() {
+            self.torrent_engine
+                .call(json!({"op":"limit", "id":id, "downloadLimit":limit.min(i32::MAX as u64)}))
+                .await?;
+        }
         let snapshot = {
             let mut record = task.record.write().await;
             record.speed_limit_bps = limit;
@@ -561,6 +1426,15 @@ impl DownloadManager {
     pub async fn overview(&self) -> EngineOverview {
         let records = self.list().await;
         EngineOverview {
+            upload_speed_bps: records
+                .iter()
+                .filter_map(|r| r.torrent.as_ref())
+                .map(|t| t.upload_speed_bps)
+                .sum(),
+            seeding: records
+                .iter()
+                .filter(|r| r.status == DownloadStatus::Seeding)
+                .count(),
             active: records
                 .iter()
                 .filter(|record| {
@@ -569,6 +1443,9 @@ impl DownloadManager {
                         DownloadStatus::Connecting
                             | DownloadStatus::Downloading
                             | DownloadStatus::Merging
+                            | DownloadStatus::Checking
+                            | DownloadStatus::Metadata
+                            | DownloadStatus::Stalled
                     )
                 })
                 .count(),
@@ -583,7 +1460,10 @@ impl DownloadManager {
                 .count(),
             completed: records
                 .iter()
-                .filter(|record| record.status == DownloadStatus::Completed)
+                .filter(|record| {
+                    record.status == DownloadStatus::Completed
+                        || record.torrent.as_ref().is_some_and(|t| t.selected_ready)
+                })
                 .count(),
             failed: records
                 .iter()
@@ -598,7 +1478,18 @@ impl DownloadManager {
     }
 
     pub async fn pause(&self, id: Uuid) -> Result<DownloadRecord, String> {
+        let _dispatch = self.dispatch_lock.lock().await;
+        self.pause_inner(id).await
+    }
+
+    async fn pause_inner(&self, id: Uuid) -> Result<DownloadRecord, String> {
         let task = self.task(id).await?;
+        if task.record.read().await.torrent.is_some() {
+            self.torrent_engine
+                .call(json!({"op":"pause", "id":id}))
+                .await?;
+            task.running.store(false, Ordering::Release);
+        }
         let snapshot = {
             let mut record = task.record.write().await;
             if matches!(
@@ -612,6 +1503,9 @@ impl DownloadManager {
             record.status = DownloadStatus::Paused;
             record.speed_bps = 0;
             record.eta_seconds = None;
+            if let Some(torrent) = &mut record.torrent {
+                torrent.upload_speed_bps = 0;
+            }
             record.clone()
         };
         self.persist_records()
@@ -622,13 +1516,16 @@ impl DownloadManager {
     }
 
     pub async fn resume(self: &Arc<Self>, id: Uuid) -> Result<DownloadRecord, String> {
+        let _dispatch = self.dispatch_lock.lock().await;
         let task = self.task(id).await?;
         let snapshot = {
             let mut record = task.record.write().await;
-            if !matches!(
-                record.status,
-                DownloadStatus::Paused | DownloadStatus::Failed | DownloadStatus::Cancelled
-            ) {
+            if !(record.torrent.is_some() && record.status == DownloadStatus::Completed)
+                && !matches!(
+                    record.status,
+                    DownloadStatus::Paused | DownloadStatus::Failed | DownloadStatus::Cancelled
+                )
+            {
                 return Err("Only paused, failed or cancelled downloads can be resumed.".into());
             }
             task.cancelled.store(false, Ordering::Release);
@@ -647,7 +1544,14 @@ impl DownloadManager {
     }
 
     pub async fn cancel(&self, id: Uuid) -> Result<DownloadRecord, String> {
+        let _dispatch = self.dispatch_lock.lock().await;
         let task = self.task(id).await?;
+        if task.record.read().await.torrent.is_some() {
+            self.torrent_engine
+                .call(json!({"op":"pause", "id":id}))
+                .await?;
+            task.running.store(false, Ordering::Release);
+        }
         let snapshot = {
             let mut record = task.record.write().await;
             if matches!(
@@ -662,6 +1566,9 @@ impl DownloadManager {
             record.status = DownloadStatus::Cancelled;
             record.speed_bps = 0;
             record.eta_seconds = None;
+            if let Some(torrent) = &mut record.torrent {
+                torrent.upload_speed_bps = 0;
+            }
             record.finished_at = Some(Utc::now());
             record.clone()
         };
@@ -679,7 +1586,11 @@ impl DownloadManager {
         directory: String,
         file_name: String,
     ) -> Result<DownloadRecord, String> {
+        let _dispatch = self.dispatch_lock.lock().await;
         let task = self.task(id).await?;
+        if task.record.read().await.torrent.is_some() {
+            return Err("Use Move storage to relocate torrent payload files.".into());
+        }
         if task.running.load(Ordering::Acquire) {
             return Err("Pause the download before changing where it is saved.".into());
         }
@@ -687,6 +1598,8 @@ impl DownloadManager {
         if !directory.is_absolute() {
             return Err("Choose a full folder path.".into());
         }
+        self.check_torrent_path(&directory.join(safe_file_name(&file_name)))
+            .await?;
         fs::create_dir_all(&directory)
             .await
             .map_err(|error| format!("Could not create destination directory: {error}"))?;
@@ -699,6 +1612,7 @@ impl DownloadManager {
             let renamed = name != record.file_name;
             if renamed || Path::new(&record.destination).parent() != Some(directory.as_path()) {
                 let destination = unique_destination(&directory, &name).await;
+                self.check_torrent_path(&destination).await?;
                 record.file_name = destination
                     .file_name()
                     .and_then(|value| value.to_str())
@@ -718,6 +1632,9 @@ impl DownloadManager {
 
     pub async fn remove(&self, id: Uuid, delete_file: bool) -> Result<(), String> {
         let task = self.task(id).await?;
+        if task.record.read().await.torrent.is_some() {
+            return self.remove_torrent(id, delete_file).await;
+        }
         if task.running.load(Ordering::Acquire) {
             return Err("Pause or cancel the download before removing it.".into());
         }
@@ -737,6 +1654,91 @@ impl DownloadManager {
 
     pub async fn settings(&self) -> DownloadSettings {
         self.settings.read().await.clone()
+    }
+
+    /// Move files already in the default Downloads folder according to the saved
+    /// category rules, or move them back out of configured category folders.
+    pub async fn organize_existing_downloads(
+        &self,
+        mode: OrganizeMode,
+    ) -> Result<OrganizeReport, String> {
+        // New download creation and filename reassignment must not race the scan.
+        let _dispatch = self.dispatch_lock.lock().await;
+        let settings = self.settings.read().await.clone();
+        if matches!(mode, OrganizeMode::Flatten) && settings.sort_into_category_folders {
+            return Err(
+                "Turn off automatic category folders and save settings before moving files back."
+                    .into(),
+            );
+        }
+
+        let records = self.list().await;
+        let root = organize::path_key(Path::new(&settings.default_download_dir));
+        let mut protected = HashSet::new();
+        let mut completed = HashMap::<PathBuf, Vec<Uuid>>::new();
+        for record in &records {
+            let path = organize::path_key(Path::new(&record.destination));
+            if record.torrent.is_some() {
+                if root.starts_with(&path) || path.starts_with(&root) {
+                    let details = self
+                        .torrent_engine
+                        .call(json!({"op":"details", "id":record.id}))
+                        .await
+                        .map_err(|error| {
+                            format!("Could not check torrent files before organizing: {error}")
+                        })?;
+                    let metadata: TorrentMetadata =
+                        serde_json::from_value(details["metadata"].clone()).map_err(|error| {
+                            format!("Could not check torrent files before organizing: {error}")
+                        })?;
+                    for file in metadata.files {
+                        protected.insert(organize::path_key(&path.join(file.path)));
+                    }
+                }
+            } else if record.status == DownloadStatus::Completed {
+                completed.entry(path).or_default().push(record.id);
+            } else {
+                protected.insert(path);
+            }
+        }
+
+        let result = tauri::async_runtime::spawn_blocking(move || {
+            organize::organize_existing(&settings, &protected, mode)
+        })
+        .await
+        .map_err(|error| format!("Could not finish organizing downloads: {error}"))??;
+
+        if !result.moves.is_empty() {
+            let tasks = self.tasks.read().await;
+            let mut changed = Vec::new();
+            for (source, destination) in &result.moves {
+                if let Some(ids) = completed.get(&organize::path_key(source)) {
+                    for id in ids {
+                        if let Some(task) = tasks.get(id) {
+                            let mut record = task.record.write().await;
+                            if record.status != DownloadStatus::Completed {
+                                continue;
+                            }
+                            record.destination = destination.to_string_lossy().into_owned();
+                            if let Some(name) = destination.file_name() {
+                                record.file_name = name.to_string_lossy().into_owned();
+                            }
+                            changed.push(record.clone());
+                        }
+                    }
+                }
+            }
+            drop(tasks);
+            if !changed.is_empty() {
+                self.persist_records().await.map_err(|error| {
+                    format!("Files moved, but the download history could not be saved: {error}")
+                })?;
+                for record in changed {
+                    self.emit_record(&record);
+                }
+            }
+        }
+        Ok(result.report)
     }
 
     pub async fn list_queues(&self) -> Vec<QueueRecord> {
@@ -923,7 +1925,7 @@ impl DownloadManager {
         sync_startup_registration(settings.launch_on_start)?;
 
         *self.settings.write().await = settings.clone();
-        self.limiter.set_limit(settings.speed_limit_bps);
+        self.apply_torrent_budget().await?;
         self.minimize_to_tray
             .store(settings.minimize_to_tray, Ordering::Release);
         self.persist_settings()
@@ -964,6 +1966,28 @@ impl DownloadManager {
         id: Uuid,
         mut options: crate::model::CompletionOptions,
     ) -> Result<DownloadRecord, String> {
+        #[cfg(target_os = "linux")]
+        if options.hang_up || options.turn_off_computer {
+            let capabilities = crate::platform::capabilities(false).await;
+            if options.turn_off_computer && !capabilities.shutdown.available {
+                return Err(capabilities.shutdown.reason);
+            }
+            if options.force_shutdown && !capabilities.force_shutdown.available {
+                return Err(capabilities.force_shutdown.reason);
+            }
+            if options.hang_up {
+                if !capabilities.disconnect.available {
+                    return Err(capabilities.disconnect.reason);
+                }
+                if !capabilities
+                    .connections
+                    .iter()
+                    .any(|c| Some(&c.id) == options.connection_id.as_ref())
+                {
+                    return Err("Choose an active connection to disconnect.".into());
+                }
+            }
+        }
         let task = self.task(id).await?;
         let snapshot = {
             let mut record = task.record.write().await;
@@ -1006,8 +2030,7 @@ impl DownloadManager {
         }
         #[cfg(not(target_os = "windows"))]
         {
-            let _ = target;
-            return Err("Reveal is currently implemented for Windows only.".into());
+            crate::platform::reveal(&target)?;
         }
         Ok(())
     }
@@ -1038,13 +2061,22 @@ impl DownloadManager {
             let mut ticker = interval(Duration::from_millis(400));
             loop {
                 ticker.tick().await;
+                if let Err(error) = manager.poll_torrents().await {
+                    eprintln!("Torrent telemetry: {error}");
+                }
                 manager.dispatch_ready_downloads().await;
             }
         });
     }
 
     async fn dispatch_ready_downloads(self: &Arc<Self>) {
+        if self.dispatch_suspended.load(Ordering::Acquire) {
+            return;
+        }
         let _dispatch = self.dispatch_lock.lock().await;
+        if self.dispatch_suspended.load(Ordering::Acquire) {
+            return;
+        }
         let max_concurrent = self.settings.read().await.max_concurrent_downloads;
         let tasks = self
             .tasks
@@ -1053,10 +2085,41 @@ impl DownloadManager {
             .values()
             .cloned()
             .collect::<Vec<_>>();
-        let mut running = tasks
-            .iter()
-            .filter(|task| task.running.load(Ordering::Acquire))
-            .count();
+        let mut running = 0;
+        let mut seeds = 0;
+        let max_seeds = self.settings.read().await.torrent.max_seeds;
+        for task in &tasks {
+            if task.running.load(Ordering::Acquire) {
+                if task
+                    .record
+                    .read()
+                    .await
+                    .torrent
+                    .as_ref()
+                    .is_some_and(|t| t.selected_ready)
+                {
+                    if seeds >= max_seeds {
+                        let mut record = task.record.write().await;
+                        if self
+                            .torrent_engine
+                            .call(json!({"op":"pause", "id":record.id}))
+                            .await
+                            .is_ok()
+                        {
+                            task.running.store(false, Ordering::Release);
+                            record.status = DownloadStatus::Queued;
+                            record.speed_bps = 0;
+                            record.torrent.as_mut().unwrap().upload_speed_bps = 0;
+                            self.emit_record(&record);
+                        }
+                    } else {
+                        seeds += 1;
+                    }
+                } else {
+                    running += 1;
+                }
+            }
+        }
         let now = Utc::now();
         let paused_queues = self
             .queues
@@ -1071,20 +2134,25 @@ impl DownloadManager {
             let mut record = task.record.write().await;
             if task.running.load(Ordering::Acquire)
                 && paused_queues.contains(&record.queue)
-                && matches!(
-                    record.status,
-                    DownloadStatus::Connecting | DownloadStatus::Downloading
-                )
+                && (record.torrent.is_some()
+                    || matches!(
+                        record.status,
+                        DownloadStatus::Connecting | DownloadStatus::Downloading
+                    ))
             {
+                if record.torrent.is_some() {
+                    let _ = self
+                        .torrent_engine
+                        .call(json!({"op":"pause", "id":record.id}))
+                        .await;
+                    task.running.store(false, Ordering::Release);
+                }
                 record.status = DownloadStatus::Queued;
                 record.speed_bps = 0;
                 record.eta_seconds = None;
                 task.cancel();
                 self.emit_record(&record);
             }
-        }
-        if running >= max_concurrent {
-            return;
         }
         let mut candidates = Vec::new();
         for task in tasks {
@@ -1103,8 +2171,18 @@ impl DownloadManager {
         candidates.sort_by_key(|(created_at, _)| *created_at);
 
         for (_, task) in candidates {
-            if running >= max_concurrent {
-                break;
+            let is_seed = task
+                .record
+                .read()
+                .await
+                .torrent
+                .as_ref()
+                .is_some_and(|t| t.selected_ready);
+            if is_seed && seeds >= max_seeds {
+                continue;
+            }
+            if !is_seed && running >= max_concurrent {
+                continue;
             }
             {
                 let mut record = task.record.write().await;
@@ -1113,9 +2191,51 @@ impl DownloadManager {
                     self.emit_record(&record);
                 }
             }
-            self.spawn(task);
-            running += 1;
+            let record = task.record.read().await.clone();
+            task.record.write().await.status = if is_seed {
+                DownloadStatus::Seeding
+            } else {
+                DownloadStatus::Connecting
+            };
+            // Set both engines' positive allocations before network work begins.
+            if let Err(error) = self.apply_torrent_budget().await {
+                let mut record = task.record.write().await;
+                record.status = DownloadStatus::Failed;
+                record.error = Some(error);
+                self.emit_record(&record);
+                continue;
+            }
+            if record.torrent.is_some() {
+                match self
+                    .torrent_engine
+                    .call(json!({"op":"resume", "id":record.id}))
+                    .await
+                {
+                    Ok(_) => {
+                        task.running.store(true, Ordering::Release);
+                        task.record.write().await.status = if is_seed {
+                            DownloadStatus::Seeding
+                        } else {
+                            DownloadStatus::Connecting
+                        };
+                    }
+                    Err(error) => {
+                        let mut r = task.record.write().await;
+                        r.status = DownloadStatus::Failed;
+                        r.error = Some(error);
+                        self.emit_record(&r);
+                    }
+                }
+            } else {
+                self.spawn(task);
+            }
+            if is_seed {
+                seeds += 1;
+            } else {
+                running += 1;
+            }
         }
+        let _ = self.apply_torrent_budget().await;
     }
 
     async fn run(
@@ -1157,6 +2277,12 @@ impl DownloadManager {
         };
 
         {
+            // Filename changes and torrent storage claims share admission order.
+            // Shutdown can cancel this wait while holding the dispatch lock.
+            let _dispatch = tokio::select! {
+                guard = self.dispatch_lock.lock() => guard,
+                _ = cancel.cancelled() => return Err(EngineError::Cancelled),
+            };
             let mut record = task.record.write().await;
             task.check_stopped(&cancel)?;
             record.total_bytes = probe.total_bytes;
@@ -1178,6 +2304,9 @@ impl DownloadManager {
                             parent
                         };
                         let candidate = unique_destination(parent, &name).await;
+                        self.check_torrent_path(&candidate)
+                            .await
+                            .map_err(EngineError::Message)?;
                         record.file_name = candidate
                             .file_name()
                             .and_then(|value| value.to_str())
@@ -1339,38 +2468,67 @@ impl DownloadManager {
                     for attempt in 0..3 {
                         task.check_stopped(batch_cancel)?;
                         let result = Self::download_segment(
-                            client, limiter, task, batch_cancel, url, part_dir, index, segment, probe,
-                        ).await;
-                        let Err(error) = result else { return Ok(()); };
+                            client,
+                            limiter,
+                            task,
+                            batch_cancel,
+                            url,
+                            part_dir,
+                            index,
+                            segment,
+                            probe,
+                        )
+                        .await;
+                        let Err(error) = result else {
+                            return Ok(());
+                        };
                         let transient = match &error {
                             EngineError::Request(error) => {
-                                error.is_timeout() || error.is_connect() || error.is_request() || error.is_body() || error.is_decode()
+                                error.is_timeout()
+                                    || error.is_connect()
+                                    || error.is_request()
+                                    || error.is_body()
+                                    || error.is_decode()
                             }
                             EngineError::Http(status) => {
                                 status.is_server_error()
                                     || *status == StatusCode::TOO_MANY_REQUESTS
                                     || *status == StatusCode::REQUEST_TIMEOUT
                             }
+                            EngineError::RetryAfter { delay, .. } => {
+                                *delay <= Duration::from_secs(3600)
+                            }
                             _ => false,
                         };
-                        if !transient || attempt == 2 { return Err(error); }
+                        if !transient || attempt == 2 {
+                            return Err(error);
+                        }
+                        let delay = match &error {
+                            EngineError::RetryAfter { delay, .. } => *delay,
+                            _ => Duration::from_millis(
+                                (500u64 << attempt) + u64::from(Uuid::new_v4().as_bytes()[0]),
+                            ),
+                        };
                         tokio::select! {
-                            _ = tokio::time::sleep(Duration::from_millis(500 * (attempt + 1))) => {},
+                            _ = tokio::time::sleep(delay) => {},
                             _ = batch_cancel.cancelled() => return Err(EngineError::Cancelled),
                         }
                         // A stream without ranges must restart instead of appending.
                         if !probe.accepts_ranges {
                             match fs::remove_file(part_dir.join(format!("{index}.part"))).await {
-                                Ok(()) => {},
-                                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {},
+                                Ok(()) => {}
+                                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                                 Err(error) => return Err(error.into()),
                             }
                             segment.downloaded.store(0, Ordering::Relaxed);
                         }
                     }
                     unreachable!()
-                }.await;
-                if result.is_err() { batch_cancel.cancel(); }
+                }
+                .await;
+                if result.is_err() {
+                    batch_cancel.cancel();
+                }
                 result
             }
         });
@@ -1430,6 +2588,9 @@ impl DownloadManager {
         }
 
         task.check_stopped(cancel)?;
+        let origin = origin_budget(url);
+        let _origin_permit = tokio::select! { permit = origin.acquire() => permit.map_err(|e| EngineError::Message(e.to_string()))?, _ = cancel.cancelled() => return Err(EngineError::Cancelled) };
+        let _global_permit = tokio::select! { permit = global_budget().acquire() => permit.map_err(|e| EngineError::Message(e.to_string()))?, _ = cancel.cancelled() => return Err(EngineError::Cancelled) };
         let absolute_start = range.start.saturating_add(existing);
         let mut request = client
             .get(url.clone())
@@ -1452,6 +2613,16 @@ impl DownloadManager {
         };
 
         if !response.status().is_success() {
+            if response.status() == StatusCode::TOO_MANY_REQUESTS
+                || response.status() == StatusCode::SERVICE_UNAVAILABLE
+            {
+                if let Some(delay) = retry_after(response.headers(), Utc::now()) {
+                    return Err(EngineError::RetryAfter {
+                        status: response.status(),
+                        delay,
+                    });
+                }
+            }
             return Err(EngineError::Http(response.status()));
         }
         reject_html_page(response.headers())?;
@@ -1532,6 +2703,9 @@ impl DownloadManager {
         .await;
         segment.active.store(false, Ordering::Relaxed);
         output.flush().await?;
+        if transfer.is_err() {
+            output.get_ref().sync_data().await?;
+        }
         transfer?;
 
         if let Some(expected_len) = expected_len {
@@ -1636,14 +2810,19 @@ impl DownloadManager {
         let mut suggested_file_name = None;
         let mut validator = None;
 
-        if let Ok(response) = self
-            .client
-            .head(url.clone())
-            .headers(context_headers(context)?)
-            .header(ACCEPT_ENCODING, "identity")
-            .send()
-            .await
-        {
+        let head = self
+            .metadata_request(
+                self.client
+                    .head(url.clone())
+                    .headers(context_headers(context)?)
+                    .header(ACCEPT_ENCODING, "identity"),
+                url,
+            )
+            .await;
+        if matches!(&head, Err(EngineError::RetryAfter { .. })) {
+            return Err(head.unwrap_err());
+        }
+        if let Ok(response) = head {
             if response.status().is_success() {
                 reject_html_page(response.headers())?;
                 total_bytes = content_length_from_headers(response.headers());
@@ -1655,12 +2834,14 @@ impl DownloadManager {
 
         if total_bytes.is_none() || !accepts_ranges {
             let response = self
-                .client
-                .get(url.clone())
-                .headers(context_headers(context)?)
-                .header(RANGE, "bytes=0-0")
-                .header(ACCEPT_ENCODING, "identity")
-                .send()
+                .metadata_request(
+                    self.client
+                        .get(url.clone())
+                        .headers(context_headers(context)?)
+                        .header(RANGE, "bytes=0-0")
+                        .header(ACCEPT_ENCODING, "identity"),
+                    url,
+                )
                 .await?;
             if response.status() == StatusCode::PARTIAL_CONTENT {
                 let (start, end, total) =
@@ -1687,12 +2868,14 @@ impl DownloadManager {
         } else if suggested_file_name.is_none() {
             // Some hosts include the filename only on GET; metadata already found by HEAD stays usable.
             if let Ok(response) = self
-                .client
-                .get(url.clone())
-                .headers(context_headers(context)?)
-                .header(RANGE, "bytes=0-0")
-                .header(ACCEPT_ENCODING, "identity")
-                .send()
+                .metadata_request(
+                    self.client
+                        .get(url.clone())
+                        .headers(context_headers(context)?)
+                        .header(RANGE, "bytes=0-0")
+                        .header(ACCEPT_ENCODING, "identity"),
+                    url,
+                )
                 .await
             {
                 if response.status().is_success() {
@@ -1707,6 +2890,50 @@ impl DownloadManager {
             suggested_file_name,
             validator,
         })
+    }
+
+    async fn metadata_request(
+        &self,
+        request: reqwest::RequestBuilder,
+        url: &Url,
+    ) -> EngineResult<reqwest::Response> {
+        let origin = origin_budget(url);
+        for attempt in 0..3 {
+            let response = {
+                let _origin = origin
+                    .acquire()
+                    .await
+                    .map_err(|e| EngineError::Message(e.to_string()))?;
+                let _global = global_budget()
+                    .acquire()
+                    .await
+                    .map_err(|e| EngineError::Message(e.to_string()))?;
+                request
+                    .try_clone()
+                    .ok_or_else(|| {
+                        EngineError::Message("Metadata request cannot be replayed.".into())
+                    })?
+                    .send()
+                    .await?
+            };
+            let status = response.status();
+            if !matches!(
+                status,
+                StatusCode::TOO_MANY_REQUESTS | StatusCode::SERVICE_UNAVAILABLE
+            ) {
+                return Ok(response);
+            }
+            let delay = retry_after(response.headers(), Utc::now()).unwrap_or_else(|| {
+                Duration::from_millis((500u64 << attempt) + u64::from(Uuid::new_v4().as_bytes()[0]))
+            });
+            drop(response);
+            if attempt == 2 || delay > Duration::from_secs(3600) {
+                return Err(EngineError::RetryAfter { status, delay });
+            }
+            // The caller selects against cancellation, including this server cooldown.
+            tokio::time::sleep(delay).await;
+        }
+        unreachable!()
     }
 
     async fn merge_parts(
@@ -1725,47 +2952,98 @@ impl DownloadManager {
             .file_name()
             .and_then(|value| value.to_str())
             .unwrap_or("download");
-        let temp_name = format!(
-            ".{}.{}.fetchrail-part",
-            safe_file_name(desired_name),
-            record.id
-        );
-        let temp_path = parent.join(temp_name);
         let total = record.total_bytes.unwrap_or(record.downloaded_bytes);
-        let merged = Arc::new(AtomicU64::new(0));
-        // Batch disk I/O on one worker instead of scheduling every small read and write.
-        let mut worker = tokio::task::spawn_blocking({
-            let part_dir = part_dir.to_owned();
-            let temp_path = temp_path.clone();
-            let ranges = ranges.to_vec();
-            let merged = merged.clone();
-            move || join_parts(&part_dir, &temp_path, &ranges, total, &merged)
-        });
-        let started = Instant::now();
-        let mut ticker = interval(Duration::from_millis(180));
-        let result = loop {
-            tokio::select! {
-                result = &mut worker => break result
-                    .map_err(|error| EngineError::Message(format!("Joining parts failed: {error}")))
-                    .and_then(|result| result),
-                _ = ticker.tick() => {
-                    let joined = merged.load(Ordering::Relaxed);
-                    let speed = (joined as f64 / started.elapsed().as_secs_f64().max(0.001)) as u64;
-                    let snapshot = {
-                        let mut record = task.record.write().await;
-                        record.merged_bytes = joined;
-                        record.speed_bps = speed;
-                        record.eta_seconds = (speed > 0 && joined < total)
-                            .then(|| (total - joined).div_ceil(speed));
-                        record.clone()
-                    };
-                    self.emit_record(&snapshot);
+        let fingerprint = format!(
+            "{:x}",
+            Sha256::digest(fs::read(part_dir.join("transfer.json")).await?)
+        );
+        let checkpoint_path = part_dir.join("merge.json");
+        let prefix = format!(".{}.{}.", safe_file_name(desired_name), record.id);
+        let checkpoint = fs::read(&checkpoint_path)
+            .await
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<MergeCheckpoint>(&bytes).ok())
+            .filter(|saved| {
+                saved.total == total
+                    && saved.fingerprint == fingerprint
+                    && saved.expected_sha256 == record.expected_sha256
+                    && saved.file_name.starts_with(&prefix)
+                    && saved.file_name.ends_with(".fetchrail-part")
+                    && Path::new(&saved.file_name).components().count() == 1
+            });
+        let temp_name = checkpoint
+            .as_ref()
+            .map(|c| c.file_name.clone())
+            .unwrap_or_else(|| format!("{prefix}{}.fetchrail-part", Uuid::new_v4()));
+        let mut temp_path = parent.join(temp_name);
+        let recovered = checkpoint.is_some()
+            && fs::symlink_metadata(&temp_path)
+                .await
+                .is_ok_and(|m| m.is_file() && m.len() == total);
+        if !recovered {
+            // Never truncate a stale checkpoint or a file planted at its saved path.
+            temp_path = parent.join(format!("{prefix}{}.fetchrail-part", Uuid::new_v4()));
+            let merged = Arc::new(AtomicU64::new(0));
+            // Batch disk I/O on one worker instead of scheduling every small read and write.
+            let mut worker = tokio::task::spawn_blocking({
+                let part_dir = part_dir.to_owned();
+                let temp_path = temp_path.clone();
+                let ranges = ranges.to_vec();
+                let merged = merged.clone();
+                let expected = record.expected_sha256.clone();
+                move || {
+                    join_parts(
+                        &part_dir,
+                        &temp_path,
+                        &ranges,
+                        total,
+                        &merged,
+                        expected.as_deref(),
+                    )
                 }
+            });
+            let started = Instant::now();
+            let mut ticker = interval(Duration::from_millis(180));
+            let result = loop {
+                tokio::select! {
+                    result = &mut worker => break result
+                        .map_err(|error| EngineError::Message(format!("Joining parts failed: {error}")))
+                        .and_then(|result| result),
+                    _ = ticker.tick() => {
+                        let joined = merged.load(Ordering::Relaxed);
+                        let speed = (joined as f64 / started.elapsed().as_secs_f64().max(0.001)) as u64;
+                        let snapshot = {
+                            let mut record = task.record.write().await;
+                            record.merged_bytes = joined;
+                            record.speed_bps = speed;
+                            record.eta_seconds = (speed > 0 && joined < total)
+                                .then(|| (total - joined).div_ceil(speed));
+                            record.clone()
+                        };
+                        self.emit_record(&snapshot);
+                    }
+                }
+            };
+            if let Err(error) = result {
+                let _ = fs::remove_file(&temp_path).await;
+                return Err(error);
             }
-        };
-        if let Err(error) = result {
-            let _ = fs::remove_file(&temp_path).await;
-            return Err(error);
+            write_json_atomic(
+                &checkpoint_path,
+                &MergeCheckpoint {
+                    file_name: temp_path.file_name().unwrap().to_str().unwrap().into(),
+                    total,
+                    fingerprint,
+                    expected_sha256: record.expected_sha256.clone(),
+                },
+            )
+            .await?;
+        } else if let Some(expected) = &record.expected_sha256 {
+            let path = temp_path.clone();
+            let expected = expected.clone();
+            tokio::task::spawn_blocking(move || verify_file_hash(&path, &expected))
+                .await
+                .map_err(|e| EngineError::Message(e.to_string()))??;
         }
         let snapshot = {
             let mut record = task.record.write().await;
@@ -1775,13 +3053,29 @@ impl DownloadManager {
             record.clone()
         };
         self.emit_record(&snapshot);
+        let _dispatch = self.dispatch_lock.lock().await;
         let _lock = self.persist_lock.lock().await;
-        let destination = unique_destination(parent, desired_name).await;
-        if let Err(error) = fs::rename(&temp_path, &destination).await {
-            let _ = fs::remove_file(&temp_path).await;
-            return Err(error.into());
+        for _ in 0..1000 {
+            let destination = unique_destination(parent, desired_name).await;
+            self.check_torrent_path(&destination)
+                .await
+                .map_err(EngineError::Message)?;
+            let from = temp_path.clone();
+            let to = destination.clone();
+            match tokio::task::spawn_blocking(move || {
+                crate::platform::publish_noreplace(&from, &to)
+            })
+            .await
+            .map_err(|e| EngineError::Message(e.to_string()))?
+            {
+                Ok(()) => return Ok(destination),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error.into()),
+            }
         }
-        Ok(destination)
+        Err(EngineError::Message(
+            "Too many destination filename collisions. Choose another name and resume.".into(),
+        ))
     }
 
     async fn handle_run_error(&self, task: &Arc<DownloadTask>, error: EngineError) {
@@ -1867,6 +3161,7 @@ impl DownloadManager {
                 task.request_context.clone()
             };
             records.push(StoredDownload {
+                torrent_priorities: record.torrent.as_ref().map(|t| t.priorities.clone()),
                 record,
                 request_context,
             });
@@ -1896,8 +3191,65 @@ impl DownloadManager {
     }
 }
 
+impl DownloadManager {
+    pub fn resume_dispatch(&self) {
+        self.dispatch_suspended.store(false, Ordering::Release);
+    }
+
+    #[cfg(target_os = "linux")]
+    pub async fn suspend_transfers(&self) -> Vec<Uuid> {
+        self.dispatch_suspended.store(true, Ordering::Release);
+        let _dispatch = self.dispatch_lock.lock().await;
+        let mut paused = Vec::new();
+        for record in self
+            .list()
+            .await
+            .into_iter()
+            .filter(|r| r.status.is_active() && r.status != DownloadStatus::Merging)
+        {
+            if self.pause_inner(record.id).await.is_ok() {
+                paused.push(record.id);
+            }
+        }
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < deadline {
+            let tasks = self.tasks.read().await;
+            if !paused.iter().any(|id| {
+                tasks
+                    .get(id)
+                    .is_some_and(|task| task.running.load(Ordering::Acquire))
+            }) {
+                break;
+            }
+            drop(tasks);
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        let _ = self
+            .torrent_engine
+            .call(json!({"op":"checkpoint", "wait":true}))
+            .await;
+        let _ = self.persist_records().await;
+        paused
+    }
+
+    #[cfg(target_os = "linux")]
+    pub async fn resume_after_suspend(self: &Arc<Self>, ids: Vec<Uuid>) {
+        for id in ids {
+            if self
+                .get_download(id)
+                .await
+                .is_ok_and(|r| r.status == DownloadStatus::Paused)
+            {
+                let _ = self.resume(id).await;
+            }
+        }
+        self.resume_dispatch();
+    }
+}
+
 fn default_settings(download_dir: &Path) -> DownloadSettings {
     DownloadSettings {
+        torrent: Default::default(),
         speed_limit_bps: 0,
         default_download_dir: download_dir.to_string_lossy().to_string(),
         max_concurrent_downloads: 3,
@@ -1908,8 +3260,127 @@ fn default_settings(download_dir: &Path) -> DownloadSettings {
         theme: Default::default(),
         accent: Default::default(),
         categories: default_categories(),
+        sort_into_category_folders: true,
         auto_update: true,
+        delete_files_on_remove: None,
     }
+}
+
+fn download_budgets(limit: u64, http: bool, torrent: bool) -> (u64, u64) {
+    if limit == 0 {
+        return (0, 0);
+    }
+    match (http, torrent) {
+        (true, true) => {
+            let native = (limit / 2).max(1);
+            (limit.saturating_sub(native).max(1), native)
+        }
+        (false, true) => (1, limit),
+        _ => (limit, 1),
+    }
+}
+
+fn rebalance_download_budgets(limit: u64, current: (u64, u64), rates: (u64, u64)) -> (u64, u64) {
+    // Reclaim unused capacity gradually, retaining a probe allocation for a stalled engine.
+    let floor = (limit / 10).max(1);
+    let step = (limit / 10).max(1);
+    let saturated = |rate: u64, budget: u64| rate as f64 >= budget as f64 * 0.8;
+    let http = match (saturated(rates.0, current.0), saturated(rates.1, current.1)) {
+        (true, false) => current
+            .0
+            .saturating_add(step)
+            .min(limit.saturating_sub(floor)),
+        (false, true) => current.0.saturating_sub(step).max(floor),
+        _ => current.0,
+    };
+    (http, limit.saturating_sub(http))
+}
+
+async fn validate_torrent_destination(
+    root: &Path,
+    metadata: &TorrentMetadata,
+    allow_existing: bool,
+) -> Result<(), String> {
+    let root = root.to_path_buf();
+    let metadata = metadata.clone();
+    tokio::task::spawn_blocking(move || {
+        validate_torrent_destination_blocking(&root, &metadata, allow_existing)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+fn validate_torrent_destination_blocking(
+    root: &Path,
+    metadata: &TorrentMetadata,
+    allow_existing: bool,
+) -> Result<(), String> {
+    fn reparse(path: &Path) -> Result<bool, String> {
+        match std::fs::symlink_metadata(path) {
+            Ok(meta) => {
+                #[cfg(windows)]
+                {
+                    use std::os::windows::fs::MetadataExt;
+                    if meta.file_attributes() & 0x400 != 0 {
+                        return Ok(true);
+                    }
+                }
+                Ok(meta.file_type().is_symlink())
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(e.to_string()),
+        }
+    }
+    if root
+        .ancestors()
+        .any(|ancestor| reparse(ancestor).unwrap_or(true))
+    {
+        return Err("Destination is a symlink or reparse point. Choose its real folder.".into());
+    }
+    for file in &metadata.files {
+        let path = Path::new(&file.path);
+        if path.is_absolute()
+            || path
+                .components()
+                .any(|c| !matches!(c, std::path::Component::Normal(_)))
+        {
+            return Err("Torrent contains an unsafe file path.".into());
+        }
+        let mut current = root.to_path_buf();
+        for part in path.components() {
+            current.push(part.as_os_str());
+            if reparse(&current)? {
+                return Err(format!(
+                    "Torrent destination contains a reparse point: {}",
+                    file.path
+                ));
+            }
+        }
+        if current.is_dir() {
+            return Err(format!(
+                "A directory occupies the torrent file path: {}",
+                file.path
+            ));
+        }
+        if !allow_existing && current.exists() {
+            return Err(format!(
+                "A file already exists at {}. Choose another folder to prevent overwriting it.",
+                file.path
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn storage_path_key(path: &Path) -> String {
+    let path = path
+        .to_string_lossy()
+        .replace("\\\\?\\", "")
+        .replace('\\', "/");
+    #[cfg(windows)]
+    return path.to_lowercase();
+    #[cfg(not(windows))]
+    path
 }
 
 fn context_headers(context: Option<&BrowserRequestContext>) -> EngineResult<HeaderMap> {
@@ -2008,6 +3479,10 @@ fn record_is_dispatch_ready(
 fn sync_startup_registration(enabled: bool) -> Result<(), String> {
     use winreg::{enums::HKEY_CURRENT_USER, RegKey};
 
+    if crate::platform::test_root()?.is_some() {
+        return Ok(());
+    }
+
     let current_exe =
         std::env::current_exe().map_err(|error| format!("Could not locate Fetchrail: {error}"))?;
     let hkcu = RegKey::predef(HKEY_CURRENT_USER);
@@ -2034,17 +3509,18 @@ fn sync_startup_registration(enabled: bool) -> Result<(), String> {
     Ok(())
 }
 
-#[cfg(not(target_os = "windows"))]
-fn sync_startup_registration(_enabled: bool) -> Result<(), String> {
-    Ok(())
+#[cfg(target_os = "linux")]
+fn sync_startup_registration(enabled: bool) -> Result<(), String> {
+    crate::platform::sync_startup_registration(enabled)
 }
 
 async fn write_json_atomic<T: serde::Serialize>(path: &Path, value: &T) -> EngineResult<()> {
     let bytes = serde_json::to_vec_pretty(value)
         .map_err(|error| EngineError::Message(format!("Could not serialize state: {error}")))?;
-    let temp = path.with_extension(format!("{}.tmp", Uuid::new_v4()));
-    fs::write(&temp, bytes).await?;
-    fs::rename(&temp, path).await?;
+    let path = path.to_owned();
+    tokio::task::spawn_blocking(move || crate::platform::write_private_atomic(&path, &bytes))
+        .await
+        .map_err(|e| EngineError::Message(e.to_string()))??;
     Ok(())
 }
 
@@ -2169,7 +3645,20 @@ async fn prepare_parts(
         }
     }
     fs::create_dir_all(part_dir).await?;
-    write_json_atomic(&part_dir.join("transfer.json"), &manifest).await
+    write_json_atomic(&part_dir.join("transfer.json"), &manifest).await?;
+    if let Some(total) = probe.total_bytes {
+        let committed = segment_counters(part_dir, ranges)
+            .await?
+            .iter()
+            .map(|segment| segment.downloaded.load(Ordering::Relaxed))
+            .sum::<u64>();
+        let remaining = total.saturating_sub(committed);
+        let available = crate::platform::available_space(part_dir)?;
+        if available < remaining {
+            return Err(EngineError::Message(format!("Download storage has {available} bytes available but the remaining parts need {remaining}. Free space and resume this download.")));
+        }
+    }
+    Ok(())
 }
 
 fn parse_content_range(headers: &HeaderMap) -> Option<(u64, u64, Option<u64>)> {
@@ -2269,8 +3758,51 @@ fn join_parts(
     ranges: &[ByteRange],
     total: u64,
     merged: &AtomicU64,
+    expected_sha256: Option<&str>,
 ) -> EngineResult<()> {
-    let mut output = std::fs::File::create(temp_path)?;
+    if ranges.len() == 1 {
+        let source = part_dir.join("0.part");
+        let metadata = std::fs::symlink_metadata(&source)?;
+        let expected = if ranges[0].end == u64::MAX {
+            total
+        } else {
+            ranges[0].len()
+        };
+        if !metadata.is_file() || metadata.len() != expected || expected != total {
+            return Err(EngineError::Message(
+                "Part 0 has an unexpected size. Retry the download.".into(),
+            ));
+        }
+        // Keep the original resume file until publication. On the same filesystem
+        // a hard link avoids reading and writing the entire payload a second time.
+        // Other filesystems and destinations keep the checked copy path below.
+        if std::fs::hard_link(&source, temp_path).is_ok() {
+            let output = std::fs::OpenOptions::new().write(true).open(temp_path)?;
+            if let Some(expected) = expected_sha256 {
+                verify_file_hash(temp_path, expected)?;
+            }
+            if output.metadata()?.len() != total {
+                return Err(EngineError::Message(
+                    "Part size changed while joining.".into(),
+                ));
+            }
+            merged.store(total, Ordering::Relaxed);
+            output.sync_all()?;
+            return Ok(());
+        }
+    }
+    let parent = temp_path
+        .parent()
+        .ok_or_else(|| EngineError::Message("Invalid destination path.".into()))?;
+    let available = crate::platform::available_space(parent)?;
+    if available < total {
+        return Err(EngineError::Message(format!("The destination has {available} bytes available but finalization needs {total}. Free space and resume this download.")));
+    }
+    let mut output = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(temp_path)?;
+    let mut hash = expected_sha256.map(|_| Sha256::new());
     let mut buffer = vec![0; MERGE_BUFFER_SIZE];
     let mut joined = 0;
     for (index, range) in ranges.iter().enumerate() {
@@ -2301,6 +3833,9 @@ fn join_parts(
                 ));
             }
             output.write_all(&buffer[..read])?;
+            if let Some(hash) = &mut hash {
+                hash.update(&buffer[..read]);
+            }
             joined += read as u64;
             merged.store(joined, Ordering::Relaxed);
         }
@@ -2315,7 +3850,31 @@ fn join_parts(
             "Joined file has an unexpected size.".into(),
         ));
     }
+    if let (Some(hash), Some(expected)) = (hash, expected_sha256) {
+        if format!("{:x}", hash.finalize()) != expected {
+            return Err(EngineError::Message("SHA-256 verification failed. The file was not published; check the source and expected checksum.".into()));
+        }
+    }
     output.sync_all()?;
+    Ok(())
+}
+
+fn verify_file_hash(path: &Path, expected: &str) -> EngineResult<()> {
+    let mut file = std::fs::File::open(path)?;
+    let mut hash = Sha256::new();
+    let mut buffer = vec![0; MERGE_BUFFER_SIZE];
+    loop {
+        let count = file.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        hash.update(&buffer[..count]);
+    }
+    if format!("{:x}", hash.finalize()) != expected {
+        return Err(EngineError::Message(
+            "Output failed SHA-256 verification. The file was not published.".into(),
+        ));
+    }
     Ok(())
 }
 
@@ -2326,7 +3885,7 @@ mod transfer_tests;
 mod tests {
     use super::{context_headers, reject_html_page, StoredDownload};
     use crate::model::BrowserRequestContext;
-    use chrono::{Duration as ChronoDuration, Utc};
+    use chrono::{DateTime, Duration as ChronoDuration, Utc};
     use reqwest::header::{
         HeaderMap, HeaderValue, CONTENT_DISPOSITION, CONTENT_LENGTH, CONTENT_RANGE,
     };
@@ -2337,6 +3896,98 @@ mod tests {
         record_is_dispatch_ready, safe_file_name, split_ranges, suggested_connection_count,
     };
     use crate::model::{DownloadRecord, DownloadStatus};
+
+    #[test]
+    fn mixed_engine_budgets_reclaim_capacity_without_exceeding_the_cap() {
+        for limit in [2, 3, 10, 1024, 1048576] {
+            let mut allocation = super::download_budgets(limit, true, true);
+            for _ in 0..20 {
+                allocation = super::rebalance_download_budgets(limit, allocation, (limit, 0));
+                assert_eq!(allocation.0 + allocation.1, limit);
+                assert!(allocation.0 > 0 && allocation.1 > 0);
+            }
+            assert!(allocation.0 >= limit / 2);
+            for _ in 0..20 {
+                allocation = super::rebalance_download_budgets(limit, allocation, (0, limit));
+                assert_eq!(allocation.0 + allocation.1, limit);
+                assert!(allocation.0 > 0 && allocation.1 > 0);
+            }
+            assert!(allocation.1 >= limit / 2);
+        }
+        assert_eq!(super::download_budgets(0, true, true), (0, 0));
+        assert_eq!(super::download_budgets(1024, false, true), (1, 1024));
+    }
+
+    #[test]
+    fn retry_after_and_origin_budgets_keep_server_cooldowns() {
+        let now = DateTime::parse_from_rfc3339("2026-10-09T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let mut headers = HeaderMap::new();
+        headers.insert(reqwest::header::RETRY_AFTER, HeaderValue::from_static("2"));
+        assert_eq!(
+            super::retry_after(&headers, now),
+            Some(std::time::Duration::from_secs(2))
+        );
+        headers.insert(
+            reqwest::header::RETRY_AFTER,
+            HeaderValue::from_static("Fri, 09 Oct 2026 12:00:03 GMT"),
+        );
+        assert_eq!(
+            super::retry_after(&headers, now),
+            Some(std::time::Duration::from_secs(3))
+        );
+        headers.insert(
+            reqwest::header::RETRY_AFTER,
+            HeaderValue::from_static("invalid"),
+        );
+        assert_eq!(super::retry_after(&headers, now), None);
+        let first = super::origin_budget(&url::Url::parse("https://example.com/a").unwrap());
+        let second = super::origin_budget(&url::Url::parse("https://example.com/b").unwrap());
+        let third = super::origin_budget(&url::Url::parse("https://example.com:8443/a").unwrap());
+        assert!(std::sync::Arc::ptr_eq(&first, &second));
+        assert!(!std::sync::Arc::ptr_eq(&first, &third));
+    }
+
+    #[test]
+    fn expected_hashes_are_validated_and_mismatches_reject_final_output() {
+        use sha2::{Digest, Sha256};
+        assert!(super::normalize_sha256(Some("invalid")).is_err());
+        assert_eq!(
+            super::normalize_sha256(Some(&"A".repeat(64)))
+                .unwrap()
+                .unwrap(),
+            "a".repeat(64)
+        );
+        let root = std::env::temp_dir().join(format!("fetchrail-hash-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("0.part"), b"bytes").unwrap();
+        let merged = std::sync::atomic::AtomicU64::new(0);
+        let hash = format!("{:x}", Sha256::digest(b"bytes"));
+        let output = root.join("complete.tmp");
+        super::join_parts(
+            &root,
+            &output,
+            &super::split_ranges(5, 1),
+            5,
+            &merged,
+            Some(&hash),
+        )
+        .unwrap();
+        super::verify_file_hash(&output, &hash).unwrap();
+        std::fs::remove_file(&output).unwrap();
+        let error = super::join_parts(
+            &root,
+            &output,
+            &super::split_ranges(5, 1),
+            5,
+            &merged,
+            Some(&"0".repeat(64)),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("SHA-256"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn html_landing_pages_are_rejected_but_html_attachments_are_downloadable() {
@@ -2363,6 +4014,7 @@ mod tests {
         assert!(headers[reqwest::header::COOKIE].is_sensitive());
         let record = queued_record(DownloadStatus::Scheduled, "Default", None);
         let stored = StoredDownload {
+            torrent_priorities: None,
             record,
             request_context: Some(context),
         };
@@ -2462,6 +4114,8 @@ mod tests {
         scheduled_for: Option<chrono::DateTime<Utc>>,
     ) -> DownloadRecord {
         DownloadRecord {
+            torrent: None,
+            expected_sha256: None,
             id: Uuid::new_v4(),
             url: "https://example.com/file.bin".into(),
             file_name: "file.bin".into(),
@@ -2571,7 +4225,7 @@ mod tests {
         }
         let output = dir.join("joined");
         let merged = std::sync::atomic::AtomicU64::new(0);
-        super::join_parts(&dir, &output, &ranges, total, &merged).unwrap();
+        super::join_parts(&dir, &output, &ranges, total, &merged, None).unwrap();
         let bytes = tokio::fs::read(&output).await.unwrap();
         assert_eq!(bytes.len() as u64, total);
         assert!(bytes[..ranges[0].len() as usize]
@@ -2601,19 +4255,34 @@ mod tests {
         tokio::fs::write(dir.join("0.part"), b"single stream")
             .await
             .unwrap();
-        super::join_parts(&dir, &output, &unknown, 13, &merged).unwrap();
+        super::join_parts(&dir, &output, &unknown, 13, &merged, None).unwrap();
         assert_eq!(tokio::fs::read(&output).await.unwrap(), b"single stream");
         assert_eq!(merged.load(std::sync::atomic::Ordering::Relaxed), 13);
+        assert!(super::join_parts(&dir, &output, &[], 0, &merged, None).is_err());
+        assert_eq!(
+            tokio::fs::read(&output).await.unwrap(),
+            b"single stream",
+            "Existing output must not be truncated"
+        );
+        tokio::fs::remove_file(&output).await.unwrap();
 
         merged.store(0, std::sync::atomic::Ordering::Relaxed);
-        super::join_parts(&dir, &output, &[], 0, &merged).unwrap();
+        super::join_parts(&dir, &output, &[], 0, &merged, None).unwrap();
         assert_eq!(tokio::fs::metadata(&output).await.unwrap().len(), 0);
+        tokio::fs::remove_file(&output).await.unwrap();
         for invalid_size in [12, 14] {
-            assert!(super::join_parts(&dir, &output, &unknown, invalid_size, &merged).is_err());
+            assert!(
+                super::join_parts(&dir, &output, &unknown, invalid_size, &merged, None).is_err()
+            );
             assert_eq!(merged.load(std::sync::atomic::Ordering::Relaxed), 0);
+            assert!(
+                !output.exists(),
+                "Invalid single parts must not create output"
+            );
         }
-        assert!(super::join_parts(&dir, &output, &split_ranges(26, 2), 26, &merged).is_err());
-        assert!(super::join_parts(&dir, &output, &[], 1, &merged).is_err());
+        assert!(super::join_parts(&dir, &output, &split_ranges(26, 2), 26, &merged, None).is_err());
+        tokio::fs::remove_file(&output).await.unwrap();
+        assert!(super::join_parts(&dir, &output, &[], 1, &merged, None).is_err());
         let mut old_record =
             serde_json::to_value(queued_record(DownloadStatus::Paused, "Default", None)).unwrap();
         old_record.as_object_mut().unwrap().remove("mergedBytes");
@@ -2622,6 +4291,117 @@ mod tests {
                 .unwrap()
                 .merged_bytes,
             0
+        );
+        tokio::fs::remove_dir_all(dir).await.unwrap();
+    }
+
+    #[test]
+    fn single_part_finalization_preserves_resume_bytes_and_rejects_hashes_and_collisions() {
+        use sha2::{Digest, Sha256};
+        let dir = std::env::temp_dir().join(format!("fetchrail-link-test-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let payload = b"committed resume bytes";
+        let part = dir.join("0.part");
+        let output = dir.join("joined");
+        std::fs::write(&part, payload).unwrap();
+        let total = payload.len() as u64;
+        let ranges = split_ranges(total, 1);
+        let merged = std::sync::atomic::AtomicU64::new(0);
+        let expected = format!("{:x}", Sha256::digest(payload));
+        super::join_parts(&dir, &output, &ranges, total, &merged, Some(&expected)).unwrap();
+        assert_eq!(std::fs::read(&output).unwrap(), payload);
+        assert_eq!(std::fs::read(&part).unwrap(), payload);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            assert_eq!(
+                std::fs::metadata(&part).unwrap().ino(),
+                std::fs::metadata(&output).unwrap().ino()
+            );
+        }
+        std::fs::remove_file(&output).unwrap();
+        assert!(super::join_parts(
+            &dir,
+            &output,
+            &ranges,
+            total,
+            &merged,
+            Some(&"0".repeat(64))
+        )
+        .is_err());
+        std::fs::remove_file(&output).unwrap();
+        assert_eq!(
+            std::fs::read(&part).unwrap(),
+            payload,
+            "Hash rejection keeps resume data"
+        );
+        std::fs::write(&output, b"existing destination").unwrap();
+        assert!(super::join_parts(&dir, &output, &ranges, total, &merged, None).is_err());
+        assert_eq!(std::fs::read(&output).unwrap(), b"existing destination");
+        assert_eq!(std::fs::read(&part).unwrap(), payload);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn single_part_finalization_copies_across_filesystems() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = std::env::temp_dir().join(format!("fetchrail-cross-device-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let Some(shared) = std::fs::metadata("/dev/shm").ok() else {
+            std::fs::remove_dir_all(dir).unwrap();
+            return;
+        };
+        if shared.dev() == std::fs::metadata(&dir).unwrap().dev() {
+            std::fs::remove_dir_all(dir).unwrap();
+            return;
+        }
+        let output = std::path::Path::new("/dev/shm")
+            .join(format!("fetchrail-cross-device-{}", Uuid::new_v4()));
+        std::fs::write(dir.join("0.part"), b"cross-device bytes").unwrap();
+        super::join_parts(
+            &dir,
+            &output,
+            &split_ranges(18, 1),
+            18,
+            &std::sync::atomic::AtomicU64::new(0),
+            None,
+        )
+        .unwrap();
+        assert_eq!(std::fs::read(&output).unwrap(), b"cross-device bytes");
+        assert_eq!(
+            std::fs::read(dir.join("0.part")).unwrap(),
+            b"cross-device bytes"
+        );
+        std::fs::remove_file(output).unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn insufficient_part_space_preserves_validated_resume_bytes() {
+        let dir = std::env::temp_dir().join(format!("fetchrail-space-test-{}", Uuid::new_v4()));
+        let total = u64::MAX - 1;
+        let probe = super::ProbeResult {
+            total_bytes: Some(total),
+            accepts_ranges: true,
+            suggested_file_name: None,
+            validator: Some("\"v1\"".into()),
+        };
+        let ranges = split_ranges(total, 1);
+        let error = super::prepare_parts(&dir, &probe, &ranges)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("remaining parts need"));
+        tokio::fs::write(dir.join("0.part"), b"partial")
+            .await
+            .unwrap();
+        let error = super::prepare_parts(&dir, &probe, &ranges)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("remaining parts need"));
+        assert_eq!(
+            tokio::fs::read(dir.join("0.part")).await.unwrap(),
+            b"partial"
         );
         tokio::fs::remove_dir_all(dir).await.unwrap();
     }

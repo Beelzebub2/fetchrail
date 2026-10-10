@@ -39,6 +39,7 @@ for (const browser of ["chromium", "firefox"]) {
     if (fail === "offline") throw new Error("Host unavailable");
     if (message.method === "controlDownload") return { ok: true, result: {} };
     if (afterAcceptance) Object.assign(current, afterAcceptance);
+    if (message.method === "addTorrents") return { ok: true, result: { accepted: 1, ids: [], errors: [], pendingConfirmation: true } };
     return { ok: true, result: fail === "rejected"
       ? { accepted: 0, ids: [], errors: [{ index: 0, message: "Browser session required" }] }
       : { accepted: 1, ids: [engineId], errors: [] } };
@@ -74,6 +75,9 @@ for (const browser of ["chromium", "firefox"]) {
     url: current.finalUrl, suggestedFileName: "file.zip", expectedBytes: current.totalBytes, expectedMime: current.mime,
   });
   reset(); saved.automaticDownloads = false; await route(); assert.equal(events.length, 0);
+  reset({ finalUrl: "https://example.com/source.torrent", filename: "C:\\Downloads\\source.torrent" }); await route();
+  assert.deepEqual(events, ["pause", "search", "addTorrents", "search", "cancel", "erase"]);
+  assert.equal(requests[0].params.items[0].requestContext, undefined);
   for (const overrides of [{ url: "blob:https://example.com/id", finalUrl: "" }, { incognito: true },
     { danger: "file" }, { paused: true }, { state: "complete" }, { byExtensionId: "another-extension" }]) {
     reset(overrides); await route(); assert.equal(events.length, 0);

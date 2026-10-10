@@ -6,6 +6,14 @@
 
 Remaining work includes browser interception exclusion rules, proxy configuration, per-host limits, clipboard monitoring, recurring bandwidth windows, and optional Explorer context-menu integration. Global/per-file speed limits, queue start/stop windows, browser batches and opt-in final-request session support are implemented. Blob URLs and protected streaming formats require separate browser authentication/media support.
 
+## Torrent support
+
+The [torrent implementation plan](torrent-plan.md) uses libtorrent rasterbar for magnets, `.torrent` files, downloading and seeding, with shared queues and bandwidth policy in the existing UI. The native runtime, metadata confirmation, file priorities, sharing controls, recovery, peers, trackers and storage actions are implemented. See [torrent validation](torrent-validation.md) for tested behavior and performance limits. RSS, search, watch folders, associations, remote control and streaming remain later phases.
+
+## Linux support
+
+The [Linux support plan](linux-support-plan.md) covers Fedora, Ubuntu, Mint, Kali, Arch and wider distro qualification. Platform adapters, matching app/native-host paths, browser registration, XDG autostart, capability-aware desktop actions, package-aware updates, native Linux build recipes and combined signed release gates are implemented. Windows regression checks pass and remain mandatory. Ubuntu 22.04 x64 builds, X11/Wayland controls and package checks pass through WSL2. Fedora 44, Mint 22.3, Kali 2026.2 and current Arch installed-app HTTP/torrent/extension and X11/Wayland controls pass in official userspaces on that kernel; their own kernels/policies, ARM64 and physical desktop acceptance remain pending. Shared single-part finalization avoids an unnecessary full-file copy; measured results and comparator limitations are in [validation](linux-validation.md). See the [installation guide](linux.md) and [evidence matrix](linux-support-matrix.md).
+
 ## Download engine improvement priorities
 
 Review date: 8 October 2026. Keep the Rust engine and its strict range/resume checks. The next gains should improve successful completion and recovery before increasing connection counts. These priorities follow the current implementation and public project documentation and reports; they are proposals, not measured performance gains.
