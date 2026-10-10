@@ -58,9 +58,9 @@ pub fn backoff(attempt: usize) -> Duration {
     Duration::from_millis(base + jitter)
 }
 
-pub fn slow_progress(bytes: u64, elapsed: Duration, best_rate: &mut f64) -> bool {
+pub fn slow_progress(bytes: u64, elapsed: Duration, best_rate: &mut f64, tail_rate: u64) -> bool {
     let rate = bytes as f64 / elapsed.as_secs_f64().max(0.001);
-    let slow = rate < 2048.0_f64.max(*best_rate * 0.05);
+    let slow = rate < 2048.0_f64.max(best_rate.max(tail_rate as f64) * 0.05);
     *best_rate = best_rate.max(rate);
     slow
 }
@@ -314,13 +314,22 @@ mod tests {
     fn slow_progress_detects_a_trickling_tail_without_rejecting_a_steady_slow_source() {
         let window = Duration::from_secs(10);
         let mut best = 0.0;
-        assert!(!slow_progress(8 * 1024 * 1024, window, &mut best));
-        assert!(slow_progress(40 * 1024, window, &mut best));
+        assert!(!slow_progress(8 * 1024 * 1024, window, &mut best, 0));
+        assert!(slow_progress(40 * 1024, window, &mut best, 0));
         let mut best = 0.0;
         for _ in 0..10 {
-            assert!(!slow_progress(40 * 1024, window, &mut best));
+            assert!(!slow_progress(40 * 1024, window, &mut best, 0));
         }
-        assert!(slow_progress(1024, window, &mut best));
+        assert!(slow_progress(1024, window, &mut best, 0));
+    }
+    #[test]
+    fn tail_uses_proven_peer_speed_even_when_it_was_slow_from_the_start() {
+        let window = Duration::from_secs(10);
+        let mut best = 0.0;
+        assert!(!slow_progress(200 * 1024, window, &mut best, 0));
+        assert!(slow_progress(200 * 1024, window, &mut best, 1024 * 1024));
+        assert!(!slow_progress(200 * 1024, window, &mut best, 20 * 1024));
+        assert!(!slow_progress(200 * 1024, window, &mut best, 0));
     }
     #[tokio::test]
     async fn origin_admits_waiters_before_refills_and_releases_cancelled_waiters() {
