@@ -1,6 +1,6 @@
 [package]
 name = "fetchrail"
-version = "0.6.3-local.5"
+version = "0.6.3-local.6"
 description = "Fetchrail high-performance download manager"
 authors = ["RRMTools"]
 edition = "2021"
@@ -40,7 +40,7 @@ tauri-plugin-updater = "2"
 
 [target.'cfg(windows)'.dependencies]
 winreg = "0.55"
-windows = { version = "0.62", features = ["Win32_System_Com", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging", "Win32_Storage_FileSystem"] }
+windows = { version = "0.62", features = ["Win32_System_Com", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_Ioctl"] }
 
 # Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration
 [profile.release]

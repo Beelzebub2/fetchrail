@@ -21,18 +21,24 @@ pub async fn write_json<T: Serialize>(path: &Path, value: &T) -> io::Result<()> 
 }
 
 async fn replace_bytes(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    let temp = path.with_extension(format!("{}.tmp", Uuid::new_v4()));
-    let mut file = fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&temp)
-        .await?;
-    file.write_all(bytes).await?;
-    file.sync_all().await?;
-    drop(file);
-    move_file(&temp, path, true)?;
-    sync_parent(path)?;
-    Ok(())
+    let path = path.to_owned();
+    let bytes = bytes.to_owned();
+    // Windows metadata moves can block; keep the entire durable write off the network task.
+    tokio::task::spawn_blocking(move || {
+        use std::io::Write;
+        let temp = path.with_extension(format!("{}.tmp", Uuid::new_v4()));
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp)?;
+        file.write_all(&bytes)?;
+        file.sync_all()?;
+        drop(file);
+        move_file(&temp, &path, true)?;
+        sync_parent(&path)
+    })
+    .await
+    .map_err(io::Error::other)?
 }
 
 pub async fn read_json<T: DeserializeOwned>(path: &Path) -> io::Result<Option<T>> {
@@ -95,6 +101,42 @@ pub async fn sha256(path: &Path) -> io::Result<String> {
         hash.update(&buffer[..count]);
     }
     Ok(format!("{:x}", hash.finalize()))
+}
+
+pub async fn create_stage(path: &Path, length: u64) -> io::Result<()> {
+    let path = path.to_owned();
+    tokio::task::spawn_blocking(move || {
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)?;
+        #[cfg(windows)]
+        {
+            use std::os::windows::io::AsRawHandle;
+            use windows::Win32::{
+                Foundation::HANDLE,
+                System::{Ioctl::FSCTL_SET_SPARSE, IO::DeviceIoControl},
+            };
+            let mut returned = 0;
+            // Avoid zero-filling unwritten gaps; unsupported volumes keep ordinary allocation.
+            let _ = unsafe {
+                DeviceIoControl(
+                    HANDLE(file.as_raw_handle()),
+                    FSCTL_SET_SPARSE,
+                    None,
+                    0,
+                    None,
+                    0,
+                    Some(&mut returned),
+                    None,
+                )
+            };
+        }
+        file.set_len(length)?;
+        file.sync_all()
+    })
+    .await
+    .map_err(io::Error::other)?
 }
 
 pub fn validate_hash(hash: Option<&str>) -> Result<Option<String>, String> {
@@ -321,12 +363,46 @@ pub async fn mark_download(path: &Path, url: &str, file_name: &str) -> io::Resul
 mod tests {
     use super::*;
     #[tokio::test]
+    async fn staging_keeps_zero_holes_and_never_truncates_an_existing_file() {
+        use tokio::io::AsyncSeekExt;
+        let root = std::env::temp_dir().join(format!("fetchrail-stage-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).await.unwrap();
+        let path = root.join("stage");
+        create_stage(&path, 8 * 1024 * 1024).await.unwrap();
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .await
+            .unwrap();
+        file.seek(io::SeekFrom::Start(4 * 1024 * 1024))
+            .await
+            .unwrap();
+        file.write_all(b"data").await.unwrap();
+        file.flush().await.unwrap();
+        file.sync_all().await.unwrap();
+        drop(file);
+        assert_eq!(
+            create_stage(&path, 1).await.unwrap_err().kind(),
+            io::ErrorKind::AlreadyExists
+        );
+        let mut bytes = fs::read(&path).await.unwrap();
+        assert_eq!(bytes.len(), 8 * 1024 * 1024);
+        assert_eq!(&bytes[4 * 1024 * 1024..4 * 1024 * 1024 + 4], b"data");
+        bytes[4 * 1024 * 1024..4 * 1024 * 1024 + 4].fill(0);
+        assert!(bytes.iter().all(|byte| *byte == 0));
+        fs::remove_dir_all(root).await.unwrap();
+    }
+    #[tokio::test]
     async fn damaged_state_recovers_and_publication_never_clobbers() {
         let root = std::env::temp_dir().join(format!("fetchrail-storage-{}", Uuid::new_v4()));
         fs::create_dir_all(&root).await.unwrap();
         let state = root.join("state.json");
         write_json(&state, &vec![1, 2]).await.unwrap();
         write_json(&state, &vec![3, 4]).await.unwrap();
+        assert_eq!(
+            read_json::<Vec<u8>>(&state).await.unwrap(),
+            Some(vec![3, 4])
+        );
         fs::write(&state, b"broken").await.unwrap();
         assert_eq!(
             read_json::<Vec<u8>>(&state).await.unwrap(),
