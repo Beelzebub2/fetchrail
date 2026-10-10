@@ -6,8 +6,9 @@ use std::{
 };
 use tokio::{
     fs,
-    io::{AsyncReadExt, AsyncWriteExt},
+    io::AsyncWriteExt,
 };
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 pub async fn write_json<T: Serialize>(path: &Path, value: &T) -> io::Result<()> {
@@ -90,17 +91,42 @@ pub async fn read_json<T: DeserializeOwned>(path: &Path) -> io::Result<Option<T>
 }
 
 pub async fn sha256(path: &Path) -> io::Result<String> {
-    let mut input = fs::File::open(path).await?;
-    let mut buffer = vec![0; 1024 * 1024];
-    let mut hash = Sha256::new();
-    loop {
-        let count = input.read(&mut buffer).await?;
-        if count == 0 {
-            break;
+    sha256_cancellable(path, &CancellationToken::new()).await
+}
+
+pub async fn sha256_cancellable(path: &Path, cancel: &CancellationToken) -> io::Result<String> {
+    let path = path.to_owned();
+    let cancel = cancel.clone();
+    // Batch sequential I/O and hashing off the runtime; finish the read before releasing the file.
+    tokio::task::spawn_blocking(move || {
+        use std::io::Read;
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true);
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            options.custom_flags(windows::Win32::Storage::FileSystem::FILE_FLAG_SEQUENTIAL_SCAN.0);
         }
-        hash.update(&buffer[..count]);
-    }
-    Ok(format!("{:x}", hash.finalize()))
+        let mut input = options.open(path)?;
+        let mut buffer = vec![0; 8 * 1024 * 1024];
+        let mut hash = Sha256::new();
+        loop {
+            if cancel.is_cancelled() {
+                return Err(io::Error::from(io::ErrorKind::Interrupted));
+            }
+            let count = match input.read(&mut buffer) {
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                result => result?,
+            };
+            if count == 0 {
+                break;
+            }
+            hash.update(&buffer[..count]);
+        }
+        Ok(format!("{:x}", hash.finalize()))
+    })
+    .await
+    .map_err(io::Error::other)?
 }
 
 pub async fn create_stage(path: &Path, length: u64) -> io::Result<()> {
@@ -362,6 +388,38 @@ pub async fn mark_download(path: &Path, url: &str, file_name: &str) -> io::Resul
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn hashing_preserves_partial_chunks_and_io_errors() {
+        let root = std::env::temp_dir().join(format!("fetchrail-hash-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).await.unwrap();
+        let path = root.join("file");
+        fs::write(&path, b"abc").await.unwrap();
+        assert_eq!(sha256(&path).await.unwrap(), "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+        let bytes = vec![7; 8 * 1024 * 1024 + 3];
+        fs::write(&path, &bytes).await.unwrap();
+        assert_eq!(sha256(&path).await.unwrap(), format!("{:x}", Sha256::digest(&bytes)));
+        fs::remove_file(&path).await.unwrap();
+        assert_eq!(sha256(&path).await.unwrap_err().kind(), io::ErrorKind::NotFound);
+        fs::remove_dir(root).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancelled_hashing_releases_the_file_before_returning() {
+        let root = std::env::temp_dir().join(format!("fetchrail-hash-cancel-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).await.unwrap();
+        let path = root.join("file");
+        create_stage(&path, 512 * 1024 * 1024).await.unwrap();
+        let cancel = CancellationToken::new();
+        let cancellation = async {
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            cancel.cancel();
+        };
+        let (result, ()) = tokio::join!(sha256_cancellable(&path, &cancel), cancellation);
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::Interrupted);
+        fs::remove_file(&path).await.unwrap();
+        fs::remove_dir(root).await.unwrap();
+    }
+
     #[tokio::test]
     async fn staging_keeps_zero_holes_and_never_truncates_an_existing_file() {
         use tokio::io::AsyncSeekExt;

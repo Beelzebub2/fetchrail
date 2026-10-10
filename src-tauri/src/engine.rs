@@ -2349,7 +2349,15 @@ impl DownloadManager {
         }
         task.check_stopped(cancel)?;
         task.record.write().await.status_detail = Some("Verifying file integrity…".into());
-        let hash = tokio::select! { result = storage::sha256(&stage) => result?, _ = cancel.cancelled() => return Err(EngineError::Cancelled) };
+        let hash = storage::sha256_cancellable(&stage, cancel)
+            .await
+            .map_err(|error| {
+                if cancel.is_cancelled() {
+                    EngineError::Cancelled
+                } else {
+                    EngineError::Io(error)
+                }
+            })?;
         if record
             .expected_sha256
             .as_ref()
