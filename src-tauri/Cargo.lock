@@ -1070,7 +1070,7 @@ dependencies = [
 
 [[package]]
 name = "fetchrail"
-version = "0.6.3-local.4"
+version = "0.6.3-local.5"
 dependencies = [
  "chrono",
  "futures-util",

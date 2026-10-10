@@ -156,9 +156,15 @@ fn sync_parent(path: &Path) -> io::Result<()> {
     Ok(())
 }
 
-pub fn publish(from: &Path, to: &Path) -> io::Result<()> {
-    move_file(from, to, false)?;
-    sync_parent(to)
+pub async fn publish(from: &Path, to: &Path) -> io::Result<()> {
+    let from = from.to_owned();
+    let to = to.to_owned();
+    tokio::task::spawn_blocking(move || {
+        move_file(&from, &to, false)?;
+        sync_parent(&to)
+    })
+    .await
+    .map_err(io::Error::other)?
 }
 
 pub fn check_space(directory: &Path, needed: u64) -> io::Result<()> {
@@ -330,7 +336,7 @@ mod tests {
         let target = root.join("target");
         fs::write(&stage, b"download").await.unwrap();
         fs::write(&target, b"other application").await.unwrap();
-        assert!(publish(&stage, &target).is_err());
+        assert!(publish(&stage, &target).await.is_err());
         assert_eq!(fs::read(&target).await.unwrap(), b"other application");
         assert_eq!(
             sha256(&stage).await.unwrap(),

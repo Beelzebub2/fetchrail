@@ -181,6 +181,8 @@ pub struct Adaptive {
     baseline_target: usize,
     baseline_rate: f64,
     minimum_target: usize,
+    minimum_rate: f64,
+    capacity_shift_windows: i8,
     rate_sum: f64,
     samples: usize,
     hold_windows: usize,
@@ -197,6 +199,8 @@ impl Adaptive {
             baseline_target: target,
             baseline_rate: 0.0,
             minimum_target: 1,
+            minimum_rate: 0.0,
+            capacity_shift_windows: 0,
             rate_sum: 0.0,
             samples: 0,
             hold_windows: 0,
@@ -212,6 +216,8 @@ impl Adaptive {
             self.baseline_target = self.target;
             self.baseline_rate = 0.0;
             self.minimum_target = 1;
+            self.minimum_rate = 0.0;
+            self.capacity_shift_windows = 0;
             self.rate_sum = 0.0;
             self.samples = 0;
             self.hold_windows = 3;
@@ -231,10 +237,33 @@ impl Adaptive {
         self.rate_sum = 0.0;
         self.samples = 0;
         if self.target == self.baseline_target
-            && self.baseline_rate > 0.0
-            && (rate < self.baseline_rate * 0.8 || rate > self.baseline_rate * 1.2)
+            && self.target == self.minimum_target
+            && self.minimum_target > 1
+            && self.minimum_rate > 0.0
         {
-            self.minimum_target = 1;
+            let shift = if rate < self.minimum_rate * 0.8 {
+                -1
+            } else if rate > self.minimum_rate * 1.2 {
+                1
+            } else {
+                0
+            };
+            if shift != 0 {
+                self.capacity_shift_windows = if self.capacity_shift_windows.signum() == shift {
+                    self.capacity_shift_windows + shift
+                } else {
+                    shift
+                };
+                if self.capacity_shift_windows.abs() >= 3 {
+                    // A brief source/disk fluctuation must not erase the proven faster count.
+                    self.minimum_target = 1;
+                    self.capacity_shift_windows = 0;
+                }
+            } else {
+                self.capacity_shift_windows = 0;
+            }
+        } else {
+            self.capacity_shift_windows = 0;
         }
         if self.hold_windows > 0 {
             self.baseline_rate = rate;
@@ -251,6 +280,8 @@ impl Adaptive {
                 if self.target < self.baseline_target {
                     // Keep a proven faster count until bandwidth changes or the server throttles.
                     self.minimum_target = self.baseline_target;
+                    self.minimum_rate = self.baseline_rate;
+                    self.capacity_shift_windows = 0;
                 }
                 self.target = self.baseline_target;
                 self.probe_more = !self.probe_more;
@@ -270,7 +301,7 @@ impl Adaptive {
         self.target = if self.probe_more {
             (self.target * 2).min(self.max)
         } else {
-            self.target.div_ceil(2).max(self.minimum_target)
+            (self.target - (self.target / 4).max(1)).max(self.minimum_target)
         };
     }
 }
@@ -504,6 +535,47 @@ mod tests {
             single.sample(100.0, false);
             assert_eq!(single.target, 1);
         }
+    }
+    #[test]
+    fn adaptive_keeps_proven_capacity_through_short_speed_fluctuations() {
+        let mut auto = Adaptive::new(8, true);
+        for _ in 0..80 {
+            auto.sample(auto.target as f64 * 100.0, false);
+        }
+        assert_eq!(auto.target, 8);
+        for index in 0..160 {
+            let variation = if index % 8 < 4 { 0.65 } else { 1.35 };
+            auto.sample(auto.target as f64 * 100.0 * variation, false);
+            assert_eq!(
+                auto.target, 8,
+                "Short dips/bursts must not trigger repeated slower trials."
+            );
+        }
+        for _ in 0..160 {
+            auto.sample(100.0, false);
+        }
+        assert!(
+            auto.target <= 2,
+            "A sustained capacity change still permits fewer workers."
+        );
+    }
+    #[test]
+    fn adaptive_tests_fewer_workers_without_halving_proven_throughput() {
+        let mut auto = Adaptive::new(8, true);
+        let mut reached_maximum = false;
+        for _ in 0..40 {
+            let before = auto.target;
+            auto.sample(before as f64 * 100.0, false);
+            reached_maximum |= auto.target == 8;
+            if reached_maximum && auto.target < before {
+                assert_eq!(auto.target, 6);
+                auto.sample(600.0, false);
+                auto.sample(600.0, false);
+                assert_eq!(auto.target, 8, "Restore the faster count after a slower trial.");
+                return;
+            }
+        }
+        panic!("The controller must still test a smaller count.");
     }
     #[tokio::test]
     async fn an_extended_server_cooldown_delays_existing_waiters() {

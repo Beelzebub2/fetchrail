@@ -178,7 +178,9 @@ struct DownloadTask {
     cancel_token: Mutex<CancellationToken>,
     running: AtomicBool,
     headers: RwLock<HeaderMap>,
+    publication_lock: tokio::sync::Mutex<()>,
     checkpoint_lock: tokio::sync::Mutex<Option<(PartManifest, Instant)>>,
+    checkpoint_write_lock: tokio::sync::Mutex<()>,
     limiter: RateLimiter,
 }
 
@@ -192,7 +194,9 @@ impl DownloadTask {
             cancel_token: Mutex::new(CancellationToken::new()),
             running: AtomicBool::new(false),
             headers: RwLock::new(HeaderMap::new()),
+            publication_lock: tokio::sync::Mutex::new(()),
             checkpoint_lock: tokio::sync::Mutex::new(None),
+            checkpoint_write_lock: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -232,7 +236,7 @@ pub struct DownloadManager {
     queues: RwLock<Vec<QueueRecord>>,
     data_dir: PathBuf,
     parts_dir: PathBuf,
-    // ponytail: serialize state writes and final renames; split locks if disk contention matters.
+    // Collect each history snapshot after the preceding write finishes.
     persist_lock: tokio::sync::Mutex<()>,
     minimize_to_tray: AtomicBool,
     add_lock: tokio::sync::Mutex<()>,
@@ -847,6 +851,9 @@ impl DownloadManager {
     pub async fn pause(&self, id: Uuid) -> Result<DownloadRecord, String> {
         let task = self.task(id).await?;
         let snapshot = {
+            let _publication = task.publication_lock.try_lock().map_err(|_| {
+                "This download is being finalized; wait for publication.".to_string()
+            })?;
             let mut record = task.record.write().await;
             if matches!(
                 record.status,
@@ -909,6 +916,9 @@ impl DownloadManager {
     pub async fn cancel(&self, id: Uuid) -> Result<DownloadRecord, String> {
         let task = self.task(id).await?;
         let snapshot = {
+            let _publication = task.publication_lock.try_lock().map_err(|_| {
+                "This download is being finalized; wait for publication.".to_string()
+            })?;
             let mut record = task.record.write().await;
             if matches!(record.status, DownloadStatus::Completed) {
                 return Err("This download is already complete or being finalized.".into());
@@ -1773,8 +1783,8 @@ impl DownloadManager {
             match result {
                 Ok(()) => return Ok(()),
                 Err(error) if is_transient(&error) && attempt + 1 < attempts => {
-                    if matches!(&error, EngineError::Slow) {
-                        // A new stream on the same HTTP/2 transport can inherit its stalled TCP state.
+                    if matches!(&error, EngineError::Slow | EngineError::Request(_)) {
+                        // Do not resume on a transport that stalled or failed mid-response.
                         *client = Self::new_session_client(task.headers.read().await.clone())
                             .map_err(EngineError::Message)?;
                     }
@@ -2043,19 +2053,38 @@ impl DownloadManager {
         let complete = manifest.ranges.iter().enumerate().all(|(index, range)| {
             range.end != u64::MAX && manifest.committed[index] == range.len()
         });
-        // Range data is synced first; batch ledger writes to avoid an NTFS flush for every tiny range.
-        if force || complete || last_saved.elapsed().as_secs() >= 5 {
-            if let Some(stage) = &manifest.direct_path {
-                fs::OpenOptions::new()
-                    .write(true)
-                    .open(stage)
-                    .await?
-                    .sync_all()
-                    .await?;
-            }
-            write_json_atomic(&path, manifest).await?;
-            *last_saved = Instant::now();
+        if !force && !complete && last_saved.elapsed().as_secs() < 5 {
+            return Ok(());
         }
+        drop(guard);
+        // Coalesce routine saves; pause/errors and the last completed piece wait for durability.
+        let _saving = if force || complete {
+            task.checkpoint_write_lock.lock().await
+        } else {
+            match task.checkpoint_write_lock.try_lock() {
+                Ok(saving) => saving,
+                Err(_) => return Ok(()),
+            }
+        };
+        let manifest = {
+            let guard = task.checkpoint_lock.lock().await;
+            let (manifest, last_saved) = guard.as_ref().unwrap();
+            if !force && !complete && last_saved.elapsed().as_secs() < 5 {
+                return Ok(());
+            }
+            manifest.clone()
+        };
+        // Range data is synced first; batch ledger writes to avoid an NTFS flush for every tiny range.
+        if let Some(stage) = &manifest.direct_path {
+            fs::OpenOptions::new()
+                .write(true)
+                .open(stage)
+                .await?
+                .sync_all()
+                .await?;
+        }
+        write_json_atomic(&path, &manifest).await?;
+        task.checkpoint_lock.lock().await.as_mut().unwrap().1 = Instant::now();
         Ok(())
     }
 
@@ -2356,7 +2385,8 @@ impl DownloadManager {
         part_dir: &Path,
         finalization: &mut Finalization,
     ) -> EngineResult<PathBuf> {
-        let _guard = self.persist_lock.lock().await;
+        // Serialize cancellation with publication without blocking progress readers on Windows I/O.
+        let _publication = task.publication_lock.lock().await;
         let requested = finalization.destination.clone();
         let parent = requested
             .parent()
@@ -2368,12 +2398,12 @@ impl DownloadManager {
         for _ in 0..100 {
             task.check_stopped(cancel)?;
             finalization.destination = unique_destination(parent, name).await;
-            let mut record = task.record.write().await;
             task.check_stopped(cancel)?;
             write_json_atomic(&part_dir.join("finalization.json"), finalization).await?;
-            match storage::publish(&finalization.stage, &finalization.destination) {
+            task.record.write().await.status_detail = Some("Publishing verified file…".into());
+            match storage::publish(&finalization.stage, &finalization.destination).await {
                 Ok(()) => {
-                    apply_publication(&mut record, finalization);
+                    apply_publication(&mut *task.record.write().await, finalization);
                     return Ok(finalization.destination.clone());
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
@@ -2787,7 +2817,11 @@ fn validate_encoding(headers: &HeaderMap) -> EngineResult<()> {
 fn is_transient(error: &EngineError) -> bool {
     match error {
         EngineError::Request(error) => {
-            error.is_timeout() || error.is_connect() || error.is_body() || error.is_decode()
+            error.is_timeout()
+                || error.is_connect()
+                || error.is_request()
+                || error.is_body()
+                || error.is_decode()
         }
         EngineError::Http(status) => {
             status.is_server_error()
@@ -3090,6 +3124,42 @@ mod tests {
         record_is_dispatch_ready, safe_file_name, split_ranges, suggested_connection_count,
     };
     use crate::model::{DownloadRecord, DownloadStatus};
+
+    #[tokio::test]
+    async fn request_disconnects_retry_but_invalid_requests_and_auth_failures_do_not() {
+        use tokio::io::AsyncReadExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            assert!(socket.read(&mut [0; 1024]).await.unwrap() > 0);
+        });
+        let error = reqwest::Client::builder()
+            .retry(reqwest::retry::never())
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .unwrap()
+            .get(format!("http://{address}/disconnect"))
+            .send()
+            .await
+            .unwrap_err()
+            .without_url();
+        server.await.unwrap();
+        assert!(error.is_request() && !error.is_connect() && !error.is_timeout());
+        assert!(!error.is_body() && !error.is_decode());
+        assert!(super::is_transient(&super::EngineError::Request(error)));
+        let invalid = reqwest::Client::new()
+            .get("invalid URL")
+            .build()
+            .unwrap_err();
+        assert!(!super::is_transient(&super::EngineError::Request(invalid)));
+        for status in [
+            reqwest::StatusCode::UNAUTHORIZED,
+            reqwest::StatusCode::FORBIDDEN,
+        ] {
+            assert!(!super::is_transient(&super::EngineError::Http(status)));
+        }
+    }
 
     #[test]
     fn html_landing_pages_are_rejected_but_html_attachments_are_downloadable() {
