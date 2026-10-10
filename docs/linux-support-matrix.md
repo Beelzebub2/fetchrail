@@ -4,7 +4,7 @@ Updated 10 October 2026. **No distro has full certification yet.** Ubuntu 22.04.
 
 | Target | Artifacts / build path | Automated evidence | Desktop acceptance | Status |
 | --- | --- | --- | --- | --- |
-| Ubuntu 22.04 x86_64 | Native baseline; unsigned deb/rpm/AppImage/archive built | WSL2: 46 Rust tests; HTTP/native bridge; TCP/uTP swarms; deb install/remove; AppImage/extracted/archive launch passed | Xvfb/X11, WSLg/Wayland and headless Weston controls passed; GNOME/KDE/GPU/power acceptance pending | Automated baseline passed; experimental |
+| Ubuntu 22.04 x86_64 | Native baseline; unsigned deb/rpm/AppImage/archive built | Version 0.5.3, WSL2: 57 Rust tests; HTTP/native bridge; TCP/uTP swarms; deb install/remove; AppImage/extracted/archive launch passed | Xvfb/X11, WSLg/Wayland and headless Weston controls passed; GNOME/KDE/GPU/power acceptance pending | Automated checks passed; experimental |
 | Ubuntu 24.04 aarch64 | Native ARM CI; deb/rpm/AppImage/archive | Pending CI | Pending ARM hardware | Experimental |
 | Ubuntu 24.04/26.04 x86_64 | deb/AppImage | Pending | Pending | Experimental |
 | Fedora 44 x86_64 | Fedora rpm/AppImage | DNF install/remove and installed HTTP/native bridge, torrent/extension fixtures passed | Non-root X11 and headless Wayland passed; GNOME/KDE/SELinux enforcing pending | Userspace checks passed; experimental |
@@ -18,6 +18,8 @@ Updated 10 October 2026. **No distro has full certification yet.** Ubuntu 22.04.
 | Gentoo / Void / other glibc systems | Matching source toolchain or portable runtime | Pending | Pending | Experimental |
 | Alpine / other musl systems | Separate native build | Not implemented/qualified as a release target | Pending | Unsupported release target |
 | Flatpak / Snap app packages | Store/runtime packaging | Not implemented as a release channel | Portal/permission parity pending | Unsupported release channel |
+
+The integrated 0.5.3 shared-staging engine passed the complete five-userspace suite. After the final legacy-manifest compatibility fix, Ubuntu passed the complete suite again and the other four userspaces passed its exact real HTTP resume regression. Their complete suites were not repeated after that fix. Build source hashes and package receipts are in [integration validation](linux-validation.md#integrated-engine-version-053).
 
 For each accepted row, attach `linux:qualify` JSON with artifact SHA-256, source commit, image/snapshot/date, architecture/libc, GTK/WebKitGTK, desktop/session, browser version/package format, filesystem/mount and driver. Add package install/upgrade/remove logs and manual results. Record unavailable host services separately from unimplemented features or failed tests. Do not replace a pending result with a capability explanation.
 

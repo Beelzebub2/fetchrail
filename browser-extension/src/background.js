@@ -285,6 +285,13 @@ async function addItems(source, items, options = {}) {
   return { accepted, rejected: errors.length, errors, ids, pendingConfirmation };
 }
 
+function safeBrowserDownload(item) {
+  const active = item?.state === "in_progress" || (globalThis.browser && item?.state === "interrupted"
+    && item.paused && item.canResume && (!item.error || item.error === "USER_CANCELED"));
+  return active && !item.incognito && (!item.danger || item.danger === "safe")
+    && (!item.byExtensionId || item.byExtensionId === api.runtime.id) && /^https?:\/\//i.test(item.finalUrl || item.url);
+}
+
 async function routeBrowserDownload(item) {
   await captureReady;
   let paused = false;
@@ -309,11 +316,20 @@ async function routeBrowserDownload(item) {
       if (trace.method !== "GET") throw new Error("This download uses a form submission and must finish in the browser.");
     }
     if (!batchId && (await api.storage.local.get("automaticDownloads")).automaticDownloads === false) return;
+    // Firefox needs initial bytes so a failed handoff can resume the browser transfer.
+    if (globalThis.browser) {
+      for (let attempt = 0; item?.bytesReceived === 0 && safeBrowserDownload(item) && !item.paused && attempt < 100; attempt++) {
+        await new Promise(resolve => setTimeout(resolve, 100));
+        [item] = await api.downloads.search({ id: item.id });
+      }
+      if (!safeBrowserDownload(item) || item.paused || !(item.bytesReceived > 0)) {
+        throw new Error("Firefox download is not ready for pickup; continuing in the browser.");
+      }
+    }
     await api.downloads.pause(item.id);
     paused = true;
     const [current] = await api.downloads.search({ id: item.id });
-    if (!current || current.state !== "in_progress" || !current.paused || current.incognito
-      || (current.danger && current.danger !== "safe")) return;
+    if (!safeBrowserDownload(current) || !current.paused) return;
     const requestTrace = recentRequests.get(current.finalUrl || current.url);
     const context = useBrowserSession && requestTrace?.method === "GET" && Date.now() - requestTrace.time < 120000 ? requestTrace.context : {};
     const result = await addItems(batchId ? "browserBatch" : "clickMonitor", [{
@@ -326,9 +342,9 @@ async function routeBrowserDownload(item) {
     engineId = result.ids[0];
     if (result.accepted !== 1 || (!engineId && !result.pendingConfirmation)) throw new Error(result.errors[0]?.message ?? "Fetchrail did not accept the download.");
     const [latest] = await api.downloads.search({ id: item.id });
-    paused = latest?.state === "in_progress" && latest.paused;
+    paused = latest?.paused && (latest.state === "in_progress" || (globalThis.browser && latest.state === "interrupted"));
     // Verification can outlast a user action or the browser's safety verdict.
-    if (!paused || latest.incognito || (latest.danger && latest.danger !== "safe")
+    if (!paused || !safeBrowserDownload(latest)
       || (latest.finalUrl || latest.url) !== (current.finalUrl || current.url)) {
       throw new Error("The browser download changed during verification.");
     }
@@ -362,10 +378,7 @@ async function routeBrowserDownload(item) {
 
 if (!api.downloads?.onCreated) void setBadge("!", "Fetchrail: reload the extension to enable browser download capture.");
 api.downloads?.onCreated?.addListener((item) => {
-  if (item.state !== "in_progress" || item.paused || item.incognito
-    || (item.danger && item.danger !== "safe")
-    || (item.byExtensionId && item.byExtensionId !== api.runtime.id)
-    || !/^https?:\/\//i.test(item.finalUrl || item.url) || routingDownloads.has(item.id)) return;
+  if (!safeBrowserDownload(item) || item.paused || routingDownloads.has(item.id)) return;
   routingDownloads.add(item.id);
   activeActions++;
   void routeBrowserDownload(item).finally(() => { routingDownloads.delete(item.id); activeActions--; });

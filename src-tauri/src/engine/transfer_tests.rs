@@ -1,106 +1,111 @@
 use super::*;
 use std::{
-    net::{Shutdown, TcpListener, TcpStream},
-    sync::Weak,
+    io::{BufRead, BufReader},
+    process::{Child, Command, Stdio},
     thread,
 };
 
-// Real HTTP and disk transfers, isolated from the desktop app and its saved state.
+// Use the same HTTP stack as the real-app fixtures, with persistent connections
+// for complete responses and an intentional early close for the dropped body.
+const HTTP_FIXTURE: &str = r#"
+import { createServer } from 'node:http';
+const total = Number(process.argv[1]), mode = process.argv[2];
+const body = Buffer.alloc(16 * 1024, 0x5a);
+let failed = false;
+const server = createServer((request, response) => {
+  const range = /^bytes=(\d+)-(\d*)$/.exec(request.headers.range ?? '');
+  let start = range ? Number(range[1]) : 0;
+  let end = range?.[2] ? Number(range[2]) : total - 1;
+  console.log(JSON.stringify([start, end]));
+  const fail = start === 0 && !failed;
+  if (start === 0) failed = true;
+  if (mode === 'retry' && fail) {
+    setTimeout(() => {
+      if (!response.destroyed) response.writeHead(503, {'Content-Length': 0}).end();
+    }, 40);
+    return;
+  }
+  if (mode === 'ignore') { start = 0; end = total - 1; }
+  const partial = range && mode !== 'ignore';
+  const headers = {'Content-Type': 'application/octet-stream'};
+  if (partial) headers['Content-Range'] = `bytes ${start + Number(mode === 'invalid')}-${end}/${total}`;
+  if (!['unknown', 'short'].includes(mode)) headers['Content-Length'] = end - start + 1;
+  if (mode === 'compressed') headers['Content-Encoding'] = 'gzip';
+  else headers.ETag = mode === 'changed' ? '\"v2\"' : ['trickle', 'validated-slow'].includes(mode) ? '\"v1\"' : '\"fixture\"';
+  response.writeHead(partial ? 206 : 200, headers);
+  response.flushHeaders();
+  const count = ['drop', 'short'].includes(mode) && fail ? 123456 : end - start + 1;
+  let remaining = count;
+  function pump() {
+    while (!response.destroyed && remaining > 0) {
+      const trickling = mode === 'trickle' && fail && remaining < count - 1024 * 1024;
+      const size = Math.min(remaining, trickling ? 64 : body.length);
+      const blocked = !response.write(body.subarray(0, size));
+      remaining -= size;
+      if (remaining === 0) {
+        // Flush the promised prefix before half-closing the socket, so its resume
+        // offset is deterministic on Windows. The declared body remains incomplete.
+        if (mode === 'drop' && fail) response.write('', () => response.socket?.end());
+        else response.end();
+        return;
+      }
+      const delay = trickling ? 50 : mode === 'validated-slow' ? 10 : ['slow', 'retry', 'drop', 'trickle'].includes(mode) ? 2 : 0;
+      const next = () => delay ? setTimeout(pump, delay) : pump();
+      if (blocked) { response.once('drain', next); return; }
+      if (delay) { setTimeout(pump, delay); return; }
+    }
+  }
+  pump();
+});
+server.listen(0, '127.0.0.1', () => console.log(JSON.stringify({port: server.address().port})));
+"#;
+
 struct TestServer {
     url: Url,
     requests: Arc<Mutex<Vec<(u64, u64)>>>,
-    stop: Arc<AtomicBool>,
-    sockets: Arc<Mutex<Vec<Weak<TcpStream>>>>,
+    process: Child,
     worker: Option<thread::JoinHandle<()>>,
 }
 
 impl TestServer {
     fn new(total: u64, mode: &'static str) -> Self {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = listener.local_addr().unwrap();
+        let mut command = Command::new("node");
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            command.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+        }
+        let mut process = command
+            .args([
+                "--input-type=module",
+                "--eval",
+                HTTP_FIXTURE,
+                &total.to_string(),
+                mode,
+            ])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .expect("Native HTTP fixtures require the project's Node.js runtime");
+        let mut output = BufReader::new(process.stdout.take().unwrap());
+        let mut ready = String::new();
+        output.read_line(&mut ready).unwrap();
+        let ready: serde_json::Value = serde_json::from_str(&ready).unwrap();
+        let port = ready["port"].as_u64().unwrap();
         let requests = Arc::new(Mutex::new(Vec::new()));
-        let stop = Arc::new(AtomicBool::new(false));
-        let sockets = Arc::new(Mutex::new(Vec::new()));
-        let failed = Arc::new(AtomicBool::new(false));
         let worker = thread::spawn({
             let requests = requests.clone();
-            let stop = stop.clone();
-            let sockets = sockets.clone();
             move || {
-                let mut workers = Vec::new();
-                for stream in listener.incoming() {
-                    if stop.load(Ordering::Relaxed) {
-                        break;
-                    }
-                    let socket = Arc::new(stream.unwrap());
-                    sockets.lock().unwrap().push(Arc::downgrade(&socket));
-                    let requests = requests.clone();
-                    let failed = failed.clone();
-                    workers.push(thread::spawn(move || {
-                        let mut stream = socket.as_ref();
-                        stream.set_nodelay(true).unwrap();
-                        stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
-                        stream.set_write_timeout(Some(Duration::from_secs(60))).unwrap();
-                        let mut headers = Vec::new();
-                        let mut buffer = [0; 1024];
-                        while !headers.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
-                            let Ok(read) = stream.read(&mut buffer) else { return };
-                            if read == 0 || headers.len() > 16384 { return; }
-                            headers.extend_from_slice(&buffer[..read]);
-                        }
-                        let headers = String::from_utf8(headers).unwrap().to_ascii_lowercase();
-                        let range = headers.lines().find_map(|line| line.strip_prefix("range: bytes="));
-                        let (start, end) = range.map(|range| {
-                            let (start, end) = range.split_once('-').unwrap();
-                            (start.parse::<u64>().unwrap(), end.parse::<u64>().unwrap())
-                        }).unwrap_or((0, total - 1));
-                        requests.lock().unwrap().push((start, end));
-                        let fail = start == 0 && !failed.swap(true, Ordering::Relaxed);
-                        if mode == "retry" && fail {
-                            thread::sleep(Duration::from_millis(40));
-                            let _ = stream.write_all(b"HTTP/1.1 503 Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
-                            thread::sleep(Duration::from_millis(50));
-                            return;
-                        }
-                        let (start, end) = if mode == "ignore" { (0, total - 1) } else { (start, end) };
-                        let status = if range.is_some() && mode != "ignore" { "206 Partial Content" } else { "200 OK" };
-                        let content_range = if status.starts_with("206") {
-                            let reported_start = start + u64::from(mode == "invalid");
-                            format!("Content-Range: bytes {reported_start}-{end}/{total}\r\n")
-                        } else { String::new() };
-                        let length = if mode == "unknown" { "Transfer-Encoding: chunked\r\n".into() } else { format!("Content-Length: {}\r\n", end - start + 1) };
-                        let headers = format!("HTTP/1.1 {status}\r\n{length}{content_range}Content-Type: application/octet-stream\r\nConnection: close\r\n\r\n");
-                        if stream.write_all(headers.as_bytes()).is_err() { return; }
-                        let body = vec![0x5a; 16 * 1024];
-                        let count = if mode == "drop" && fail { 123_456 } else { end - start + 1 };
-                        let mut remaining = count;
-                        while remaining > 0 {
-                            let count = remaining.min(body.len() as u64) as usize;
-                            if mode == "unknown" && write!(stream, "{count:x}\r\n").is_err() { break; }
-                            if stream.write_all(&body[..count]).is_err() { break; }
-                            if mode == "unknown" && stream.write_all(b"\r\n").is_err() { break; }
-                            remaining -= count as u64;
-                            if matches!(mode, "slow" | "retry" | "drop") {
-                                thread::sleep(Duration::from_millis(2));
-                            }
-                        }
-                        if mode == "unknown" { let _ = stream.write_all(b"0\r\n\r\n"); }
-                        // Windows can reset a socket closed before the client's send completes.
-                        thread::sleep(Duration::from_millis(50));
-                        // Let Windows deliver queued response bytes before closing the socket.
-                        let _ = stream.shutdown(Shutdown::Write);
-                    }));
-                }
-                for worker in workers {
-                    worker.join().unwrap();
+                for line in output.lines().map_while(Result::ok) {
+                    let range: (u64, u64) = serde_json::from_str(&line).unwrap();
+                    requests.lock().unwrap().push(range);
                 }
             }
         });
         Self {
-            url: Url::parse(&format!("http://{address}/file.bin")).unwrap(),
+            url: Url::parse(&format!("http://127.0.0.1:{port}/file.bin")).unwrap(),
             requests,
-            stop,
-            sockets,
+            process,
             worker: Some(worker),
         }
     }
@@ -108,19 +113,9 @@ impl TestServer {
 
 impl Drop for TestServer {
     fn drop(&mut self) {
-        self.stop.store(true, Ordering::Relaxed);
-        // Drop runs on Tokio's test thread. Wake blocked writers before joining;
-        // they must not need Hyper cleanup tasks on that same thread to make progress.
-        for stream in self
-            .sockets
-            .lock()
-            .unwrap()
-            .iter()
-            .filter_map(Weak::upgrade)
-        {
-            let _ = stream.shutdown(Shutdown::Both);
-        }
-        let _ = TcpStream::connect(("127.0.0.1", self.url.port().unwrap()));
+        // Only this fixture's child is terminated; wait and join release every pipe.
+        let _ = self.process.kill();
+        let _ = self.process.wait();
         self.worker.take().unwrap().join().unwrap();
     }
 }
@@ -185,9 +180,13 @@ async fn cancellation_flushes_partial_bytes_and_resume_appends_exactly() {
             &probe
         ),
         async {
-            while segments[0].downloaded.load(Ordering::Relaxed) < 64 * 1024 {
-                tokio::time::sleep(Duration::from_millis(1)).await;
-            }
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while segments[0].downloaded.load(Ordering::Relaxed) < 64 * 1024 {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            })
+            .await
+            .expect("The first transfer must start before cancelling");
             cancel.cancel();
         }
     );
@@ -217,7 +216,7 @@ async fn transient_failures_retry_only_the_failed_range() {
     let total = 8 * 1024 * 1024;
     let client = Client::builder().no_proxy().build().unwrap();
     let limiter = RateLimiter::new(0);
-    for mode in ["retry", "drop"] {
+    for mode in ["retry", "drop", "short"] {
         let server = TestServer::new(total, mode);
         let (dir, segments, probe) = parts(total, 4).await;
         DownloadManager::download_ranges(
@@ -246,8 +245,8 @@ async fn transient_failures_retry_only_the_failed_range() {
                 "A healthy range must keep its original connection: {mode}"
             );
         }
-        assert_eq!(requests.len(), 5);
-        if mode == "drop" {
+        assert_eq!(requests.len(), 5, "{mode}: {requests:?}");
+        if matches!(mode, "drop" | "short") {
             assert!(
                 requests.iter().any(|&(start, _)| start == 123_456),
                 "Resume exactly after the flushed partial body."
@@ -258,14 +257,264 @@ async fn transient_failures_retry_only_the_failed_range() {
 }
 
 #[tokio::test]
+async fn changed_or_encoded_representations_are_rejected_before_writing() {
+    for mode in ["changed", "compressed"] {
+        let total = 1024 * 1024;
+        let server = TestServer::new(total, mode);
+        let (dir, segments, mut probe) = parts(total, 1).await;
+        if mode == "changed" {
+            probe.validator = Some("\"v1\"".into());
+        }
+        let result = DownloadManager::download_ranges(
+            &Client::builder().no_proxy().build().unwrap(),
+            &RateLimiter::new(0),
+            &task(),
+            &CancellationToken::new(),
+            &server.url,
+            &dir,
+            &segments,
+            &probe,
+        )
+        .await;
+        assert!(matches!(result, Err(EngineError::Message(_))));
+        assert!(
+            !dir.join("0.part").exists(),
+            "Unverified bytes must not enter the resume file"
+        );
+        assert_eq!(segments[0].downloaded.load(Ordering::Relaxed), 0);
+        fs::remove_dir_all(dir).await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn trickling_tail_resumes_only_its_flushed_suffix() {
+    let total = 32 * 1024 * 1024;
+    let server = TestServer::new(total, "trickle");
+    let (dir, segments, mut probe) = parts(total, 4).await;
+    probe.validator = Some("\"v1\"".into());
+    tokio::time::timeout(
+        Duration::from_secs(50),
+        DownloadManager::download_ranges(
+            &download_client_builder().no_proxy().build().unwrap(),
+            &RateLimiter::new(0),
+            &task(),
+            &CancellationToken::new(),
+            &server.url,
+            &dir,
+            &segments,
+            &probe,
+        ),
+    )
+    .await
+    .expect("A trickling socket must not keep the job alive indefinitely")
+    .unwrap();
+    verify_parts(&dir, &segments).await;
+    let requests = server.requests.lock().unwrap().clone();
+    assert_eq!(
+        requests.len(),
+        5,
+        "Keep the three healthy requests: {requests:?}"
+    );
+    assert!(requests
+        .iter()
+        .any(|&(start, end)| start > 1024 * 1024 && end == segments[0].range.end));
+    fs::remove_dir_all(dir).await.unwrap();
+}
+
+#[tokio::test]
+async fn shared_staging_resumes_verified_prefixes_and_repairs_only_corrupted_ranges() {
+    use tokio::io::{AsyncSeekExt, AsyncWriteExt};
+    let total = 32 * 1024 * 1024;
+    let server = TestServer::new(total, "validated-slow");
+    let (dir, _, mut probe) = parts(total, 4).await;
+    probe.validator = Some("\"v1\"".into());
+    let ranges = split_ranges(total, 4);
+    prepare_parts(&dir, &probe, &ranges).await.unwrap();
+    assert!(shared_staging(&dir).await.unwrap());
+    let segments = segment_counters(&dir, &ranges).await.unwrap();
+    let cancel = CancellationToken::new();
+    let client = download_client_builder().no_proxy().build().unwrap();
+    let download_task = task();
+    let limiter = RateLimiter::new(0);
+    let (result, _) = tokio::join!(
+        DownloadManager::download_ranges(
+            &client,
+            &limiter,
+            &download_task,
+            &cancel,
+            &server.url,
+            &dir,
+            &segments,
+            &probe,
+        ),
+        async {
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while segments
+                    .iter()
+                    .any(|segment| segment.downloaded.load(Ordering::Relaxed) < 64 * 1024)
+                {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("Each staging writer must receive bytes before cancellation");
+            cancel.cancel();
+        }
+    );
+    assert!(matches!(result, Err(EngineError::Cancelled)));
+    let mut saved = Vec::new();
+    for index in 0..4 {
+        let checkpoint = part_checkpoint(&dir, index, ranges[index].len())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(checkpoint.bytes > 0 && checkpoint.bytes < ranges[index].len());
+        saved.push(checkpoint.bytes);
+    }
+    assert_eq!(fs::metadata(dir.join("0.part")).await.unwrap().len(), total);
+    assert!(
+        !dir.join("1.part").exists(),
+        "Parallel ranges share one private file"
+    );
+    let mut damaged = fs::OpenOptions::new()
+        .write(true)
+        .open(dir.join("0.part"))
+        .await
+        .unwrap();
+    damaged.seek(std::io::SeekFrom::Start(0)).await.unwrap();
+    damaged.write_all(b"corrupt").await.unwrap();
+    damaged.sync_all().await.unwrap();
+    drop(damaged);
+    prepare_parts(&dir, &probe, &ranges).await.unwrap();
+    let resumed = segment_counters(&dir, &ranges).await.unwrap();
+    DownloadManager::download_ranges(
+        &client,
+        &limiter,
+        &download_task,
+        &CancellationToken::new(),
+        &server.url,
+        &dir,
+        &resumed,
+        &probe,
+    )
+    .await
+    .unwrap();
+    assert!(fs::read(dir.join("0.part"))
+        .await
+        .unwrap()
+        .iter()
+        .all(|&byte| byte == 0x5a));
+    let requests = server.requests.lock().unwrap().clone();
+    assert_eq!(requests.iter().filter(|&&(start, _)| start == 0).count(), 2);
+    for index in 1..4 {
+        assert!(
+            requests
+                .iter()
+                .any(|&(start, end)| start == ranges[index].start + saved[index]
+                    && end == ranges[index].end),
+            "Healthy ranges resume their exact durable suffix"
+        );
+    }
+    let output = dir.join("published.bin");
+    let checksum = format!("{:x}", Sha256::digest(vec![0x5a; total as usize]));
+    join_parts_cancellable(
+        &dir,
+        &output,
+        &split_ranges(total, 1),
+        total,
+        &AtomicU64::new(0),
+        Some(&checksum),
+        &CancellationToken::new(),
+    )
+    .unwrap();
+    assert_eq!(fs::metadata(&output).await.unwrap().len(), total);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        assert_eq!(
+            fs::metadata(dir.join("0.part")).await.unwrap().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            fs::metadata(dir.join("0.progress.json"))
+                .await
+                .unwrap()
+                .mode()
+                & 0o777,
+            0o600
+        );
+    }
+    fs::remove_dir_all(dir).await.unwrap();
+}
+
+#[tokio::test]
+async fn old_large_part_files_keep_their_layout_and_resume_offsets() {
+    let total = 8 * 1024 * 1024;
+    let server = TestServer::new(total, "validated-slow");
+    let (dir, _, mut probe) = parts(total, 4).await;
+    probe.validator = Some("\"v1\"".into());
+    let ranges = split_ranges(total, 4);
+    let legacy = serde_json::json!({"total_bytes": total, "ranges": ranges,
+        "validator": "\"v1\"", "accepts_ranges": true});
+    let legacy_bytes = serde_json::to_vec(&legacy).unwrap();
+    fs::write(dir.join("transfer.json"), &legacy_bytes)
+        .await
+        .unwrap();
+    fs::write(dir.join("0.part"), vec![0x5a; 123_456])
+        .await
+        .unwrap();
+    prepare_parts(&dir, &probe, &ranges).await.unwrap();
+    assert_eq!(
+        fs::read(dir.join("transfer.json")).await.unwrap(),
+        legacy_bytes,
+        "Keep the fingerprint used by a finished legacy merge checkpoint"
+    );
+    assert!(!shared_staging(&dir).await.unwrap());
+    assert_eq!(
+        fs::metadata(dir.join("0.part")).await.unwrap().len(),
+        123_456
+    );
+    let segments = segment_counters(&dir, &ranges).await.unwrap();
+    DownloadManager::download_ranges(
+        &download_client_builder().no_proxy().build().unwrap(),
+        &RateLimiter::new(0),
+        &task(),
+        &CancellationToken::new(),
+        &server.url,
+        &dir,
+        &segments,
+        &probe,
+    )
+    .await
+    .unwrap();
+    verify_parts(&dir, &segments).await;
+    assert!(server
+        .requests
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|&(start, _)| start == 123_456));
+    fs::remove_dir_all(dir).await.unwrap();
+}
+
+#[tokio::test]
 async fn single_stream_retries_restart_and_unknown_lengths_complete() {
     let total = 512 * 1024;
     let client = Client::builder().no_proxy().build().unwrap();
     let limiter = RateLimiter::new(0);
-    for mode in ["retry", "drop", "unknown"] {
+    for (mode, ranges, validated) in [
+        ("retry", false, true),
+        ("drop", false, true),
+        ("unknown", false, true),
+        ("drop", true, false),
+    ] {
+        eprintln!("Single-stream fixture: {mode}, ranges={ranges}, validated={validated}");
         let server = TestServer::new(total, mode);
         let (dir, mut segments, mut probe) = parts(total, 1).await;
-        probe.accepts_ranges = false;
+        probe.accepts_ranges = ranges;
+        if !validated {
+            probe.validator = None;
+        }
         if mode == "unknown" {
             probe.total_bytes = None;
             segments = segment_counters(
@@ -278,17 +527,21 @@ async fn single_stream_retries_restart_and_unknown_lengths_complete() {
             .await
             .unwrap();
         }
-        DownloadManager::download_ranges(
-            &client,
-            &limiter,
-            &task(),
-            &CancellationToken::new(),
-            &server.url,
-            &dir,
-            &segments,
-            &probe,
+        tokio::time::timeout(
+            Duration::from_secs(15),
+            DownloadManager::download_ranges(
+                &client,
+                &limiter,
+                &task(),
+                &CancellationToken::new(),
+                &server.url,
+                &dir,
+                &segments,
+                &probe,
+            ),
         )
         .await
+        .expect("A small single-stream fixture must finish or report failure")
         .unwrap();
         let bytes = fs::read(dir.join("0.part")).await.unwrap();
         assert_eq!(bytes.len() as u64, total);
@@ -410,7 +663,7 @@ async fn transfer_throughput() {
             let ranges = segments.iter().map(|s| s.range).collect::<Vec<_>>();
             join_parts(&dir, &joined, &ranges, total, &AtomicU64::new(0), None).unwrap();
             let seconds = started.elapsed().as_secs_f64();
-            verify_file_hash(&joined, &expected).unwrap();
+            verify_file_hash(&joined, &expected, &CancellationToken::new()).unwrap();
             eprintln!(
                 "BENCHMARK {}",
                 serde_json::json!({"connections":connections,"run":run,"warmup":run==0,"bytes":total,"seconds":seconds,"networkSeconds":network_seconds,"finalizationSeconds":seconds-network_seconds,"mbps":total as f64/seconds/1_000_000.0,"sha256":expected})

@@ -78,7 +78,7 @@ for (const browser of ["chromium", "firefox"]) {
   for (let i = 0; i < 5; i++) webRequest({ url: `https://host.test/step/${i}`, tabId: 10, method: "GET" });
   assert.equal(requests.filter((r) => r.method === "addDownloads").length, 0);
   const capture = async (tabId = 10, method = "GET") => {
-    current = { id: 42, state: "in_progress", paused: false, incognito: false, danger: "safe", url: "https://host.test/redirect", finalUrl: "https://cdn.test/final.zip?token=123", totalBytes: 1234, mime: "application/zip", filename: "final.zip" };
+    current = { id: 42, state: "in_progress", paused: false, incognito: false, danger: "safe", url: "https://host.test/redirect", finalUrl: "https://cdn.test/final.zip?token=123", totalBytes: 1234, bytesReceived: 1024, mime: "application/zip", filename: "final.zip" };
     webRequest({ url: current.finalUrl, tabId, method, requestHeaders: [
       { name: "Cookie", value: "session=test" }, { name: "Referer", value: "https://host.test/step/5" },
       { name: "User-Agent", value: "Browser test" }, { name: "X-Unrelated", value: "do-not-forward" },
