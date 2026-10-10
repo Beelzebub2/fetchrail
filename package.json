@@ -1,7 +1,7 @@
 {
   "name": "fetchrail",
   "private": true,
-  "version": "0.5.2",
+  "version": "0.5.3",
   "type": "module",
   "scripts": {
     "dev": "vite",
@@ -12,6 +12,7 @@
     "browser:uninstall": "node scripts/platform-command.mjs browser:uninstall",
     "browser:test": "node scripts/test-native-host.mjs",
     "browser:check": "node scripts/test-extension.mjs && node scripts/test-extension-routing.mjs && node scripts/test-browser-batch.mjs",
+    "cws:test": "node scripts/test-chrome-web-store.mjs",
     "engine:test": "node scripts/test-downloads.mjs",
     "engine:bench": "node scripts/benchmark-downloads.mjs",
     "torrent:deps": "node scripts/platform-command.mjs torrent:deps",
