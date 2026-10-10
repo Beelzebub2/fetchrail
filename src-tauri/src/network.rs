@@ -60,9 +60,20 @@ pub fn backoff(attempt: usize) -> Duration {
 
 pub fn slow_progress(bytes: u64, elapsed: Duration, best_rate: &mut f64, tail_rate: u64) -> bool {
     let rate = bytes as f64 / elapsed.as_secs_f64().max(0.001);
-    let slow = rate < 2048.0_f64.max(best_rate.max(tail_rate as f64) * 0.05);
+    let proven = best_rate.max(tail_rate as f64);
+    let slow = proven > 0.0 && rate < proven * 0.05;
     *best_rate = best_rate.max(rate);
     slow
+}
+
+pub fn weak_peer(bytes: u64, elapsed: Duration, peer_rate: u64, windows: &mut u8) -> bool {
+    let rate = bytes as f64 / elapsed.as_secs_f64().max(0.001);
+    if peer_rate > 0 && rate < peer_rate as f64 * 0.25 {
+        *windows = windows.saturating_add(1);
+    } else {
+        *windows = 0;
+    }
+    *windows >= 2
 }
 
 pub struct OriginGate {
@@ -321,6 +332,10 @@ mod tests {
             assert!(!slow_progress(40 * 1024, window, &mut best, 0));
         }
         assert!(slow_progress(1024, window, &mut best, 0));
+        let mut best = 0.0;
+        for _ in 0..4 {
+            assert!(!slow_progress(1, window, &mut best, 0));
+        }
     }
     #[test]
     fn tail_uses_proven_peer_speed_even_when_it_was_slow_from_the_start() {
@@ -330,6 +345,21 @@ mod tests {
         assert!(slow_progress(200 * 1024, window, &mut best, 1024 * 1024));
         assert!(!slow_progress(200 * 1024, window, &mut best, 20 * 1024));
         assert!(!slow_progress(200 * 1024, window, &mut best, 0));
+    }
+    #[test]
+    fn peer_recovery_needs_two_weak_windows_and_current_fast_peers() {
+        let window = Duration::from_secs(5);
+        let mut weak = 0;
+        assert!(!weak_peer(0, window, 1_000_000, &mut weak));
+        assert!(!weak_peer(5_000_000, window, 1_000_000, &mut weak));
+        assert!(!weak_peer(0, window, 1_000_000, &mut weak));
+        assert!(weak_peer(500_000, window, 1_000_000, &mut weak));
+        assert!(!weak_peer(0, window, 0, &mut weak));
+        assert_eq!(weak, 0);
+        for _ in 0..4 {
+            assert!(!weak_peer(50, window, 10, &mut weak));
+        }
+        assert!(!weak_peer(1_250_000, window, 1_000_000, &mut weak));
     }
     #[tokio::test]
     async fn origin_admits_waiters_before_refills_and_releases_cancelled_waiters() {
