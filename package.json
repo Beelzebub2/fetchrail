@@ -1,7 +1,7 @@
 {
   "name": "fetchrail",
   "private": true,
-  "version": "0.6.3-local.8",
+  "version": "0.6.3-local.9",
   "type": "module",
   "scripts": {
     "dev": "vite",

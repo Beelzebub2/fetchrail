@@ -200,6 +200,13 @@ impl DownloadTask {
         }
     }
 
+    fn report_connections(&self, target: usize) {
+        // Keep polling range futures; a contended display update can wait for the next sample.
+        if let Ok(mut record) = self.record.try_write() {
+            record.connections = target;
+        }
+    }
+
     fn fresh_cancel_token(&self) -> CancellationToken {
         let mut guard = self
             .cancel_token
@@ -1675,7 +1682,7 @@ impl DownloadManager {
             maximum,
             settings.adaptive_connections && probe.accepts_ranges,
         );
-        task.record.write().await.connections = auto.target;
+        task.report_connections(auto.target);
         let origin = self.origin(url).await;
         let mut last_throttles = origin.throttles();
         let mut last_waits = origin.waits();
@@ -1755,7 +1762,7 @@ impl DownloadManager {
                     tail_rate.store(if pending.is_empty() && active.len() == 1 && receiving == 1 && uncontended { best_peer_rate as u64 } else { 0 }, Ordering::Relaxed);
                     // Shared-budget waits must not look like a slower connection-count trial.
                     if !pending.is_empty() && (throttled || (sample_ready && waits == last_waits && !origin.is_waiting())) { auto.sample(rate, throttled); }
-                    task.record.write().await.connections = auto.target;
+                    task.report_connections(auto.target);
                     last_bytes = bytes;
                     last_sample = now;
                     last_throttles = throttles;
@@ -1787,7 +1794,9 @@ impl DownloadManager {
         for attempt in 0..attempts {
             task.check_stopped(cancel)?;
             let result = self
-                .download_segment(task, cancel, client, url, part_dir, index, segment, probe, tail_rate)
+                .download_segment(
+                    task, cancel, client, url, part_dir, index, segment, probe, tail_rate,
+                )
                 .await;
             match result {
                 Ok(()) => return Ok(()),
@@ -3142,6 +3151,35 @@ mod tests {
         record_is_dispatch_ready, safe_file_name, split_ranges, suggested_connection_count,
     };
     use crate::model::{DownloadRecord, DownloadStatus};
+
+    #[tokio::test]
+    async fn connection_reporting_keeps_polling_queued_range_workers() {
+        use futures_util::{stream::FuturesUnordered, FutureExt, StreamExt};
+        use std::time::Duration;
+
+        let task = super::DownloadTask::new(queued_record(DownloadStatus::Queued, "Default", None));
+        let held = task.record.write().await;
+        let mut workers = FuturesUnordered::new();
+        workers.push(async {
+            task.record.write().await.speed_bps = 42;
+        });
+        assert!(workers.next().now_or_never().is_none());
+        drop(held);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), task.record.write())
+                .await
+                .is_err()
+        );
+        task.report_connections(16);
+        tokio::time::timeout(Duration::from_secs(1), workers.next())
+            .await
+            .unwrap()
+            .unwrap();
+        task.report_connections(16);
+        let record = task.record.read().await;
+        assert_eq!(record.connections, 16);
+        assert_eq!(record.speed_bps, 42);
+    }
 
     #[tokio::test]
     async fn request_disconnects_retry_but_invalid_requests_and_auth_failures_do_not() {
