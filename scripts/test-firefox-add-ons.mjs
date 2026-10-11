@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { readFile, stat } from "node:fs/promises";
 import { createHmac } from "node:crypto";
-import { authorization, syncPrivacyPolicy } from "./firefox-add-ons-policy.mjs";
+import { authorization, syncPrivacyPolicy, verifyCredentials } from "./firefox-add-ons-policy.mjs";
 
 const json = async (path) => JSON.parse(await readFile(new URL(`../${path}`, import.meta.url), "utf8"));
 const source = await json("browser-extension/manifests/firefox.json");
@@ -40,6 +40,16 @@ const [header, payload, signature] = token.split(".");
 assert.deepEqual(JSON.parse(Buffer.from(header, "base64url")), { alg: "HS256", typ: "JWT" });
 assert.equal(JSON.parse(Buffer.from(payload, "base64url")).exp, 1_700_000_060);
 assert.equal(createHmac("sha256", "test-secret").update(`${header}.${payload}`).digest("base64url"), signature);
+const trimmed = authorization(" user:test:123 \n", " test-secret \n", 1_700_000_000).split(" ")[1].split(".");
+assert.equal(JSON.parse(Buffer.from(trimmed[1], "base64url")).iss, "user:test:123");
+assert.equal(createHmac("sha256", "test-secret").update(`${trimmed[0]}.${trimmed[1]}`).digest("base64url"), trimmed[2]);
+await verifyCredentials({ issuer: " user:test:123 \n", secret: " test-secret \n", fetcher: async (url, init) => {
+  assert.equal(url, "https://addons.mozilla.org/api/v5/accounts/profile/");
+  assert.match(init.headers.Authorization, /^JWT /);
+  return new Response("{}", { status: 200 });
+} });
+await assert.rejects(verifyCredentials({ issuer: "not-a-key", secret: "example", fetcher: async () => assert.fail("Invalid issuer should be rejected before network access") }), /AMO_JWT_ISSUER/);
+await assert.rejects(verifyCredentials({ issuer: "user:test:123", secret: "wrong", fetcher: async () => new Response("{}", { status: 401 }) }), /copied from the same active Mozilla API key pair/);
 
 let currentPolicy = "previous policy";
 const methods = [];

@@ -6,11 +6,27 @@ const base64url = (value) => Buffer.from(JSON.stringify(value)).toString("base64
 
 // Mozilla AMO uses short-lived HS256 JWTs with an issuer, unique request ID and expiry.
 export function authorization(issuer, secret, now = Math.floor(Date.now() / 1000)) {
+  issuer = issuer?.trim();
+  secret = secret?.trim();
   if (!issuer || !secret) throw new Error("AMO_JWT_ISSUER and AMO_JWT_SECRET must be configured.");
   const header = base64url({ alg: "HS256", typ: "JWT" });
   const payload = base64url({ iss: issuer, jti: randomUUID(), iat: now, exp: now + 60 });
   const unsigned = `${header}.${payload}`;
   return `JWT ${unsigned}.${createHmac("sha256", secret).update(unsigned).digest("base64url")}`;
+}
+
+export async function verifyCredentials({ issuer, secret, fetcher = fetch }) {
+  if (!issuer?.trim()?.startsWith("user:")) {
+    throw new Error("AMO_JWT_ISSUER must be the Mozilla API key (usually user:123:456), not the API secret or an entire JWT.");
+  }
+  const response = await fetcher("https://addons.mozilla.org/api/v5/accounts/profile/", {
+    headers: { Authorization: authorization(issuer, secret) },
+  });
+  if (response.status === 401) {
+    throw new Error("Mozilla rejected the JWT (HTTP 401). Verify AMO_JWT_ISSUER and AMO_JWT_SECRET are copied from the same active Mozilla API key pair; remove quotes, prefixes and extra spaces. Regenerate the pair if necessary.");
+  }
+  if (!response.ok) throw new Error(`Mozilla API authentication check failed (HTTP ${response.status}).`);
+  console.log("Mozilla API credentials authenticated successfully.");
 }
 
 export async function syncPrivacyPolicy({ issuer, secret, guid, policy, apiBase = "https://addons.mozilla.org/api/v5", fetcher = fetch }) {
