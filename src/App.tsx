@@ -1757,11 +1757,12 @@ function SettingsPage({
     }
   }
 
-  async function openExtensionFolder(browser: "chromium" | "firefox") {
+  async function openExtension(browser: "store" | "chromium" | "firefox") {
     setOpeningExtension(true);
     setExtensionError(null);
     try {
-      await invoke("open_browser_extension_folder", { browser });
+      if (browser === "store") await invoke("open_browser_extension_store");
+      else await invoke("open_browser_extension_folder", { browser });
     } catch (error) {
       setExtensionError(String(error));
     } finally {
@@ -2248,37 +2249,44 @@ function SettingsPage({
               <h2 id="extension-settings-title">Browser companion</h2>
               <p>Sends downloads from your browser to Fetchrail.</p>
             </div>
-            <ol className="steps">
-              <li>
-                <span className="mono" aria-hidden="true">1</span>
-                <div>
-                  <strong>Open the extension folder</strong>
-                  <button type="button" className="secondary-button" disabled={openingExtension} onClick={() => void openExtensionFolder("chromium")}>
-                    <FolderOpen size={16} /> Open extension folder
-                  </button>
-                </div>
-              </li>
-              <li>
-                <span className="mono" aria-hidden="true">2</span>
-                <strong>In Chrome or Edge, enable Developer mode</strong>
-              </li>
-              <li>
-                <span className="mono" aria-hidden="true">3</span>
-                <strong>Choose Load unpacked and select this folder</strong>
-              </li>
-            </ol>
-            <div className="extension-actions">
-              <button type="button" className="ghost-button" disabled={openingExtension} onClick={() => void openExtensionFolder("firefox")}>
+            <div className="companion-store">
+              <strong>Chrome Web Store · Recommended</strong>
+              <p>Get the official companion. Chrome updates it automatically when approved updates are published.</p>
+              <button type="button" className="primary-button" disabled={openingExtension} onClick={() => void openExtension("store")}>
+                <Globe size={16} /> Get from Chrome Web Store
+              </button>
+              <p className="hint">If you loaded the unpacked companion before, disable it when installing the store version to avoid duplicate download capture.</p>
+            </div>
+            <details className="companion-manual">
+              <summary>Manual installation and Firefox</summary>
+              <ol className="steps">
+                <li>
+                  <span className="mono" aria-hidden="true">1</span>
+                  <div>
+                    <strong>Open the extension folder</strong>
+                    <button type="button" className="secondary-button" disabled={openingExtension} onClick={() => void openExtension("chromium")}>
+                      <FolderOpen size={16} /> Open extension folder
+                    </button>
+                  </div>
+                </li>
+                <li>
+                  <span className="mono" aria-hidden="true">2</span>
+                  <strong>In Chrome or Edge, enable Developer mode</strong>
+                </li>
+                <li>
+                  <span className="mono" aria-hidden="true">3</span>
+                  <strong>Choose Load unpacked and select this folder</strong>
+                </li>
+              </ol>
+              <button type="button" className="ghost-button" disabled={openingExtension} onClick={() => void openExtension("firefox")}>
                 Firefox folder
               </button>
+              <p className="hint">Unpacked companions follow the version bundled with Fetchrail after their panels close. Firefox temporary add-ons use Load Temporary Add-on in about:debugging and must be loaded again after a browser restart.</p>
+            </details>
+            <div className="extension-actions">
               <button type="button" className="ghost-button" disabled={openingExtension} onClick={async () => { setOpeningExtension(true); setExtensionError(null); try { const status = await invoke<{reason:string}>("repair_browser_integration"); setIntegrationNote(status.reason); } catch(error) { setExtensionError(String(error)); } finally { setOpeningExtension(false); } }}>Repair integration</button>
               <button type="button" className="ghost-button" onClick={async () => { try { const diagnostics = await invoke("platform_diagnostics"); await navigator.clipboard.writeText(JSON.stringify(diagnostics, null, 2)); setIntegrationNote("Desktop diagnostics copied. URLs, cookies, tokens and private paths are excluded."); } catch(error) { setExtensionError(String(error)); } }}>Copy desktop diagnostics</button>
             </div>
-            <p className="hint">
-              Updates follow Fetchrail automatically within about a minute after all companion panels close. Firefox
-              development builds use Load Temporary Add-on in about:debugging and must be loaded again after a browser
-              restart.
-            </p>
             {extensionError && <p className="extension-error" role="alert">{extensionError}</p>}
             {integrationNote && <p className="hint" role="status">{integrationNote}</p>}
             {capabilities?.os === "linux" && <p className="hint">{capabilities.browserIntegration.reason} Firefox Snap/Flatpak needs the native-messaging portal supplied by its desktop. If capture is unavailable, the companion keeps the download in the browser.</p>}

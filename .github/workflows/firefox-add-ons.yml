@@ -33,6 +33,11 @@ jobs:
         with:
           node-version: '24'
           cache: npm
+      - name: Verify Mozilla API authentication
+        env:
+          AMO_JWT_ISSUER: ${{ secrets.AMO_JWT_ISSUER }}
+          AMO_JWT_SECRET: ${{ secrets.AMO_JWT_SECRET }}
+        run: node scripts/check-firefox-amo-credentials.mjs
       - name: Check version and build Firefox companion
         run: |
           if [[ "$GITHUB_REF_TYPE" == tag ]]; then node scripts/check-release.mjs "$GITHUB_REF_NAME"; else node scripts/check-release.mjs; fi
@@ -66,6 +71,10 @@ jobs:
           WEB_EXT_API_KEY: ${{ secrets.AMO_JWT_ISSUER }}
           WEB_EXT_API_SECRET: ${{ secrets.AMO_JWT_SECRET }}
         run: |
+          # GitHub secret values may contain accidental whitespace from copying them.
+          # Capture sanitized values in variables; never print credentials in CI logs.
+          export WEB_EXT_API_KEY="$(node -e 'process.stdout.write(process.env.WEB_EXT_API_KEY.trim())')"
+          export WEB_EXT_API_SECRET="$(node -e 'process.stdout.write(process.env.WEB_EXT_API_SECRET.trim())')"
           version="$(node -p 'JSON.parse(require("fs").readFileSync("package.json", "utf8")).version')"
           node browser-extension/publisher/node_modules/web-ext/bin/web-ext.js sign \
             --source-dir browser-extension/dist/firefox \
