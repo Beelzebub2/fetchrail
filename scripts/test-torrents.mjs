@@ -23,6 +23,20 @@ for (const [name, mb] of files) {
   await writeFile(join(source, name), bytes); expected.set(name, hash(bytes));
 }
 try {
+  const removal = harness("removal-state");
+  const removalMetadata = join(root, "removal.torrent");
+  await removal.call({ op: "create", path: source, output: removalMetadata, format: "v1", pieceLength: 256 * 1024 });
+  for (let attempt = 0; attempt < 8; ++attempt) {
+    const id = randomUUID();
+    await removal.call({ op: "add", id, source: removalMetadata, destination: join(root, "seed"), config: localTorrentConfig, start: true });
+    // Remove without polling so completion alerts can remain queued.
+    await delay(500);
+    await removal.call({ op: "remove", id });
+    await removal.call({ op: "remove", id });
+    assert.equal(await removal.call({ op: "pathAvailable", path: join(source, "one.bin") }), true, "Removal releases payload ownership");
+  }
+  await removal.close();
+  console.log("PASS: removal with queued completion alerts, repeated cleanup and released payload paths");
   const seed = harness("seed-state");
   let receive = harness("receive-state");
   for (const format of ["v1", "v2", "hybrid"]) {

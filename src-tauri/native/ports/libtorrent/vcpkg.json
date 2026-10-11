@@ -24,6 +24,11 @@
     "boost-variant",
     "openssl",
     {
+      "name": "pkgconf",
+      "host": true,
+      "platform": "windows & !mingw"
+    },
+    {
       "name": "vcpkg-cmake",
       "host": true
     },
