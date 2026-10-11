@@ -41,7 +41,7 @@
     "updater": {
       "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDY2NTg5N0FDQUFCQTQ5NTkKUldSWlNicXFySmRZWnA2bHFGdXdoYklwOCtDWW1FY0ppK1ZZNzVvT0lDckt6QXExM1VrODgwcXQK",
       "endpoints": [
-        "https://fetchrail.rrmtools.uk/api/updates/latest",
+        "https://fetchrail.rrmtools.uk/api/updates/latest?current_version={{current_version}}",
         "https://github.com/Beelzebub2/fetchrail/releases/latest/download/latest.json"
       ],
       "requireSignedVersion": true

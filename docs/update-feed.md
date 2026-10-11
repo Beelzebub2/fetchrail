@@ -58,6 +58,12 @@ every 30 minutes thereafter. The settings button still performs a manual check.
 Metadata requests have a 15-second timeout and retain GitHub's existing manifest
 as the fallback endpoint. The locked updater clears the timeout for artifact
 downloads, so large or slow update downloads do not inherit that metadata limit.
+The app supplies Tauri's `current_version` query variable. Already current or
+newer clients receive an uncached `204 No Content`, preventing the updater from
+looking for a missing Linux asset in the older Windows-only bootstrap release.
+Older clients receive the signed release manifest; the generic endpoint without
+that variable remains available to inspect the feed. See
+[Tauri's updater endpoint protocol](https://v2.tauri.app/plugin/updater/).
 Windows claims the checking state under its lock, like Linux, preventing a manual
 and background check from starting two installations.
 
