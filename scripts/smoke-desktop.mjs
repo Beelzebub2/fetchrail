@@ -49,7 +49,7 @@ try {
       assert.equal(manifest.path, launcher);
     }
     const manifest = JSON.parse(await readFile(join(fixture.root, "home/.mozilla/native-messaging-hosts/com.rrmtools.braid.json")));
-    assert.deepEqual(manifest.allowed_extensions, ["browser@braid.rrmtools.uk"]);
+    assert.deepEqual(manifest.allowed_extensions, ["browser@braid.rrmtools.uk", "{bb4d3986-35bd-4e55-bbcb-bb7f67894086}"]);
   }
   console.log("PASS: real embedded frontend, isolated native bridge, and platform host integration.");
 } finally {
