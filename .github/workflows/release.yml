@@ -1,6 +1,16 @@
 name: Release
 
 on:
+  workflow_dispatch:
+    inputs:
+      benchmark:
+        description: Run completion benchmarks and retain raw evidence
+        type: boolean
+        default: false
+  pull_request:
+    paths-ignore:
+      - '**/*.md'
+      - 'website/**'
   push:
     branches:
       - main
@@ -23,9 +33,7 @@ jobs:
   windows:
     name: Windows x64
     runs-on: windows-2022
-    timeout-minutes: 45
-    permissions:
-      contents: write
+    timeout-minutes: 90
     defaults:
       run:
         shell: pwsh
@@ -56,6 +64,16 @@ jobs:
           }
       - name: Install frontend dependencies
         run: npm ci
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: microsoft/vcpkg
+          ref: 96d5fb3de135b86d7222c53f2352ca92827a156b
+          path: .native-vcpkg
+          persist-credentials: false
+      - name: Build native torrent dependencies
+        run: |
+          ./.native-vcpkg/bootstrap-vcpkg.bat -disableMetrics
+          ./scripts/build-torrent-deps.ps1 -VcpkgRoot "$PWD/.native-vcpkg"
       - name: Build frontend and extensions
         run: npm run build
       - name: Check extension behaviour
@@ -65,26 +83,33 @@ jobs:
       - name: Run Rust tests
         run: cargo test --manifest-path src-tauri/Cargo.toml --locked
       - name: Build Windows executable
-        run: npm run release:build
+        run: cargo build --manifest-path src-tauri/Cargo.toml --release --bins --features tauri/custom-protocol,test-tools --locked
+      - name: Check signed artifact verification
+        run: node scripts/test-signatures.mjs
       - name: Check bundled interface and native bridge
-        run: |
-          $app = Start-Process -FilePath "$PWD/src-tauri/target/release/fetchrail.exe" -ArgumentList '--background' -WindowStyle Hidden -PassThru
-          try {
-            $config = Join-Path $env:APPDATA 'com.rrmtools.braid/browser-bridge.json'
-            $deadline = (Get-Date).AddSeconds(45)
-            while (-not (Test-Path -LiteralPath $config)) {
-              if ($app.HasExited -or (Get-Date) -ge $deadline) { throw 'Fetchrail did not start its browser bridge.' }
-              Start-Sleep -Milliseconds 250
-            }
-            npm run browser:test -- --frontend
-            if ($LASTEXITCODE -ne 0) { throw 'Bundled interface startup check failed.' }
-          } finally {
-            if (-not $app.HasExited) { Stop-Process -Id $app.Id -Force; $app.WaitForExit() }
-          }
+        run: node scripts/smoke-desktop.mjs
       - name: Test real multi-connection transfers
         run: npm run engine:test
+      - name: Test real torrent swarms
+        run: |
+          cargo build --manifest-path src-tauri/Cargo.toml --release --bin torrent-harness --features tauri/custom-protocol,test-tools --locked
+          npm run torrent:test
+          npm run torrent:listeners
+      - name: Test torrent UI and packaged integration
+        run: |
+          npm run torrent:ui
+          node scripts/test-torrent-desktop.mjs src-tauri/target/release/fetchrail.exe src-tauri/target/release/torrent-harness.exe
       - name: Test setup and removal
         run: npm run setup:test
+      - name: Benchmark HTTP completion
+        if: inputs.benchmark == true
+        run: npm run engine:bench
+      - name: Retain benchmark evidence
+        if: inputs.benchmark == true
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: benchmarks-windows
+          path: artifacts/benchmarks/*
       - name: Package and sign release
         if: startsWith(github.ref, 'refs/tags/')
         env:
@@ -92,27 +117,312 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
         run: |
           if (-not $env:TAURI_SIGNING_PRIVATE_KEY) { throw 'The TAURI_SIGNING_PRIVATE_KEY secret is missing.' }
-          ./scripts/package-release.ps1 -Tag "$env:GITHUB_REF_NAME"
-      - name: Publish release
+          ./scripts/package-release.ps1 -Tag "$env:GITHUB_REF_NAME" -FragmentOnly
+          node scripts/release-notices.mjs
+          cargo build --manifest-path src-tauri/Cargo.toml --release --bin verify-update --features tauri/custom-protocol,test-tools --locked
+      - name: Upload Windows release assets
         if: startsWith(github.ref, 'refs/tags/')
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: release-windows
+          path: |
+            release-artifacts/*
+            src-tauri/target/release/verify-update.exe
+          if-no-files-found: error
+
+  linux:
+    name: Linux ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 180
+    env:
+      APPIMAGE_EXTRACT_AND_RUN: '1'
+      GDK_BACKEND: x11
+      XDG_SESSION_TYPE: x11
+      XDG_CURRENT_DESKTOP: Xvfb
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-22.04
+            arch: x64
+          - runner: ubuntu-24.04-arm
+            arch: arm64
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version: '24'
+          cache: npm
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d
+        with:
+          toolchain: stable
+          components: rustfmt
+      - name: Install Linux dependencies
+        run: bash scripts/linux-dependencies.sh
+      - name: Check Linux portable integration
+        run: bash scripts/test-linux-integration.sh
+      - name: Cache native dependencies
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830
+        with:
+          path: |
+            src-tauri/native/vcpkg
+            src-tauri/native/installed-secure
+          key: native-${{ matrix.runner }}-96d5fb3-${{ hashFiles('src-tauri/native/ports/**', 'src-tauri/native/triplets/**', 'scripts/build-torrent-deps.sh') }}
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+        with:
+          workspaces: src-tauri -> target
+      - name: Validate version and install frontend
+        run: |
+          if [[ "$GITHUB_REF_TYPE" == tag ]]; then node scripts/check-release.mjs "$GITHUB_REF_NAME"; else node scripts/check-release.mjs; fi
+          npm ci
+      - name: Build pinned native torrent dependencies
+        run: bash scripts/build-torrent-deps.sh
+      - name: Build frontend and check extension behavior
+        run: |
+          npm run build
+          npm run browser:check
+          node scripts/test-release-aggregation.mjs
+      - name: Generate dependency inventory and bundled notices
+        run: node scripts/release-notices.mjs
+      - name: Install Linux UI test browser
+        run: npx playwright install --with-deps chromium
+      - name: Check Linux progress and torrent interfaces
+        run: |
+          npm run ui:test
+          npm run torrent:ui
+      - name: Check Rust and native transfer correctness
+        run: |
+          cargo fmt --manifest-path src-tauri/Cargo.toml -- --check
+          cargo test --manifest-path src-tauri/Cargo.toml --locked
+      - name: Build embedded Linux executables
+        run: cargo build --manifest-path src-tauri/Cargo.toml --release --bins --features tauri/custom-protocol,test-tools --locked
+      - name: Check signed artifact verification
+        run: node scripts/test-signatures.mjs
+      - name: Check ELF dependencies
+        run: |
+          ldd src-tauri/target/release/fetchrail | tee elf-dependencies.txt
+          ! grep -q 'not found' elf-dependencies.txt
+      - name: Run actual WebKitGTK desktop and HTTP fixtures
+        run: xvfb-run -a dbus-run-session -- npm run linux:qualify
+      - name: Install native WebKitGTK desktop test driver
+        run: |
+          sudo apt-get install -y --no-install-recommends webkit2gtk-driver weston
+          cargo install tauri-driver --version 2.1.0 --locked
+      - name: Test native settings, autostart and progress windows
+        run: xvfb-run -a dbus-run-session -- npm run linux:desktop
+      - name: Test native Wayland settings and progress windows
+        run: npm run linux:wayland
+      - name: Build Linux packages without release secrets
+        if: github.ref_type != 'tag'
+        run: npm run linux:build
+      - name: Build and sign Linux packages
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+        run: |
+          test -n "$TAURI_SIGNING_PRIVATE_KEY"
+          node scripts/release-notices.mjs
+          npm run tauri -- build
+          node scripts/package-linux.mjs "$GITHUB_REF_NAME"
+      - name: Inspect package contents and desktop entries
+        run: |
+          deb=$(find src-tauri/target/release/bundle -name '*.deb' -print -quit)
+          rpm=$(find src-tauri/target/release/bundle -name '*.rpm' -print -quit)
+          test -n "$deb" && test -n "$rpm"
+          dpkg-deb --info "$deb"
+          rpm -qp --requires "$rpm"
+          desktop=$(mktemp -d)
+          dpkg-deb --extract "$deb" "$desktop"
+          find "$desktop/usr/share/applications" -name '*.desktop' -exec desktop-file-validate {} +
+          sudo apt-get install -y "$(realpath "$deb")"
+          xvfb-run -a dbus-run-session -- node scripts/smoke-desktop.mjs /usr/bin/fetchrail
+          sudo apt-get remove -y fetchrail
+          image=$(find src-tauri/target/release/bundle -name '*.AppImage' -print -quit)
+          test -n "$image"
+          xvfb-run -a dbus-run-session -- node scripts/smoke-desktop.mjs "$image"
+          xvfb-run -a dbus-run-session -- node scripts/test-linux-appimage.mjs "$image"
+          if [[ "$GITHUB_REF_TYPE" == tag ]]; then archive_root=release-artifacts; else archive_root=artifacts/linux-development; fi
+          archive=$(find "$archive_root" -name '*.tar.gz' -print -quit)
+          test -n "$archive"
+          xvfb-run -a dbus-run-session -- node scripts/test-linux-archive.mjs "$archive"
+      - name: Benchmark HTTP completion
+        if: inputs.benchmark == true
+        run: xvfb-run -a dbus-run-session -- npm run engine:bench
+      - name: Stage installed-package distro fixtures
+        if: matrix.arch == 'x64'
+        run: |
+          mkdir -p artifacts/distro-inputs
+          cp src-tauri/target/release/bundle/deb/*.deb src-tauri/target/release/bundle/rpm/*.rpm artifacts/distro-inputs/
+          if [[ "$GITHUB_REF_TYPE" == tag ]]; then archive_root=release-artifacts; else archive_root=artifacts/linux-development; fi
+          cp "$archive_root"/*.tar.gz artifacts/distro-inputs/
+          cp src-tauri/target/release/torrent-harness "$HOME/.cargo/bin/tauri-driver" artifacts/distro-inputs/
+          cp -L "$(command -v node)" artifacts/distro-inputs/node
+          cp -a browser-extension artifacts/distro-inputs/
+      - name: Retain private CI distro fixture inputs
+        if: matrix.arch == 'x64'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: distro-inputs-x64
+          path: artifacts/distro-inputs/*
+          if-no-files-found: error
+      - name: Retain Linux qualification evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: qualification-linux-${{ matrix.arch }}
+          path: |
+            artifacts/linux-qualification/*
+            artifacts/linux-development/*
+            artifacts/benchmarks/*
+            elf-dependencies.txt
+          if-no-files-found: warn
+      - name: Upload Linux release assets
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: release-linux-${{ matrix.arch }}
+          path: release-artifacts/*
+          if-no-files-found: error
+
+  distros:
+    name: Installed Linux package / ${{ matrix.distro }}
+    needs: linux
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        distro: [fedora44, mint223, kali, arch]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: distro-inputs-x64
+          path: artifacts/distro-inputs
+      - name: Install userspace fixture tools
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends curl xz-utils xorriso squashfs-tools xvfb
+      - name: Test package, HTTP, torrents and native X11/Wayland controls
+        env:
+          FETCHRAIL_SOURCE_REVISION: ${{ github.sha }}
+        run: |
+          chmod +x artifacts/distro-inputs/node artifacts/distro-inputs/tauri-driver artifacts/distro-inputs/torrent-harness
+          sudo --preserve-env=FETCHRAIL_SOURCE_REVISION bash scripts/test-linux-distro.sh '${{ matrix.distro }}' artifacts/distro-inputs
+      - name: Retain distro evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: qualification-${{ matrix.distro }}
+          path: artifacts/linux-qualification/${{ matrix.distro }}/*
+          if-no-files-found: warn
+
+  update-service:
+    name: Update feed security and runtime
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: update-service/package-lock.json
+      - run: npm ci --prefix update-service
+      - run: npm test --prefix update-service
+
+  publish:
+    name: Verify and publish one complete release
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: [windows, linux, distros, update-service]
+    runs-on: windows-2022
+    permissions:
+      contents: write
+    outputs:
+      manifest_sha256: ${{ steps.release-manifest.outputs.sha256 }}
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version: '24'
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          pattern: release-*
+          path: incoming
+      - name: Collect and cryptographically verify assets
+        id: release-manifest
+        run: |
+          New-Item -ItemType Directory -Force release-artifacts | Out-Null
+          Get-ChildItem incoming -Recurse -File | ForEach-Object {
+            if ($_.Name -eq 'verify-update.exe') {
+              Copy-Item -LiteralPath $_.FullName -Destination release-artifacts/verify-update.exe
+            } elseif ($_.Name -notin @('THIRD_PARTY_NOTICES.txt', 'dependency-inventory.json')) {
+              $target = Join-Path release-artifacts $_.Name
+              if (Test-Path -LiteralPath $target) { throw "Duplicate release asset $($_.Name)" }
+              Copy-Item -LiteralPath $_.FullName -Destination $target
+            } else {
+              $relative = [IO.Path]::GetRelativePath("$PWD/incoming", $_.FullName)
+              $sourceArtifact = ($relative -split '[\\/]')[0]
+              Copy-Item -LiteralPath $_.FullName -Destination (Join-Path release-artifacts "$sourceArtifact-$($_.Name)")
+            }
+          }
+          $env:FETCHRAIL_SIGNATURE_VERIFIER = "$PWD/release-artifacts/verify-update.exe"
+          node scripts/aggregate-release.mjs
+          if ($LASTEXITCODE -ne 0) { throw 'Combined release verification failed.' }
+          $manifestDigest = (Get-FileHash -LiteralPath release-artifacts/latest.json -Algorithm SHA256).Hash.ToLowerInvariant()
+          "sha256=$manifestDigest" >> $env:GITHUB_OUTPUT
+      - name: Publish validated draft and then latest metadata
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           $tag = $env:GITHUB_REF_NAME
-          $assets = @("release-artifacts/Fetchrail-Setup-$tag-windows-x64.exe", "release-artifacts/Fetchrail-Setup-$tag-windows-x64.sha256", "release-artifacts/latest.json")
           gh release view $tag --repo "$env:GITHUB_REPOSITORY" *> $null
-          if ($LASTEXITCODE -eq 0) {
-            gh release upload $tag @assets --clobber --repo "$env:GITHUB_REPOSITORY"
-          } else {
-            gh release create $tag @assets --verify-tag --title "Fetchrail $tag" --generate-notes --repo "$env:GITHUB_REPOSITORY"
-          }
-          if ($LASTEXITCODE -ne 0) { throw 'Release publication failed.' }
-          gh release edit $tag --title "Fetchrail $tag" --repo "$env:GITHUB_REPOSITORY"
-          if ($LASTEXITCODE -ne 0) { throw 'Release title update failed.' }
+          if ($LASTEXITCODE -eq 0) { throw 'Refusing to overwrite an existing immutable release. Use a new version tag.' }
+          $assets = Get-ChildItem release-artifacts -File | Where-Object { $_.Name -notmatch '^(verify-update\.exe|latest\.json|windows\.json|linux-(x64|arm64)\.json)$' } | ForEach-Object { $_.FullName }
+          gh release create $tag @assets --draft --verify-tag --title "Fetchrail $tag" --generate-notes --repo "$env:GITHUB_REPOSITORY"
+          if ($LASTEXITCODE -ne 0) { throw 'Draft release creation failed.' }
+          gh release upload $tag release-artifacts/latest.json --repo "$env:GITHUB_REPOSITORY"
+          if ($LASTEXITCODE -ne 0) { throw 'Latest manifest publication failed; release remains a draft.' }
+          gh release edit $tag --draft=false --repo "$env:GITHUB_REPOSITORY"
+          if ($LASTEXITCODE -ne 0) { throw 'Release remains a draft.' }
+
+  notify-updates:
+    name: Announce published update to Fetchrail
+    needs: publish
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version: '24'
+      - name: Retrieve verified manifest
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release download "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --pattern latest.json --dir release-artifacts
+      - name: Notify authenticated release feed
+        env:
+          FETCHRAIL_MANIFEST_SHA256: ${{ needs.publish.outputs.manifest_sha256 }}
+        run: node scripts/notify-update-feed.mjs release-artifacts/latest.json
 
   chrome-web-store:
     name: Chrome Web Store
-    needs: windows
+    needs: publish
     if: startsWith(github.ref, 'refs/tags/')
     concurrency:
       group: chrome-web-store-publish

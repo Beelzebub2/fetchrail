@@ -1,7 +1,4 @@
-use std::{
-    collections::BTreeMap,
-    path::{Path, PathBuf},
-};
+use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -14,6 +11,10 @@ pub enum DownloadStatus {
     Scheduled,
     Connecting,
     Downloading,
+    Metadata,
+    Checking,
+    Stalled,
+    Seeding,
     Paused,
     Merging,
     Completed,
@@ -23,13 +24,29 @@ pub enum DownloadStatus {
 
 impl DownloadStatus {
     pub fn is_active(&self) -> bool {
-        matches!(self, Self::Connecting | Self::Downloading | Self::Merging)
+        matches!(
+            self,
+            Self::Connecting
+                | Self::Downloading
+                | Self::Merging
+                | Self::Metadata
+                | Self::Checking
+                | Self::Stalled
+                | Self::Seeding
+        )
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct DownloadRecord {
+    // Preserve metadata written by prior local builds during ordinary saves.
+    #[serde(default, flatten)]
+    pub extra: std::collections::BTreeMap<String, serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub torrent: Option<crate::torrent::TorrentSummary>,
     pub id: Uuid,
     pub url: String,
     pub file_name: String,
@@ -52,26 +69,12 @@ pub struct DownloadRecord {
     pub queue: String,
     #[serde(default)]
     pub scheduled_for: Option<DateTime<Utc>>,
-    /// Compact range groups for progress; empty before a transfer and after completion.
+    /// One entry per connection of the current transfer; empty before it starts and after it completes.
     #[serde(default)]
     pub segments: Vec<SegmentProgress>,
     /// The user chose this file name; a name suggested by the server must not replace it.
     #[serde(default)]
     pub name_locked: bool,
-    #[serde(default)]
-    pub expected_sha256: Option<String>,
-    #[serde(default)]
-    pub sha256: Option<String>,
-    #[serde(default)]
-    pub status_detail: Option<String>,
-    #[serde(default)]
-    pub finalizing_bytes: u64,
-    #[serde(default)]
-    pub handoff_id: Option<String>,
-    #[serde(default)]
-    pub handoff_committed: bool,
-    #[serde(default)]
-    pub requires_session: bool,
     #[serde(default)]
     pub speed_limit_bps: u64,
     /// Server support is unknown until the first probe.
@@ -92,6 +95,7 @@ pub struct CompletionOptions {
     pub exit_app: bool,
     pub turn_off_computer: bool,
     pub force_shutdown: bool,
+    pub connection_id: Option<String>,
 }
 
 impl Default for CompletionOptions {
@@ -102,6 +106,7 @@ impl Default for CompletionOptions {
             exit_app: false,
             turn_off_computer: false,
             force_shutdown: false,
+            connection_id: None,
         }
     }
 }
@@ -125,10 +130,8 @@ pub struct SegmentProgress {
     pub length: Option<u64>,
     pub downloaded_bytes: u64,
     pub speed_bps: u64,
-    /// At least one request is receiving within this file section.
+    /// The connection is open and receiving.
     pub active: bool,
-    #[serde(default)]
-    pub active_connections: usize,
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -152,6 +155,10 @@ pub enum Accent {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DownloadSettings {
+    #[serde(default, flatten)]
+    pub extra: std::collections::BTreeMap<String, serde_json::Value>,
+    #[serde(default)]
+    pub torrent: crate::torrent::TorrentSettings,
     /// Shared by all downloads and connections; zero is unlimited.
     #[serde(default)]
     pub speed_limit_bps: u64,
@@ -169,30 +176,45 @@ pub struct DownloadSettings {
     pub accent: Accent,
     #[serde(default = "default_categories")]
     pub categories: Vec<Category>,
+    /// Place new downloads in category folders unless a destination was chosen explicitly.
+    #[serde(default = "default_true")]
+    pub sort_into_category_folders: bool,
     /// Look for new releases in the background and put them in place.
     #[serde(default = "default_true")]
     pub auto_update: bool,
-    #[serde(default = "default_true")]
-    pub adaptive_connections: bool,
-    #[serde(default = "default_origin_limit")]
-    pub max_requests_per_origin: usize,
-    #[serde(default = "default_retries")]
-    pub retry_attempts: usize,
-    /// Zero means unlimited. Shared by all downloads.
+    /// Whether removing a download from the list also deletes its file; unset asks each time.
     #[serde(default)]
-    pub bandwidth_limit_kbps: u64,
-    #[serde(default = "default_true")]
-    pub direct_write: bool,
+    pub delete_files_on_remove: Option<bool>,
 }
 
 impl DownloadSettings {
     pub fn normalized(mut self) -> Self {
+        if let Some(legacy) = self
+            .extra
+            .get("bandwidthLimitKbps")
+            .and_then(|v| v.as_u64())
+            .filter(|v| *v > 0)
+        {
+            let legacy = legacy.saturating_mul(1024);
+            self.speed_limit_bps = if self.speed_limit_bps == 0 {
+                legacy
+            } else {
+                self.speed_limit_bps.min(legacy)
+            };
+        }
+        if self.speed_limit_bps > 0 {
+            self.speed_limit_bps = self.speed_limit_bps.max(2);
+        }
         self.max_concurrent_downloads = self.max_concurrent_downloads.clamp(1, 12);
         self.connections_per_download = self.connections_per_download.clamp(1, 32);
         self.min_segment_size_mb = self.min_segment_size_mb.clamp(1, 128);
-        self.max_requests_per_origin = self.max_requests_per_origin.clamp(1, 32);
-        self.retry_attempts = self.retry_attempts.clamp(1, 20);
-        self.bandwidth_limit_kbps = self.bandwidth_limit_kbps.min(10_000_000);
+        self.torrent.max_seeds = self.torrent.max_seeds.clamp(1, 100);
+        self.torrent.connections = self.torrent.connections.clamp(20, 2000);
+        self.torrent.encryption = self.torrent.encryption.min(2);
+        self.torrent.protocol = self.torrent.protocol.min(2);
+        if !self.torrent.ratio_limit.is_finite() || self.torrent.ratio_limit < 0.0 {
+            self.torrent.ratio_limit = 1.0;
+        }
         for category in &mut self.categories {
             category.name = category.name.trim().to_string();
             category.folder = category.folder.trim().to_string();
@@ -207,8 +229,8 @@ impl DownloadSettings {
         self
     }
 
-    /// Where a file lands when no folder was chosen for it: its category's folder, else the default one.
-    pub fn folder_for(&self, file_name: &str) -> PathBuf {
+    /// Category destination regardless of automatic sorting; used by the manual organizer.
+    pub fn category_folder_for(&self, file_name: &str) -> Option<PathBuf> {
         let base = Path::new(&self.default_download_dir);
         let ending = Path::new(file_name)
             .extension()
@@ -219,16 +241,26 @@ impl DownloadSettings {
             .iter()
             .find(|category| category.extensions.contains(&ending))
             // Joining an absolute folder replaces the base.
-            .map_or_else(
-                || base.to_path_buf(),
-                |category| base.join(&category.folder),
-            )
+            .map(|category| base.join(&category.folder))
+    }
+
+    /// Where an ordinary new download lands without an explicitly chosen folder.
+    pub fn folder_for(&self, file_name: &str) -> PathBuf {
+        let base = Path::new(&self.default_download_dir);
+        if !self.sort_into_category_folders {
+            return base.to_path_buf();
+        }
+        self.category_folder_for(file_name)
+            .unwrap_or_else(|| base.to_path_buf())
     }
 }
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AddDownloadRequest {
+    #[serde(skip)]
+    pub handoff_id: Option<String>,
+    pub expected_sha256: Option<String>,
     pub url: String,
     pub directory: Option<String>,
     pub file_name: Option<String>,
@@ -238,25 +270,15 @@ pub struct AddDownloadRequest {
     pub connections: Option<usize>,
     /// The size a browser already saw, shown until the engine has probed the server itself.
     pub expected_bytes: Option<u64>,
-    pub expected_sha256: Option<String>,
-    /// Session headers are deliberately never serialized into download history.
-    pub request_headers: Option<BTreeMap<String, String>>,
-    pub handoff_id: Option<String>,
     pub speed_limit_bps: Option<u64>,
     pub request_context: Option<BrowserRequestContext>,
-}
-
-pub fn default_origin_limit() -> usize {
-    8
-}
-pub fn default_retries() -> usize {
-    6
 }
 
 /// Only headers needed to replay the final browser GET. Never included in UI events.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct BrowserRequestContext {
+    pub origin: Option<String>,
     pub cookie: Option<String>,
     pub authorization: Option<String>,
     pub referer: Option<String>,
@@ -277,8 +299,8 @@ pub struct QueueRecord {
 impl QueueRecord {
     pub fn allows_downloads(&self, now: DateTime<Utc>) -> bool {
         !self.paused
-            && self.starts_at.is_none_or(|start| now >= start)
-            && self.stops_at.is_none_or(|stop| now < stop)
+            && !self.starts_at.is_some_and(|start| now < start)
+            && !self.stops_at.is_some_and(|stop| now >= stop)
     }
 }
 
@@ -299,6 +321,8 @@ pub struct BatchDownloadError {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EngineOverview {
+    pub upload_speed_bps: u64,
+    pub seeding: usize,
     pub active: usize,
     pub queued: usize,
     pub completed: usize,
@@ -319,7 +343,14 @@ pub fn default_categories() -> Vec<Category> {
         ),
         ("Documents", "pdf doc docx xls xlsx ppt pptx pps odt"),
         ("Music", "mp3 wav wma mpa ram ra aac aif m4a flac opus"),
-        ("Programs", "exe msi"),
+        (
+            "Programs",
+            if cfg!(target_os = "linux") {
+                "exe msi deb rpm appimage run sh"
+            } else {
+                "exe msi"
+            },
+        ),
         (
             "Video",
             "avi mpg mpe mpeg asf wmv mov qt rm mp4 flv m4v webm ogv ogg mkv ts",
@@ -377,9 +408,21 @@ mod tests {
 
     #[test]
     fn files_are_sorted_into_category_folders() {
+        let download_root = if cfg!(windows) {
+            r"D:\Downloads"
+        } else {
+            "/tmp/Downloads"
+        };
+        let films = if cfg!(windows) {
+            r"E:\Films"
+        } else {
+            "/tmp/Films"
+        };
         let settings = DownloadSettings {
+            extra: Default::default(),
+            torrent: Default::default(),
             speed_limit_bps: 0,
-            default_download_dir: r"D:\Downloads".into(),
+            default_download_dir: download_root.into(),
             max_concurrent_downloads: 3,
             connections_per_download: 8,
             min_segment_size_mb: 4,
@@ -388,11 +431,8 @@ mod tests {
             theme: Theme::default(),
             accent: Accent::default(),
             auto_update: true,
-            adaptive_connections: true,
-            max_requests_per_origin: default_origin_limit(),
-            retry_attempts: default_retries(),
-            bandwidth_limit_kbps: 0,
-            direct_write: true,
+            delete_files_on_remove: None,
+            sort_into_category_folders: true,
             categories: vec![
                 Category {
                     name: " Archives ".into(),
@@ -402,7 +442,7 @@ mod tests {
                 Category {
                     name: "Films".into(),
                     extensions: vec!["mkv".into()],
-                    folder: r"E:\Films".into(),
+                    folder: films.into(),
                 },
                 Category {
                     name: " ".into(),
@@ -418,11 +458,29 @@ mod tests {
             "nameless categories are dropped"
         );
         assert_eq!(settings.categories[0].extensions, ["zip", "7z"]);
-        let base = Path::new(r"D:\Downloads");
+        let base = Path::new(download_root);
         assert_eq!(settings.folder_for("Setup.Zip"), base.join("Compressed"));
-        assert_eq!(settings.folder_for("film.mkv"), Path::new(r"E:\Films"));
+        assert_eq!(settings.folder_for("film.mkv"), Path::new(films));
         assert_eq!(settings.folder_for("data.bin"), base);
         assert_eq!(settings.folder_for("README"), base);
+        let flat = DownloadSettings {
+            extra: Default::default(),
+            sort_into_category_folders: false,
+            ..settings.clone()
+        };
+        assert_eq!(flat.folder_for("Setup.Zip"), base);
+        assert_eq!(
+            flat.category_folder_for("Setup.Zip"),
+            Some(base.join("Compressed"))
+        );
+        let serialized = serde_json::to_value(&settings).unwrap();
+        let mut legacy = serialized.as_object().unwrap().clone();
+        legacy.remove("sortIntoCategoryFolders");
+        legacy.remove("deleteFilesOnRemove");
+        let restored: DownloadSettings =
+            serde_json::from_value(serde_json::Value::Object(legacy)).unwrap();
+        assert!(restored.sort_into_category_folders);
+        assert_eq!(restored.delete_files_on_remove, None);
         assert!(default_categories()
             .iter()
             .any(|category| category.name == "Programs"

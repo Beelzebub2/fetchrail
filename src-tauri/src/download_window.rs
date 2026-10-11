@@ -67,7 +67,9 @@ pub async fn open_download(
     id: Uuid,
 ) -> Result<(), String> {
     let record = manager.get_download(id).await?;
-    if record.status != DownloadStatus::Completed {
+    if record.status != DownloadStatus::Completed
+        && !record.torrent.as_ref().is_some_and(|t| t.selected_ready)
+    {
         return Err("Wait for the download to finish before opening the file.".into());
     }
     app.opener()
@@ -77,18 +79,27 @@ pub async fn open_download(
 
 pub async fn on_completion(app: &AppHandle, record: &DownloadRecord) {
     let options = record.completion_options.clone();
+    if options.turn_off_computer {
+        app.state::<Arc<DownloadManager>>().shutdown().await;
+    }
+    #[cfg(windows)]
     let result = tauri::async_runtime::spawn_blocking(move || completion_actions(&options)).await;
+    #[cfg(target_os = "linux")]
+    let result: Result<Result<(), String>, String> =
+        Ok(crate::platform::completion_actions(&options).await);
     let error = match result {
         Ok(Ok(())) => None,
         Ok(Err(error)) => Some(error),
         Err(error) => Some(error.to_string()),
     };
     if let Some(message) = error {
+        if record.completion_options.turn_off_computer {
+            app.state::<Arc<DownloadManager>>().resume_dispatch();
+        }
         let _ = app.emit(
             "fetchrail://completion-error",
             serde_json::json!({ "id": record.id, "message": message }),
         );
-        return;
     }
     if record.completion_options.show_complete_dialog && record.progress_requested {
         if let Err(message) = show_progress(app, record) {
@@ -113,6 +124,9 @@ fn completion_actions(options: &CompletionOptions) -> Result<(), String> {
 
     if !options.hang_up && !options.turn_off_computer {
         return Ok(());
+    }
+    if crate::platform::test_root()?.is_some() {
+        return Err("Machine actions are disabled in isolated application fixtures.".into());
     }
     let system = std::path::PathBuf::from(
         std::env::var_os("SystemRoot").ok_or("Windows system directory was not found.")?,
@@ -146,14 +160,6 @@ fn completion_actions(options: &CompletionOptions) -> Result<(), String> {
                 String::from_utf8_lossy(&output.stderr).trim()
             ));
         }
-    }
-    Ok(())
-}
-
-#[cfg(not(windows))]
-fn completion_actions(options: &CompletionOptions) -> Result<(), String> {
-    if options.hang_up || options.turn_off_computer {
-        return Err("Modem disconnection and shutdown require Windows.".into());
     }
     Ok(())
 }

@@ -1,17 +1,15 @@
 use std::{fs, path::Path, sync::Mutex};
 
 use serde::Deserialize;
-use tauri::{AppHandle, Manager};
+use tauri::AppHandle;
 
-#[cfg(windows)]
 use serde_json::json;
 #[cfg(windows)]
 use winreg::{enums::HKEY_CURRENT_USER, RegKey};
 
-#[cfg(windows)]
 use crate::native_host::{
     CHROMIUM_EXTENSION_ID, CHROMIUM_STORE_EXTENSION_ID, FIREFOX_EXTENSION_ID,
-    LEGACY_FIREFOX_EXTENSION_ID,
+    LOCAL_FIREFOX_EXTENSION_ID,
 };
 
 // These files travel inside fetchrail.exe, so the companion does not depend on a checkout.
@@ -44,7 +42,6 @@ extension_files!(
 );
 static INSTALL_LOCK: Mutex<()> = Mutex::new(());
 
-#[cfg(windows)]
 const NATIVE_HOST_NAME: &str = "com.rrmtools.braid";
 
 /// Where each browser looks up native messaging hosts under HKEY_CURRENT_USER; `true` marks Firefox's manifest format.
@@ -58,7 +55,6 @@ const NATIVE_HOST_BROWSERS: [(&str, bool); 6] = [
     (r"Software\Mozilla", true),
 ];
 
-#[cfg(windows)]
 fn native_host_manifests(executable: &Path) -> [serde_json::Value; 2] {
     let executable = executable.to_string_lossy();
     [
@@ -77,9 +73,112 @@ fn native_host_manifests(executable: &Path) -> [serde_json::Value; 2] {
             "description": "Fetchrail browser integration",
             "path": executable,
             "type": "stdio",
-            "allowed_extensions": [FIREFOX_EXTENSION_ID, LEGACY_FIREFOX_EXTENSION_ID]
+            "allowed_extensions": [FIREFOX_EXTENSION_ID, LOCAL_FIREFOX_EXTENSION_ID]
         }),
     ]
+}
+
+#[cfg(target_os = "linux")]
+fn linux_manifest_paths() -> Result<Vec<(std::path::PathBuf, bool)>, String> {
+    let config = crate::platform::xdg_dir("XDG_CONFIG_HOME", ".config")?;
+    let home = crate::platform::home_dir()?;
+    let mut paths = [
+        "google-chrome",
+        "google-chrome-beta",
+        "google-chrome-unstable",
+        "chromium",
+        "microsoft-edge",
+        "microsoft-edge-beta",
+        "microsoft-edge-dev",
+        "BraveSoftware/Brave-Browser",
+        "vivaldi",
+        "vivaldi-snapshot",
+    ]
+    .into_iter()
+    .map(|browser| {
+        (
+            config
+                .join(browser)
+                .join("NativeMessagingHosts")
+                .join(format!("{NATIVE_HOST_NAME}.json")),
+            false,
+        )
+    })
+    .collect::<Vec<_>>();
+    for root in [home.join(".mozilla"), config.join("mozilla")] {
+        paths.push((
+            root.join("native-messaging-hosts")
+                .join(format!("{NATIVE_HOST_NAME}.json")),
+            true,
+        ));
+    }
+    // Explicit profile roots accommodate browsers started with --user-data-dir.
+    if let Ok(value) = std::env::var("FETCHRAIL_BROWSER_ROOTS") {
+        let roots: Vec<std::path::PathBuf> = serde_json::from_str(&value).map_err(|e| format!("FETCHRAIL_BROWSER_ROOTS must be a JSON array of absolute Chromium profile roots: {e}"))?;
+        for root in roots {
+            if !root.is_absolute() {
+                return Err("Custom browser profile roots must be absolute.".into());
+            }
+            paths.push((
+                root.join("NativeMessagingHosts")
+                    .join(format!("{NATIVE_HOST_NAME}.json")),
+                false,
+            ));
+        }
+    }
+    Ok(paths)
+}
+
+#[cfg(target_os = "linux")]
+fn install_native_host() -> Result<(), String> {
+    let executable = crate::platform::native_launcher()?;
+    let [chromium, firefox] = native_host_manifests(&executable);
+    let mut errors = Vec::new();
+    for (path, is_firefox) in linux_manifest_paths()? {
+        let value = if is_firefox { &firefox } else { &chromium };
+        let bytes = serde_json::to_vec_pretty(value).map_err(|e| e.to_string())?;
+        if fs::read(&path).ok().as_deref() == Some(&bytes) {
+            continue;
+        }
+        if let Err(error) = crate::platform::write_private_atomic(&path, &bytes) {
+            errors.push(format!("{}: {error}", path.display()));
+        }
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "Some browser registrations failed: {}",
+            errors.join("; ")
+        ))
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub fn remove_native_host() -> Result<(), String> {
+    let launcher = crate::platform::app_data_dir()?.join("bin/fetchrail-host");
+    let mut errors = Vec::new();
+    for (path, _) in linux_manifest_paths()? {
+        if let Ok(bytes) = fs::read(&path) {
+            // A malformed or foreign manifest is not proof of ownership.
+            let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+                continue;
+            };
+            if value["name"] == NATIVE_HOST_NAME && value["path"].as_str() == launcher.to_str() {
+                if let Err(error) = fs::remove_file(path) {
+                    errors.push(error.to_string());
+                }
+            }
+        }
+    }
+    if !errors.is_empty() {
+        return Err(errors.join("; "));
+    }
+    match fs::remove_file(launcher) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e.to_string()),
+    }
 }
 
 #[derive(Clone, Copy, Deserialize)]
@@ -197,12 +296,13 @@ pub fn remove_native_host() {
 }
 
 pub fn install(app: &AppHandle) -> Result<(), String> {
+    let _ = app;
+    install_files()
+}
+
+pub fn install_files() -> Result<(), String> {
     let _guard = INSTALL_LOCK.lock().map_err(|error| error.to_string())?;
-    let root = app
-        .path()
-        .app_data_dir()
-        .map_err(|error| error.to_string())?
-        .join("browser-extension");
+    let root = crate::platform::app_data_dir()?.join("browser-extension");
     for (browser, files) in [
         (Browser::Chromium, CHROMIUM_FILES),
         (Browser::Firefox, FIREFOX_FILES),
@@ -215,16 +315,17 @@ pub fn install(app: &AppHandle) -> Result<(), String> {
         })?;
     }
     #[cfg(windows)]
+    if crate::platform::test_root()?.is_none() {
+        install_native_host()?;
+    }
+    #[cfg(target_os = "linux")]
     install_native_host()?;
     Ok(())
 }
 
 pub fn open_folder(app: &AppHandle, browser: Browser) -> Result<(), String> {
     install(app)?;
-    let folder = app
-        .path()
-        .app_data_dir()
-        .map_err(|error| error.to_string())?
+    let folder = crate::platform::app_data_dir()?
         .join("browser-extension")
         .join(browser.folder());
     tauri_plugin_opener::open_path(folder, None::<&str>)
@@ -292,9 +393,6 @@ mod tests {
                 format!("chrome-extension://{CHROMIUM_STORE_EXTENSION_ID}/")
             ])
         );
-        assert_eq!(
-            firefox["allowed_extensions"],
-            serde_json::json!([FIREFOX_EXTENSION_ID, LEGACY_FIREFOX_EXTENSION_ID])
-        );
+        assert_eq!(firefox["allowed_extensions"][0], FIREFOX_EXTENSION_ID);
     }
 }

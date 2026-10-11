@@ -12,8 +12,10 @@ dist
 dist-ssr
 release-artifacts/
 artifacts/
+/.native-vcpkg/
 # Hosted separately on Cloudflare Workers
 /website/
+/update-service/.wrangler/
 *.local
 
 # Editor directories and files

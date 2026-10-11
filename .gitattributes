@@ -1,0 +1,6 @@
+*.sh text eol=lf
+*.desktop text eol=lf
+*.hbs text eol=lf
+*.nix text eol=lf
+*.patch text eol=lf
+src-tauri/native/ports/openssl/unix/configure text eol=lf

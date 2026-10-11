@@ -223,8 +223,8 @@ api.alarms.onAlarm.addListener((alarm) => {
   if (alarm.name === UPDATE_ALARM) void checkForExtensionUpdate();
 });
 
-async function nativeRequest(method, params = {}, requestId = crypto.randomUUID()) {
-  const message = { v: 1, id: requestId, method, params };
+async function nativeRequest(method, params = {}) {
+  const message = { v: 1, id: crypto.randomUUID(), method, params };
   const response = globalThis.browser
     ? await api.runtime.sendNativeMessage(HOST_NAME, message)
     : await new Promise((resolve, reject) => {
@@ -252,177 +252,106 @@ async function addItems(source, items, options = {}) {
   const seen = new Set();
   const safeItems = items.map((item) => {
     const url = new URL(item.url);
-    if (!["http:", "https:"].includes(url.protocol)) throw new Error("Only HTTP and HTTPS links are supported.");
+    if (!["http:", "https:", "magnet:"].includes(url.protocol)) throw new Error("Only HTTP, HTTPS and magnet links are supported.");
     url.hash = "";
     return { url: url.href, ...(item.suggestedFileName ? { suggestedFileName: item.suggestedFileName } : {}),
       ...(item.expectedBytes != null ? { expectedBytes: item.expectedBytes } : {}),
       ...(item.expectedMime ? { expectedMime: item.expectedMime } : {}),
-      ...(item.expectedSha256 ? { expectedSha256: item.expectedSha256 } : {}),
-      ...(item.requestHeaders ? { requestHeaders: item.requestHeaders } : {}),
       ...(item.requestContext ? { requestContext: item.requestContext } : {}) };
   }).filter((item) => !seen.has(item.url) && seen.add(item.url));
   let accepted = 0;
   const ids = [];
+  let pendingConfirmation = false;
   const errors = [];
   // Small batches stay below native messaging limits even with long signed URLs.
   for (let offset = 0; offset < safeItems.length; offset += 25) {
     try {
-      const { requestId, ...params } = options;
-      const result = await nativeRequest("addDownloads", { source, items: safeItems.slice(offset, offset + 25), ...params }, requestId);
-      accepted += result.accepted;
-      ids.push(...(result.ids ?? []));
-      errors.push(...result.errors.map((error) => ({ ...error, index: error.index + offset, url: safeItems[offset + error.index].url })));
+      const batch = safeItems.slice(offset, offset + 25).map((item, index) => ({ item, index: offset + index }));
+      const torrent = ({ item }) => item.url.startsWith("magnet:") || new URL(item.url).pathname.toLowerCase().endsWith(".torrent");
+      for (const [method, group] of [["addDownloads", batch.filter(entry => !torrent(entry))], ["addTorrents", batch.filter(torrent)]]) {
+        if (!group.length) continue;
+        const result = await nativeRequest(method, { source, items: group.map(({ item }) => method === "addTorrents" ? { url: item.url } : item), ...options });
+        accepted += result.accepted;
+        pendingConfirmation ||= result.pendingConfirmation === true;
+        ids.push(...(result.ids ?? []));
+        errors.push(...result.errors.map((error) => ({ ...error, index: group[error.index].index, url: group[error.index].item.url })));
+      }
     } catch (error) {
       await setBadge("!", "Fetchrail: " + error.message);
       throw new Error(`${accepted ? accepted + " downloads were already accepted. " : ""}${error.message}`);
     }
   }
   await setBadge(errors.length ? "!" : String(accepted), `Fetchrail: ${accepted} downloads accepted`);
-  return { accepted, rejected: errors.length, errors, ids };
+  return { accepted, rejected: errors.length, errors, ids, pendingConfirmation };
 }
 
-const JOURNAL = "fetchrailHandoffs";
-let journalWrite = Promise.resolve();
-let recovering = false;
-const attempted = new Set();
-const observedRequests = new Map();
-let observingRequests = false;
-
-async function saveHandoff(id, entry) {
-  journalWrite = journalWrite.catch(() => {}).then(async () => {
-    const saved = (await api.storage.local.get(JOURNAL))[JOURNAL] ?? {};
-    if (entry) saved[id] = entry; else delete saved[id];
-    await api.storage.local.set({ [JOURNAL]: saved });
-  });
-  return journalWrite;
-}
-
-function safeBrowserItem(item) {
+function safeBrowserDownload(item) {
   const active = item?.state === "in_progress" || (globalThis.browser && item?.state === "interrupted"
     && item.paused && item.canResume && (!item.error || item.error === "USER_CANCELED"));
   return active && !item.incognito && (!item.danger || item.danger === "safe")
     && (!item.byExtensionId || item.byExtensionId === api.runtime.id) && /^https?:\/\//i.test(item.finalUrl || item.url);
 }
 
-function matchingRequest(item) {
-  const matches = [...observedRequests.values()].filter((request) => !request.incognito && Date.now()-request.time < 30000
-    && request.url === (item.finalUrl || item.url) && (!item.cookieStoreId || request.cookieStoreId === item.cookieStoreId));
-  return matches.length === 1 ? matches[0] : null;
-}
-
-async function sessionContext(item) {
-  const saved = await api.storage.local.get("sessionSupport");
-  if (!saved.sessionSupport) return null;
-  const url = item.finalUrl || item.url;
-  const origin = new URL(url).origin + "/*";
-  if (!await api.permissions?.contains({ permissions: ["webRequest", "cookies"], origins: [origin], ...(globalThis.browser ? {data_collection:["authenticationInfo"]} : {}) })) return null;
-  const request = matchingRequest(item);
-  if (!request || request.method !== "GET") throw new Error("The request cannot be safely replayed; continuing in the browser.");
-  const headers = { ...request.headers };
-  // Firefox provides the exact container store on the observed request/download.
-  const storeId = item.cookieStoreId || request.cookieStoreId;
-  if (globalThis.browser && !storeId) throw new Error("Browser container is unknown; continuing in the browser.");
-  if (!headers.cookie) {
-    const cookies = await api.cookies.getAll({ url, ...(storeId ? { storeId } : {}) });
-    if (cookies.length) headers.cookie = cookies.map((cookie) => cookie.name + "=" + cookie.value).join("; ");
-  }
-  return Object.keys(headers).length ? headers : null;
-}
-
-function observeRequests() {
-  if (observingRequests || !api.webRequest?.onSendHeaders) return;
-  try {
-    api.webRequest.onSendHeaders.addListener((details) => {
-      if (details.incognito) return;
-      const headers = {};
-      for (const header of details.requestHeaders ?? []) {
-        const name = header.name.toLowerCase();
-        if (["cookie", "authorization", "referer", "user-agent", "origin"].includes(name) && header.value?.length <= 16384) headers[name] = header.value;
-      }
-      observedRequests.set(details.requestId, { url: details.url, method: details.method, cookieStoreId: details.cookieStoreId, time: Date.now(), headers });
-      for (const [id, request] of observedRequests) if (Date.now()-request.time > 30000) observedRequests.delete(id);
-      while (observedRequests.size > 256) observedRequests.delete(observedRequests.keys().next().value);
-    }, { urls: ["http://*/*", "https://*/*"] }, globalThis.browser ? ["requestHeaders"] : ["requestHeaders", "extraHeaders"]);
-    observingRequests = true;
-  } catch { /* Optional site permissions can be granted from the companion. */ }
-}
-observeRequests();
-api.permissions?.onAdded?.addListener(observeRequests);
-
 async function routeBrowserDownload(item) {
   await captureReady;
   let paused = false;
   let engineId;
-  let entry;
-  const handoffId = crypto.randomUUID();
+  let handedOff = false;
   let batchId;
   let batchOptions;
-  let handedOff = false;
   const trace = recentRequests.get(item.finalUrl || item.url);
   try {
     if (trace && Date.now() - trace.time < 120000) {
       await changeBatch(async () => {
         const { browserBatch: batch } = await api.storage.local.get("browserBatch");
         if (batch?.status === "waiting" && batch.tabIds.includes(trace.tabId)) {
+          batch.status = "capturing";
+          batch.browserDownloadId = item.id;
           batchId = batch.id;
-          if (trace.method !== "GET") throw new Error("Downloads from a form submission stay in the browser.");
-          batch.status = "capturing"; batch.browserDownloadId = item.id;
-          batchId = batch.id; batchOptions = batch.options;
+          batchOptions = batch.options;
           await stopFollowingButtons(batch.tabIds);
           await api.storage.local.set({ browserBatch: batch });
         }
       });
+      if (trace.method !== "GET") throw new Error("This download uses a form submission and must finish in the browser.");
     }
-    const policy = await api.storage.local.get(["automaticDownloads","captureMode","captureMinimumKb","excludedSites","excludedTypes"]);
-    if (!batchId && (policy.automaticDownloads === false || policy.captureMode === "browser")) return;
-    const url = item.finalUrl || item.url;
-    const hostname = new URL(url).hostname;
-    if ((policy.excludedSites ?? "").split(/[\s,]+/).filter(Boolean).some((site) => hostname === site || hostname.endsWith("."+site))) return;
-    const ending = item.filename?.split(".").pop()?.toLowerCase();
-    if ((policy.excludedTypes ?? "").toLowerCase().split(/[\s,]+/).filter(Boolean).includes(ending)) return;
-    const minimum = Number(policy.captureMinimumKb ?? 64) * 1024;
-    if (!batchId && item.totalBytes >= 0 && item.totalBytes < minimum) return;
-    const observed = matchingRequest(item);
-    if (observed && observed.method !== "GET") return;
-    // Firefox pause cancels the connection; wait for partial data so rollback can resume it.
+    if (!batchId && (await api.storage.local.get("automaticDownloads")).automaticDownloads === false) return;
+    // Firefox needs initial bytes so a failed handoff can resume the browser transfer.
     if (globalThis.browser) {
-      for (let attempt = 0; item?.bytesReceived === 0 && safeBrowserItem(item) && !item.paused && attempt < 100; attempt++) {
-        await new Promise((resolve) => setTimeout(resolve, 100));
+      for (let attempt = 0; item?.bytesReceived === 0 && safeBrowserDownload(item) && !item.paused && attempt < 100; attempt++) {
+        await new Promise(resolve => setTimeout(resolve, 100));
         [item] = await api.downloads.search({ id: item.id });
       }
-      if (!safeBrowserItem(item) || item.paused || !(item.bytesReceived > 0)) throw new Error("Firefox download is not ready for pickup; continuing in the browser.");
-      if (!batchId && item.totalBytes >= 0 && item.totalBytes < minimum) return;
+      if (!safeBrowserDownload(item) || item.paused || !(item.bytesReceived > 0)) {
+        throw new Error("Firefox download is not ready for pickup; continuing in the browser.");
+      }
     }
-    entry = { browserId: item.id, url, phase: "preparing", time: Date.now(), autoStart: batchId ? !batchOptions.startPaused : policy.captureMode === "auto", source: batchId ? "browserBatch" : "clickMonitor" };
-    await saveHandoff(handoffId,entry);
     await api.downloads.pause(item.id);
     paused = true;
     const [current] = await api.downloads.search({ id: item.id });
-    if (!safeBrowserItem(current) || !current.paused) throw new Error("Browser download changed.");
-    const requestHeaders = await sessionContext(current);
-    let result;
-    try {
-      result = await addItems(entry.source, [{ url: current.finalUrl || current.url,
-        suggestedFileName: current.filename?.split(/[\\/]/).pop(), expectedBytes: current.totalBytes >= 0 ? current.totalBytes : null,
-        expectedMime: current.mime, ...(requestHeaders ? { requestHeaders } : {}),
-        ...(useBrowserSession && trace?.method === "GET" ? { requestContext: trace.context } : {}) }], { ...batchOptions, requestId: handoffId, handoffProtocol: 2 });
-    } catch (error) {
-      const lookup = await nativeRequest("getHandoff", { handoffId }).catch(() => null);
-      if (!lookup?.ids?.length || lookup.statuses?.includes("cancelled")) throw error;
-      result = { accepted: 1, ids: lookup.ids, errors: [] };
-    }
+    if (!safeBrowserDownload(current) || !current.paused) return;
+    const requestTrace = recentRequests.get(current.finalUrl || current.url);
+    const context = useBrowserSession && requestTrace?.method === "GET" && Date.now() - requestTrace.time < 120000 ? requestTrace.context : {};
+    const result = await addItems(batchId ? "browserBatch" : "clickMonitor", [{
+      url: current.finalUrl || current.url,
+      suggestedFileName: current.filename?.split(/[\\/]/).pop(),
+      expectedBytes: current.totalBytes >= 0 ? current.totalBytes : null,
+      expectedMime: current.mime,
+      ...(Object.keys(context).length ? { requestContext: context } : {}),
+    }], batchOptions ?? {});
     engineId = result.ids[0];
-    if (result.accepted !== 1 || !engineId) throw new Error(result.errors[0]?.message ?? "Fetchrail did not accept the download.");
-    entry.engineId = engineId;
+    if (result.accepted !== 1 || (!engineId && !result.pendingConfirmation)) throw new Error(result.errors[0]?.message ?? "Fetchrail did not accept the download.");
     const [latest] = await api.downloads.search({ id: item.id });
     paused = latest?.paused && (latest.state === "in_progress" || (globalThis.browser && latest.state === "interrupted"));
-    if (!paused || !safeBrowserItem(latest) || (latest.finalUrl || latest.url) !== (current.finalUrl || current.url)) throw new Error("Browser download changed during verification.");
-    entry.phase = "cancelling"; await saveHandoff(handoffId,entry);
-    await api.downloads.cancel(item.id); paused = false;
-    entry.phase = "committing"; await saveHandoff(handoffId,entry);
-    await nativeRequest("commitHandoff", { handoffId, autoStart: entry.autoStart, source: entry.source });
-    await saveHandoff(handoffId,null);
+    // Verification can outlast a user action or the browser's safety verdict.
+    if (!paused || !safeBrowserDownload(latest)
+      || (latest.finalUrl || latest.url) !== (current.finalUrl || current.url)) {
+      throw new Error("The browser download changed during verification.");
+    }
+    await api.downloads.cancel(item.id);
     handedOff = true;
+    paused = false;
+    // History cleanup must not roll back a successful handoff.
     await api.downloads.erase({ id: item.id }).catch(() => {});
     if (batchId) await changeBatch(async () => {
       const { browserBatch: batch } = await api.storage.local.get("browserBatch");
@@ -433,62 +362,26 @@ async function routeBrowserDownload(item) {
     recentRequests.delete(current.finalUrl || current.url);
     void api.storage.session?.set({ recentRequests: [...recentRequests] }).catch(() => {});
   } catch (error) {
-    if (entry?.phase === "committing") {
-      await setBadge("!","Fetchrail: recovering accepted download handoff.");
-    } else {
-      if (entry) { entry.phase = "rollback"; await saveHandoff(handoffId,entry).catch(() => {}); }
-      if (engineId) {
-        try { await nativeRequest("controlDownload",{ downloadId:engineId,action:"cancel" }); await saveHandoff(handoffId,null); } catch {}
-      }
-      await setBadge("!","Fetchrail: continuing in your browser. " + error.message);
-    }
+    if (engineId && !handedOff) await nativeRequest("controlDownload", { downloadId: engineId, action: "cancel" }).catch(() => {});
+    await setBadge("!", (handedOff ? "Fetchrail: file accepted; could not open the next page. " : "Fetchrail: continuing in your browser. ") + error.message);
     if (batchId) await changeBatch(async () => {
       const { browserBatch: batch } = await api.storage.local.get("browserBatch");
-      if (batch?.id === batchId) { batch.status = "waiting"; batch.error = handedOff ? "File accepted. Reopen the next page or skip it. " + error.message : error.message; await api.storage.local.set({ browserBatch: batch }); }
+      if (batch?.id !== batchId) return;
+      batch.status = "waiting";
+      batch.error = handedOff ? "File accepted. Reopen the next page to continue. " + error.message : "Continuing in the browser. " + error.message + " Skip this item once it finishes, or retry.";
+      await api.storage.local.set({ browserBatch: batch });
     });
   } finally {
-    if (paused) await api.downloads.resume(item.id).catch((error) => setBadge("!","Fetchrail: resume the browser download manually. " + error.message));
+    if (paused) await api.downloads.resume(item.id).catch((error) => setBadge("!", "Fetchrail: resume the browser download manually. " + error.message));
   }
 }
 
-async function recoverHandoffs() {
-  if (recovering || activeActions) return;
-  recovering = true;
-  try {
-    const saved = (await api.storage.local.get(JOURNAL))[JOURNAL] ?? {};
-    for (const [handoffId,entry] of Object.entries(saved)) {
-      try {
-        const [browser] = await api.downloads.search({ id: entry.browserId });
-        const result = await nativeRequest("getHandoff",{ handoffId });
-        if (entry.phase === "committing" || (entry.phase === "cancelling" && browser?.state === "interrupted" && !browser.paused)) {
-          if (result.ids.length) await nativeRequest("commitHandoff",{ handoffId,autoStart:entry.autoStart,source:entry.source });
-          else if (Date.now()-entry.time < 60000) continue;
-        } else {
-          for (const downloadId of result.ids) await nativeRequest("controlDownload",{ downloadId,action:"cancel" });
-          if (safeBrowserItem(browser) && browser.paused && (browser.finalUrl || browser.url) === entry.url) await api.downloads.resume(browser.id);
-          if (!result.ids.length && Date.now()-entry.time < 60000) continue;
-        }
-        await saveHandoff(handoffId,null);
-      } catch { /* Preserve the journal and retry when the native host is available. */ }
-    }
-  } finally { recovering = false; }
-}
-api.alarms.onAlarm.addListener((alarm) => { if (alarm.name === UPDATE_ALARM) void recoverHandoffs(); });
-api.runtime.onStartup.addListener(() => void recoverHandoffs());
-void recoverHandoffs();
-
-function considerDownload(item) {
-  if (!safeBrowserItem(item) || item.paused || routingDownloads.has(item.id) || attempted.has(item.id)) return;
-  attempted.add(item.id);
-  routingDownloads.add(item.id); activeActions++;
+if (!api.downloads?.onCreated) void setBadge("!", "Fetchrail: reload the extension to enable browser download capture.");
+api.downloads?.onCreated?.addListener((item) => {
+  if (!safeBrowserDownload(item) || item.paused || routingDownloads.has(item.id)) return;
+  routingDownloads.add(item.id);
+  activeActions++;
   void routeBrowserDownload(item).finally(() => { routingDownloads.delete(item.id); activeActions--; });
-}
-if (!api.downloads?.onCreated) void setBadge("!","Fetchrail: reload the companion to enable capture.");
-api.downloads?.onCreated?.addListener(considerDownload);
-api.downloads?.onChanged?.addListener((delta) => {
-  if (["filename","totalBytes","mime","url","finalUrl"].some((key) => delta[key]) && !attempted.has(delta.id)) {
-    void api.downloads.search({ id:delta.id }).then(([item]) => { if (item) considerDownload(item); }).catch(() => {});
-  }
 });
 
 async function collectLinks(tabId) {
@@ -500,7 +393,7 @@ async function collectLinks(tabId) {
       for (const element of document.querySelectorAll("a[href], area[href], video[src], audio[src], source[src], img[src]")) {
         try {
           const url = new URL(element.href || element.currentSrc || element.src, document.baseURI);
-          if (!["http:", "https:"].includes(url.protocol)) continue;
+          if (!["http:", "https:", "magnet:"].includes(url.protocol)) continue;
           url.hash = "";
           if (seen.has(url.href)) continue;
           seen.add(url.href);
@@ -509,7 +402,7 @@ async function collectLinks(tabId) {
           links.push({
             url: url.href,
             title: (element.textContent?.trim() || element.alt || name || url.pathname.split("/").pop() || url.host).slice(0, 200),
-            kind: media ? "media" : /\.(zip|7z|rar|exe|msi|pdf|iso|dmg|apk|bin|tar|gz|mp4|mp3|webm|wav|png|jpe?g|webp|csv|docx|xlsx)$/i.test(url.pathname) || element.hasAttribute("download") ? "file" : "link",
+            kind: media ? "media" : url.protocol === "magnet:" || /\.(torrent|zip|7z|rar|exe|msi|pdf|iso|dmg|apk|bin|tar|gz|mp4|mp3|webm|wav|png|jpe?g|webp|csv|docx|xlsx)$/i.test(url.pathname) || element.hasAttribute("download") ? "file" : "link",
             ...(name ? { suggestedFileName: name } : {}),
           });
           if (links.length === 1000) break;
@@ -585,10 +478,6 @@ api.runtime.onMessage.addListener((message, sender, sendResponse) => {
       startPaused: message.startPaused ?? false, scheduledFor: message.scheduledFor ?? null,
       speedLimitBps: message.speedLimitBps ?? 0,
     });
-    if (message.type === "refreshDownload") {
-      const requestHeaders = await sessionContext({url:message.url,incognito:false});
-      return nativeRequest("refreshDownload", { downloadId:message.downloadId,url:message.url,expectedSha256:message.expectedSha256??null,restart:message.restart??false,requestHeaders });
-    }
     if (["ping", "getDownloads", "showApp"].includes(message.type)) return nativeRequest(message.type);
     if (message.type === "controlDownload") return nativeRequest("controlDownload", { downloadId: message.downloadId, action: message.action });
     throw new Error("Unknown Fetchrail action.");

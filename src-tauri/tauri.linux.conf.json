@@ -1,0 +1,23 @@
+{
+  "bundle": {
+    "targets": ["deb", "rpm", "appimage"],
+    "createUpdaterArtifacts": true,
+    "resources": { "../release-artifacts/THIRD_PARTY_NOTICES.txt": "licenses/THIRD_PARTY_NOTICES.txt" },
+    "category": "Utility",
+    "shortDescription": "Download files with multiple connections and resume support",
+    "homepage": "https://github.com/Beelzebub2/fetchrail",
+    "linux": {
+      "deb": {
+        "depends": ["libwebkit2gtk-4.1-0", "libgtk-3-0", "libxdo3", "ca-certificates", "xdg-utils"],
+        "recommends": ["libayatana-appindicator3-1"],
+        "section": "net",
+        "desktopTemplate": "linux/fetchrail.desktop.hbs"
+      },
+      "rpm": {
+        "depends": ["webkit2gtk4.1", "gtk3", "libxdo", "ca-certificates", "xdg-utils"],
+        "recommends": ["libayatana-appindicator-gtk3"],
+        "desktopTemplate": "linux/fetchrail.desktop.hbs"
+      }
+    }
+  }
+}

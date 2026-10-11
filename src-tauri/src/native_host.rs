@@ -3,8 +3,6 @@ use std::{
     fs,
     io::{self, BufRead, BufReader, Read, Write},
     net::TcpStream,
-    path::PathBuf,
-    process::Command,
     thread,
     time::Duration,
 };
@@ -16,8 +14,8 @@ use crate::native_protocol::{
 
 pub const CHROMIUM_EXTENSION_ID: &str = "fkmedfamaoejlhddajndhjemiedmnldh";
 pub const CHROMIUM_STORE_EXTENSION_ID: &str = "ccmbmcgihlemlheldpkgnidgohlkaipb";
-pub const FIREFOX_EXTENSION_ID: &str = "{bb4d3986-35bd-4e55-bbcb-bb7f67894086}";
-pub const LEGACY_FIREFOX_EXTENSION_ID: &str = "browser@braid.rrmtools.uk";
+pub const FIREFOX_EXTENSION_ID: &str = "browser@braid.rrmtools.uk";
+pub const LOCAL_FIREFOX_EXTENSION_ID: &str = "{bb4d3986-35bd-4e55-bbcb-bb7f67894086}";
 
 pub fn is_browser_invocation() -> bool {
     is_browser_invocation_args(std::env::args_os().skip(1))
@@ -34,7 +32,7 @@ fn is_browser_invocation_args(args: impl IntoIterator<Item = OsString>) -> bool 
             .iter()
             .any(|origin| argument == origin.as_str())
             || argument == FIREFOX_EXTENSION_ID
-            || argument == LEGACY_FIREFOX_EXTENSION_ID
+            || argument == LOCAL_FIREFOX_EXTENSION_ID
     })
 }
 
@@ -89,14 +87,11 @@ fn forward_request(request: NativeRequest) -> Result<NativeResponse, String> {
             match send_to_bridge(&config, &request) {
                 Ok(Some(response)) => return Ok(response),
                 Ok(None) => {}
-                // Adds reuse their persisted handoff ID; other uncertain writes are never replayed.
+                // Reads can be retried after a reset; never replay an uncertain write.
                 Err(_)
                     if matches!(
                         request.method,
-                        NativeMethod::Ping
-                            | NativeMethod::GetDownloads
-                            | NativeMethod::GetHandoff
-                            | NativeMethod::AddDownloads
+                        NativeMethod::Ping | NativeMethod::GetDownloads
                     ) && attempt < 2 =>
                 {
                     thread::sleep(Duration::from_millis(100));
@@ -151,17 +146,7 @@ fn send_to_bridge(
 }
 
 fn read_bridge_config() -> Result<BrowserBridgeConfig, String> {
-    if let Some(directory) = std::env::var_os("FETCHRAIL_DATA_DIR") {
-        let bytes = fs::read(PathBuf::from(directory).join("browser-bridge.json"))
-            .map_err(|error| error.to_string())?;
-        return serde_json::from_slice(&bytes).map_err(|error| error.to_string());
-    }
-    let appdata = std::env::var_os("APPDATA")
-        .map(PathBuf::from)
-        .ok_or_else(|| "APPDATA is unavailable.".to_string())?;
-    let path = appdata
-        .join("com.rrmtools.braid")
-        .join("browser-bridge.json");
+    let path = crate::platform::app_data_dir()?.join("browser-bridge.json");
     let bytes =
         fs::read(path).map_err(|error| format!("Browser bridge state is unavailable: {error}"))?;
     serde_json::from_slice(&bytes)
@@ -169,18 +154,13 @@ fn read_bridge_config() -> Result<BrowserBridgeConfig, String> {
 }
 
 /// The port of a running app's bridge, as last published.
+#[cfg(windows)]
 pub(crate) fn bridge_port() -> Option<u16> {
     read_bridge_config().ok().map(|config| config.port)
 }
 
 fn launch_fetchrail() -> Result<(), String> {
-    let app =
-        std::env::current_exe().map_err(|error| format!("Could not locate Fetchrail: {error}"))?;
-    Command::new(app)
-        .arg("--background")
-        .spawn()
-        .map_err(|error| format!("Could not launch Fetchrail: {error}"))?;
-    Ok(())
+    crate::platform::launch(&["--background"])
 }
 
 fn read_native_message(reader: &mut impl Read) -> Result<Option<Vec<u8>>, String> {
@@ -234,9 +214,6 @@ mod tests {
         ]));
         assert!(!is_browser_invocation_args([OsString::from(
             "--background",
-        )]));
-        assert!(is_browser_invocation_args([OsString::from(
-            LEGACY_FIREFOX_EXTENSION_ID
         )]));
         assert!(!is_browser_invocation_args([OsString::from(
             "chrome-extension://arbitrary-extension-id/",

@@ -1,0 +1,16 @@
+diff --git a/src/session_impl.cpp b/src/session_impl.cpp
+--- a/src/session_impl.cpp
++++ b/src/session_impl.cpp
+@@ -636,6 +636,12 @@ namespace aux {
+ 		if (ec) session_log("SSL load_verify_file failed: %s", ec.message().c_str());
+ #endif
+ 		ec.clear();
++		// Fedora's current trust extraction path does not require legacy symlinks.
++		m_ssl_ctx.load_verify_file("/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem", ec);
++#ifndef TORRENT_DISABLE_LOGGING
++		if (ec) session_log("SSL load_verify_file failed: %s", ec.message().c_str());
++#endif
++		ec.clear();
+ #endif // __linux__
+ #endif // TORRENT_USE_SSL
+ #ifdef TORRENT_SSL_PEERS

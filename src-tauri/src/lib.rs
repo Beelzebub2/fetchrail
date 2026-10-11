@@ -7,23 +7,20 @@ mod download_window;
 mod engine;
 #[cfg(windows)]
 pub mod install;
+mod integrity;
+#[cfg(target_os = "linux")]
+mod linux_updates;
 mod model;
 pub mod native_host;
 pub mod native_protocol;
 mod network;
-mod storage;
-
-pub(crate) fn data_dir(app: &AppHandle) -> Result<std::path::PathBuf, String> {
-    if let Some(path) = std::env::var_os("FETCHRAIL_DATA_DIR") {
-        let path = std::path::PathBuf::from(path);
-        if !path.is_absolute() {
-            return Err("FETCHRAIL_DATA_DIR must be absolute.".into());
-        }
-        return Ok(path);
-    }
-    app.path().app_data_dir().map_err(|error| error.to_string())
-}
+mod organize;
+pub mod platform;
+#[cfg(target_os = "linux")]
+mod power_events;
 mod rate_limit;
+mod staging;
+pub mod torrent;
 
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -36,6 +33,7 @@ use model::{
     AddDownloadRequest, BatchDownloadResult, DownloadRecord, DownloadSettings, EngineOverview,
     QueueRecord,
 };
+use organize::{OrganizeMode, OrganizeReport};
 use tauri::{
     menu::{Menu, MenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
@@ -43,11 +41,57 @@ use tauri::{
 };
 use uuid::Uuid;
 
-struct FrontendReady(AtomicBool);
+struct FrontendReady(AtomicBool, std::sync::Mutex<Option<String>>);
+struct ShuttingDown(AtomicBool);
+struct TrayReady(AtomicBool);
+struct BrowserIntegration(std::sync::Mutex<platform::Feature>);
 
 #[tauri::command]
-fn frontend_ready(ready: State<'_, FrontendReady>) {
+fn repair_browser_integration(app: AppHandle) -> Result<platform::Feature, String> {
+    let outcome = browser_extension::install(&app);
+    let status = platform::Feature::new(outcome.is_ok(), outcome.as_ref().err().cloned().unwrap_or_else(|| "Browser manifests and companion files were repaired. Reload the companion in your browser.".into()));
+    *app.state::<BrowserIntegration>()
+        .0
+        .lock()
+        .expect("browser status poisoned") = status.clone();
+    outcome.map(|_| status)
+}
+
+#[tauri::command]
+async fn platform_diagnostics(app: AppHandle) -> serde_json::Value {
+    let capabilities = platform_capabilities(app).await;
+    // Registration errors can contain a home/profile path; diagnostics only expose availability.
+    serde_json::json!({"applicationVersion":env!("CARGO_PKG_VERSION"),"os":capabilities.os,"architecture":std::env::consts::ARCH,"webviewVersion":tauri::webview_version().ok(),"updateOwner":capabilities.update_owner,"trayAvailable":capabilities.tray.available,"shutdownAvailable":capabilities.shutdown.available,"disconnectAvailable":capabilities.disconnect.available,"browserIntegrationAvailable":capabilities.browser_integration.available,"sessionType":std::env::var("XDG_SESSION_TYPE").ok().filter(|v| matches!(v.as_str(), "x11" | "wayland"))})
+}
+
+#[tauri::command]
+fn torrent_licenses() -> &'static str {
+    include_str!("../native/THIRD-PARTY-NOTICES.txt")
+}
+
+#[tauri::command]
+async fn platform_capabilities(app: AppHandle) -> platform::Capabilities {
+    let ready = app.state::<TrayReady>().0.load(Ordering::Relaxed);
+    #[cfg(target_os = "linux")]
+    let ready = ready && platform::tray_available().await;
+    let mut capabilities = platform::capabilities(ready).await;
+    let integration = app.state::<BrowserIntegration>();
+    let status = integration.0.lock().expect("browser status poisoned");
+    if !status.available {
+        capabilities.browser_integration = status.clone();
+    }
+    capabilities
+}
+
+#[tauri::command]
+fn frontend_ready(
+    app: AppHandle,
+    ready: State<'_, FrontendReady>,
+    manager: State<'_, Arc<DownloadManager>>,
+) {
     ready.0.store(true, Ordering::Relaxed);
+    let _ = manager.offer_torrent_sources(Vec::new(), true);
+    let _ = app;
 }
 
 #[tauri::command]
@@ -64,6 +108,43 @@ async fn add_downloads(
     requests: Vec<AddDownloadRequest>,
 ) -> Result<BatchDownloadResult, String> {
     manager.inner().add_batch(requests).await
+}
+
+#[tauri::command]
+async fn import_torrent(
+    manager: State<'_, Arc<DownloadManager>>,
+    request: torrent::TorrentImportRequest,
+) -> Result<serde_json::Value, String> {
+    manager.import_torrent(request).await
+}
+#[tauri::command]
+async fn torrent_import_status(
+    manager: State<'_, Arc<DownloadManager>>,
+    id: Uuid,
+) -> Result<serde_json::Value, String> {
+    manager.torrent_import_status(id).await
+}
+#[tauri::command]
+async fn cancel_torrent_import(
+    manager: State<'_, Arc<DownloadManager>>,
+    id: Uuid,
+) -> Result<(), String> {
+    manager.cancel_torrent_import(id).await
+}
+#[tauri::command]
+async fn commit_torrent(
+    manager: State<'_, Arc<DownloadManager>>,
+    request: torrent::TorrentCommitRequest,
+) -> Result<DownloadRecord, String> {
+    manager.commit_torrent(request).await
+}
+#[tauri::command]
+async fn torrent_command(
+    manager: State<'_, Arc<DownloadManager>>,
+    id: Uuid,
+    request: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    manager.torrent_command(id, request).await
 }
 
 #[tauri::command]
@@ -159,6 +240,14 @@ async fn update_settings(
 }
 
 #[tauri::command]
+async fn organize_existing_downloads(
+    manager: State<'_, Arc<DownloadManager>>,
+    mode: OrganizeMode,
+) -> Result<OrganizeReport, String> {
+    manager.organize_existing_downloads(mode).await
+}
+
+#[tauri::command]
 async fn list_queues(manager: State<'_, Arc<DownloadManager>>) -> Result<Vec<QueueRecord>, String> {
     Ok(manager.list_queues().await)
 }
@@ -217,27 +306,12 @@ async fn place_download(
 }
 
 #[tauri::command]
-async fn refresh_download(
-    manager: State<'_, Arc<DownloadManager>>,
-    id: Uuid,
-    url: String,
-    expected_sha256: Option<String>,
-    restart: bool,
-) -> Result<DownloadRecord, String> {
-    manager
-        .inner()
-        .refresh(id, url, expected_sha256, None, restart)
-        .await
-}
-
-#[tauri::command]
 fn update_status(app: AppHandle) -> serde_json::Value {
     #[cfg(windows)]
     return serde_json::json!(app.state::<install::Updates>().status());
-    #[cfg(not(windows))]
+    #[cfg(target_os = "linux")]
     {
-        let _ = app;
-        serde_json::json!({ "state": "unmanaged" })
+        serde_json::json!(app.state::<linux_updates::Updates>().status())
     }
 }
 
@@ -245,17 +319,18 @@ fn update_status(app: AppHandle) -> serde_json::Value {
 async fn check_for_update(app: AppHandle) -> serde_json::Value {
     #[cfg(windows)]
     return serde_json::json!(install::check_for_update(&app).await);
-    #[cfg(not(windows))]
-    update_status(app)
+    #[cfg(target_os = "linux")]
+    serde_json::json!(linux_updates::check(&app).await)
 }
 
 #[tauri::command]
 fn restart_app(app: AppHandle) -> Result<(), String> {
     #[cfg(windows)]
     return install::restart(&app);
-    #[cfg(not(windows))]
+    #[cfg(target_os = "linux")]
     {
-        app.request_restart();
+        platform::launch(&["--restart-after", &std::process::id().to_string()])?;
+        app.exit(0);
         Ok(())
     }
 }
@@ -293,7 +368,18 @@ fn show_main_window(app: &AppHandle) {
 
 // One embedded copy of the interface serves both the app and its setup program.
 fn context() -> tauri::Context {
-    tauri::generate_context!()
+    let mut context = tauri::generate_context!();
+    if platform::test_root()
+        .expect("invalid isolated test environment")
+        .is_some()
+    {
+        context.config_mut().identifier = format!(
+            "{0}.fixture{1}",
+            platform::APP_ID,
+            std::env::var("FETCHRAIL_TEST_ID").unwrap().replace('-', "")
+        );
+    }
+    context
 }
 
 /// The interface is drawn by the WebView2 runtime; say so plainly on a PC that lacks it.
@@ -421,13 +507,31 @@ pub fn run() {
     #[cfg(windows)]
     require_webview();
     tauri::Builder::default()
-        .manage(FrontendReady(AtomicBool::new(false)))
-        .plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
+        .manage(FrontendReady(
+            AtomicBool::new(false),
+            std::sync::Mutex::new(None),
+        ))
+        .on_page_load(|webview, payload| {
+            if webview.label() == "main" {
+                let ready = webview.state::<FrontendReady>();
+                if payload.event() == tauri::webview::PageLoadEvent::Started {
+                    ready.0.store(false, Ordering::Relaxed);
+                }
+                *ready.1.lock().expect("frontend URL poisoned") = Some(payload.url().to_string());
+            }
+        })
+        .manage(ShuttingDown(AtomicBool::new(false)))
+        .manage(TrayReady(AtomicBool::new(false)))
+        .manage(BrowserIntegration(std::sync::Mutex::new(
+            platform::Feature::new(false, "Browser integration has not started."),
+        )))
+        .plugin(tauri_plugin_single_instance::init(|app, args, cwd| {
             // Setup asks a running copy to step aside before it replaces the executable.
             if args.iter().any(|argument| argument == "--quit") {
                 app.exit(0);
             } else if !args.iter().any(|argument| argument == "--background") {
                 show_main_window(app);
+                offer_torrent_arguments(app, args, Some(std::path::Path::new(&cwd)));
             }
         }))
         .plugin(tauri_plugin_dialog::init())
@@ -443,17 +547,22 @@ pub fn run() {
                 install::tidy_after_update();
                 app.manage(install::Updates::new());
             }
+            #[cfg(target_os = "linux")]
+            app.manage(linux_updates::Updates::new());
             tauri::WebviewWindowBuilder::from_config(app.handle(), &app.config().app.windows[0])?
                 .build()?;
-            if std::env::var_os("FETCHRAIL_DATA_DIR").is_none() {
-                if let Err(error) = browser_extension::install(app.handle()) {
-                    eprintln!("Fetchrail browser extension: {error}");
-                }
+            if let Err(error) = repair_browser_integration(app.handle().clone()) {
+                eprintln!("Fetchrail browser extension: {error}");
             }
             let manager =
                 tauri::async_runtime::block_on(DownloadManager::load(app.handle().clone()))
                     .map_err(std::io::Error::other)?;
             app.manage(manager.clone());
+            offer_torrent_arguments(
+                app.handle(),
+                std::env::args().collect(),
+                std::env::current_dir().ok().as_deref(),
+            );
             // Setup passes this on when "Start with Windows" was ticked.
             if std::env::args().any(|argument| argument == "--launch-on-start") {
                 let mut settings = tauri::async_runtime::block_on(manager.settings());
@@ -466,64 +575,125 @@ pub fn run() {
                 tauri::async_runtime::spawn(async move {
                     tokio::time::sleep(std::time::Duration::from_secs(20)).await;
                     loop {
-                        if std::env::var_os("FETCHRAIL_DATA_DIR").is_none()
-                            && manager.settings().await.auto_update
-                        {
+                        if manager.settings().await.auto_update {
                             install::check_for_update(&app).await;
                         }
-                        tokio::time::sleep(std::time::Duration::from_secs(6 * 60 * 60)).await;
+                        tokio::time::sleep(std::time::Duration::from_secs(30 * 60)).await;
                     }
                 });
             }
+            #[cfg(target_os = "linux")]
+            {
+                let (app, manager) = (app.handle().clone(), manager.clone());
+                tauri::async_runtime::spawn(async move {
+                    tokio::time::sleep(std::time::Duration::from_secs(20)).await;
+                    loop {
+                        if manager.settings().await.auto_update {
+                            linux_updates::check(&app).await;
+                        }
+                        tokio::time::sleep(std::time::Duration::from_secs(30 * 60)).await;
+                    }
+                });
+            }
+            #[cfg(target_os = "linux")]
+            tauri::async_runtime::spawn(power_events::watch(manager.clone()));
             tauri::async_runtime::block_on(browser_bridge::start(app.handle().clone(), manager))
                 .map_err(std::io::Error::other)?;
 
-            let show_item = MenuItem::with_id(app, "show", "Show Fetchrail", true, None::<&str>)?;
-            let extension_item = MenuItem::with_id(
-                app,
-                "extension",
-                "Open extension folder",
-                true,
-                None::<&str>,
-            )?;
-            let quit_item = MenuItem::with_id(app, "quit", "Quit Fetchrail", true, None::<&str>)?;
-            let tray_menu = Menu::with_items(app, &[&show_item, &extension_item, &quit_item])?;
-            TrayIconBuilder::new()
-                // The simplified mark stays legible at tray size.
-                .icon(tauri::include_image!("icons/tray.png"))
-                .tooltip("Fetchrail Download Manager")
-                .menu(&tray_menu)
-                .show_menu_on_left_click(false)
-                .on_menu_event(|app, event| match event.id().as_ref() {
-                    "show" => show_main_window(app),
-                    "extension" => {
-                        if let Err(error) = browser_extension::open_folder(
-                            app,
-                            browser_extension::Browser::Chromium,
+            let tray_result = (|| -> tauri::Result<_> {
+                let show_item =
+                    MenuItem::with_id(app, "show", "Show Fetchrail", true, None::<&str>)?;
+                let extension_item = MenuItem::with_id(
+                    app,
+                    "extension",
+                    "Open extension folder",
+                    true,
+                    None::<&str>,
+                )?;
+                let quit_item =
+                    MenuItem::with_id(app, "quit", "Quit Fetchrail", true, None::<&str>)?;
+                let tray_menu = Menu::with_items(app, &[&show_item, &extension_item, &quit_item])?;
+                let tray_builder = TrayIconBuilder::new()
+                    // The simplified mark stays legible at tray size.
+                    .icon(tauri::include_image!("icons/tray.png"))
+                    .tooltip("Fetchrail Download Manager")
+                    .menu(&tray_menu)
+                    .show_menu_on_left_click(false)
+                    .on_menu_event(|app, event| match event.id().as_ref() {
+                        "show" => show_main_window(app),
+                        "extension" => {
+                            if let Err(error) = browser_extension::open_folder(
+                                app,
+                                browser_extension::Browser::Chromium,
+                            ) {
+                                eprintln!("Fetchrail browser extension: {error}");
+                            }
+                        }
+                        "quit" => app.exit(0),
+                        _ => {}
+                    })
+                    .on_tray_icon_event(|tray, event| {
+                        if matches!(
+                            event,
+                            TrayIconEvent::Click {
+                                button: MouseButton::Left,
+                                button_state: MouseButtonState::Up,
+                                ..
+                            }
                         ) {
-                            eprintln!("Fetchrail browser extension: {error}");
+                            show_main_window(tray.app_handle());
                         }
-                    }
-                    "quit" => app.exit(0),
-                    _ => {}
-                })
-                .on_tray_icon_event(|tray, event| {
-                    if matches!(
-                        event,
-                        TrayIconEvent::Click {
-                            button: MouseButton::Left,
-                            button_state: MouseButtonState::Up,
-                            ..
+                    });
+                #[cfg(target_os = "linux")]
+                let tray_builder = {
+                    let directory = platform::app_data_dir()
+                        .map_err(std::io::Error::other)?
+                        .join("tray");
+                    platform::private_dir(&directory)?;
+                    tray_builder.temp_dir_path(directory)
+                };
+                tray_builder.build(app)
+            })();
+            let tray_created = tray_result.is_ok();
+            let tray_ready = tray_created;
+            if let Err(error) = tray_result {
+                eprintln!("Fetchrail tray is unavailable: {error}");
+            }
+            #[cfg(target_os = "linux")]
+            let tray_ready =
+                tray_ready && tauri::async_runtime::block_on(platform::tray_available());
+            app.state::<TrayReady>()
+                .0
+                .store(tray_created, Ordering::Relaxed);
+            #[cfg(target_os = "linux")]
+            if tray_created {
+                let app = app.handle().clone();
+                tauri::async_runtime::spawn(async move {
+                    let mut present = tray_ready;
+                    loop {
+                        tokio::time::sleep(std::time::Duration::from_secs(4)).await;
+                        let now = platform::tray_available().await;
+                        if present && !now {
+                            if let Some(window) = app.get_webview_window("main") {
+                                if !window.is_visible().unwrap_or(true) {
+                                    let _ = window.show();
+                                    let _ = window.minimize();
+                                }
+                            }
                         }
-                    ) {
-                        show_main_window(tray.app_handle());
+                        present = now;
                     }
-                })
-                .build(app)?;
+                });
+            }
 
             if std::env::args().any(|argument| argument == "--background") {
                 if let Some(window) = app.get_webview_window("main") {
-                    let _ = window.hide();
+                    if tray_ready {
+                        let _ = window.hide();
+                    } else {
+                        let _ = window.show();
+                        let _ = window.minimize();
+                    }
                 }
             } else {
                 show_main_window(app.handle());
@@ -548,7 +718,34 @@ pub fn run() {
                 }
                 if manager.minimize_to_tray_enabled() {
                     api.prevent_close();
-                    let _ = window.hide();
+                    #[cfg(windows)]
+                    if window
+                        .app_handle()
+                        .state::<TrayReady>()
+                        .0
+                        .load(Ordering::Relaxed)
+                    {
+                        let _ = window.hide();
+                    } else {
+                        let _ = window.minimize();
+                    }
+                    #[cfg(target_os = "linux")]
+                    {
+                        let window = window.clone();
+                        let built = window
+                            .app_handle()
+                            .state::<TrayReady>()
+                            .0
+                            .load(Ordering::Relaxed);
+                        tauri::async_runtime::spawn(async move {
+                            if built && platform::tray_available().await {
+                                let _ = window.hide();
+                            } else {
+                                let _ = window.show();
+                                let _ = window.minimize();
+                            }
+                        });
+                    }
                 } else {
                     window.app_handle().exit(0);
                 }
@@ -556,12 +753,21 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             frontend_ready,
+            platform_capabilities,
+            platform_diagnostics,
+            repair_browser_integration,
             download_window::get_download,
             download_window::show_download_progress,
             download_window::set_download_completion_options,
             download_window::open_download,
             add_download,
             add_downloads,
+            import_torrent,
+            torrent_import_status,
+            cancel_torrent_import,
+            commit_torrent,
+            torrent_command,
+            torrent_licenses,
             set_download_speed_limit,
             schedule_queue,
             list_downloads,
@@ -571,11 +777,11 @@ pub fn run() {
             cancel_download,
             remove_download,
             place_download,
-            refresh_download,
             reveal_download,
             get_settings,
             open_browser_extension_folder,
             update_settings,
+            organize_existing_downloads,
             list_queues,
             create_queue,
             delete_queue,
@@ -586,6 +792,81 @@ pub fn run() {
             check_for_update,
             restart_app,
         ])
-        .run(context())
-        .expect("error while running Fetchrail");
+        .build(context())
+        .expect("error while building Fetchrail")
+        .run(|app, event| {
+            if let tauri::RunEvent::ExitRequested { api, code, .. } = event {
+                if !app.state::<ShuttingDown>().0.swap(true, Ordering::AcqRel) {
+                    api.prevent_exit();
+                    let app = app.clone();
+                    let manager = app.state::<Arc<DownloadManager>>().inner().clone();
+                    tauri::async_runtime::spawn(async move {
+                        manager.shutdown().await;
+                        app.exit(code.unwrap_or(0));
+                    });
+                }
+            }
+        });
+}
+
+fn offer_torrent_arguments(
+    app: &AppHandle,
+    arguments: Vec<String>,
+    _cwd: Option<&std::path::Path>,
+) {
+    #[cfg(target_os = "linux")]
+    let sources = arguments
+        .into_iter()
+        .skip(1)
+        .filter_map(|argument| platform::torrent_argument_source(&argument, _cwd))
+        .collect::<Vec<_>>();
+    #[cfg(not(target_os = "linux"))]
+    let sources = arguments
+        .into_iter()
+        .skip(1)
+        .filter(|arg| arg.starts_with("magnet:") || arg.to_lowercase().ends_with(".torrent"))
+        .collect::<Vec<_>>();
+    if let Some(manager) = app.try_state::<Arc<DownloadManager>>() {
+        let ready = app.state::<FrontendReady>().0.load(Ordering::Relaxed);
+        if let Err(error) = manager.offer_torrent_sources(sources, ready) {
+            eprintln!("Torrent handoff: {error}");
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub fn repair_linux_integration() -> Result<(), String> {
+    browser_extension::install_files()
+}
+
+#[cfg(target_os = "linux")]
+pub fn remove_linux_integration() -> Result<(), String> {
+    platform::sync_startup_registration(false)?;
+    browser_extension::remove_native_host()
+}
+
+#[cfg(target_os = "linux")]
+pub fn wait_for_linux_restart() -> Result<(), String> {
+    let args = std::env::args().collect::<Vec<_>>();
+    if let Some(index) = args.iter().position(|arg| arg == "--restart-after") {
+        let pid = args
+            .get(index + 1)
+            .ok_or("Missing restart PID.")?
+            .parse::<u32>()
+            .map_err(|_| "Invalid restart PID.")?;
+        if pid == 0 || pid == std::process::id() {
+            return Err("Invalid restart PID.".into());
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while std::path::Path::new(&format!("/proc/{pid}")).exists() {
+            if std::time::Instant::now() >= deadline {
+                return Err(
+                    "The previous Fetchrail instance did not exit. Its downloads were kept intact."
+                        .into(),
+                );
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+    }
+    Ok(())
 }

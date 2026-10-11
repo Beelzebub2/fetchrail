@@ -6,8 +6,7 @@ import { randomUUID } from "node:crypto";
 const requests = [];
 const titles = [];
 let listener;
-const alarmListeners = [];
-const alarmListener = (alarm) => alarmListeners.forEach((listener) => listener(alarm));
+let alarmListener;
 let openPanels = [];
 let reloads = 0;
 let holdNativeRequest = null;
@@ -32,7 +31,7 @@ const api = {
   },
   alarms: {
     create(name, options) { assert.equal(name, "fetchrail.extensionUpdate"); assert.equal(options.periodInMinutes, 1); },
-    onAlarm: { addListener(value) { alarmListeners.push(value); } },
+    onAlarm: { addListener(value) { alarmListener = value; } },
   },
   storage: { local: {
     async get(key) { return { [key]: stored[key] }; },
@@ -73,6 +72,17 @@ assert.equal((await send({ type: "unknown" })).ok, false);
 const partial = await send({ type: "addDownloads", items: [{ url: 'https://example.com/ok.zip' }, { url: 'https://example.com/reject.zip' }] });
 assert.equal(partial.result.accepted, 1);
 assert.equal(partial.result.errors[0].url, 'https://example.com/reject.zip');
+const torrentStart = requests.length;
+const torrentBatch = await send({ type: "addDownloads", items: [
+  { url: 'https://example.com/ok.zip' },
+  { url: 'magnet:?xt=urn:btih:abcdef0123456789abcdef0123456789abcdef0123', requestContext: { cookie: 'private' } },
+  { url: 'https://example.com/source.torrent', requestContext: { authorization: 'private' } },
+] });
+assert.equal(torrentBatch.result.accepted, 3);
+const torrentRequests = requests.slice(torrentStart);
+assert.deepEqual(torrentRequests.map(request => request.method), ['addDownloads', 'addTorrents']);
+assert.equal(torrentRequests[1].params.items.length, 2);
+assert.ok(torrentRequests[1].params.items.every(item => !item.requestContext), 'Torrent handoff must omit browser credentials');
 const checkUpdate = () => vm.runInContext("checkForExtensionUpdate()", context);
 await new Promise(setImmediate); // Let the completed message handlers release their busy counters.
 await checkUpdate();
@@ -119,6 +129,6 @@ delete api.downloads;
 vm.runInContext(await readFile(new URL("../browser-extension/dist/chromium/background.js", import.meta.url), "utf8"),
   vm.createContext({ browser: api, crypto: { randomUUID }, URL }));
 await new Promise(setImmediate);
-assert.match(titles.at(-1), /reload the companion to enable capture/);
+assert.match(titles.at(-1), /reload the extension to enable browser download capture/);
 assert.equal((await send({ type: "ping" })).ok, true, "Missing capture permission must not break the app connection.");
 console.log("Extension checks passed: sender isolation, URL validation, batches, controls, idle updates, draft protection, busy deferral, reload-loop prevention, Firefox fallback, missing download permission recovery.");

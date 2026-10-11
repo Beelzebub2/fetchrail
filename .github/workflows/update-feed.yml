@@ -1,0 +1,32 @@
+name: Repair update feed notification
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Published stable release tag to announce
+        required: true
+        type: string
+permissions:
+  contents: read
+  id-token: write
+jobs:
+  notify:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version: '24'
+      - name: Retrieve published manifest
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          FETCHRAIL_RELEASE_TAG: ${{ inputs.tag }}
+        run: gh release download "$FETCHRAIL_RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --pattern latest.json --dir release-artifacts
+      - name: Repair notification
+        env:
+          FETCHRAIL_RELEASE_TAG: ${{ inputs.tag }}
+        run: node scripts/notify-update-feed.mjs release-artifacts/latest.json
