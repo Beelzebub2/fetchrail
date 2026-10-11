@@ -243,13 +243,14 @@ jobs:
           ldd src-tauri/target/release/fetchrail | tee elf-dependencies.txt
           ! grep -q 'not found' elf-dependencies.txt
       - name: Run actual WebKitGTK desktop and HTTP fixtures
-        run: xvfb-run -a dbus-run-session -- npm run linux:qualify
+        # Keep X11 available while restart recovery closes the last app connection.
+        run: xvfb-run -a -s "-screen 0 1280x1024x24 -noreset" dbus-run-session -- npm run linux:qualify
       - name: Install native WebKitGTK desktop test driver
         run: |
           sudo apt-get install -y --no-install-recommends webkit2gtk-driver weston
           cargo install tauri-driver --version 2.1.0 --locked
       - name: Test native settings, autostart and progress windows
-        run: xvfb-run -a dbus-run-session -- npm run linux:desktop
+        run: xvfb-run -a -s "-screen 0 1280x1024x24 -noreset" dbus-run-session -- npm run linux:desktop
       - name: Test native Wayland settings and progress windows
         run: npm run linux:wayland
       - name: Build Linux packages without release secrets
@@ -275,19 +276,19 @@ jobs:
           dpkg-deb --extract "$deb" "$desktop"
           find "$desktop/usr/share/applications" -name '*.desktop' -exec desktop-file-validate {} +
           sudo apt-get install -y "$(realpath "$deb")"
-          xvfb-run -a dbus-run-session -- node scripts/smoke-desktop.mjs /usr/bin/fetchrail
+          xvfb-run -a -s "-screen 0 1280x1024x24 -noreset" dbus-run-session -- node scripts/smoke-desktop.mjs /usr/bin/fetchrail
           sudo apt-get remove -y fetchrail
           image=$(find src-tauri/target/release/bundle -name '*.AppImage' -print -quit)
           test -n "$image"
-          xvfb-run -a dbus-run-session -- node scripts/smoke-desktop.mjs "$image"
-          xvfb-run -a dbus-run-session -- node scripts/test-linux-appimage.mjs "$image"
+          xvfb-run -a -s "-screen 0 1280x1024x24 -noreset" dbus-run-session -- node scripts/smoke-desktop.mjs "$image"
+          xvfb-run -a -s "-screen 0 1280x1024x24 -noreset" dbus-run-session -- node scripts/test-linux-appimage.mjs "$image"
           if [[ "$GITHUB_REF_TYPE" == tag ]]; then archive_root=release-artifacts; else archive_root=artifacts/linux-development; fi
           archive=$(find "$archive_root" -name '*.tar.gz' -print -quit)
           test -n "$archive"
-          xvfb-run -a dbus-run-session -- node scripts/test-linux-archive.mjs "$archive"
+          xvfb-run -a -s "-screen 0 1280x1024x24 -noreset" dbus-run-session -- node scripts/test-linux-archive.mjs "$archive"
       - name: Benchmark HTTP completion
         if: inputs.benchmark == true
-        run: xvfb-run -a dbus-run-session -- npm run engine:bench
+        run: xvfb-run -a -s "-screen 0 1280x1024x24 -noreset" dbus-run-session -- npm run engine:bench
       - name: Stage installed-package distro fixtures
         if: matrix.arch == 'x64'
         run: |

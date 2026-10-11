@@ -8,8 +8,7 @@ const server = spawn(process.execPath, ["node_modules/vite/bin/vite.js", "previe
 let browser;
 try {
   for (let i = 0; i < 100; i++) { if (await fetch("http://127.0.0.1:1428").then(r => r.ok, () => false)) break; await delay(100); }
-  // Measure rendering work without the hosted runner's virtual-display frame pacing.
-  browser = await chromium.launch({ headless: true, args: ["--disable-frame-rate-limit"], ...(process.env.PLAYWRIGHT_CHANNEL ? { channel: process.env.PLAYWRIGHT_CHANNEL } : process.platform === "win32" ? { channel: "chrome" } : {}) });
+  browser = await chromium.launch({ headless: true, ...(process.env.PLAYWRIGHT_CHANNEL ? { channel: process.env.PLAYWRIGHT_CHANNEL } : process.platform === "win32" ? { channel: "chrome" } : {}) });
   const page = await browser.newPage({ viewport: { width: 1440, height: 1000 } });
   const errors = []; page.on("pageerror", error => errors.push(error.message));
   await page.addInitScript(() => {
