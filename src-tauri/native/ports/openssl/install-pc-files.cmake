@@ -29,4 +29,6 @@ Libs.private: -lcrypt32 -lws2_32 -ladvapi32 -luser32
 Cflags: -I"${includedir}"
 ]])
 
+# Use the native host tool instead of acquiring the pinned, obsolete MSYS2 runtime.
+find_program(PKGCONFIG NAMES pkgconf PATHS "${CURRENT_HOST_INSTALLED_DIR}/tools/pkgconf" NO_DEFAULT_PATH REQUIRED)
 vcpkg_fixup_pkgconfig()
