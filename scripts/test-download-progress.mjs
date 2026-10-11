@@ -54,7 +54,7 @@ try {
         if (name === "get_download") return structuredClone(window.testRecord);
         if (name === "list_downloads") return [structuredClone(window.testRecord)];
         if (name === "get_settings") return structuredClone(window.testSettings);
-        if (window.testOpenError === name) throw new Error("Could not open destination");
+        if (window.testOpenError === name) throw new Error(name === "open_browser_extension_store" ? "Could not open the Chrome Web Store" : "Could not open destination");
         if (name === "platform_capabilities") return window.testCapabilities ?? (location.search.includes("platform=linux") ? { os: "linux", startup: { available: true, reason: "XDG startup" }, tray: { available: false, reason: "No watcher" }, shutdown: { available: false, reason: "Shutdown denied by policy" }, forceShutdown: { available: false, reason: "Old logind" }, disconnect: { available: true, reason: "Allowed" }, connections: [{ id: "connection-uuid", name: "Test connection" }], updateOwner: "package-manager", browserIntegration: { available: true, reason: "Native browser" } } : { os: "windows", startup: { available: true, reason: "Startup enabled" }, tray: { available: true, reason: "Tray available" }, shutdown: { available: true, reason: "Allowed" }, forceShutdown: { available: true, reason: "Allowed" }, disconnect: { available: true, reason: "Allowed" }, connections: [], updateOwner: "setup", browserIntegration: { available: true, reason: "Native browser" } });
         if (name === "get_overview") return { active: 0, queued: 0, completed: 1, failed: 0, currentSpeedBps: 0 };
         if (name === "list_queues") return [{ name: "Default", paused: false, startsAt: null, stopsAt: null }];
@@ -203,6 +203,31 @@ try {
   await page.locator(".top-rail").getByRole("button", { name: /Restart to update/ }).click();
   await page.getByRole("alert").filter({ hasText: "Could not restart Fetchrail: test launch failure" }).waitFor();
   assert.equal(await page.evaluate(() => window.testCalls.filter((call) => call.name === "restart_app").length), 2);
+  for (const platform of ["windows", "linux"]) {
+    await page.setViewportSize({ width: 960, height: 1000 });
+    await page.goto(base + "?platform=" + platform);
+    await page.getByRole("button", { name: "Settings", exact: true }).click();
+    await page.getByRole("tab", { name: "Browser", exact: true }).click();
+    const companion = page.locator('[aria-labelledby="extension-settings-title"]');
+    const store = companion.getByRole("button", { name: "Get from Chrome Web Store", exact: true });
+    await store.waitFor();
+    assert.equal(await companion.getByRole("button", { name: "Open extension folder", exact: true }).isVisible(), false);
+    await page.evaluate(() => { window.testCalls = []; });
+    await store.click();
+    await page.waitForFunction(() => window.testCalls.some(call => call.name === "open_browser_extension_store"));
+    assert.equal(await page.evaluate(() => window.testCalls.some(call => call.name === "open_browser_extension_folder")), false);
+    await page.screenshot({ path: join(output, `companion-store-${platform}.png`), fullPage: true });
+    await page.evaluate(() => { window.testOpenError = "open_browser_extension_store"; });
+    await store.click();
+    await companion.getByRole("alert").filter({ hasText: "Could not open the Chrome Web Store" }).waitFor();
+    assert.equal(await store.isEnabled(), true, "A failed store launch must allow retry and manual installation.");
+    await companion.getByText("Manual installation and Firefox", { exact: true }).click();
+    await companion.getByRole("button", { name: "Open extension folder", exact: true }).click();
+    await companion.getByRole("button", { name: "Firefox folder", exact: true }).click();
+    const folders = await page.evaluate(() => window.testCalls.filter(call => call.name === "open_browser_extension_folder").map(call => call.args.browser));
+    assert.deepEqual(folders, ["chromium", "firefox"]);
+    assert.equal(await companion.getByRole("alert").count(), 0, "A successful manual action clears the store launch error.");
+  }
   await page.goto(base + "?progress=test-download&platform=linux");
   await page.getByRole("tab", { name: "Options on completion", exact: true }).click();
   const disconnect = page.getByLabel("Disconnect selected connection when done");
@@ -242,6 +267,7 @@ try {
   console.log("PASS: Linux policy restrictions and connection selection block unsupported actions; saved actions remain clearable after capability loss");
   console.log("PASS: live progress, connection details, pause/resume/cancel, speed limits, completion settings, keyboard tabs, themes, completion actions, close behavior, and prompt handoff");
   console.log("PASS: settings contain switches, update buttons and long error text; both restart actions report launch failures");
+  console.log("PASS: Windows/Linux companion settings recommend the store, report launch failures and retain Chromium/Firefox manual installation");
   console.log("Screenshots: " + output);
 } finally {
   await browser.close();
