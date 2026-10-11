@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "minimum_chrome_version": "116",
   "name": "Fetchrail Browser Integration",
-  "version": "0.5.3",
+  "version": "0.6.0",
   "description": "Send browser downloads to the Fetchrail download manager.",
   "icons": { "16": "icons/16.png", "32": "icons/32.png", "48": "icons/48.png", "128": "icons/128.png" },
   "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAwTCFHXxdBTToDqG34oBW7YCXhzKG9DleYcL/aDCqIlD9rr/uoh4F4GbCXm3Fdf31yaA3o1v/33DTlCVBt4qMloowg1PrqeGoUE9S8v0pQ8cngnE7socMiTSKw+N249wTsxC5jzfj/GD4RyJRknHLP5+irLTxhtLF/zDhh18IbgF+tbmslqc1qEBPrfXOUCpup2sYdEUUCYBc69UwAdngknGymeBhCPW31U4pLzZIUDZzD9QcnbKqwHP28l4GGnm0thlblNhFWXpDa+0a2w0OurQf8C9KmSjpnTD4Zv1IrRbdej/lfjIfjQFs7zuBI/7TWbkLwoow+NfsSVK1F2nnOwIDAQAB",

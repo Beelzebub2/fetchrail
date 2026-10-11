@@ -68,7 +68,6 @@ if [[ -n $prepared ]]; then
   root=$(realpath "$prepared")
   [[ -f $root/etc/os-release && $root != / ]] || exit 1
 else
-  mkdir -p "$root"
   curl --fail --location --retry 3 --output "$work/image" "$url"
   printf '%s  %s\n' "$digest" "$work/image" | sha256sum --check
   if [[ $distro == mint223 ]]; then
@@ -77,6 +76,7 @@ else
     unsquashfs -processors 2 -d "$root" "$work/root.squashfs"
     rm -- "$work/root.squashfs"
   else
+    mkdir -p "$root"
     tar --numeric-owner -xaf "$work/image" -C "$root"
     rm -- "$work/image"
   fi
