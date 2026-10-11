@@ -53,6 +53,14 @@ try {
   await page.goto("http://127.0.0.1:1428");
   // The list is grouped by status: Torrent 1 leads the Downloading section, Torrent 0 is seeding far below it.
   await page.getByRole("button", { name: "Inspect Torrent 1", exact: true }).waitFor();
+  // A mounted button can precede the first paint on a fresh hosted browser.
+  // Finish page startup before measuring actions; the first inspector opening is still measured.
+  const initialPaintMs = await page.evaluate(async () => {
+    const start = performance.now();
+    await document.fonts.ready;
+    await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+    return performance.now() - start;
+  });
   const renderedTransfers = await page.locator(".download-row").count();
   assert.ok(renderedTransfers < 40, `1,000 records must remain virtualized (${renderedTransfers} rendered)`);
   const latencies = [];
@@ -107,7 +115,7 @@ try {
   await page.getByRole("tab", { name: "Files", exact: true }).click();
   await page.screenshot({ path: "artifacts/torrent-ui-narrow.png" });
   const p95 = [...latencies].sort((a, b) => a - b)[Math.ceil(latencies.length * 0.95) - 1];
-  const metrics = { records: 1000, files: 10000, peers: 2000, telemetryHz: 4, steadyTelemetrySeconds: 15, steadyStallsMs: steadyStalls, actionPaintP95Ms: p95, actionPaintSamplesMs: latencies, errors };
+  const metrics = { records: 1000, files: 10000, peers: 2000, initialPaintMs, telemetryHz: 4, steadyTelemetrySeconds: 15, steadyStallsMs: steadyStalls, actionPaintP95Ms: p95, actionPaintSamplesMs: latencies, errors };
   await writeFile("artifacts/torrent-ui-performance.json", JSON.stringify(metrics, null, 2));
   console.log("Torrent UI performance: " + JSON.stringify(metrics));
   assert.deepEqual(errors, []);
