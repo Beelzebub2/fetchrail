@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Download Fetchrail for Linux — x64 and ARM64 Packages</title>
+  <meta name="description" content="Download the free Fetchrail download manager for Linux x64 and ARM64. Choose deb, rpm, AppImage or native archive and check installation requirements.">
+  <meta name="theme-color" content="#0c0e13">
+  <link rel="canonical" href="https://fetchrail.rrmtools.uk/download/linux">
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+  <meta property="og:type" content="website">
+  <meta property="og:site_name" content="Fetchrail">
+  <meta property="og:title" content="Download Fetchrail for Linux — x64 and ARM64 Packages">
+  <meta property="og:description" content="Download the free Fetchrail download manager for Linux x64 and ARM64. Choose deb, rpm, AppImage or native archive and check installation requirements.">
+  <meta property="og:url" content="https://fetchrail.rrmtools.uk/download/linux">
+  <meta property="og:image" content="https://fetchrail.rrmtools.uk/og.jpg">
+  <meta name="twitter:card" content="summary_large_image">
+  <link rel="stylesheet" href="/styles.css">
+  <script src="/theme.js"></script>
+  <script src="/download-ui.mjs" type="module"></script>
+</head>
+<body data-download-platform="linux">
+  <a class="skip" href="#main">Skip to content</a>
+  <header class="site-head"><div class="wrap site-head-row"><a class="brand" href="/">Fetchrail</a><a href="/#install">All downloads</a></div></header>
+  <main id="main" class="wrap guide">
+    <h1>Download Fetchrail for Linux</h1>
+    <p class="lede">Parallel HTTP and HTTPS downloads, safe resume, queues and a browser companion on Linux. Fetchrail is free to download. Choose an x64 or ARM64 package for your desktop.</p><p class="eyebrow mono" data-release-version>Latest release</p>
+<div class="download-choices">
+<label>System <select data-download-os><option value="linux">Linux</option></select></label>
+<label>CPU <select data-download-arch><option value="x64">x86_64 (x64)</option><option value="arm64">aarch64 (ARM64)</option></select></label>
+<label>Package <select data-download-format><option value="deb">deb — Ubuntu / Mint / Kali / Debian</option><option value="rpm">rpm — Fedora</option><option value="AppImage">AppImage</option><option value="tar.gz">Native archive</option></select></label>
+</div><p data-download-help>Choose your CPU with uname -m and a package for your distribution.</p>
+<p class="mono" data-release-file aria-live="polite">Choose your package on the GitHub release page if the feed is unavailable.</p>
+<div class="cta-buttons"><a class="btn btn-primary" href="https://github.com/Beelzebub2/fetchrail/releases/latest" data-download><span data-download-label>View releases</span></a><a class="btn btn-secondary" href="https://github.com/Beelzebub2/fetchrail/releases">All releases and signatures</a></div>
+<h2>Choose a package for your distribution</h2><ul><li><strong>Ubuntu, Mint, Kali and Debian:</strong> choose a matching deb package. Install with <code>sudo apt install ./Fetchrail-vVERSION-linux-x64.deb</code>, substituting the downloaded filename.</li><li><strong>Fedora:</strong> choose rpm and use <code>sudo dnf install ./Fetchrail-vVERSION-linux-x64.rpm</code>, substituting the downloaded filename.</li><li><strong>Other glibc desktops:</strong> use an AppImage or native archive. Native archives require compatible GTK3 and WebKitGTK 4.1 libraries.</li><li><strong>Arch:</strong> the release's <code>release-metadata.tar.gz</code> includes a binary PKGBUILD recipe. Inspect it before running <code>makepkg -si</code>.</li></ul>
+<p>Run <code>uname -m</code>: x86_64 means x64; aarch64 means ARM64. Browser CPU detection is unreliable. Release glibc artifacts are not certified for musl/Alpine or older WebKitGTK systems. Check the <a href="https://github.com/Beelzebub2/fetchrail/blob/main/docs/linux.md">Linux guide</a> and <a href="https://github.com/Beelzebub2/fetchrail/blob/main/docs/linux-support-matrix.md">tested distro and CPU combinations</a> before installing.</p>
+<h2>AppImage installation and updates</h2><p>Keep the AppImage in a persistent, writable location. Make it executable with <code>chmod +x Fetchrail-vVERSION-linux-x64.AppImage</code>, using your filename. The Linux guide covers FUSE requirements and the alternative extracted launch. Writable AppImages support signed automatic updates; native packages update through their package manager, while archives and extracted AppImages update manually.</p>
+<h2>Connect your browser</h2><p>Launch Fetchrail once to register its native host, then follow the <a href="/browser-integration">browser integration guide</a>. Browser package sandboxing can affect native messaging; see the Linux guide for custom profiles and sandbox limits.</p><p>For interrupted downloads, read <a href="/guides/resume-interrupted-downloads">how safe resume works</a>. Need Windows instead? <a href="/download/windows">Get Windows setup</a>.</p>
+  </main>
+  <footer class="wrap site-foot"><nav class="resource-links" aria-label="Download and help"><a href="/download/windows">Download for Windows</a><a href="/download/linux">Download for Linux</a><a href="/browser-integration">Browser integration</a><a href="/compare/fetchrail-vs-idm">Fetchrail vs IDM</a><a href="/guides/resume-interrupted-downloads">Resume a download</a></nav><p><a href="/privacy">Privacy policy</a> · <a href="https://github.com/Beelzebub2/fetchrail/issues">Report an issue</a></p></footer>
+</body>
+</html>

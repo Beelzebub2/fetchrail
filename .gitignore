@@ -14,8 +14,10 @@ release-artifacts/
 artifacts/
 /.native-vcpkg/
 /.vcpkg-binary-cache/
-# Hosted separately on Cloudflare Workers
-/website/
+# Cloudflare website source is tracked; local runtime/build output is not.
+/website/.wrangler/
+/website/artifacts/
+/.wrangler/
 /update-service/.wrangler/
 *.local
 

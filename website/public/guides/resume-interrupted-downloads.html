@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>How to Resume Interrupted Downloads with Fetchrail</title>
+  <meta name="description" content="Resume a paused or interrupted HTTP download with Fetchrail. Learn when byte ranges and file validators allow safe resume and when a restart is required.">
+  <meta name="theme-color" content="#0c0e13">
+  <link rel="canonical" href="https://fetchrail.rrmtools.uk/guides/resume-interrupted-downloads">
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+  <meta property="og:type" content="website">
+  <meta property="og:site_name" content="Fetchrail">
+  <meta property="og:title" content="How to Resume Interrupted Downloads with Fetchrail">
+  <meta property="og:description" content="Resume a paused or interrupted HTTP download with Fetchrail. Learn when byte ranges and file validators allow safe resume and when a restart is required.">
+  <meta property="og:url" content="https://fetchrail.rrmtools.uk/guides/resume-interrupted-downloads">
+  <meta property="og:image" content="https://fetchrail.rrmtools.uk/og.jpg">
+  <meta name="twitter:card" content="summary_large_image">
+  <link rel="stylesheet" href="/styles.css">
+  <script src="/theme.js"></script>
+</head>
+<body>
+  <a class="skip" href="#main">Skip to content</a>
+  <header class="site-head"><div class="wrap site-head-row"><a class="brand" href="/">Fetchrail</a><a href="/#install">All downloads</a></div></header>
+  <main id="main" class="wrap guide">
+    <h1>Resume an interrupted download with Fetchrail</h1>
+    <p class="lede">A dropped connection does not always mean starting over. Fetchrail saves partial transfer progress, then checks the server before reusing those bytes.</p><h2>Resume a paused transfer</h2><ol><li>Open Fetchrail and locate the transfer in your download list. After the app closes during a transfer, it returns paused on the next launch.</li><li>Keep the partial download files in their original location. Restore your network connection and select Resume.</li><li>Expand the download row or open More → Download progress to inspect resume support, speed and individual connections.</li></ol>
+<h2>Why a download can restart from zero</h2><p>Resume probes the URL again. Fetchrail reuses saved partial files only when their range layout, total length and strong ETag or Last-Modified validator still match. A changed or unverifiable file representation restarts safely. This prevents joining bytes from two different versions of a file.</p><p>If the server ignores byte-range requests, Fetchrail falls back to a single stream. Non-range streams restart from zero after interruption. Transient range-transfer errors retry the affected segment from its saved offset while healthy connections continue; permanent errors can stop the whole transfer.</p><h2>Expired links and logged-in downloads</h2><p>A server may expire a URL or session while a transfer is paused. Sign in to the website again and obtain a current permitted file link if necessary. The <a href="/browser-integration">browser companion</a> has an optional Use browser session for captured files setting for downloads requiring authentication. Do not share private links, cookies or Authorization headers in public support issues.</p><h2>Schedules and speed limits</h2><p>Queue stop times pause network transfers while keeping partial bytes. Clear or extend the schedule to continue, and keep Fetchrail running, including in the tray, for scheduled starts. Check total and per-download speed limits if a resumed transfer is slower than expected.</p><h2>Before asking for help</h2><p>Check that the file still exists on the server, the destination has space and the partial files are present. Include the app version, operating system and a non-private example URL in an issue. The <a href="https://github.com/Beelzebub2/fetchrail/blob/main/docs/usage.md">user guide</a> and <a href="https://github.com/Beelzebub2/fetchrail/blob/main/docs/architecture.md">architecture guide</a> describe the behavior in more detail.</p><p>New to Fetchrail? Download it for <a href="/download/windows">Windows</a> or <a href="/download/linux">Linux</a>.</p>
+  </main>
+  <footer class="wrap site-foot"><nav class="resource-links" aria-label="Download and help"><a href="/download/windows">Download for Windows</a><a href="/download/linux">Download for Linux</a><a href="/browser-integration">Browser integration</a><a href="/compare/fetchrail-vs-idm">Fetchrail vs IDM</a><a href="/guides/resume-interrupted-downloads">Resume a download</a></nav><p><a href="/privacy">Privacy policy</a> · <a href="https://github.com/Beelzebub2/fetchrail/issues">Report an issue</a></p></footer>
+</body>
+</html>
