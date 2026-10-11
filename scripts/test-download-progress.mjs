@@ -54,6 +54,12 @@ try {
         if (name === "get_download") return structuredClone(window.testRecord);
         if (name === "list_downloads") return [structuredClone(window.testRecord)];
         if (name === "get_settings") return structuredClone(window.testSettings);
+        if (name === "update_settings") {
+          if (window.testDelaySettings) await new Promise(resolve => { window.testFinishSettings = resolve; });
+          window.testSettings = args.settings;
+          return structuredClone(window.testSettings);
+        }
+        if (name === "setup_info") return { mode: new URLSearchParams(location.search).get("setup"), version: "0.6.1", dir: "C:\\Programs\\Fetchrail", installed: location.search.includes("installed"), desktopShortcut: true, theme: "dark", accent: "ember", downloadDir: "C:\\Downloads", sortsIntoFolders: true, launchOnStart: location.search.includes("installed") };
         if (window.testOpenError === name) throw new Error(name === "open_browser_extension_store" ? "Could not open the Chrome Web Store" : "Could not open destination");
         if (name === "platform_capabilities") return window.testCapabilities ?? (location.search.includes("platform=linux") ? { os: "linux", startup: { available: true, reason: "XDG startup" }, tray: { available: false, reason: "No watcher" }, shutdown: { available: false, reason: "Shutdown denied by policy" }, forceShutdown: { available: false, reason: "Old logind" }, disconnect: { available: true, reason: "Allowed" }, connections: [{ id: "connection-uuid", name: "Test connection" }], updateOwner: "package-manager", browserIntegration: { available: true, reason: "Native browser" } } : { os: "windows", startup: { available: true, reason: "Startup enabled" }, tray: { available: true, reason: "Tray available" }, shutdown: { available: true, reason: "Allowed" }, forceShutdown: { available: true, reason: "Allowed" }, disconnect: { available: true, reason: "Allowed" }, connections: [], updateOwner: "setup", browserIntegration: { available: true, reason: "Native browser" } });
         if (name === "get_overview") return { active: 0, queued: 0, completed: 1, failed: 0, currentSpeedBps: 0 };
@@ -171,8 +177,17 @@ try {
         ? { state, version: "0.5.3" }
         : { state, message: "error sending request for url (https://github.com/Beelzebub2/fetchrail/releases/latest/download/latest.json?" + "x".repeat(200) + ")" }), state);
       const background = page.locator('[aria-labelledby="background-settings-title"]');
-      await background.getByRole("status").filter({ hasText: state === "ready" ? "0.5.3" : "Could not check" }).waitFor();
-      const layout = await background.evaluate((card) => {
+      const version = page.locator('[aria-label="Version and updates"]');
+      await version.getByRole("status").filter({ hasText: state === "ready" ? "0.5.3" : "Could not check" }).waitFor();
+      const togglesContained = await background.evaluate((card) => {
+        const bounds = card.getBoundingClientRect();
+        return [...card.querySelectorAll(".switch")].every((input) => {
+          const label = input.previousElementSibling.getBoundingClientRect();
+          const toggle = input.getBoundingClientRect();
+          return toggle.left >= bounds.left && toggle.right <= bounds.right && toggle.bottom <= bounds.bottom && label.right <= toggle.left;
+        });
+      });
+      const layout = await version.evaluate((card) => {
         const bounds = card.getBoundingClientRect();
         const row = card.querySelector(".update-row");
         const status = row.querySelector('[role="status"]');
@@ -180,29 +195,121 @@ try {
         ranges.selectNodeContents(status);
         const contained = (rect) => rect.left >= bounds.left && rect.right <= bounds.right && rect.bottom <= bounds.bottom;
         return {
-          togglesContained: [...card.querySelectorAll(".switch")].every((input) => {
-            const label = input.previousElementSibling.getBoundingClientRect();
-            const toggle = input.getBoundingClientRect();
-            return contained(toggle) && label.right <= toggle.left;
-          }),
           buttonContained: contained(row.querySelector("button").getBoundingClientRect()),
           textContained: [...ranges.getClientRects()].every(contained),
         };
       });
-      assert.deepEqual(layout, { togglesContained: true, buttonContained: true, textContained: true }, `Settings ${width}px/${state} must stay inside its card.`);
+      assert.deepEqual({ togglesContained, ...layout }, { togglesContained: true, buttonContained: true, textContained: true }, `Settings ${width}px/${state} must stay inside its card.`);
       if (width === 1280) {
         await background.scrollIntoViewIfNeeded();
         await page.screenshot({ path: join(output, `settings-${state}.png`), fullPage: true });
       }
     }
   }
-  await page.locator('[aria-labelledby="background-settings-title"]').getByRole("button", { name: "Restart to update" }).click();
+  await page.locator('[aria-label="Version and updates"]').getByRole("button", { name: "Restart to update" }).click();
   await page.getByRole("alert").filter({ hasText: "Could not restart Fetchrail: test launch failure" }).waitFor();
   assert.equal(await page.getByRole("heading", { name: "Background behavior" }).isVisible(), true, "A failed relaunch must keep the app open and explain the error.");
   await page.getByRole("button", { name: "Dismiss error" }).click();
   await page.locator(".top-rail").getByRole("button", { name: /Restart to update/ }).click();
   await page.getByRole("alert").filter({ hasText: "Could not restart Fetchrail: test launch failure" }).waitFor();
   assert.equal(await page.evaluate(() => window.testCalls.filter((call) => call.name === "restart_app").length), 2);
+
+  // One navigation strip: the rail's second row swaps to the settings sections, and unsaved changes wait in a bar.
+  await page.setViewportSize({ width: 1280, height: 900 });
+  await page.goto(base);
+  const rail = page.locator(".top-rail");
+  const gear = page.getByRole("button", { name: "Settings", exact: true });
+  const dockShown = () => page.locator(".save-dock").evaluate((bar) => bar.classList.contains("shown"));
+  const glide = () => page.locator(".tab-glide").evaluate((bar) => ({ opacity: bar.style.opacity, transform: bar.style.transform }));
+  await page.getByRole("button", { name: /^All downloads/ }).waitFor();
+  assert.equal(await gear.getAttribute("aria-pressed"), "false");
+  assert.equal((await glide()).opacity, "1", "The current view tab carries the underline.");
+  await page.getByRole("button", { name: /^Default/ }).click();
+  assert.equal((await glide()).opacity, "0", "A queue filter has no tab to underline.");
+  await page.getByRole("button", { name: /^Default/ }).click();
+  assert.equal((await glide()).opacity, "1");
+  const underAll = (await glide()).transform;
+  assert.equal(await page.locator(".download-row").first().evaluate((row) => getComputedStyle(row).borderTopLeftRadius), "14px", "Each download is its own card.");
+  const thumb = () => page.locator(".segmented").evaluate((group) => getComputedStyle(group, "::before").transform);
+  const thumbAtStatus = await thumb();
+  await page.getByRole("button", { name: "Queue", exact: true }).click();
+  await page.waitForFunction((before) => getComputedStyle(document.querySelector(".segmented"), "::before").transform !== before, thumbAtStatus);
+  await page.getByRole("button", { name: "Status", exact: true }).click();
+
+  await gear.click();
+  await page.getByRole("heading", { name: "General", exact: true }).waitFor();
+  assert.equal(await gear.getAttribute("aria-pressed"), "true");
+  assert.equal(await rail.getByRole("tab").count(), 6, "The settings sections live in the rail.");
+  assert.equal(await page.locator(".content").getByRole("tab").count(), 0, "Settings must not stack a tab bar of its own under the rail.");
+  assert.equal(await page.getByRole("button", { name: /^All downloads/ }).count(), 0, "The view tabs give way to the settings sections.");
+  assert.equal(await page.getByRole("heading", { name: "Settings", exact: true }).count(), 0, "There is no shared Settings page head.");
+  assert.equal(await page.getByRole("button", { name: "Download options", exact: true }).count(), 1, "The paste field keeps its options button.");
+  assert.notEqual((await glide()).transform, underAll, "The same underline moves to the current settings section.");
+  await rail.getByRole("status").filter({ hasText: "All changes saved" }).waitFor();
+  assert.equal(await dockShown(), false, "The save bar stays away until something changes.");
+
+  await page.locator(".look-card", { hasText: "Azure" }).click();
+  await page.waitForFunction(() => document.documentElement.dataset.accent === "azure" && window.testSettings.accent === "azure");
+  assert.equal(await dockShown(), false, "A look applies at once and never raises the save bar.");
+  const tray = page.getByRole("checkbox", { name: /^Minimize to tray on close/ });
+  await tray.uncheck();
+  await rail.getByRole("status").filter({ hasText: "1 unsaved change" }).waitFor();
+  assert.equal(await dockShown(), true);
+  await page.getByRole("checkbox", { name: /^Launch when you sign in/ }).check();
+  await page.locator(".save-dock").getByText("2 unsaved changes", { exact: true }).waitFor();
+  await page.screenshot({ path: join(output, "settings-unsaved.png") });
+
+  await page.getByRole("button", { name: "Downloads", exact: true }).click();
+  await page.getByRole("button", { name: /^All downloads/ }).waitFor();
+  assert.equal(await dockShown(), false);
+  assert.equal(await gear.locator(".dot.on").count(), 1, "A closed Settings with unsaved changes marks the gear.");
+  assert.equal(await page.evaluate(() => window.testSettings.minimizeToTray), true, "Leaving Settings must not save the draft.");
+  await gear.click();
+  assert.equal(await tray.isChecked(), false, "The draft survives leaving Settings.");
+  assert.equal(await dockShown(), true);
+  assert.equal(await gear.locator(".dot.on").count(), 0);
+
+  await rail.getByRole("tab", { name: "Downloads", exact: true }).click();
+  await page.getByRole("heading", { name: "Connections", exact: true }).waitFor();
+  await page.getByRole("button", { name: "Save settings", exact: true }).click();
+  await page.locator(".save-dock").getByText("Settings saved", { exact: true }).waitFor();
+  assert.deepEqual(await page.evaluate(() => [window.testSettings.minimizeToTray, window.testSettings.launchOnStart, window.testSettings.accent]), [false, true, "azure"]);
+  await page.waitForFunction(() => !document.querySelector(".save-dock").classList.contains("shown"));
+  await rail.getByRole("status").filter({ hasText: "All changes saved" }).waitFor();
+  assert.equal(await page.getByRole("heading", { name: "Connections", exact: true }).isVisible(), true, "Saving keeps Settings open.");
+
+  await page.getByRole("button", { name: "Increase simultaneous downloads", exact: true }).click();
+  await page.locator(".save-dock").getByText("1 unsaved change", { exact: true }).waitFor();
+  await page.getByRole("button", { name: "Discard", exact: true }).click();
+  await page.waitForFunction(() => !document.querySelector(".save-dock").classList.contains("shown"));
+  assert.equal(await page.getByRole("spinbutton", { name: "Simultaneous downloads", exact: true }).inputValue(), "3");
+  await rail.getByRole("tab", { name: "General", exact: true }).click();
+  await tray.check();
+  await page.evaluate(() => { window.testDelaySettings = true; });
+  await page.getByRole("button", { name: "Save settings", exact: true }).click();
+  await page.waitForFunction(() => typeof window.testFinishSettings === "function");
+  await tray.uncheck();
+  await page.evaluate(() => { window.testDelaySettings = false; window.testFinishSettings(); });
+  await page.getByRole("button", { name: "Save settings", exact: true }).waitFor({ state: "visible" });
+  assert.equal(await tray.isChecked(), false, "An edit made during saving survives, including a return to the earlier saved value.");
+  await page.locator(".save-dock").getByText("1 unsaved change", { exact: true }).waitFor();
+  await page.getByRole("button", { name: "Save settings", exact: true }).click();
+  await page.waitForFunction(() => window.testSettings.minimizeToTray === false);
+  await page.waitForFunction(() => !document.querySelector(".save-dock").classList.contains("shown"));
+  await tray.check();
+  await tray.uncheck();
+  await rail.getByRole("status").filter({ hasText: "All changes saved" }).waitFor();
+  await page.evaluate(() => window.testEmit("fetchrail://settings-updated", { ...window.testSettings, minimizeToTray: true }));
+  await page.waitForFunction(() => document.querySelectorAll('[aria-labelledby="background-settings-title"] .switch')[1].checked);
+  assert.equal(await dockShown(), false, "A change undone by hand must not come back when the setting is saved elsewhere.");
+  await page.emulateMedia({ reducedMotion: "reduce" });
+  assert.deepEqual(await page.evaluate(() => [".rail-tab", ".tab-glide", ".card", ".save-dock"].map((selector) => getComputedStyle(document.querySelector(selector)).transitionDuration)), ["0s", "0s", "0s", "0s"], "Reduced motion covers the new transitions.");
+  await page.emulateMedia({ reducedMotion: null });
+  await gear.click();
+  await page.getByRole("button", { name: /^All downloads/ }).waitFor();
+  assert.equal(await gear.getAttribute("aria-pressed"), "false", "A second click on the gear closes Settings.");
+  await page.evaluate(() => { window.testSettings = { ...window.testSettings, accent: "ember", minimizeToTray: true, launchOnStart: false }; });
+
   for (const platform of ["windows", "linux"]) {
     await page.setViewportSize({ width: 960, height: 1000 });
     await page.goto(base + "?platform=" + platform);
@@ -211,7 +318,7 @@ try {
     const companion = page.locator('[aria-labelledby="extension-settings-title"]');
     const store = companion.getByRole("button", { name: "Get from Chrome Web Store", exact: true });
     await store.waitFor();
-    assert.equal(await companion.getByRole("button", { name: "Open extension folder", exact: true }).isVisible(), false);
+    assert.equal(await companion.getByText("Recommended", { exact: true }).count(), 1);
     await page.evaluate(() => { window.testCalls = []; });
     await store.click();
     await page.waitForFunction(() => window.testCalls.some(call => call.name === "open_browser_extension_store"));
@@ -221,7 +328,7 @@ try {
     await store.click();
     await companion.getByRole("alert").filter({ hasText: "Could not open the Chrome Web Store" }).waitFor();
     assert.equal(await store.isEnabled(), true, "A failed store launch must allow retry and manual installation.");
-    await companion.getByText("Manual installation and Firefox", { exact: true }).click();
+    await companion.getByRole("heading", { name: "Manual installation and Firefox", exact: true }).waitFor();
     await companion.getByRole("button", { name: "Open extension folder", exact: true }).click();
     await companion.getByRole("button", { name: "Firefox folder", exact: true }).click();
     const folders = await page.evaluate(() => window.testCalls.filter(call => call.name === "open_browser_extension_folder").map(call => call.args.browser));
@@ -263,7 +370,68 @@ try {
   await page.waitForFunction(() => window.testRecord.completionOptions.turnOffComputer === false);
   assert.equal(await page.getByLabel("Turn off computer when done").isDisabled(), true);
   assert.equal(await page.getByLabel("Ignore shutdown inhibitors").isDisabled(), true);
+
+  // The setup program is the same page with `setup` in its address: three steps to install, one screen to remove.
+  await page.setViewportSize({ width: 920, height: 600 });
+  await page.goto(base + "?setup=install");
+  const steps = page.locator(".setup-steps li");
+  const current = () => steps.evaluateAll((items) => items.findIndex((item) => item.getAttribute("aria-current") === "step"));
+  await page.getByRole("heading", { name: "Where should Fetchrail live?" }).waitFor();
+  assert.equal(await steps.count(), 3);
+  assert.equal(await current(), 0);
+  assert.equal(await page.getByLabel("Install to").inputValue(), "C:\\Programs\\Fetchrail");
+  await page.getByRole("checkbox", { name: /^Start with Windows/ }).check();
+  await page.screenshot({ path: join(output, "setup-location.png") });
+  await page.getByRole("button", { name: "Continue", exact: true }).click();
+  await page.getByRole("heading", { name: "Make it yours" }).waitFor();
+  assert.equal(await current(), 1);
+  await page.locator(".look-card", { hasText: "Light" }).click();
+  await page.locator(".look-card", { hasText: "Jade" }).click();
+  assert.equal(await page.getByRole("radio", { name: "Jade", exact: true }).isChecked(), true);
+  assert.deepEqual(await page.evaluate(() => ({ ...document.documentElement.dataset })), { theme: "light", accent: "jade" }, "Setup wears the look that is picked in it.");
+  await page.getByLabel("Save downloads to").fill("D:\\Files");
+  await page.screenshot({ path: join(output, "setup-look.png") });
+  await page.getByRole("button", { name: "Back", exact: true }).click();
+  assert.equal(await page.getByRole("checkbox", { name: /^Start with Windows/ }).isChecked(), true, "Going back keeps what was chosen.");
+  await page.getByRole("button", { name: "Continue", exact: true }).click();
+  await page.evaluate(() => { window.testOpenError = "setup_install"; });
+  await page.getByRole("button", { name: "Install", exact: true }).click();
+  await page.getByRole("alert").filter({ hasText: "Could not open destination" }).waitFor();
+  assert.equal(await current(), 1, "A failed install returns to the choices so it can be retried.");
+  await page.evaluate(() => { window.testOpenError = null; window.testCalls = []; });
+  await page.getByRole("button", { name: "Install", exact: true }).click();
+  await page.getByRole("heading", { name: "Fetchrail is installed" }).waitFor();
+  assert.equal(await page.getByRole("progressbar").getAttribute("aria-valuenow"), "100");
+  await page.screenshot({ path: join(output, "setup-installed.png") });
+  await page.waitForFunction(() => window.testCalls.some((call) => call.name === "setup_finish"));
+  assert.deepEqual(await page.evaluate(() => window.testCalls.filter((call) => call.name.startsWith("setup_") && call.name !== "setup_info")), [
+    { name: "setup_install", args: { options: { dir: "C:\\Programs\\Fetchrail", desktopShortcut: true, downloadDir: "D:\\Files" } } },
+    { name: "setup_finish", args: { choices: { launchOnStart: true, theme: "light", accent: "jade", downloadDir: "D:\\Files" } } },
+  ], "Setup installs once, then starts the app with what was chosen.");
+
+  await page.goto(base + "?setup=install&installed");
+  await page.getByText("Replaces the copy already here", { exact: true }).waitFor();
+  assert.equal(await page.getByLabel("Install to").isDisabled(), true);
+  const setupStartup = page.getByRole("checkbox", { name: /^Start with Windows/ });
+  assert.equal(await setupStartup.isChecked(), true, "Updating starts with the saved startup preference.");
+  await setupStartup.uncheck();
+  await page.getByRole("button", { name: "Continue", exact: true }).click();
+  await page.getByRole("button", { name: "Update", exact: true }).waitFor();
+  await page.getByRole("button", { name: "Update", exact: true }).click();
+  await page.waitForFunction(() => window.testCalls.some(call => call.name === "setup_finish"));
+  assert.equal(await page.evaluate(() => window.testCalls.find(call => call.name === "setup_finish").args.choices.launchOnStart), false, "Updating passes an unchecked startup preference to the installed app.");
+
+  await page.goto(base + "?setup=uninstall&installed");
+  await page.getByRole("heading", { name: "Remove Fetchrail from this PC?" }).waitFor();
+  assert.equal(await steps.count(), 0, "Removing has no steps.");
+  await page.getByRole("checkbox", { name: /^Also delete my download history and settings/ }).check();
+  await page.screenshot({ path: join(output, "setup-uninstall.png") });
+  await page.getByRole("button", { name: "Uninstall", exact: true }).click();
+  await page.getByRole("heading", { name: "Fetchrail was removed" }).waitFor();
+  assert.deepEqual(await page.evaluate(() => window.testCalls.find((call) => call.name === "setup_uninstall").args), { removeData: true });
   assert.deepEqual(errors, []);
+  console.log("PASS: setup walks through location, look and install, retries a failed install, and still updates and uninstalls");
+  console.log("PASS: one rail strip for views and settings, a gliding underline, a save bar that counts, confirms and survives leaving Settings");
   console.log("PASS: Linux policy restrictions and connection selection block unsupported actions; saved actions remain clearable after capability loss");
   console.log("PASS: live progress, connection details, pause/resume/cancel, speed limits, completion settings, keyboard tabs, themes, completion actions, close behavior, and prompt handoff");
   console.log("PASS: settings contain switches, update buttons and long error text; both restart actions report launch failures");
