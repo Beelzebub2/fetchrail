@@ -16,5 +16,5 @@ if (-not (Test-Path -LiteralPath $jsonHeader)) {
 }
 $expected = '4ff9ee8c7ca94f5b730590f73b01be5aa66a7b82a8271a6391170e42043b66866d4f7a89c8dc2feca88df4e40fc9052a96454b6aa315fcc6704dbf20c532f19e'
 if ((Get-FileHash -LiteralPath $jsonHeader -Algorithm SHA512).Hash.ToLowerInvariant() -ne $expected) { throw 'JSON header integrity check failed.' }
-& (Join-Path $VcpkgRoot 'vcpkg.exe') install 'libtorrent[core]:x64-windows-static' "--overlay-ports=$nativeDir/ports" "--x-install-root=$nativeDir/installed-secure" "--x-buildtrees-root=$nativeDir/buildtrees-secure" "--x-packages-root=$nativeDir/packages-secure"
+& (Join-Path $VcpkgRoot 'vcpkg.exe') install 'libtorrent[core]:x64-windows-static' "--overlay-ports=$nativeDir/ports" "--overlay-triplets=$nativeDir/triplets" "--x-install-root=$nativeDir/installed-secure" "--x-buildtrees-root=$nativeDir/buildtrees-secure" "--x-packages-root=$nativeDir/packages-secure"
 if ($LASTEXITCODE -ne 0) { throw 'Native dependency build failed.' }
