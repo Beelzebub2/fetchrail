@@ -61,21 +61,33 @@ const server = createServer((request, response) => {
   if (request.method !== "HEAD" && name.startsWith("opaque-")) response.setHeader("Content-Disposition",
     `attachment; filename="fallback.bin"; filename*=UTF-8''${name}.rar`);
   response.setHeader("ETag", '"fetchrail-test-v1"');
-  if (name !== "unknown.bin") response.setHeader("Accept-Ranges", "bytes");
+  const unknown = ["unknown.bin", "zero-head-unknown.bin", "zero-probe.bin"].includes(name);
+  if (!unknown && name !== "head-only-size.bin") response.setHeader("Accept-Ranges", "bytes");
   if (request.method === "HEAD") {
-    if (name !== "unknown.bin") response.setHeader("Content-Length", data.length);
+    if (name.startsWith("zero-head") || ["empty.bin", "no-content.bin"].includes(name)) response.setHeader("Content-Length", 0);
+    else if (!unknown) response.setHeader("Content-Length", data.length);
+    response.end(); return;
+  }
+  entry.gets = (entry.gets ?? 0) + 1;
+  if (name === "no-content.bin") { response.writeHead(204).end(); return; }
+  if (request.headers.range && ["zero-probe.bin", "head-only-size.bin"].includes(name)) {
+    response.setHeader("Content-Length", 0); response.end(); return;
+  }
+  if (name === "empty.bin") {
+    response.setHeader("Content-Length", 0);
+    if (request.headers.range) { response.setHeader("Content-Range", "bytes */0"); response.statusCode = 416; }
     response.end(); return;
   }
   const match = /^bytes=(\d+)-(\d*)$/.exec(request.headers.range ?? "");
   let start = 0, end = data.length - 1;
-  if (match && !["ignore.bin", "unknown.bin"].includes(name)) {
+  if (match && name !== "ignore.bin" && !unknown) {
     start = Number(match[1]); end = match[2] ? Number(match[2]) : end;
     entry.ranges.push({ start, end });
     if (name === "retry.bin" && !retryFailed) { retryFailed = true; response.writeHead(503).end(); return; }
     response.setHeader("Content-Range", `bytes ${name === "invalid.bin" ? start + 1 : start}-${end}/${data.length}`);
     response.statusCode = 206;
   }
-  if (name !== "unknown.bin") response.setHeader("Content-Length", end - start + 1);
+  if (!unknown) response.setHeader("Content-Length", end - start + 1);
   response.flushHeaders();
   entry.active++; entry.peak = Math.max(entry.peak, entry.active);
   const timer = setInterval(() => {
@@ -185,6 +197,23 @@ try {
   console.log("PASS: queue start/stop windows gate active transfers and retain partial bytes");
   for (let index = 0; index < 100; index++) await native("ping");
   console.log("PASS: 100 rapid native bridge requests");
+  for (const name of ["zero-head.bin", "zero-head-unknown.bin", "zero-probe.bin", "head-only-size.bin"]) await complete(await add(name), 1);
+  const empty = await add("empty.bin");
+  const emptyRecord = await waitFor(async () => {
+    const item = await record(empty);
+    if (item?.status === "failed") throw new Error(item.error);
+    return item?.status === "completed" && item;
+  }, "verified empty download");
+  const emptySaved = JSON.parse(await read("downloads.json")).find(item => item.id === empty);
+  assert.equal((await readFile(emptySaved.destination)).length, 0);
+  assert.equal(emptyRecord.downloadedBytes, 0);
+  assert.ok(observed.get("empty.bin").gets >= 2, "The full GET must run even after an empty metadata GET.");
+  const noContent = await add("no-content.bin");
+  const rejected = await waitFor(async () => { const item = await record(noContent); return item?.status === "failed" && item; }, "HTTP 204 rejection");
+  assert.match(rejected.error, /204/);
+  const noContentSaved = JSON.parse(await read("downloads.json")).find(item => item.id === noContent);
+  await assert.rejects(access(noContentSaved.destination), { code: "ENOENT" });
+  console.log("PASS: zero-length HEAD/probes download real known/unknown-length bytes; valid HEAD size and genuine empty GET remain supported");
   await assert.rejects(native("addDownloads", { source: "popup", items: [{ url: "file:///C:/secret" }] }));
   await assert.rejects(native("addDownloads", { source: "popup", items: [{ url: base + "range.bin" }], connections: 33 }));
   const transferStarted = Date.now();

@@ -2836,7 +2836,7 @@ impl DownloadManager {
             _ = cancel.cancelled() => return Err(EngineError::Cancelled),
         };
 
-        if !response.status().is_success() {
+        if !response.status().is_success() || response.status() == StatusCode::NO_CONTENT {
             if response.status() == StatusCode::TOO_MANY_REQUESTS
                 || response.status() == StatusCode::SERVICE_UNAVAILABLE
             {
@@ -3163,17 +3163,17 @@ impl DownloadManager {
             }
         }
 
-        if total_bytes.is_none() || !accepts_ranges {
-            let response = self
-                .metadata_request(
-                    self.client
-                        .get(url.clone())
-                        .headers(context_headers(context)?)
-                        .header(RANGE, "bytes=0-0")
-                        .header(ACCEPT_ENCODING, "identity"),
-                    url,
-                )
-                .await?;
+        if total_bytes.is_none() || total_bytes == Some(0) || !accepts_ranges {
+            let mut request = self
+                .client
+                .get(url.clone())
+                .headers(context_headers(context)?)
+                .header(ACCEPT_ENCODING, "identity");
+            // A zero-length HEAD can describe a generated export; a range is invalid for a truly empty file.
+            if total_bytes != Some(0) {
+                request = request.header(RANGE, "bytes=0-0");
+            }
+            let response = self.metadata_request(request, url).await?;
             if response.status() == StatusCode::PARTIAL_CONTENT {
                 let (start, end, total) =
                     parse_content_range(response.headers()).ok_or_else(|| {
@@ -3185,9 +3185,12 @@ impl DownloadManager {
                     ));
                 }
                 accepts_ranges = true;
-                total_bytes = total.or(total_bytes);
-            } else if response.status().is_success() && total_bytes.is_none() {
-                total_bytes = content_length_from_headers(response.headers());
+                total_bytes = total.or(total_bytes.filter(|bytes| *bytes > 0));
+            } else if response.status().is_success() {
+                accepts_ranges = false;
+                if total_bytes.is_none_or(|bytes| bytes == 0) {
+                    total_bytes = content_length_from_headers(response.headers());
+                }
             }
             if !response.status().is_success() {
                 return Err(EngineError::Http(response.status()));
@@ -3216,8 +3219,9 @@ impl DownloadManager {
         }
 
         Ok(ProbeResult {
-            total_bytes,
-            accepts_ranges,
+            // Even a zero-length GET probe must not bypass the actual full-body transfer.
+            total_bytes: total_bytes.filter(|bytes| *bytes > 0),
+            accepts_ranges: accepts_ranges && total_bytes != Some(0),
             suggested_file_name,
             validator,
         })
