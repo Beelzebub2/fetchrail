@@ -1,0 +1,22 @@
+{
+  "name": {
+    "en-US": "Fetchrail Browser Integration"
+  },
+  "summary": {
+    "en-US": "Send browser downloads to the free Fetchrail desktop download manager."
+  },
+  "description": {
+    "en-US": "Fetchrail connects Firefox with the free Fetchrail download manager for Windows and Linux.\n\n- Send downloads to the desktop app and manage transfers from the Firefox toolbar.\n- Find downloadable links and media on the current page, choose files, and use the Download with Fetchrail context menu.\n- Follow multi-step download pages with optional assistance, keeping logins and CAPTCHAs under your control.\n- Choose queues, connection counts, speed limits, and scheduled or paused starts.\n\nThis extension requires the separate Fetchrail desktop application from https://github.com/Beelzebub2/fetchrail.\n\nThe companion sends the selected download URL and relevant request details to the locally installed Fetchrail app through Firefox native messaging. Session-header forwarding is off by default and can be enabled in the companion for downloads that need browser authentication. Data is handled locally by Fetchrail; the chosen file server receives normal download requests. Privacy policy: https://fetchrail.rrmtools.uk/privacy"
+  },
+  "categories": ["download-management"],
+  "homepage": {
+    "en-US": "https://github.com/Beelzebub2/fetchrail"
+  },
+  "support_url": {
+    "en-US": "https://github.com/Beelzebub2/fetchrail/issues"
+  },
+  "version": {
+    "license": "all-rights-reserved",
+    "approval_notes": "The add-on connects to the optional Fetchrail desktop download manager via Firefox nativeMessaging host com.rrmtools.braid. Install Fetchrail from the GitHub releases page and start it once to register the host. The extension has no remote service or account; users choose which file server to download from. Session-header forwarding is disabled by default. Review the documented native host setup and features at https://github.com/Beelzebub2/fetchrail/blob/main/browser-extension/README.md."
+  }
+}

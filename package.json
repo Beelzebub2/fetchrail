@@ -13,6 +13,8 @@
     "browser:test": "node scripts/test-native-host.mjs",
     "browser:check": "node scripts/test-extension.mjs && node scripts/test-extension-routing.mjs && node scripts/test-browser-batch.mjs",
     "cws:test": "node scripts/test-chrome-web-store.mjs",
+    "amo:test": "node scripts/test-firefox-add-ons.mjs",
+    "amo:lint": "node browser-extension/publisher/node_modules/web-ext/bin/web-ext.js lint --source-dir browser-extension/dist/firefox",
     "engine:test": "node scripts/test-downloads.mjs",
     "engine:bench": "node scripts/benchmark-downloads.mjs",
     "torrent:deps": "node scripts/platform-command.mjs torrent:deps",
