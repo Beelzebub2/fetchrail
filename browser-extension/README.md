@@ -25,11 +25,13 @@ Chrome/Edge 116 or newer is required for automatic panel-aware companion reloads
 
 ### Firefox
 
-1. In Fetchrail's browser companion settings, choose **Firefox folder**.
+Firefox's official store release is submitted through [Mozilla Add-ons automation](../docs/firefox-add-ons-automation.md) and requires Mozilla approval before the public listing is available. Once listed, install from Firefox Add-ons for automatic updates. Until then, a temporary add-on can be tested:
+
+1. In Fetchrail's browser companion settings, expand **Manual installation and Firefox**, then choose **Firefox folder**.
 2. Open `about:debugging` and choose **Load Temporary Add-on**.
 3. Select `manifest.json` from that folder.
 
-Temporary Firefox add-ons must be loaded again after a browser restart. Safari and mobile browsers require separate integrations.
+Temporary Firefox add-ons must be loaded again after a browser restart. The signed Firefox store build requires Firefox 140 or later. Safari and mobile browsers require separate integrations.
 
 If you previously loaded `browser-extension/dist` from the checkout, switch to the stable folder once.
 
@@ -98,9 +100,11 @@ The registration script allow-lists both Chromium IDs for Chrome, Edge, Chromium
 
 ## Companion updates
 
-Fetchrail refreshes the stable folders from its embedded companion on launch. Replacements are atomic, and readiness is published last.
+Once approved and published, Chrome Web Store and Mozilla Add-ons copies receive updates through their browser's normal store mechanism. Chrome checks on startup and every few hours; installation waits until the companion is idle, so open panels can delay it. Store updates are independent of the desktop app's installed version. See [Chrome's extension update lifecycle](https://developer.chrome.com/docs/extensions/develop/concepts/extensions-update-lifecycle).
 
-The extension checks the local build every minute. It reloads after all companion panels close and pending browser actions finish. This deploys the companion bundled with Fetchrail; desktop releases update through Fetchrail's signed updater.
+For manually loaded companions, Fetchrail refreshes the stable folders from its embedded companion on launch. Replacements are atomic, and readiness is published last.
+
+The unpacked extension checks the local build every minute. It reloads after all companion panels close and pending browser actions finish. This deploys the companion bundled with Fetchrail; desktop releases update through Fetchrail's signed updater.
 
 Existing builds from before this update mechanism need one manual reload to enable it.
 
