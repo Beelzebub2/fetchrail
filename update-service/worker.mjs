@@ -65,7 +65,11 @@ export default {
       if (unchanged) return new Response(null, { status: 304, headers: response.headers });
       return request.method === "HEAD" ? new Response(null, { headers: response.headers }) : response;
     } catch (error) {
-      if (error instanceof FeedError) return failure(error.status, error.message);
+      if (error instanceof FeedError) {
+        if (url.pathname === "/api/updates/notify" && error.status >= 500)
+          console.warn(JSON.stringify({ event: "release_notification_error", status: error.status, reason: error.message }));
+        return failure(error.status, error.message);
+      }
       // DO RPC preserves error messages but not custom prototypes across the boundary.
       if (/Refusing to replace a newer release|Published versions are immutable/.test(error.message ?? "")) return failure(409, "Release conflicts with the published feed.");
       console.error(JSON.stringify({ event: "update_feed_error", path: url.pathname, message: "Upstream or storage operation failed" }));

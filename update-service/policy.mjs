@@ -21,7 +21,7 @@ export async function sha256(bytes) {
   return [...new Uint8Array(await crypto.subtle.digest("SHA-256", bytes))].map(x => x.toString(16).padStart(2, "0")).join("");
 }
 export async function readJson(response, limit = 65536, timeoutMs = 10000) {
-  require(response.ok, 502, "Upstream metadata is unavailable.");
+  require(response.ok, 502, `Upstream metadata is unavailable (HTTP ${response.status}).`);
   require(response.body && !(Number(response.headers.get("content-length")) > limit), 413, "Metadata is too large.");
   const reader = response.body.getReader(), chunks = []; let size = 0;
   let timedOut = false;
