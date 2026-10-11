@@ -27,6 +27,8 @@ pub enum NativeMethod {
     Ping,
     AddDownloads,
     AddTorrents,
+    GetHandoff,
+    CommitHandoff,
     GetDownloads,
     ControlDownload,
     ShowApp,
@@ -35,6 +37,9 @@ pub enum NativeMethod {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct NativeParams {
+    pub handoff_id: Option<String>,
+    pub handoff_protocol: Option<u8>,
+    pub auto_start: Option<bool>,
     pub source: Option<BrowserSource>,
     #[serde(default)]
     pub items: Vec<BrowserDownloadItem>,
@@ -68,6 +73,7 @@ pub enum BrowserSource {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct BrowserDownloadItem {
+    pub request_headers: Option<std::collections::BTreeMap<String, String>>,
     pub expected_sha256: Option<String>,
     pub url: String,
     pub suggested_file_name: Option<String>,
@@ -144,6 +150,16 @@ pub fn validate_request(request: &NativeRequest) -> Result<(), String> {
     }
     Uuid::parse_str(&request.id).map_err(|_| "Request id must be a UUID.".to_string())?;
     match request.method {
+        NativeMethod::GetHandoff | NativeMethod::CommitHandoff => {
+            Uuid::parse_str(
+                request
+                    .params
+                    .handoff_id
+                    .as_deref()
+                    .ok_or("Handoff id is required.")?,
+            )
+            .map_err(|_| "Handoff id must be a UUID.")?;
+        }
         NativeMethod::Ping | NativeMethod::GetDownloads | NativeMethod::ShowApp => {}
         NativeMethod::AddDownloads | NativeMethod::AddTorrents => {
             if request.params.source.is_none() {
@@ -172,6 +188,25 @@ pub fn validate_request(request: &NativeRequest) -> Result<(), String> {
                 return Err("Invalid queue name.".into());
             }
             for item in &request.params.items {
+                if let Some(headers) = &item.request_headers {
+                    if !matches!(
+                        request.params.source,
+                        Some(BrowserSource::ClickMonitor | BrowserSource::BrowserBatch)
+                    ) || request.method != NativeMethod::AddDownloads
+                    {
+                        return Err("Session headers require a captured HTTP download.".into());
+                    }
+                    if headers.len() > 5
+                        || headers.iter().any(|(name, value)| {
+                            !["cookie", "authorization", "referer", "user-agent", "origin"]
+                                .contains(&name.to_ascii_lowercase().as_str())
+                                || value.len() > 16384
+                                || value.chars().any(char::is_control)
+                        })
+                    {
+                        return Err("Unsupported or invalid browser session header.".into());
+                    }
+                }
                 if let Some(context) = &item.request_context {
                     if !matches!(
                         request.params.source,
@@ -187,6 +222,7 @@ pub fn validate_request(request: &NativeRequest) -> Result<(), String> {
                         &context.authorization,
                         &context.referer,
                         &context.user_agent,
+                        &context.origin,
                     ]
                     .into_iter()
                     .flatten()
@@ -244,7 +280,7 @@ pub fn validate_request(request: &NativeRequest) -> Result<(), String> {
         request.method,
         NativeMethod::AddDownloads | NativeMethod::AddTorrents
     ) && (!request.params.items.is_empty()
-        || request.params.source.is_some()
+        || (request.params.source.is_some() && request.method != NativeMethod::CommitHandoff)
         || request.params.connections.is_some()
         || request.params.queue.is_some()
         || request.params.start_paused.is_some()
@@ -258,12 +294,55 @@ pub fn validate_request(request: &NativeRequest) -> Result<(), String> {
     {
         return Err("Control options are only accepted by controlDownload.".into());
     }
+    if request.params.handoff_protocol.is_some()
+        && (request.params.handoff_protocol != Some(2)
+            || request.method != NativeMethod::AddDownloads)
+    {
+        return Err("Unsupported handoff protocol.".into());
+    }
+    if request.params.handoff_id.is_some()
+        && !matches!(
+            request.method,
+            NativeMethod::GetHandoff | NativeMethod::CommitHandoff
+        )
+    {
+        return Err("Handoff id is only accepted by handoff controls.".into());
+    }
+    if request.params.auto_start.is_some() && request.method != NativeMethod::CommitHandoff {
+        return Err("Auto-start is only accepted by commitHandoff.".into());
+    }
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn installed_companion_handoff_is_accepted_without_relaxing_header_validation() {
+        let mut req = request("https://example.com/file.bin");
+        req.params.source = Some(BrowserSource::ClickMonitor);
+        req.params.handoff_protocol = Some(2);
+        req.params.items[0].request_headers = Some(std::collections::BTreeMap::from([(
+            "Cookie".into(),
+            "session=value".into(),
+        )]));
+        assert!(validate_request(&req).is_ok());
+        req.params.items[0]
+            .request_headers
+            .as_mut()
+            .unwrap()
+            .insert("Host".into(), "other.example".into());
+        assert!(validate_request(&req).is_err());
+        req.params.items.clear();
+        req.params.handoff_protocol = None;
+        req.method = NativeMethod::CommitHandoff;
+        req.params.handoff_id = Some(Uuid::new_v4().to_string());
+        req.params.auto_start = Some(true);
+        assert!(validate_request(&req).is_ok());
+        req.params.handoff_id = Some("not-a-uuid".into());
+        assert!(validate_request(&req).is_err());
+    }
 
     fn request(url: &str) -> NativeRequest {
         NativeRequest {
@@ -273,6 +352,7 @@ mod tests {
             params: NativeParams {
                 source: Some(BrowserSource::ContextMenu),
                 items: vec![BrowserDownloadItem {
+                    request_headers: None,
                     expected_sha256: None,
                     url: url.to_string(),
                     suggested_file_name: None,
@@ -299,6 +379,7 @@ mod tests {
             req.method = NativeMethod::AddTorrents;
             assert!(validate_request(&req).is_ok());
             req.params.items[0].request_context = Some(crate::model::BrowserRequestContext {
+                origin: None,
                 cookie: Some("session=secret".into()),
                 ..Default::default()
             });

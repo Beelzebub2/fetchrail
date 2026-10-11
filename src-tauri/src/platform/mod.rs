@@ -7,12 +7,16 @@ use std::{
 
 #[cfg(target_os = "linux")]
 mod linux;
+#[cfg(windows)]
+mod windows_attachment;
 #[cfg(target_os = "linux")]
 pub(crate) use linux::torrent_argument_source;
 #[cfg(target_os = "linux")]
 pub use linux::{
     capabilities, completion_actions, native_launcher, sync_startup_registration, tray_available,
 };
+#[cfg(windows)]
+pub use windows_attachment::mark_download;
 
 pub const APP_ID: &str = "com.rrmtools.braid";
 
@@ -186,10 +190,8 @@ pub fn launch(arguments: &[&str]) -> Result<(), String> {
 }
 
 pub fn reveal(path: &Path) -> Result<(), String> {
-    if path.is_file() {
-        if tauri_plugin_opener::reveal_item_in_dir(path).is_ok() {
-            return Ok(());
-        }
+    if path.is_file() && tauri_plugin_opener::reveal_item_in_dir(path).is_ok() {
+        return Ok(());
     }
     let folder = if path.is_dir() {
         path
