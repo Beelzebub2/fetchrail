@@ -161,9 +161,11 @@ npm run release:check
 
 Pass a specific tag after `--` to validate it explicitly.
 
-The Windows runner builds the frontend, companions, and executable; checks Rust formatting; runs Rust and browser checks; verifies the bundled interface and bridge; and tests real multi-connection downloads, silent setup, and removal before publishing.
+The Windows runner builds the frontend, companions, application, torrent harness and signature verifier; checks Rust formatting; runs Rust and browser checks; verifies the bundled interface and bridge; and tests real HTTP/torrent transfers, retained Firefox handoffs, packaged WebView2 integration, silent setup and removal before packaging.
 
-Pushes to `main` run the same build and checks and cache compiled Rust dependencies. Tag builds reuse the cache from `main`; only tags package, sign, and publish releases. A new Rust toolchain or changed dependencies can require rebuilding the cache.
+Native Linux x64 and arm64 runners build AppImage, DEB, RPM and portable archives. Both run embedded desktop, HTTP/restart, torrent, signature and native X11/Wayland checks. Separate installed-package gates cover Fedora 44, Mint 22.3, Kali and Arch. The retained Firefox handoff test also runs against each installed distro binary. Publishing requires every platform, distro and update-service gate to pass, then verifies all artifact signatures and combines all three platform manifests into one release.
+
+Pushes to `main` run these checks, package unsigned development downloads and cache compiled Rust dependencies. Tag builds reuse the cache from `main` and sign and publish release downloads. A new Rust toolchain or changed dependencies can require rebuilding the cache. Actions display these as `Build / main` and `Release vVERSION`; pushing a commit and its tag creates one run of each.
 
 Release assets are:
 
@@ -171,7 +173,15 @@ Release assets are:
 | --- | --- |
 | `Fetchrail-Setup-vVERSION-windows-x64.exe` | Per-user setup with the desktop app, companions, and native host. |
 | `Fetchrail-Setup-vVERSION-windows-x64.sha256` | Checksum for the setup executable. |
+| `Fetchrail-vVERSION-linux-ARCH.AppImage` | Portable Linux desktop download for `x64` or `arm64`. |
+| `Fetchrail-vVERSION-linux-ARCH.deb` / `.rpm` | Native packages with package-manager dependency resolution. |
+| `Fetchrail-vVERSION-linux-ARCH.tar.gz` | Native binary, desktop integration scripts, icon and notices. |
+| Linux `.sig` / `.sha256` files and dependency inventories | Artifact verification and bundled dependency notices. |
 | `latest.json` | Signed update manifest read by installed copies. |
+
+AppImage is the portable Linux option; native packages offer ordinary package-manager installation and removal. Build against the oldest supported Linux base with WebKitGTK 4.1, and build each AppImage on its native architecture. Current CI uses Ubuntu 22.04 for x64 and Ubuntu 24.04 for arm64, so older ARM distributions need separate compatibility qualification. See [Tauri's AppImage guidance](https://v2.tauri.app/distribute/appimage/) and the [Linux artifact guide](linux.md).
+
+On Windows, updater signatures and Authenticode publisher signatures have different purposes. The current custom setup requires an existing WebView2 Runtime and explains how to install it if absent; it does not bootstrap that runtime. Authenticode signing is not configured. Before adding clean-machine Windows coverage, choose runtime bootstrap/offline delivery and configure a publisher certificate or signing service. Tauri documents [WebView2 installer modes](https://v2.tauri.app/distribute/windows-installer/) and [publisher signing](https://v2.tauri.app/distribute/sign/windows/). The existing setup remains the release artifact because it also owns Fetchrail's browser registration, uninstall and self-update integration.
 
 ## Update signing
 
