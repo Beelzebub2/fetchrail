@@ -167,6 +167,8 @@ Native Linux x64 and arm64 runners build AppImage, DEB, RPM and portable archive
 
 Pushes to `main` run these checks, package unsigned development downloads and cache compiled Rust dependencies. Windows also saves vcpkg binary archives on `main`; vcpkg validates compiler, port and dependency ABI hashes before restoring them. Tag builds reuse these caches and sign and publish release downloads. A new toolchain or changed dependencies can require rebuilding the cache. Superseded branch builds are cancelled; tag builds finish independently. Update-service-only changes run the separate feed checks without rebuilding the desktop app. Actions display desktop builds as `Build / main` and `Release vVERSION`; pushing a commit and its tag creates one run of each.
 
+Wait for the `main` build to finish before tagging the same commit so the release run can reuse its saved caches.
+
 Release assets are:
 
 | Asset | Purpose |
@@ -182,6 +184,8 @@ Release assets are:
 The publisher uploads only these 12 assets. Per-platform fragments, individual checksum files and the signature verifier stay in CI. All nine downloads still pass signature, hash and size verification before publication, and `latest.json` retains the three updater signatures inline. Existing published releases remain immutable; this layout applies to future releases.
 
 The 0.6.0 release's first successful native run took 32m26s on Windows (18m11s for native dependencies), 14m06s on Linux x64 and 14m55s on Linux arm64. Windows now builds only the Release native libraries that `build.rs` and the fixtures link, matching Linux's existing configuration. Linux x64 spent another 2m37s recompiling before bundling; CI now runs `tauri bundle` on the already-qualified release binary, preserving the package-content checks that reject developer tools. It still builds all four Linux formats and runs every native/distro gate. Windows cache savings depend on a compatible warmed cache; cold builds still compile the required Release dependencies. The Windows native build was the release's critical path, so reducing release attachment count alone does not materially shorten compilation.
+
+In the [first optimized CI run](https://github.com/Beelzebub2/fetchrail/actions/runs/38129032965), the cold Windows native dependency build took 8m21s and saved a 152 MB binary cache. Linux packaging took 1m45s on x64 and 1m44s on arm64, compared with 4m17s and 4m26s previously. A fresh local Windows install restored all 71 dependency packages from cache in 24.6 seconds without compilation; the hosted Windows warm-cache duration has not been measured.
 
 AppImage is the portable Linux option; native packages offer ordinary package-manager installation and removal. Build against the oldest supported Linux base with WebKitGTK 4.1, and build each AppImage on its native architecture. Current CI uses Ubuntu 22.04 for x64 and Ubuntu 24.04 for arm64, so older ARM distributions need separate compatibility qualification. See [Tauri's AppImage guidance](https://v2.tauri.app/distribute/appimage/) and the [Linux artifact guide](linux.md).
 
