@@ -20,7 +20,8 @@ export async function tokenFixture(tag = "v1.2.3") {
 }
 export function releaseFixture(tag = "v1.2.3") {
   const version = tag.slice(1), base = `https://github.com/${REPOSITORY}/releases/download/${tag}/`;
-  const names = ["latest.json", `Fetchrail-v${version}-windows-x64.exe`, `Fetchrail-Setup-${tag}-windows-x64.exe`];
+  // Match the packagers: Windows setup is also the installed app's updater asset.
+  const names = ["latest.json", `Fetchrail-Setup-${tag}-windows-x64.exe`];
   for (const arch of ["x64", "arm64"]) for (const format of ["deb", "rpm", "AppImage", "tar.gz"])
     names.push(`Fetchrail-${tag}-linux-${arch}.${format}`);
   const release = { tag_name: tag, draft: false, prerelease: false, published_at: "2026-10-10T00:00:00Z",
@@ -75,6 +76,11 @@ if (process.argv[1]?.endsWith("test.mjs")) {
     return new Response(fixture.bytes);
   };
   const snapshot = await loadRelease("v1.2.3", digest, upstream);
+  const rawBinary = structuredClone(fixture.manifest);
+  rawBinary.platforms["windows-x86_64"].url = `https://github.com/${REPOSITORY}/releases/download/v1.2.3/Fetchrail-v1.2.3-windows-x64.exe`;
+  const withRawBinary = { ...fixture.release, assets: [...fixture.release.assets,
+    { name: "Fetchrail-v1.2.3-windows-x64.exe", size: 1234, browser_download_url: rawBinary.platforms["windows-x86_64"].url }] };
+  assert.throws(() => validateRelease(withRawBinary, rawBinary, "v1.2.3"), /Updater asset is not in the published release/);
   await assert.rejects(loadRelease("v1.2.3", "0".repeat(64), upstream), error => error.status === 409);
   for (const property of ["draft", "prerelease"])
     assert.throws(() => validateRelease({ ...fixture.release, [property]: true }, fixture.manifest, "v1.2.3"), FeedError);
