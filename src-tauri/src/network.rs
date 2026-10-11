@@ -26,6 +26,16 @@ pub fn slow_progress(
     slow
 }
 
+pub fn weak_peer(bytes: u64, elapsed: Duration, peer: u64, windows: &mut usize) -> bool {
+    let rate = bytes as f64 / elapsed.as_secs_f64().max(0.001);
+    *windows = if peer > 0 && rate < peer as f64 * 0.25 {
+        *windows + 1
+    } else {
+        0
+    };
+    *windows >= 2
+}
+
 pub struct OriginGate {
     active: AtomicUsize,
     waits: AtomicUsize,
@@ -127,6 +137,26 @@ impl OriginGate {
 mod tests {
     use super::*;
     use futures_util::FutureExt;
+
+    #[test]
+    fn weak_peer_requires_two_live_windows_and_resets_on_host_pause() {
+        let mut windows = 0;
+        assert!(!weak_peer(0, Duration::from_secs(5), 100_000, &mut windows));
+        assert!(!weak_peer(0, Duration::from_secs(5), 0, &mut windows));
+        assert!(!weak_peer(0, Duration::from_secs(5), 100_000, &mut windows));
+        assert!(weak_peer(
+            1000,
+            Duration::from_secs(5),
+            100_000,
+            &mut windows
+        ));
+        assert!(!weak_peer(
+            500_000,
+            Duration::from_secs(5),
+            100_000,
+            &mut windows
+        ));
+    }
 
     #[test]
     fn slow_links_and_isolated_spikes_are_not_stalls() {

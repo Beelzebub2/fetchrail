@@ -15,6 +15,7 @@ use crate::native_protocol::{
 pub const CHROMIUM_EXTENSION_ID: &str = "fkmedfamaoejlhddajndhjemiedmnldh";
 pub const CHROMIUM_STORE_EXTENSION_ID: &str = "ccmbmcgihlemlheldpkgnidgohlkaipb";
 pub const FIREFOX_EXTENSION_ID: &str = "browser@braid.rrmtools.uk";
+pub const LOCAL_FIREFOX_EXTENSION_ID: &str = "{bb4d3986-35bd-4e55-bbcb-bb7f67894086}";
 
 pub fn is_browser_invocation() -> bool {
     is_browser_invocation_args(std::env::args_os().skip(1))
@@ -31,6 +32,7 @@ fn is_browser_invocation_args(args: impl IntoIterator<Item = OsString>) -> bool 
             .iter()
             .any(|origin| argument == origin.as_str())
             || argument == FIREFOX_EXTENSION_ID
+            || argument == LOCAL_FIREFOX_EXTENSION_ID
     })
 }
 
