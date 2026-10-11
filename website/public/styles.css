@@ -277,8 +277,7 @@ html:not(.js) .engine-stage { display: none; }
 .motion .engine-stage { grid-area: stage; margin: 0; }
 .motion .engine-rails { height: min(46vh, 420px); }
 .motion .engine-steps { grid-area: steps; display: block; margin: 0; }
-.motion .engine-steps li { position: relative; padding: 14px 0 14px 22px; opacity: .34; transition: opacity 450ms; }
-.motion .engine-steps li.active { opacity: 1; }
+.motion .engine-steps li { position: relative; padding: 14px 0 14px 22px; }
 .motion .engine-steps li::before, .motion .engine-steps li::after { content: ""; position: absolute; top: 14px; bottom: 14px; left: 0; width: 2px; border-radius: 2px; background: var(--line); }
 .motion .engine-steps li::after { background: var(--accent); transform: scaleY(var(--sp, 0)); transform-origin: 50% 0; }
 .motion .engine-steps h3 { margin-top: 2px; font-size: clamp(22px, 3.4vh, 30px); }
@@ -533,8 +532,7 @@ html:not(.js) .converge { display: none; }
   .handoff-layout { grid-template-columns: minmax(0, 1.05fr) minmax(0, .95fr); gap: clamp(40px, 7vw, 112px); align-items: start; }
   .motion .handoff-visual { position: sticky; top: max(calc(var(--head) + 24px), calc(50vh - 230px)); }
   .motion .handoff-steps { gap: 0; }
-  .motion .handoff-steps li { min-height: 60vh; display: flex; flex-direction: column; justify-content: center; opacity: .28; transition: opacity 450ms; }
-  .motion .handoff-steps li.active { opacity: 1; }
+  .motion .handoff-steps li { min-height: 60vh; display: flex; flex-direction: column; justify-content: center; }
 }
 @media (max-width: 1179px) {
   .shot-side { display: none; }
