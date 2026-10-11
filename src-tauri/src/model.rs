@@ -195,6 +195,8 @@ impl DownloadSettings {
             .and_then(|v| v.as_u64())
             .filter(|v| *v > 0)
         {
+            // Consume the migrated cap so a later UI change can remove it.
+            self.extra.remove("bandwidthLimitKbps");
             let legacy = legacy.saturating_mul(1024);
             self.speed_limit_bps = if self.speed_limit_bps == 0 {
                 legacy

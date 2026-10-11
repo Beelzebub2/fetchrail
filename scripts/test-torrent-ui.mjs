@@ -52,11 +52,25 @@ try {
   await page.goto("http://127.0.0.1:1428");
   // The list is grouped by status: Torrent 1 leads the Downloading section, Torrent 0 is seeding far below it.
   await page.getByRole("button", { name: "Inspect Torrent 1", exact: true }).waitFor();
+  // A mounted button can precede the first paint on a fresh hosted browser.
+  // Finish page startup before measuring actions; the first inspector opening is still measured.
+  const initialPaintMs = await page.evaluate(async () => {
+    const start = performance.now();
+    await document.fonts.ready;
+    await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+    return performance.now() - start;
+  });
   const renderedTransfers = await page.locator(".download-row").count();
   assert.ok(renderedTransfers < 40, `1,000 records must remain virtualized (${renderedTransfers} rendered)`);
   const latencies = [];
   for (let i = 0; i < 10; i++) {
-    const elapsed = await page.evaluate(async () => { const start = performance.now(); document.querySelector('.torrent-row .icon-button').click(); await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))); return performance.now() - start; });
+    const elapsed = await page.evaluate(async () => {
+      const start = performance.now();
+      document.querySelector('.torrent-row .icon-button').click();
+      await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+      if (!document.querySelector('.torrent-inspector')?.getBoundingClientRect().height) throw Error("Torrent details did not render during the measured frames.");
+      return performance.now() - start;
+    });
     latencies.push(elapsed);
     await page.getByRole("button", { name: "Close torrent details", exact: true }).click();
   }
@@ -100,8 +114,9 @@ try {
   await page.getByRole("tab", { name: "Files", exact: true }).click();
   await page.screenshot({ path: "artifacts/torrent-ui-narrow.png" });
   const p95 = [...latencies].sort((a, b) => a - b)[Math.ceil(latencies.length * 0.95) - 1];
-  const metrics = { records: 1000, files: 10000, peers: 2000, telemetryHz: 4, steadyTelemetrySeconds: 15, steadyStallsMs: steadyStalls, actionPaintP95Ms: p95, actionPaintSamplesMs: latencies, errors };
+  const metrics = { records: 1000, files: 10000, peers: 2000, initialPaintMs, telemetryHz: 4, steadyTelemetrySeconds: 15, steadyStallsMs: steadyStalls, actionPaintP95Ms: p95, actionPaintSamplesMs: latencies, errors };
   await writeFile("artifacts/torrent-ui-performance.json", JSON.stringify(metrics, null, 2));
+  console.log("Torrent UI performance: " + JSON.stringify(metrics));
   assert.deepEqual(errors, []);
   assert.ok(p95 < 100, `UI action p95 was ${p95.toFixed(1)} ms`);
   assert.ok(steadyStalls.filter(ms => ms > 50).length <= 1, `Repeated steady-state UI stalls: ${JSON.stringify(steadyStalls)}`);

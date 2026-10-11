@@ -228,6 +228,10 @@ try {
     window.testRecord.completionOptions.forceShutdown = true;
     window.testEmit("fetchrail://download-updated", structuredClone(window.testRecord));
   });
+  await page.waitForFunction(() => {
+    const checkbox = [...document.querySelectorAll('input[type="checkbox"]')].find((input) => input.parentElement.textContent.includes("Ignore shutdown inhibitors"));
+    return checkbox?.checked && !checkbox.disabled;
+  });
   await page.getByLabel("Ignore shutdown inhibitors").uncheck();
   await page.waitForFunction(() => window.testRecord.completionOptions.forceShutdown === false);
   await page.getByLabel("Turn off computer when done").uncheck();

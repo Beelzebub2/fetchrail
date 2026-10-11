@@ -64,6 +64,34 @@ jobs:
           }
       - name: Install frontend dependencies
         run: npm ci
+      - name: Build frontend and extensions
+        run: npm run build
+      - name: Check extension behaviour
+        run: npm run browser:check
+      - name: Test progress and torrent interfaces
+        run: |
+          npm run ui:test
+          if ($LASTEXITCODE -ne 0) { throw 'Progress interface checks failed.' }
+          npm run torrent:ui
+          if ($LASTEXITCODE -ne 0) { throw 'Torrent interface checks failed.' }
+      - name: Retain Windows interface evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: qualification-windows-ui
+          path: artifacts/torrent-ui-*
+          if-no-files-found: warn
+      - name: Check release tooling and build store package
+        run: |
+          npm run release:test
+          if ($LASTEXITCODE -ne 0) { throw 'Release tooling checks failed.' }
+          npm run cws:test
+          if ($LASTEXITCODE -ne 0) { throw 'Chrome Web Store checks failed.' }
+          $version = (Get-Content package.json -Raw | ConvertFrom-Json).version
+          $env:CWS_OUTPUT = "$PWD/artifacts/chrome-web-store-$version"
+          node scripts/prepare-chrome-web-store.mjs "v$version"
+          if ($LASTEXITCODE -ne 0) { throw 'Production extension packaging failed.' }
+          Compress-Archive -Path "$env:CWS_OUTPUT/*" -DestinationPath "artifacts/chrome-web-store-$version.zip"
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: microsoft/vcpkg
@@ -74,10 +102,8 @@ jobs:
         run: |
           ./.native-vcpkg/bootstrap-vcpkg.bat -disableMetrics
           ./scripts/build-torrent-deps.ps1 -VcpkgRoot "$PWD/.native-vcpkg"
-      - name: Build frontend and extensions
-        run: npm run build
-      - name: Check extension behaviour
-        run: npm run browser:check
+      - name: Generate dependency inventory and notices
+        run: node scripts/release-notices.mjs
       - name: Check Rust formatting
         run: cargo fmt --manifest-path src-tauri/Cargo.toml -- --check
       - name: Run Rust tests
@@ -92,15 +118,25 @@ jobs:
         run: npm run engine:test
       - name: Test real torrent swarms
         run: |
-          cargo build --manifest-path src-tauri/Cargo.toml --release --bin torrent-harness --features tauri/custom-protocol,test-tools --locked
           npm run torrent:test
+          if ($LASTEXITCODE -ne 0) { throw 'Torrent swarm checks failed.' }
           npm run torrent:listeners
-      - name: Test torrent UI and packaged integration
-        run: |
-          npm run torrent:ui
-          node scripts/test-torrent-desktop.mjs src-tauri/target/release/fetchrail.exe src-tauri/target/release/torrent-harness.exe
+      - name: Test packaged torrent integration
+        run: node scripts/test-torrent-desktop.mjs src-tauri/target/release/fetchrail.exe src-tauri/target/release/torrent-harness.exe
       - name: Test setup and removal
         run: npm run setup:test
+      - name: Package Windows build without release secrets
+        if: github.ref_type != 'tag'
+        run: ./scripts/package-release.ps1 -FragmentOnly
+      - name: Upload Windows development assets
+        if: github.ref_type != 'tag'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: development-windows-x64
+          path: |
+            release-artifacts/*
+            artifacts/chrome-web-store-*.zip
+          if-no-files-found: error
       - name: Benchmark HTTP completion
         if: inputs.benchmark == true
         run: npm run engine:bench
@@ -118,8 +154,6 @@ jobs:
         run: |
           if (-not $env:TAURI_SIGNING_PRIVATE_KEY) { throw 'The TAURI_SIGNING_PRIVATE_KEY secret is missing.' }
           ./scripts/package-release.ps1 -Tag "$env:GITHUB_REF_NAME" -FragmentOnly
-          node scripts/release-notices.mjs
-          cargo build --manifest-path src-tauri/Cargo.toml --release --bin verify-update --features tauri/custom-protocol,test-tools --locked
       - name: Upload Windows release assets
         if: startsWith(github.ref, 'refs/tags/')
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -183,7 +217,7 @@ jobs:
         run: |
           npm run build
           npm run browser:check
-          node scripts/test-release-aggregation.mjs
+          npm run release:test
       - name: Generate dependency inventory and bundled notices
         run: node scripts/release-notices.mjs
       - name: Install Linux UI test browser
@@ -209,13 +243,14 @@ jobs:
           ldd src-tauri/target/release/fetchrail | tee elf-dependencies.txt
           ! grep -q 'not found' elf-dependencies.txt
       - name: Run actual WebKitGTK desktop and HTTP fixtures
-        run: xvfb-run -a dbus-run-session -- npm run linux:qualify
+        # Keep X11 available while restart recovery closes the last app connection.
+        run: xvfb-run -a -s "-screen 0 1280x1024x24 -noreset" dbus-run-session -- npm run linux:qualify
       - name: Install native WebKitGTK desktop test driver
         run: |
           sudo apt-get install -y --no-install-recommends webkit2gtk-driver weston
           cargo install tauri-driver --version 2.1.0 --locked
       - name: Test native settings, autostart and progress windows
-        run: xvfb-run -a dbus-run-session -- npm run linux:desktop
+        run: xvfb-run -a -s "-screen 0 1280x1024x24 -noreset" dbus-run-session -- npm run linux:desktop
       - name: Test native Wayland settings and progress windows
         run: npm run linux:wayland
       - name: Build Linux packages without release secrets
@@ -241,19 +276,19 @@ jobs:
           dpkg-deb --extract "$deb" "$desktop"
           find "$desktop/usr/share/applications" -name '*.desktop' -exec desktop-file-validate {} +
           sudo apt-get install -y "$(realpath "$deb")"
-          xvfb-run -a dbus-run-session -- node scripts/smoke-desktop.mjs /usr/bin/fetchrail
+          xvfb-run -a -s "-screen 0 1280x1024x24 -noreset" dbus-run-session -- node scripts/smoke-desktop.mjs /usr/bin/fetchrail
           sudo apt-get remove -y fetchrail
           image=$(find src-tauri/target/release/bundle -name '*.AppImage' -print -quit)
           test -n "$image"
-          xvfb-run -a dbus-run-session -- node scripts/smoke-desktop.mjs "$image"
-          xvfb-run -a dbus-run-session -- node scripts/test-linux-appimage.mjs "$image"
+          xvfb-run -a -s "-screen 0 1280x1024x24 -noreset" dbus-run-session -- node scripts/smoke-desktop.mjs "$image"
+          xvfb-run -a -s "-screen 0 1280x1024x24 -noreset" dbus-run-session -- node scripts/test-linux-appimage.mjs "$image"
           if [[ "$GITHUB_REF_TYPE" == tag ]]; then archive_root=release-artifacts; else archive_root=artifacts/linux-development; fi
           archive=$(find "$archive_root" -name '*.tar.gz' -print -quit)
           test -n "$archive"
-          xvfb-run -a dbus-run-session -- node scripts/test-linux-archive.mjs "$archive"
+          xvfb-run -a -s "-screen 0 1280x1024x24 -noreset" dbus-run-session -- node scripts/test-linux-archive.mjs "$archive"
       - name: Benchmark HTTP completion
         if: inputs.benchmark == true
-        run: xvfb-run -a dbus-run-session -- npm run engine:bench
+        run: xvfb-run -a -s "-screen 0 1280x1024x24 -noreset" dbus-run-session -- npm run engine:bench
       - name: Stage installed-package distro fixtures
         if: matrix.arch == 'x64'
         run: |
