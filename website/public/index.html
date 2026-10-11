@@ -1,0 +1,535 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Fetchrail — Download Manager for Windows and Linux</title>
+  <meta name="description" content="A download manager for Windows and Linux. Parallel transfers on up to 32 connections, reliable resume and browser integration.">
+  <meta name="theme-color" content="#0c0e13">
+  <link rel="canonical" href="https://fetchrail.rrmtools.uk/">
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+  <meta property="og:type" content="website">
+  <meta property="og:site_name" content="Fetchrail">
+  <meta property="og:title" content="Fetchrail — Download Manager for Windows and Linux">
+  <meta property="og:description" content="A download manager for Windows and Linux. Parallel transfers on up to 32 connections, resume that checks before it trusts, and a browser companion.">
+  <meta property="og:url" content="https://fetchrail.rrmtools.uk/">
+  <meta property="og:image" content="https://fetchrail.rrmtools.uk/og.jpg">
+  <meta property="og:image:width" content="1200">
+  <meta property="og:image:height" content="630">
+  <meta property="og:image:alt" content="Fetchrail. One file. Thirty-two rails. A row of thirty-two orange download segments fills side by side on a dark background.">
+  <meta name="twitter:card" content="summary_large_image">
+  <link rel="preload" href="/fonts/bricolage-grotesque-latin-opsz-normal.woff2" as="font" type="font/woff2" crossorigin>
+  <link rel="preload" href="/fonts/geist-latin-wght-normal.woff2" as="font" type="font/woff2" crossorigin>
+  <link rel="stylesheet" href="/styles.css">
+  <meta name="google-site-verification" content="S7z4vk1oagNmW3kmUlylJTOc1mizQ0ugW4xY2a_FI6o">
+  <script type="application/ld+json">{"@context":"https://schema.org","@type":"SoftwareApplication","name":"Fetchrail","url":"https://fetchrail.rrmtools.uk/","applicationCategory":"UtilitiesApplication","operatingSystem":"Windows, Linux","description":"A free download manager for Windows and Linux with up to 32 parallel connections, safe resume, queues and browser integration.","downloadUrl":"https://github.com/Beelzebub2/fetchrail/releases/latest","offers":{"@type":"Offer","price":"0","priceCurrency":"USD"}}</script>
+  <script src="/theme.js"></script>
+  <script src="/app.js" type="module"></script>
+</head>
+<body>
+  <a class="skip" href="#main">Skip to content</a>
+
+  <svg class="sprite" aria-hidden="true">
+    <symbol id="i-download" viewBox="0 0 24 24"><path d="M12 3v12"/><path d="m7 10 5 5 5-5"/><path d="M5 21h14"/></symbol>
+    <symbol id="i-link" viewBox="0 0 24 24"><path d="M10 13a5 5 0 0 0 7.5.5l3-3a5 5 0 0 0-7-7l-1.8 1.7M14 11a5 5 0 0 0-7.5-.5l-3 3a5 5 0 0 0 7 7l1.7-1.7"/></symbol>
+    <symbol id="i-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></symbol>
+    <symbol id="i-list" viewBox="0 0 24 24"><path d="M8 6h13M8 12h13M8 18h13M3 6h.01M3 12h.01M3 18h.01"/></symbol>
+    <symbol id="i-activity" viewBox="0 0 24 24"><path d="M22 12h-4l-3 9L9 3l-3 9H2"/></symbol>
+    <symbol id="i-done" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="m8.5 12 2.5 2.5 4.5-5"/></symbol>
+    <symbol id="i-alert" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 8v5M12 16h.01"/></symbol>
+    <symbol id="i-settings" viewBox="0 0 24 24"><path d="M3 6h11M18 6h3M3 12h3M10 12h11M3 18h9M16 18h5"/><circle cx="16" cy="6" r="2"/><circle cx="8" cy="12" r="2"/><circle cx="14" cy="18" r="2"/></symbol>
+    <symbol id="i-chevron" viewBox="0 0 24 24"><path d="m9 6 6 6-6 6"/></symbol>
+    <symbol id="i-down" viewBox="0 0 24 24"><path d="m6 9 6 6 6-6"/></symbol>
+    <symbol id="i-pause" viewBox="0 0 24 24"><path d="M8 5v14M16 5v14"/></symbol>
+    <symbol id="i-folder" viewBox="0 0 24 24"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></symbol>
+    <symbol id="i-more" viewBox="0 0 24 24"><circle cx="5" cy="12" r="1"/><circle cx="12" cy="12" r="1"/><circle cx="19" cy="12" r="1"/></symbol>
+    <symbol id="i-check" viewBox="0 0 24 24"><path d="M5 12.5 10 17 19 7"/></symbol>
+    <symbol id="i-calendar" viewBox="0 0 24 24"><rect x="3" y="5" width="18" height="16" rx="2"/><path d="M3 10h18M8 3v4M16 3v4"/></symbol>
+    <symbol id="i-out" viewBox="0 0 24 24"><path d="M7 7h10v10M7 17 17 7"/></symbol>
+    <symbol id="i-rescan" viewBox="0 0 24 24"><path d="M21 12a9 9 0 1 1-2.6-6.4L21 8M21 3v5h-5"/></symbol>
+    <symbol id="logo" viewBox="0 0 48 48"><rect width="48" height="48" rx="12"/><g transform="translate(24 24) scale(.78) translate(-24 -24)"><path d="M37 7 24 19"/><path class="cut" d="M11 7 28 22.7"/><path d="M11 7 28 22.7"/><path d="M11 18 24 30"/><path class="cut" d="M37 18 20 33.7"/><path d="M37 18 20 33.7"/><path class="cut" d="M11 29 24 41"/><path d="M11 29 24 41"/><path d="M37 29 24 41"/></g></symbol>
+  </svg>
+
+  <div class="head-sentinel" data-head-sentinel></div>
+  <header class="site-head" data-site-head>
+    <div class="wrap site-head-row">
+      <a class="brand" href="/" aria-label="Fetchrail home">
+        <svg class="logo" width="30" height="30" aria-hidden="true"><use href="#logo"/></svg>
+        <span>Fetchrail</span>
+      </a>
+      <nav class="site-nav" aria-label="Sections">
+        <a href="#engine">Engine</a>
+        <a href="#controls">Controls</a>
+        <a href="#companion">Browser companion</a>
+        <a href="#finish">Themes</a>
+        <a href="#install">Install</a>
+      </nav>
+      <div class="site-head-actions">
+        <a class="site-nav-github" href="https://github.com/Beelzebub2/fetchrail">GitHub</a>
+        <a class="btn btn-primary btn-small" href="https://github.com/Beelzebub2/fetchrail/releases/latest" data-download><svg class="ico"><use href="#i-download"/></svg>Download</a>
+      </div>
+    </div>
+    <span class="page-progress" aria-hidden="true"></span>
+  </header>
+
+  <main id="main">
+    <section class="hero">
+      <div class="wrap hero-copy">
+        <p class="eyebrow mono">
+          <span class="accent" data-release-version>Latest release</span>
+          <span>Windows · Linux</span>
+          <span>Download manager</span>
+        </p>
+        <h1><span class="line"><span>Download manager.</span></span><span class="line"><span>Windows &amp; Linux.</span></span></h1>
+        <p class="hero-tagline">One file. Thirty-two rails.</p>
+        <p class="lede">A download manager for Windows and Linux. Fetchrail splits each file across parallel connections, safely resumes supported transfers, and picks up downloads straight from your browser.</p>
+        <div class="cta">
+          <div class="cta-buttons">
+            <a class="btn btn-primary" href="https://github.com/Beelzebub2/fetchrail/releases/latest" data-download><svg class="ico"><use href="#i-download"/></svg><span data-download-label>View releases</span></a>
+            <a class="btn btn-secondary" href="https://github.com/Beelzebub2/fetchrail">View on GitHub</a>
+          </div>
+          <p>Free to download · no account required</p>
+          <p class="cta-note mono">Choose your system, CPU and package below · signed releases</p>
+        </div>
+      </div>
+
+      <div class="hero-rails">
+        <div class="strands rails" data-rails aria-hidden="true"></div>
+      </div>
+
+      <div class="wrap hero-stage" data-hero-stage>
+        <span class="hero-glow" aria-hidden="true"></span>
+        <figure class="shot" role="img" aria-label="The Fetchrail window: a 4.2 GB download split across 16 connections, with each connection's byte range, progress and speed listed underneath.">
+          <div class="shot-side">
+            <div class="shot-brand">
+              <svg class="logo" width="28" height="28" aria-hidden="true"><use href="#logo"/></svg>
+              <span>Fetchrail</span>
+            </div>
+            <div class="shot-nav">
+              <div class="shot-nav-item active"><svg class="ico"><use href="#i-list"/></svg><span>All downloads</span><span class="count mono">4</span></div>
+              <div class="shot-nav-item"><svg class="ico"><use href="#i-activity"/></svg><span>Active</span><span class="count mono">2</span></div>
+              <div class="shot-nav-item"><svg class="ico"><use href="#i-done"/></svg><span>Completed</span><span class="count mono">1</span></div>
+              <div class="shot-nav-item"><svg class="ico"><use href="#i-alert"/></svg><span>Failed</span><span class="count mono">0</span></div>
+            </div>
+            <div class="shot-nav">
+              <span class="overline shot-nav-heading">Queues</span>
+              <div class="shot-nav-item"><span class="queue-dot live"></span><span>Default</span><span class="count mono">3</span></div>
+              <div class="shot-nav-item"><span class="queue-dot"></span><span>Overnight</span><span class="count mono">1</span></div>
+            </div>
+            <div class="shot-side-bottom">
+              <div class="shot-nav-item"><svg class="ico"><use href="#i-settings"/></svg><span>Settings</span></div>
+              <div class="throughput">
+                <span class="overline">Downloading now</span>
+                <div class="throughput-speed mono"><strong data-sim="total-speed">81.0</strong><span>MB/s</span></div>
+                <svg viewBox="0 0 200 44" preserveAspectRatio="none"><path data-sim="spark-area" d="M0,44 L0,30 L14,26 L28,28 L42,20 L57,22 L71,14 L85,18 L100,10 L114,13 L128,8 L142,12 L157,6 L171,9 L185,5 L200,7 L200,44 Z"/><polyline data-sim="spark-line" points="0,30 14,26 28,28 42,20 57,22 71,14 85,18 100,10 114,13 128,8 142,12 157,6 171,9 185,5 200,7"/></svg>
+                <p><span data-sim="active-summary">2 active · 1 waiting</span><span data-sim="total-connections">20 connections</span></p>
+              </div>
+            </div>
+          </div>
+
+          <div class="shot-main">
+            <div class="add-bar">
+              <div class="add-field"><svg class="ico"><use href="#i-link"/></svg><span>Paste a link to download</span></div>
+              <div class="btn btn-primary add-button"><svg class="ico"><use href="#i-download"/></svg><span>Download</span></div>
+            </div>
+            <div class="list-head">
+              <div class="list-title">All downloads<span class="mono">4</span></div>
+              <div class="search"><svg class="ico"><use href="#i-search"/></svg><span>Search name, site or queue</span></div>
+            </div>
+
+            <div class="download-list">
+              <div class="row-main list-columns overline"><span></span><span></span><span>Name</span><span>Progress</span><span class="col-speed">Speed</span><span class="col-eta">Time left</span><span></span></div>
+
+              <div class="download-row expanded" data-download-row="iso">
+                <div class="row-main">
+                  <span class="col-chevron"><svg class="ico chevron"><use href="#i-chevron"/></svg></span>
+                  <span class="file-badge live mono">ISO</span>
+                  <div class="col-name"><strong>linux-desktop-24.04-amd64.iso</strong><span>mirror.example.org · Default</span></div>
+                  <div class="col-progress">
+                    <div class="progress-line mono"><span data-sim="caption">2.6 GB of 4.2 GB</span><span data-sim="percent">62%</span></div>
+                    <div class="strands" data-sim="strands"></div>
+                  </div>
+                  <div class="col-speed"><span class="mono" data-sim="speed">76.8 MB/s</span><small data-sim="connections">12 of 16 connections</small></div>
+                  <div class="col-eta"><span class="mono" data-sim="eta">21s</span><small data-sim="eta-label">left</small></div>
+                  <div class="row-actions"><span class="icon-cell"><svg class="ico"><use href="#i-pause"/></svg></span><span class="icon-cell"><svg class="ico"><use href="#i-folder"/></svg></span><span class="icon-cell"><svg class="ico"><use href="#i-more"/></svg></span></div>
+                </div>
+                <div class="connections-body">
+                  <div class="connections-head"><span class="overline">Connections</span><span data-sim="summary">16 connections · 12 receiving · 4 done</span></div>
+                  <div class="strands map" data-sim="map"></div>
+                  <div class="axis mono"><span>0</span><span>2.1 GB</span><span>4.2 GB</span></div>
+                  <div class="lanes" data-sim="lanes"></div>
+                </div>
+              </div>
+
+              <div class="download-row" data-download-row="zip">
+                <div class="row-main">
+                  <span class="col-chevron"><svg class="ico chevron"><use href="#i-chevron"/></svg></span>
+                  <span class="file-badge live mono">ZIP</span>
+                  <div class="col-name"><strong>field-recordings-2026.zip</strong><span>files.example.org · Default</span></div>
+                  <div class="col-progress">
+                    <div class="progress-line mono"><span data-sim="caption">308 MB of 1.1 GB</span><span data-sim="percent">28%</span></div>
+                    <div class="strands" data-sim="strands"></div>
+                  </div>
+                  <div class="col-speed"><span class="mono" data-sim="speed">4.2 MB/s</span><small data-sim="connections">8 of 8 connections</small></div>
+                  <div class="col-eta"><span class="mono" data-sim="eta">3m 08s</span><small data-sim="eta-label">left</small></div>
+                  <div class="row-actions"><span class="icon-cell"><svg class="ico"><use href="#i-pause"/></svg></span><span class="icon-cell"><svg class="ico"><use href="#i-folder"/></svg></span><span class="icon-cell"><svg class="ico"><use href="#i-more"/></svg></span></div>
+                </div>
+              </div>
+
+              <div class="download-row">
+                <div class="row-main">
+                  <span class="col-chevron"><svg class="ico chevron"><use href="#i-chevron"/></svg></span>
+                  <span class="file-badge mono">MP4</span>
+                  <div class="col-name"><strong>lecture-series-1080p.mp4</strong><span>media.example.org · Overnight</span></div>
+                  <div class="col-progress">
+                    <div class="progress-line"><span><svg class="ico ico-14"><use href="#i-calendar"/></svg>Starts tonight at 02:00</span></div>
+                    <div class="strands"><span></span></div>
+                  </div>
+                  <div class="col-speed"><span class="mono">—</span></div>
+                  <div class="col-eta"><span class="mono">—</span></div>
+                  <div class="row-actions"><span class="icon-cell"><svg class="ico"><use href="#i-more"/></svg></span></div>
+                </div>
+              </div>
+
+              <div class="download-row completed">
+                <div class="row-main">
+                  <span class="col-chevron"><svg class="ico chevron"><use href="#i-chevron"/></svg></span>
+                  <span class="file-badge mono">PDF</span>
+                  <div class="col-name"><strong>annual-report-2025.pdf</strong><span>docs.example.org · Default</span></div>
+                  <div class="col-progress">
+                    <div class="progress-line"><span><svg class="ico ico-14"><use href="#i-check"/></svg>Completed 9 Oct, 11:42</span><span class="mono">18.4 MB</span></div>
+                  </div>
+                  <div class="col-speed"><span class="mono">—</span></div>
+                  <div class="col-eta"><span class="mono">—</span></div>
+                  <div class="row-actions"><span class="icon-cell"><svg class="ico"><use href="#i-folder"/></svg></span><span class="icon-cell"><svg class="ico"><use href="#i-more"/></svg></span></div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </figure>
+      </div>
+    </section>
+
+    <section class="wrap statement">
+      <p data-words>Most downloads travel down a single connection. Fetchrail opens up to thirty-two, and lets you watch every one.</p>
+    </section>
+
+    <section class="engine" id="engine" data-engine>
+      <div class="engine-pin">
+        <div class="wrap engine-layout">
+          <header class="engine-head">
+            <p class="overline">The engine</p>
+            <h2>Split on the way down. Whole when it lands.</h2>
+          </header>
+
+          <div class="engine-stage" aria-hidden="true">
+            <div class="engine-readout mono"><span data-engine-out="left">1 request</span><span data-engine-out="right">Asking the server</span></div>
+            <div class="engine-rails">
+              <span class="engine-file mono">linux-desktop-24.04-amd64.iso</span>
+              <div class="engine-bar" data-engine-rails><i class="engine-pulse"></i></div>
+              <span class="engine-done mono"><svg class="ico"><use href="#i-check"/></svg>Saved · 4.2 GB</span>
+            </div>
+          </div>
+
+          <ol class="engine-steps">
+            <li>
+              <span class="step-number mono">01</span>
+              <h3>Probe</h3>
+              <div class="step-body"><p>Before any bytes move, Fetchrail asks the server how long the file is and whether it honours byte ranges.</p></div>
+            </li>
+            <li>
+              <span class="step-number mono">02</span>
+              <h3>Split</h3>
+              <div class="step-body"><p>The file is cut into segments that never overlap, one per connection. The count adapts to the file and the server, up to 32.</p></div>
+            </li>
+            <li>
+              <span class="step-number mono">03</span>
+              <h3>Fetch</h3>
+              <div class="step-body"><p>Segments download side by side. If one drops, only that segment retries from its saved offset while the others keep going.</p></div>
+            </li>
+            <li>
+              <span class="step-number mono">04</span>
+              <h3>Join</h3>
+              <div class="step-body"><p>Parts are merged into a temporary file and renamed only when every byte is present. A half-finished file never takes the final name.</p></div>
+            </li>
+          </ol>
+        </div>
+      </div>
+    </section>
+
+    <section class="wrap section resume-section">
+      <div class="resume">
+        <div class="resume-copy">
+          <h2 class="h2-small" data-reveal>Resume that checks before it trusts.</h2>
+          <dl class="facts">
+            <div data-reveal class="d1"><dt>Pause</dt><dd>Closes the connections and frees the download slot.</dd></div>
+            <div data-reveal class="d2"><dt>Closed mid-transfer</dt><dd>The download comes back paused the next time Fetchrail starts.</dd></div>
+            <div data-reveal class="d3"><dt>Resume</dt><dd>Saved parts are reused only when the file's length, range layout and ETag or Last-Modified still match. Anything else restarts cleanly.</dd></div>
+          </dl>
+        </div>
+        <div class="card resume-card" data-reveal data-resume-card aria-hidden="true">
+          <div>
+            <div class="resume-label"><strong>Paused</strong><span class="mono">connections closed · parts kept on disk</span></div>
+            <div class="strands map" data-fills="0.72,0.6,0.66,0.5,0.7,0.55,0.62,0.58" data-state="stopped"></div>
+          </div>
+          <div>
+            <div class="resume-label"><strong>Resumed</strong><span class="mono accent">validators match · parts reused</span></div>
+            <div class="strands map" data-resume-strands data-fills="0.72,0.6,0.66,0.5,0.7,0.55,0.62,0.58"></div>
+          </div>
+        </div>
+      </div>
+      <p class="aside" data-reveal>If a server ignores byte ranges, Fetchrail drops the segmented attempt and fetches the file as a single stream instead.</p>
+    </section>
+
+    <section class="gallery" id="controls" data-gallery>
+      <div class="gallery-pin">
+        <div class="wrap gallery-head">
+          <h2>Decide when, where and how fast.</h2>
+          <span class="gallery-progress" aria-hidden="true"><i></i></span>
+        </div>
+        <div class="gallery-viewport">
+          <div class="gallery-track" data-gallery-track>
+            <article class="gcard">
+              <div class="gdemo gdemo-batch" aria-hidden="true">
+                <span class="overline">New downloads</span>
+                <div class="batch-lines mono">
+                  <span>https://files.example.org/set/part-01.zip</span>
+                  <span>https://files.example.org/set/part-02.zip</span>
+                  <span>https://files.example.org/set/part-03.zip</span>
+                </div>
+                <div class="batch-foot"><span class="mono accent">3 links</span><span>one folder · one queue · one limit</span></div>
+              </div>
+              <div class="gtext">
+                <h3>URL batches</h3>
+                <p>Paste several links, one per line. A batch shares its folder, queue, start time and per-file limit, and rejected links stay in the form to fix.</p>
+              </div>
+            </article>
+
+            <article class="gcard">
+              <div class="gdemo gdemo-speed" aria-hidden="true">
+                <div class="speed-chart">
+                  <svg class="speed-free" viewBox="0 0 400 160" preserveAspectRatio="none"><polyline points="0,120 25,96 50,104 75,70 100,82 125,44 150,58 175,26 200,40 225,18 250,36 275,22 300,48 325,30 350,56 375,38 400,50"/></svg>
+                  <div class="speed-capped"><svg viewBox="0 0 400 160" preserveAspectRatio="none"><path d="M0,160 L0,120 L25,96 L50,104 L75,70 L100,82 L125,44 L150,58 L175,26 L200,40 L225,18 L250,36 L275,22 L300,48 L325,30 L350,56 L375,38 L400,50 L400,160 Z"/></svg></div>
+                  <div class="speed-cap"><span class="mono">Total limit · 20480 KiB/s</span></div>
+                </div>
+              </div>
+              <div class="gtext">
+                <h3>Speed limits</h3>
+                <p>One limit for everything and another per file, both adjustable while a download runs. Zero means unlimited.</p>
+              </div>
+            </article>
+
+            <article class="gcard">
+              <div class="gdemo gdemo-queue" aria-hidden="true">
+                <div class="queue-row"><span class="queue-dot live"></span><strong>Overnight</strong><span class="queue-state mono"><span class="waiting">waiting</span><span class="running">running</span></span></div>
+                <div class="day"><span class="day-window"></span><span class="day-now"></span></div>
+                <div class="day-ticks mono"><span>00:00</span><span>06:00</span><span>12:00</span><span>18:00</span><span>24:00</span></div>
+                <div class="queue-times mono"><span>Start 02:00</span><span>Stop 07:00</span></div>
+              </div>
+              <div class="gtext">
+                <h3>Queues and schedules</h3>
+                <p>Give a queue a start time and an optional stop time. At the stop time, transfers return to the queue with their partial bytes intact.</p>
+              </div>
+            </article>
+
+            <article class="gcard">
+              <div class="gdemo gdemo-cats" aria-hidden="true">
+                <div class="cat-row"><svg class="ico"><use href="#i-folder"/></svg><strong>Compressed</strong><span class="mono"><i>zip</i><i>rar</i><i>7z</i></span></div>
+                <div class="cat-row"><svg class="ico"><use href="#i-folder"/></svg><strong>Documents</strong><span class="mono"><i>pdf</i><i>docx</i><i>xlsx</i></span></div>
+                <div class="cat-row"><svg class="ico"><use href="#i-folder"/></svg><strong>Music</strong><span class="mono"><i>mp3</i><i>flac</i><i>opus</i></span></div>
+                <div class="cat-row"><svg class="ico"><use href="#i-folder"/></svg><strong>Programs</strong><span class="mono"><i>exe</i><i>msi</i></span></div>
+                <div class="cat-row"><svg class="ico"><use href="#i-folder"/></svg><strong>Video</strong><span class="mono"><i>mp4</i><i>mkv</i><i>webm</i></span></div>
+              </div>
+              <div class="gtext">
+                <h3>File categories</h3>
+                <p>Files sort into folders by type. Change the extensions and destinations, or add categories of your own.</p>
+              </div>
+            </article>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="section handoff" id="companion" data-handoff>
+      <div class="wrap handoff-intro">
+        <h2 data-reveal>Your browser hands over the download.</h2>
+        <p class="section-lede" data-reveal>The companion works in Chrome, Edge, Chromium, Vivaldi, Brave and Firefox. It sends downloads to Fetchrail, and gives them back to the browser if the handoff fails.</p>
+      </div>
+
+      <div class="wrap handoff-layout">
+        <div class="handoff-visual" data-handoff-visual data-state="0" aria-hidden="true">
+          <div class="hv-browser">
+            <div class="hv-bar"><span class="overline">Browser</span><span class="hv-url mono">files.example.org/releases</span></div>
+            <div class="hv-item">
+              <span class="file-badge mono">ZIP</span>
+              <div class="hv-item-text">
+                <strong>field-recordings-2026.zip</strong>
+                <span class="hv-swap"><span class="s0">Downloading in the browser</span><span class="s1">Paused by the companion</span><span class="s2">Cancelled here, continues in Fetchrail</span></span>
+              </div>
+              <div class="hv-progress"><i></i></div>
+            </div>
+          </div>
+          <div class="hv-link"><i></i></div>
+          <div class="hv-app">
+            <div class="hv-app-head">
+              <svg class="logo" width="24" height="24"><use href="#logo"/></svg>
+              <strong>Fetchrail</strong>
+              <span class="hv-swap hv-app-state mono"><span class="s0">listening</span><span class="s1">verifying</span><span class="s2">downloading</span></span>
+            </div>
+            <div class="hv-swap hv-app-body">
+              <p class="s0">Waiting for the next download.</p>
+              <ul class="s1 hv-checks">
+                <li><svg class="ico"><use href="#i-check"/></svg><span>Size matches</span><span class="mono">1.1 GB</span></li>
+                <li><svg class="ico"><use href="#i-check"/></svg><span>Content type matches</span><span class="mono">application/zip</span></li>
+              </ul>
+              <div class="s2">
+                <div class="progress-line mono"><span>field-recordings-2026.zip</span><span>8 connections</span></div>
+                <div class="strands map hv-strands"><span><i></i></span><span><i></i></span><span><i></i></span><span><i></i></span><span><i></i></span><span><i></i></span><span><i></i></span><span><i></i></span></div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <ol class="handoff-steps">
+          <li>
+            <span class="step-number mono">01</span>
+            <h3>A download starts in your browser</h3>
+            <p>Click a file the way you always do. The companion notices it begin.</p>
+          </li>
+          <li>
+            <span class="step-number mono">02</span>
+            <h3>The companion pauses it and asks Fetchrail</h3>
+            <p>Fetchrail makes its own request and compares the size and content type with what the browser saw.</p>
+          </li>
+          <li>
+            <span class="step-number mono">03</span>
+            <h3>Fetchrail takes over</h3>
+            <p>The browser's copy is cancelled only after Fetchrail has accepted the file. If anything fails along the way, the browser carries on as if nothing happened.</p>
+          </li>
+        </ol>
+      </div>
+
+      <div class="wrap companion">
+        <div class="companion-copy">
+          <h2 class="h2-small" data-reveal>And it does more than catch.</h2>
+          <div class="points">
+            <div data-reveal class="d1"><h3>Picks from the page</h3><p>Scan the current page for links and media, search and filter them, then send only the ones you want.</p></div>
+            <div data-reveal class="d2"><h3>Works through download pages</h3><p>For sites with countdowns, it opens each page in turn, follows a single clear download button and captures the final file. Logins and CAPTCHAs stay with you.</p></div>
+            <div data-reveal class="d3"><h3>One right-click away</h3><p>Choose Download with Fetchrail on any link, or control running transfers from the toolbar.</p></div>
+          </div>
+          <p class="aside aside-plain" data-reveal>The companion ships inside Fetchrail and is loaded as an unpacked extension for now. <a class="text-link" href="https://github.com/Beelzebub2/fetchrail/blob/main/browser-extension/README.md">Read the companion guide</a></p>
+        </div>
+
+        <figure class="panel" data-reveal role="img" aria-label="The Fetchrail browser companion listing the links found on the current page, with three files selected for download.">
+          <div class="panel-head">
+            <svg class="logo" width="28" height="28" aria-hidden="true"><use href="#logo"/></svg>
+            <span class="panel-title">Fetchrail</span>
+            <span class="panel-status"><span class="queue-dot live"></span>Connected</span>
+            <span class="panel-open">Open app<svg class="ico ico-13"><use href="#i-out"/></svg></span>
+          </div>
+          <div class="panel-tabs">
+            <span>Downloads <span class="mono">3</span></span>
+            <span class="active">This page <span class="mono">12</span></span>
+          </div>
+          <div class="panel-section-head"><strong>Links on this page</strong><span><svg class="ico ico-13"><use href="#i-rescan"/></svg>Rescan</span></div>
+          <div class="panel-tools">
+            <span class="panel-field">Search links or file types</span>
+            <span class="panel-field panel-select">Files &amp; media<svg class="ico ico-13"><use href="#i-down"/></svg></span>
+          </div>
+          <div class="panel-selection"><span>Select visible</span><span class="mono">3 selected</span></div>
+          <ul class="panel-links">
+            <li class="on"><span class="box"><svg class="ico"><use href="#i-check"/></svg></span><span class="ext mono">ZIP</span><span class="name">field-recordings-2026.zip</span></li>
+            <li class="on"><span class="box"><svg class="ico"><use href="#i-check"/></svg></span><span class="ext mono">PDF</span><span class="name">programme-notes.pdf</span></li>
+            <li><span class="box"></span><span class="ext mono">MP4</span><span class="name">opening-session-1080p.mp4</span></li>
+            <li class="on"><span class="box"><svg class="ico"><use href="#i-check"/></svg></span><span class="ext mono">FLAC</span><span class="name">session-03-master.flac</span></li>
+            <li><span class="box"></span><span class="ext mono">EXE</span><span class="name">viewer-setup-x64.exe</span></li>
+          </ul>
+          <div class="panel-actions">
+            <div class="panel-switch"><span>Send browser downloads to Fetchrail</span><span class="switch"></span></div>
+            <span class="panel-summary">Default queue · default connections · starts now</span>
+            <span class="btn btn-primary panel-button">Download selected</span>
+          </div>
+          <div class="panel-foot"><span>Local engine · No cloud required</span><span>Fetchrail</span></div>
+        </figure>
+      </div>
+    </section>
+
+    <section class="finish" id="finish">
+      <div class="wrap">
+        <p class="overline" data-reveal>Make it yours</p>
+        <p class="finish-name" data-accent-name aria-live="polite">Ember</p>
+        <div class="strands rails finish-rails" data-fills="1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1" aria-hidden="true"></div>
+        <div class="swatches" role="group" aria-label="Accent" data-reveal>
+          <button type="button" class="swatch-button" data-set-accent="ember" aria-pressed="true"><i></i>Ember</button>
+          <button type="button" class="swatch-button" data-set-accent="azure" aria-pressed="false"><i></i>Azure</button>
+          <button type="button" class="swatch-button" data-set-accent="jade" aria-pressed="false"><i></i>Jade</button>
+          <button type="button" class="swatch-button" data-set-accent="iris" aria-pressed="false"><i></i>Iris</button>
+        </div>
+        <div class="segmented" role="group" aria-label="Theme" data-reveal>
+          <button type="button" data-set-theme="dark" aria-pressed="true">Dark</button>
+          <button type="button" data-set-theme="light" aria-pressed="false">Light</button>
+        </div>
+        <p class="finish-note" data-reveal>Two themes, four accents. Pick one and this page follows, the same way the app does.</p>
+      </div>
+    </section>
+
+    <section class="wrap section install-section" id="install">
+      <h2 data-reveal>Three steps to the first download.</h2>
+      <div class="download-choices">
+        <label>System <select data-download-os><option value="windows">Windows</option><option value="linux">Linux</option></select></label>
+        <label>CPU <select data-download-arch><option value="x64">x86_64 (x64)</option><option value="arm64">aarch64 (ARM64)</option></select></label>
+        <label>Package <select data-download-format><option value="exe">Windows setup</option><option value="deb">deb — Ubuntu / Mint / Kali</option><option value="rpm">rpm — Fedora</option><option value="AppImage">AppImage</option><option value="tar.gz">Native archive</option></select></label>
+      </div>
+      <p class="install-note" data-download-help></p>
+      <ol class="install-steps">
+        <li data-reveal class="d1"><span class="step-number mono">01</span><h3>Choose a package and download it</h3><p class="mono" data-release-file aria-live="polite">Choose your system, CPU and package above.</p></li>
+        <li data-reveal class="d2"><span class="step-number mono">02</span><h3>Install the package, then launch</h3><p>Use Windows setup, your Linux package manager, or a persistent AppImage location.</p></li>
+        <li data-reveal class="d3"><span class="step-number mono">03</span><h3>Paste a file link, pick a destination and start</h3><p>Any HTTP or HTTPS file link works.</p></li>
+      </ol>
+      <p class="install-note" data-reveal>Signed automatic updates are available for Windows setup and writable AppImages. Native Linux packages update through their package manager. Check the <a href="https://github.com/Beelzebub2/fetchrail/blob/main/docs/linux.md">Linux installation and qualification guide</a> for package availability, source builds and tested distro/CPU combinations.</p>
+    </section>
+
+    <section class="final" data-final>
+      <svg class="converge" data-converge aria-hidden="true"></svg>
+      <div class="wrap final-copy">
+        <svg class="logo final-mark" width="72" height="72" aria-hidden="true"><use href="#logo"/></svg>
+        <h2>Put your downloads on rails.</h2>
+        <div class="cta-buttons">
+          <a class="btn btn-primary" href="https://github.com/Beelzebub2/fetchrail/releases/latest" data-download><svg class="ico"><use href="#i-download"/></svg><span data-download-label>View releases</span></a>
+          <a class="btn btn-secondary" href="https://github.com/Beelzebub2/fetchrail">View on GitHub</a>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <footer class="wrap site-foot">
+    <nav class="resource-links" aria-label="Download and help"><a href="/download/windows">Download for Windows</a><a href="/download/linux">Download for Linux</a><a href="/browser-integration">Browser integration</a><a href="/compare/fetchrail-vs-idm">Fetchrail vs IDM</a><a href="/guides/resume-interrupted-downloads">Resume a download</a></nav>
+    <div class="site-foot-row">
+      <div class="site-foot-about">
+        <div class="brand brand-foot">
+          <svg class="logo" width="28" height="28" aria-hidden="true"><use href="#logo"/></svg>
+          <span>Fetchrail</span>
+        </div>
+        <p>A download manager for Windows and Linux with parallel transfers, reliable resume and a browser companion. Built with Rust, Tauri and React.</p>
+      </div>
+      <div class="site-foot-links">
+        <nav aria-label="Documentation">
+          <span class="overline">Documentation</span>
+          <a href="https://github.com/Beelzebub2/fetchrail/blob/main/docs/usage.md">User guide</a>
+          <a href="/browser-integration">Browser companion</a>
+          <a href="https://github.com/Beelzebub2/fetchrail/blob/main/docs/architecture.md">Architecture</a>
+          <a href="https://github.com/Beelzebub2/fetchrail/blob/main/docs/roadmap.md">Roadmap</a>
+        </nav>
+        <nav aria-label="Project">
+          <span class="overline">Project</span>
+          <a href="https://github.com/Beelzebub2/fetchrail">Source on GitHub</a>
+          <a href="https://github.com/Beelzebub2/fetchrail/releases">Releases</a>
+          <a href="https://github.com/Beelzebub2/fetchrail/blob/main/docs/development.md">Build from source</a>
+          <a href="https://github.com/Beelzebub2/fetchrail/issues">Report an issue</a>
+          <a href="/privacy">Privacy policy</a>
+        </nav>
+      </div>
+    </div>
+  </footer>
+</body>
+</html>

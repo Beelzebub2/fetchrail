@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Fetchrail Browser Integration — Chrome, Edge and Firefox</title>
+  <meta name="description" content="Connect Chrome, Edge, Brave, Vivaldi or Firefox to Fetchrail on Windows and Linux. Send links, capture downloads and manage transfers locally.">
+  <meta name="theme-color" content="#0c0e13">
+  <link rel="canonical" href="https://fetchrail.rrmtools.uk/browser-integration">
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+  <meta property="og:type" content="website">
+  <meta property="og:site_name" content="Fetchrail">
+  <meta property="og:title" content="Fetchrail Browser Integration — Chrome, Edge and Firefox">
+  <meta property="og:description" content="Connect Chrome, Edge, Brave, Vivaldi or Firefox to Fetchrail on Windows and Linux. Send links, capture downloads and manage transfers locally.">
+  <meta property="og:url" content="https://fetchrail.rrmtools.uk/browser-integration">
+  <meta property="og:image" content="https://fetchrail.rrmtools.uk/og.jpg">
+  <meta name="twitter:card" content="summary_large_image">
+  <link rel="stylesheet" href="/styles.css">
+  <script src="/theme.js"></script>
+</head>
+<body>
+  <a class="skip" href="#main">Skip to content</a>
+  <header class="site-head"><div class="wrap site-head-row"><a class="brand" href="/">Fetchrail</a><a href="/#install">All downloads</a></div></header>
+  <main id="main" class="wrap guide">
+    <h1>Connect your browser to Fetchrail</h1>
+    <p class="lede">Send selected links and browser downloads to the Fetchrail desktop app on Windows or Linux. The companion can list files on the current page, send URL batches and control live transfers.</p>
+<h2>Install the desktop app first</h2><p>Get <a href="/download/windows">Fetchrail for Windows</a> or <a href="/download/linux">Fetchrail for Linux</a> and launch it once to register the native messaging host. Open Settings → Browser companion for installation choices and the stable extension folders.</p>
+<h2>Chrome, Edge, Brave, Vivaldi and Chromium</h2><p>Use the <a href="https://chromewebstore.google.com/detail/ccmbmcgihlemlheldpkgnidgohlkaipb">Chrome Web Store listing</a> where supported. You can also enable Developer mode on your browser's extensions page, choose Load unpacked and select the Chromium folder shown by Fetchrail. Chrome and Edge 116 or newer support automatic panel-aware companion reloads.</p>
+<h2>Firefox</h2><p>Use a signed Mozilla Add-ons build when approved and available. The signed store build requires Firefox 140 or later. For temporary testing, open <code>about:debugging#/runtime/this-firefox</code>, choose Load Temporary Add-on and select <code>manifest.json</code> from Fetchrail's Firefox folder. A temporary add-on must be loaded again after a browser restart. Follow the <a href="https://github.com/Beelzebub2/fetchrail/blob/main/browser-extension/README.md#install-the-companion">maintained installation guide</a> for current store availability.</p>
+<h2>Send a file to the app</h2><ol><li>Right-click a link and choose Download with Fetchrail, paste URLs into the companion, or select links from This page.</li><li>Choose the destination, queue, connection count or future start time.</li><li>Use Send browser downloads to Fetchrail for automatic routing. The companion verifies the handoff before cancelling the browser's copy; a failed handoff continues in the browser.</li></ol>
+<h2>Downloads that require a login</h2><p>Use browser session for captured files is optional and off by default. When enabled, only the observed final GET's available Cookie, Referer, User-Agent and Authorization headers are forwarded to the local app. Unfinished transfers may store those headers locally for resume and scheduling; they are removed on completion or removal. Treat unfinished history as private. Read the <a href="/privacy">privacy policy</a> before enabling this option.</p>
+<h2>Limits and troubleshooting</h2><p>Safari and mobile browsers require separate integrations. Native messaging depends on the browser's package and profile; Linux sandboxed browser packages may need additional setup. If the companion cannot connect, launch Fetchrail and check the native-host instructions in the <a href="https://github.com/Beelzebub2/fetchrail/blob/main/browser-extension/README.md">companion guide</a>. Protected-media capture is not a promised feature; use downloads the site makes available to you.</p><p>Transfers interrupted after handoff follow the same <a href="/guides/resume-interrupted-downloads">safe resume rules</a> as pasted links.</p>
+  </main>
+  <footer class="wrap site-foot"><nav class="resource-links" aria-label="Download and help"><a href="/download/windows">Download for Windows</a><a href="/download/linux">Download for Linux</a><a href="/browser-integration">Browser integration</a><a href="/compare/fetchrail-vs-idm">Fetchrail vs IDM</a><a href="/guides/resume-interrupted-downloads">Resume a download</a></nav><p><a href="/privacy">Privacy policy</a> · <a href="https://github.com/Beelzebub2/fetchrail/issues">Report an issue</a></p></footer>
+</body>
+</html>

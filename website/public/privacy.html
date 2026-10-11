@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Fetchrail Browser Integration — Privacy Policy</title>
+  <meta name="description" content="How Fetchrail Browser Integration processes download and browser data locally on your device.">
+  <link rel="canonical" href="https://fetchrail.rrmtools.uk/privacy">
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <main class="wrap legal">
+    <a href="/">Fetchrail home</a>
+    <h1>Fetchrail Browser Integration privacy policy</h1>
+    <p>Last updated: 11 October 2026.</p>
+    <p>Fetchrail Browser Integration connects your browser to the Fetchrail download manager installed on your Windows or Linux computer. It processes the information needed to select, route and control downloads. The extension does not send this information to the developer, an analytics service or an advertising service.</p>
+    <h2>Information processed</h2>
+    <ul>
+      <li><strong>Downloads:</strong> file URLs, referring page URLs, filenames, file sizes, content types, progress and the transfer options you choose.</li>
+      <li><strong>Page content:</strong> when you choose “This page” or a page batch, the extension reads relevant links, media URLs, labels and download controls on those pages.</li>
+      <li><strong>Browsing activity:</strong> with optional website access, the extension temporarily observes HTTP(S) request URLs, request methods and tab identifiers to associate a file request with its download page, including redirects and popups. It does not sell or use browsing activity for advertising.</li>
+      <li><strong>Authentication information:</strong> only when you explicitly enable “Use browser session for captured files”, the extension may capture the final request's Cookie, Authorization, Referer and User-Agent headers to let Fetchrail download a file using your existing website session.</li>
+      <li><strong>Local preferences:</strong> routing choices, session support, queues, connection counts, speed limits, schedules and page-batch state.</li>
+    </ul>
+    <h2>Where information goes</h2>
+    <p>The extension passes download requests and transfer controls to the local Fetchrail app through Chrome's native messaging API. Fetchrail contacts the file server you select to verify and download the file. When browser session support is enabled, the relevant session headers accompany that file request. File servers receive normal network-request information, including your IP address, and apply their own privacy policies.</p>
+    <p>The developer does not receive your download history, page content, browser session headers or local preferences. The extension contains no advertising, analytics or remotely hosted executable code.</p>
+    <h2>Storage and retention</h2>
+    <p>Preferences and page-batch state are stored in local browser extension storage. Temporary request observations use browser session storage, are bounded in size and are ignored after two minutes. Disabling browser session support clears the captured request observations.</p>
+    <p>Fetchrail stores download history and unfinished-transfer details locally. If you enable session support, unfinished downloads may include sensitive session headers in the desktop app's local downloads.json file so they can resume after a restart. These headers are removed when the transfer completes or is removed. They are excluded from the extension's transfer status responses and the app's interface events. Downloaded files remain on your computer until you delete them.</p>
+    <h2>Your choices</h2>
+    <p>You can disable automatic download routing, leave browser session support off, revoke optional website access in your browser, stop a page batch, remove downloads from Fetchrail or uninstall the extension. Session support is off by default. Page scanning uses temporary access to the active tab after your action; broader HTTP(S) website access is optional and requested for page batches or session support. The extension does not capture private/incognito downloads.</p>
+    <h2>Limited use</h2>
+    <p>Fetchrail Browser Integration's use of information received from browser APIs complies with the Chrome Web Store User Data Policy, including the Limited Use requirements. Information is used only to provide the extension's download-management features. It is not sold, used for advertising, used to determine creditworthiness or provided to data brokers.</p>
+    <h2>Website and support</h2>
+    <p>This policy describes the browser extension and its local desktop integration. The Fetchrail website is hosted by Cloudflare, which may process ordinary website request logs and aggregate website analytics. Those website visits do not transmit your extension download history or session headers. GitHub handles visits, software downloads and support issues under its own policies.</p>
+    <p>For questions or requests, email <a href="mailto:support.fetchrail@rrmtools.uk">support.fetchrail@rrmtools.uk</a> or <a href="https://github.com/Beelzebub2/fetchrail/issues">contact the maintainer through GitHub</a>. Do not include private download URLs, cookies or credentials in public issues.</p>
+    <h2>Changes</h2>
+    <p>This page will be updated when the extension's data handling changes. The date above identifies the current policy.</p>
+  </main>
+</body>
+</html>
