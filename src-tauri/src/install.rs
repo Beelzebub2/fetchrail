@@ -521,6 +521,12 @@ pub enum UpdateStatus {
 
 pub struct Updates(Mutex<UpdateStatus>);
 
+impl Default for Updates {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Updates {
     pub fn new() -> Self {
         Self(Mutex::new(if is_installed_copy() {

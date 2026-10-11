@@ -35,9 +35,12 @@ const server = createServer((request, response) => {
   else headers.ETag = mode === 'changed' ? '\"v2\"' : ['trickle', 'validated-slow'].includes(mode) ? '\"v1\"' : '\"fixture\"';
   response.writeHead(partial ? 206 : 200, headers);
   response.flushHeaders();
+  if (mode === 'weak' && fail) { response.write(body.subarray(0, 1024)); return; }
   const count = ['drop', 'short'].includes(mode) && fail ? 123456 : end - start + 1;
   let remaining = count;
+  let paused = false;
   function pump() {
+    if (mode === 'host-pause' && !paused && remaining < count - 1024 * 1024) { paused = true; setTimeout(pump, 12000); return; }
     while (!response.destroyed && remaining > 0) {
       const trickling = mode === 'trickle' && fail && remaining < count - 1024 * 1024;
       const size = Math.min(remaining, trickling ? 64 : body.length);
@@ -50,7 +53,7 @@ const server = createServer((request, response) => {
         else response.end();
         return;
       }
-      const delay = trickling ? 50 : mode === 'validated-slow' ? 10 : ['slow', 'retry', 'drop', 'trickle'].includes(mode) ? 2 : 0;
+      const delay = trickling ? 50 : ['validated-slow', 'weak', 'host-pause'].includes(mode) ? 10 : ['slow', 'retry', 'drop', 'trickle'].includes(mode) ? 2 : 0;
       const next = () => delay ? setTimeout(pump, delay) : pump();
       if (blocked) { response.once('drain', next); return; }
       if (delay) { setTimeout(pump, delay); return; }
@@ -323,6 +326,110 @@ async fn trickling_tail_resumes_only_its_flushed_suffix() {
 }
 
 #[tokio::test]
+async fn weak_transport_recovers_while_healthy_ranges_continue() {
+    let total = 128 * 1024 * 1024;
+    let server = TestServer::new(total, "weak");
+    let (dir, segments, mut probe) = parts(total, 4).await;
+    probe.validator = Some("\"fixture\"".into());
+    let client = download_client_builder().no_proxy().build().unwrap();
+    let limiter = RateLimiter::new(0);
+    let task = task();
+    let cancel = CancellationToken::new();
+    let transfer = DownloadManager::download_ranges(
+        &client,
+        &limiter,
+        &task,
+        &cancel,
+        &server.url,
+        &dir,
+        &segments,
+        &probe,
+    );
+    let (result, _) = tokio::join!(transfer, async {
+        tokio::time::timeout(Duration::from_secs(23), async {
+            while !server
+                .requests
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|&(start, _)| start == 1024)
+            {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("Recover the flushed prefix before the 30-second read timeout");
+        assert!(segments[1..]
+            .iter()
+            .any(|s| s.active.load(Ordering::Relaxed)));
+    });
+    result.unwrap();
+    verify_parts(&dir, &segments).await;
+    assert_eq!(server.requests.lock().unwrap().len(), 5);
+    fs::remove_dir_all(dir).await.unwrap();
+}
+
+#[tokio::test]
+async fn shared_host_pause_does_not_renew_healthy_transports() {
+    let total = 32 * 1024 * 1024;
+    let server = TestServer::new(total, "host-pause");
+    let (dir, segments, probe) = parts(total, 4).await;
+    DownloadManager::download_ranges(
+        &download_client_builder().no_proxy().build().unwrap(),
+        &RateLimiter::new(0),
+        &task(),
+        &CancellationToken::new(),
+        &server.url,
+        &dir,
+        &segments,
+        &probe,
+    )
+    .await
+    .unwrap();
+    assert_eq!(server.requests.lock().unwrap().len(), 4);
+    verify_parts(&dir, &segments).await;
+    fs::remove_dir_all(dir).await.unwrap();
+}
+
+#[tokio::test]
+async fn legacy_local_ledger_is_preserved_instead_of_silently_reset() {
+    let (dir, segments, probe) = parts(1024, 1).await;
+    let ledger = br#"{"committed":[123],"direct_path":"old.fetchrail-part"}"#;
+    fs::write(dir.join("transfer.json"), ledger).await.unwrap();
+    fs::write(dir.join("0.part"), b"preserved bytes")
+        .await
+        .unwrap();
+    let ranges = segments.iter().map(|s| s.range).collect::<Vec<_>>();
+    assert!(prepare_parts(&dir, &probe, &ranges).await.is_err());
+    assert_eq!(fs::read(dir.join("transfer.json")).await.unwrap(), ledger);
+    assert_eq!(
+        fs::read(dir.join("0.part")).await.unwrap(),
+        b"preserved bytes"
+    );
+    fs::remove_dir_all(dir).await.unwrap();
+}
+
+#[tokio::test]
+async fn damaged_saved_state_is_not_replaced_with_empty_history() {
+    let (dir, _, _) = parts(1, 1).await;
+    let path = dir.join("downloads.json");
+    assert!(read_saved_json::<Vec<StoredDownload>>(&path)
+        .await
+        .unwrap()
+        .is_none());
+    fs::write(&path, b"{damaged-private-state}").await.unwrap();
+    let error = read_saved_json::<Vec<StoredDownload>>(&path)
+        .await
+        .err()
+        .unwrap()
+        .to_string();
+    assert!(error.contains("preserved"));
+    assert!(!error.contains("damaged-private-state"));
+    assert_eq!(fs::read(&path).await.unwrap(), b"{damaged-private-state}");
+    fs::remove_dir_all(dir).await.unwrap();
+}
+
+#[tokio::test]
 async fn shared_staging_resumes_verified_prefixes_and_repairs_only_corrupted_ranges() {
     use tokio::io::{AsyncSeekExt, AsyncWriteExt};
     let total = 32 * 1024 * 1024;
@@ -364,12 +471,12 @@ async fn shared_staging_resumes_verified_prefixes_and_repairs_only_corrupted_ran
     );
     assert!(matches!(result, Err(EngineError::Cancelled)));
     let mut saved = Vec::new();
-    for index in 0..4 {
-        let checkpoint = part_checkpoint(&dir, index, ranges[index].len())
+    for (index, range) in ranges.iter().enumerate() {
+        let checkpoint = part_checkpoint(&dir, index, range.len())
             .await
             .unwrap()
             .unwrap();
-        assert!(checkpoint.bytes > 0 && checkpoint.bytes < ranges[index].len());
+        assert!(checkpoint.bytes > 0 && checkpoint.bytes < range.len());
         saved.push(checkpoint.bytes);
     }
     assert_eq!(fs::metadata(dir.join("0.part")).await.unwrap().len(), total);

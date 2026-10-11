@@ -288,10 +288,12 @@ impl DownloadTask {
 
 pub struct DownloadManager {
     torrent_engine: TorrentEngine,
+    #[allow(clippy::type_complexity)] // Keep the existing bounded import state together.
     torrent_imports: RwLock<HashMap<Uuid, (String, Option<TorrentMetadata>, Instant)>>,
     torrent_checkpoint: Mutex<Instant>,
     torrent_configuration: tokio::sync::Mutex<serde_json::Value>,
     torrent_import_lock: tokio::sync::Mutex<()>,
+    #[allow(clippy::type_complexity)] // This shared budget is updated under one lock.
     bandwidth_broker: Mutex<(Instant, u64, (bool, bool), (u64, u64))>,
     pending_torrent_sources: Mutex<Vec<String>>,
     app: AppHandle,
@@ -331,20 +333,17 @@ impl DownloadManager {
             .map_err(|error| format!("Could not create default download directory: {error}"))?;
 
         let settings_path = data_dir.join(SETTINGS_FILE);
-        let settings = match fs::read(&settings_path).await {
-            Ok(bytes) => serde_json::from_slice::<DownloadSettings>(&bytes)
-                .unwrap_or_else(|_| default_settings(&default_download_dir))
-                .normalized(),
-            Err(_) => default_settings(&default_download_dir),
-        };
+        let settings = read_saved_json::<DownloadSettings>(&settings_path)
+            .await
+            .map_err(|e| e.to_string())?
+            .unwrap_or_else(|| default_settings(&default_download_dir))
+            .normalized();
 
-        let mut queues = match fs::read(data_dir.join(QUEUES_FILE)).await {
-            Ok(bytes) => serde_json::from_slice::<Vec<QueueRecord>>(&bytes)
-                .ok()
-                .filter(|queues| !queues.is_empty())
-                .unwrap_or_else(default_queues),
-            Err(_) => default_queues(),
-        };
+        let mut queues = read_saved_json::<Vec<QueueRecord>>(&data_dir.join(QUEUES_FILE))
+            .await
+            .map_err(|e| e.to_string())?
+            .filter(|queues| !queues.is_empty())
+            .unwrap_or_else(default_queues);
         if !queues
             .iter()
             .any(|queue| queue.name.eq_ignore_ascii_case("Default"))
@@ -369,30 +368,31 @@ impl DownloadManager {
 
         let mut task_map = HashMap::new();
         let state_path = data_dir.join(STATE_FILE);
-        if let Ok(bytes) = fs::read(&state_path).await {
-            if let Ok(records) = serde_json::from_slice::<Vec<StoredDownload>>(&bytes) {
-                for stored in records {
-                    let mut record = stored.record;
-                    if let (Some(torrent), Some(priorities)) =
-                        (&mut record.torrent, stored.torrent_priorities)
-                    {
-                        torrent.priorities = priorities;
-                    }
-                    if record.status.is_active() {
-                        record.status = DownloadStatus::Paused;
-                        record.speed_bps = 0;
-                        record.eta_seconds = None;
-                        record.merged_bytes = 0;
-                    }
-                    for segment in &mut record.segments {
-                        segment.speed_bps = 0;
-                        segment.active = false;
-                    }
-                    task_map.insert(
-                        record.id,
-                        Arc::new(DownloadTask::new(record, stored.request_context)),
-                    );
+        if let Some(records) = read_saved_json::<Vec<StoredDownload>>(&state_path)
+            .await
+            .map_err(|e| e.to_string())?
+        {
+            for stored in records {
+                let mut record = stored.record;
+                if let (Some(torrent), Some(priorities)) =
+                    (&mut record.torrent, stored.torrent_priorities)
+                {
+                    torrent.priorities = priorities;
                 }
+                if record.status.is_active() {
+                    record.status = DownloadStatus::Paused;
+                    record.speed_bps = 0;
+                    record.eta_seconds = None;
+                    record.merged_bytes = 0;
+                }
+                for segment in &mut record.segments {
+                    segment.speed_bps = 0;
+                    segment.active = false;
+                }
+                task_map.insert(
+                    record.id,
+                    Arc::new(DownloadTask::new(record, stored.request_context)),
+                );
             }
         }
 
@@ -456,6 +456,85 @@ impl DownloadManager {
     ) -> Result<DownloadRecord, String> {
         let _dispatch = self.dispatch_lock.lock().await;
         self.add_inner(request, true).await
+    }
+
+    pub async fn get_handoff(&self, key: &str) -> Vec<DownloadRecord> {
+        let _dispatch = self.dispatch_lock.lock().await;
+        let prefix = format!("{key}:");
+        self.list()
+            .await
+            .into_iter()
+            .filter(|r| {
+                r.extra
+                    .get("handoffId")
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|id| id.starts_with(&prefix))
+            })
+            .collect()
+    }
+
+    pub async fn commit_handoff(
+        self: &Arc<Self>,
+        key: &str,
+        auto_start: bool,
+    ) -> Result<Vec<DownloadRecord>, String> {
+        let dispatch = self.dispatch_lock.lock().await;
+        let prefix = format!("{key}:");
+        let mut records = self
+            .list()
+            .await
+            .into_iter()
+            .filter(|r| {
+                r.extra
+                    .get("handoffId")
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|id| id.starts_with(&prefix))
+            })
+            .collect::<Vec<_>>();
+        if records.is_empty() {
+            return Err("Handoff has not been accepted yet.".into());
+        }
+        if records
+            .iter()
+            .any(|r| r.status == DownloadStatus::Cancelled)
+        {
+            return Err("Handoff was rolled back.".into());
+        }
+        let previous = records
+            .iter()
+            .map(|r| (r.id, r.extra.get("handoffCommitted").cloned()))
+            .collect::<Vec<_>>();
+        // Background saves must not publish provisional handoff flags.
+        let persist = self.persist_lock.lock().await;
+        for record in &mut records {
+            let task = self.task(record.id).await?;
+            let mut saved = task.record.write().await;
+            saved.extra.insert("handoffCommitted".into(), json!(true));
+            *record = saved.clone();
+        }
+        if let Err(error) = self.persist_records_locked().await {
+            for (id, value) in previous {
+                let task = self.task(id).await?;
+                let mut saved = task.record.write().await;
+                match value {
+                    Some(value) => {
+                        saved.extra.insert("handoffCommitted".into(), value);
+                    }
+                    None => {
+                        saved.extra.remove("handoffCommitted");
+                    }
+                }
+            }
+            return Err(error.to_string());
+        }
+        drop(persist);
+        drop(dispatch);
+        for record in &records {
+            if auto_start && record.status == DownloadStatus::Paused {
+                self.resume(record.id).await?;
+            }
+        }
+        Ok(records)
     }
 
     pub async fn import_torrent(
@@ -661,6 +740,7 @@ impl DownloadManager {
             .await?;
         let record = DownloadRecord {
             id,
+            extra: Default::default(),
             expected_sha256: None,
             url: source,
             file_name: metadata.name,
@@ -1055,11 +1135,9 @@ impl DownloadManager {
                 0
             };
             record.connections = number("peers") as usize;
-            record.eta_seconds = if record.speed_bps > 0 {
-                Some(number("wanted").saturating_sub(number("downloaded")) / record.speed_bps)
-            } else {
-                None
-            };
+            record.eta_seconds = number("wanted")
+                .saturating_sub(number("downloaded"))
+                .checked_div(record.speed_bps);
             let t = record.torrent.as_mut().unwrap();
             t.uploaded_bytes = number("uploaded");
             t.all_downloaded_bytes = number("allDownloaded");
@@ -1221,6 +1299,22 @@ impl DownloadManager {
         }
         context_headers(request.request_context.as_ref()).map_err(|error| error.to_string())?;
         let expected_sha256 = normalize_sha256(request.expected_sha256.as_deref())?;
+        if let Some(key) = &request.handoff_id {
+            if let Some(record) = self
+                .list()
+                .await
+                .into_iter()
+                .find(|r| r.extra.get("handoffId").and_then(|v| v.as_str()) == Some(key))
+            {
+                if record.url != parsed.as_str()
+                    || record.expected_sha256 != expected_sha256
+                    || record.status == DownloadStatus::Cancelled
+                {
+                    return Err("Handoff was rolled back or its resource changed.".into());
+                }
+                return Ok(record);
+            }
+        }
 
         let settings = self.settings.read().await.clone();
         if request
@@ -1269,6 +1363,15 @@ impl DownloadManager {
         let record = DownloadRecord {
             torrent: None,
             id,
+            extra: request
+                .handoff_id
+                .map(|key| {
+                    std::collections::BTreeMap::from([
+                        ("handoffId".into(), json!(key)),
+                        ("handoffCommitted".into(), json!(false)),
+                    ])
+                })
+                .unwrap_or_default(),
             expected_sha256,
             url: parsed.to_string(),
             file_name: destination
@@ -1451,7 +1554,7 @@ impl DownloadManager {
         for task in tasks {
             records.push(task.record.read().await.clone());
         }
-        records.sort_by(|left, right| right.created_at.cmp(&left.created_at));
+        records.sort_by_key(|record| std::cmp::Reverse(record.created_at));
         records
     }
 
@@ -1552,11 +1655,10 @@ impl DownloadManager {
         let task = self.task(id).await?;
         let snapshot = {
             let mut record = task.record.write().await;
-            if !(record.torrent.is_some() && record.status == DownloadStatus::Completed)
-                && !matches!(
-                    record.status,
-                    DownloadStatus::Paused | DownloadStatus::Failed | DownloadStatus::Cancelled
-                )
+            if !(matches!(
+                record.status,
+                DownloadStatus::Paused | DownloadStatus::Failed | DownloadStatus::Cancelled
+            ) || record.torrent.is_some() && record.status == DownloadStatus::Completed)
             {
                 return Err("Only paused, failed or cancelled downloads can be resumed.".into());
             }
@@ -1667,6 +1769,7 @@ impl DownloadManager {
         if task.record.read().await.torrent.is_some() {
             return self.remove_torrent(id, delete_file).await;
         }
+        let _dispatch = self.dispatch_lock.lock().await;
         if task.running.load(Ordering::Acquire) {
             return Err("Pause or cancel the download before removing it.".into());
         }
@@ -2493,10 +2596,12 @@ impl DownloadManager {
         task.check_stopped(cancel)?;
         let batch_cancel = cancel.child_token();
         let peer_rate = AtomicU64::new(0);
+        let live_peer_rate = AtomicU64::new(0);
         let shared = shared_staging(part_dir).await?;
         let futures = segments.iter().enumerate().map(|(index, segment)| {
             let batch_cancel = &batch_cancel;
             let peer_rate = &peer_rate;
+            let live_peer_rate = &live_peer_rate;
             async move {
                 let mut client = client.clone();
                 // Retry only this range so healthy connections keep their throughput.
@@ -2515,6 +2620,8 @@ impl DownloadManager {
                             probe,
                             peer_rate,
                             shared,
+                            live_peer_rate,
+                            attempt == 0 && probe.accepts_ranges && probe.validator.is_some(),
                         )
                         .await;
                         let Err(error) = result else {
@@ -2579,8 +2686,41 @@ impl DownloadManager {
                 result
             }
         });
-        let mut errors = join_all(futures)
-            .await
+        let receiving_rates = async {
+            let mut previous = segments
+                .iter()
+                .map(|s| s.downloaded.load(Ordering::Relaxed))
+                .collect::<Vec<_>>();
+            let mut previous_rate = 0;
+            let mut sampled_at = Instant::now();
+            loop {
+                tokio::time::sleep(Duration::from_secs(4)).await;
+                let elapsed = sampled_at.elapsed().as_secs_f64();
+                let (mut bytes, mut receiving) = (0u64, 0usize);
+                for (segment, prior) in segments.iter().zip(&mut previous) {
+                    let current = segment.downloaded.load(Ordering::Relaxed);
+                    let delta = current.saturating_sub(*prior);
+                    if segment.active.load(Ordering::Relaxed) && delta > 0 {
+                        bytes += delta;
+                        receiving += 1;
+                    }
+                    *prior = current;
+                }
+                let rate = if receiving >= 2
+                    && limiter.quantum() == usize::MAX
+                    && task.limiter.quantum() == usize::MAX
+                {
+                    (bytes as f64 / elapsed / receiving as f64) as u64
+                } else {
+                    0
+                };
+                live_peer_rate.store(rate.min(previous_rate), Ordering::Relaxed);
+                previous_rate = rate;
+                sampled_at = Instant::now();
+            }
+        };
+        let results = tokio::select! { results = join_all(futures) => results, _ = receiving_rates => unreachable!() };
+        let mut errors = results
             .into_iter()
             .filter_map(Result::err)
             .collect::<Vec<_>>();
@@ -2607,6 +2747,8 @@ impl DownloadManager {
         probe: &ProbeResult,
         peer_rate: &AtomicU64,
         shared: bool,
+        live_peer_rate: &AtomicU64,
+        recover_peer: bool,
     ) -> EngineResult<()> {
         let range = segment.range;
         let part_path = part_dir.join(format!("{}.part", if shared { 0 } else { index }));
@@ -2759,17 +2901,27 @@ impl DownloadManager {
         let (mut best_rate, mut previous_rate) = (0.0, 0.0);
         let mut slow_windows = 0;
         let mut checkpoint_at = Instant::now();
+        let (mut response_wait, mut watched_bytes, mut weak_windows) =
+            (Duration::ZERO, existing, 0usize);
         let transfer = async {
             let mut written = existing;
             loop {
                 task.check_stopped(cancel)?;
+                let waiting_at = Instant::now();
                 let item = tokio::select! {
-                    item = stream.next() => item,
+                    item = stream.next() => Some(item),
                     _ = cancel.cancelled() => return Err(EngineError::Cancelled),
+                    _ = tokio::time::sleep(Duration::from_secs(5).saturating_sub(response_wait)), if recover_peer => None,
                 };
-                let Some(chunk) = item else {
-                    break;
-                };
+                response_wait += waiting_at.elapsed();
+                if recover_peer && response_wait >= Duration::from_secs(5) {
+                    let peer = if limiter.quantum() == usize::MAX && task.limiter.quantum() == usize::MAX { live_peer_rate.load(Ordering::Relaxed) } else { 0 };
+                    if crate::network::weak_peer(written.saturating_sub(watched_bytes), response_wait, peer, &mut weak_windows) { return Err(EngineError::Slow); }
+                    watched_bytes = written;
+                    response_wait = Duration::ZERO;
+                }
+                let Some(item) = item else { continue; };
+                let Some(chunk) = item else { break; };
                 let chunk = chunk?;
                 written = written.saturating_add(chunk.len() as u64);
                 if expected_len.is_some_and(|expected| written > expected) {
@@ -3172,7 +3324,11 @@ impl DownloadManager {
                 let temp_path = temp_path.clone();
                 let ranges = ranges.to_vec();
                 let merged = merged.clone();
-                let expected = record.expected_sha256.clone();
+                let expected = if cfg!(windows) {
+                    None
+                } else {
+                    record.expected_sha256.clone()
+                };
                 let cancel = cancel.clone();
                 move || {
                     join_parts_cancellable(
@@ -3222,7 +3378,14 @@ impl DownloadManager {
                 },
             )
             .await?;
-        } else if let Some(expected) = &record.expected_sha256 {
+        }
+        #[cfg(windows)]
+        crate::platform::mark_download(&temp_path, &record.url, desired_name).await?;
+        if let Some(expected) = record
+            .expected_sha256
+            .as_ref()
+            .filter(|_| cfg!(windows) || recovered)
+        {
             let path = temp_path.clone();
             let expected = expected.clone();
             let cancel = cancel.clone();
@@ -3331,6 +3494,10 @@ impl DownloadManager {
 
     async fn persist_records(&self) -> EngineResult<()> {
         let _lock = self.persist_lock.lock().await;
+        self.persist_records_locked().await
+    }
+
+    async fn persist_records_locked(&self) -> EngineResult<()> {
         let tasks = self
             .tasks
             .read()
@@ -3352,7 +3519,7 @@ impl DownloadManager {
                 request_context,
             });
         }
-        records.sort_by(|left, right| left.record.created_at.cmp(&right.record.created_at));
+        records.sort_by_key(|task| task.record.created_at);
         write_json_atomic(&self.data_dir.join(STATE_FILE), &records).await
     }
 
@@ -3435,6 +3602,7 @@ impl DownloadManager {
 
 fn default_settings(download_dir: &Path) -> DownloadSettings {
     DownloadSettings {
+        extra: Default::default(),
         torrent: Default::default(),
         speed_limit_bps: 0,
         default_download_dir: download_dir.to_string_lossy().to_string(),
@@ -3577,6 +3745,7 @@ fn context_headers(context: Option<&BrowserRequestContext>) -> EngineResult<Head
             (header::AUTHORIZATION, context.authorization.as_deref()),
             (header::REFERER, context.referer.as_deref()),
             (header::USER_AGENT, context.user_agent.as_deref()),
+            (header::ORIGIN, context.origin.as_deref()),
         ] {
             if let Some(value) = value {
                 if value.len() > 16 * 1024 {
@@ -3659,7 +3828,7 @@ fn record_is_dispatch_ready(
     if paused_queues.iter().any(|name| name == &record.queue) {
         return false;
     }
-    !record.scheduled_for.is_some_and(|when| when > now)
+    record.scheduled_for.is_none_or(|when| when <= now)
 }
 
 #[cfg(target_os = "windows")]
@@ -3701,6 +3870,17 @@ fn sync_startup_registration(enabled: bool) -> Result<(), String> {
     crate::platform::sync_startup_registration(enabled)
 }
 
+async fn read_saved_json<T: serde::de::DeserializeOwned>(path: &Path) -> EngineResult<Option<T>> {
+    match fs::read(path).await {
+        Ok(bytes) => serde_json::from_slice(&bytes).map(Some).map_err(|error| EngineError::Message(format!(
+            "Saved {} is invalid at line {}, column {}. Data was preserved; restore a valid backup.",
+            path.file_name().unwrap_or_default().to_string_lossy(), error.line(), error.column()
+        ))),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
 async fn write_json_atomic<T: serde::Serialize>(path: &Path, value: &T) -> EngineResult<()> {
     let bytes = serde_json::to_vec_pretty(value)
         .map_err(|error| EngineError::Message(format!("Could not serialize state: {error}")))?;
@@ -3723,7 +3903,7 @@ fn safe_file_name(value: &str) -> String {
 
 fn name_from_url(url: &Url) -> String {
     url.path_segments()
-        .and_then(|segments| segments.filter(|segment| !segment.is_empty()).next_back())
+        .and_then(|mut segments| segments.rfind(|segment| !segment.is_empty()))
         .map(safe_file_name)
         .filter(|name| !name.is_empty())
         .unwrap_or_else(|| "download".to_string())
@@ -3840,6 +4020,15 @@ async fn prepare_parts(
     probe: &ProbeResult,
     ranges: &[ByteRange],
 ) -> EngineResult<()> {
+    if let Ok(bytes) = fs::read(part_dir.join("transfer.json")).await {
+        if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) {
+            if value.get("direct_path").is_some_and(|v| !v.is_null())
+                || value.get("committed").is_some()
+            {
+                return Err(EngineError::Message("This partial transfer belongs to an older local engine. Its bytes were preserved; finish it with that build before upgrading.".into()));
+            }
+        }
+    }
     let stored = fs::read(part_dir.join("transfer.json"))
         .await
         .ok()
@@ -3940,7 +4129,7 @@ fn suggested_connection_count(total: u64, configured: usize, min_segment: u64) -
     if total == 0 {
         return 1;
     }
-    let by_size = (total / min_segment.max(1)).max(1).min(32) as usize;
+    let by_size = (total / min_segment.max(1)).clamp(1, 32) as usize;
     configured.clamp(1, 32).min(by_size.max(1))
 }
 
@@ -4173,12 +4362,14 @@ mod transfer_tests;
 
 #[cfg(test)]
 mod tests {
-    use super::{context_headers, reject_html_page, StoredDownload};
-    use crate::model::BrowserRequestContext;
+    use super::{context_headers, default_settings, reject_html_page, StoredDownload};
+    use crate::model::{BrowserRequestContext, DownloadSettings};
     use chrono::{DateTime, Duration as ChronoDuration, Utc};
     use reqwest::header::{
         HeaderMap, HeaderValue, CONTENT_DISPOSITION, CONTENT_LENGTH, CONTENT_RANGE,
     };
+    use serde_json::json;
+    use std::path::Path;
     use uuid::Uuid;
 
     use super::{
@@ -4326,6 +4517,7 @@ mod tests {
     #[test]
     fn browser_headers_are_validated_and_kept_out_of_public_records() {
         let context = BrowserRequestContext {
+            origin: None,
             cookie: Some("session=secret".into()),
             ..Default::default()
         };
@@ -4348,6 +4540,7 @@ mod tests {
             Some("session=secret")
         );
         assert!(context_headers(Some(&BrowserRequestContext {
+            origin: None,
             referer: Some("bad\r\nheader".into()),
             ..Default::default()
         }))
@@ -4433,6 +4626,7 @@ mod tests {
         scheduled_for: Option<chrono::DateTime<Utc>>,
     ) -> DownloadRecord {
         DownloadRecord {
+            extra: Default::default(),
             torrent: None,
             expected_sha256: None,
             id: Uuid::new_v4(),
@@ -4459,6 +4653,36 @@ mod tests {
             completion_options: Default::default(),
             progress_requested: false,
         }
+    }
+
+    #[test]
+    fn local_history_preserves_checksums_and_private_context_stays_private() {
+        let record = queued_record(DownloadStatus::Completed, "Default", None);
+        let mut value = serde_json::to_value(record).unwrap();
+        value["sha256"] = json!("a".repeat(64));
+        value["handoffCommitted"] = json!(true);
+        value["requestContext"] = json!({"cookie":"private-session"});
+        let stored: StoredDownload = serde_json::from_value(value).unwrap();
+        let public = serde_json::to_value(&stored.record).unwrap();
+        assert_eq!(public["sha256"], "a".repeat(64));
+        assert_eq!(public["handoffCommitted"], true);
+        assert!(public.get("requestContext").is_none());
+        assert_eq!(
+            stored.request_context.as_ref().unwrap().cookie.as_deref(),
+            Some("private-session")
+        );
+        let roundtrip = serde_json::to_value(stored).unwrap();
+        assert_eq!(roundtrip["requestContext"]["cookie"], "private-session");
+        let mut settings = serde_json::to_value(default_settings(Path::new("Downloads"))).unwrap();
+        settings["bandwidthLimitKbps"] = json!(64);
+        settings["maxRequestsPerOrigin"] = json!(16);
+        let settings: DownloadSettings = serde_json::from_value(settings).unwrap();
+        let mut settings = settings.normalized();
+        let restored = serde_json::to_value(&settings).unwrap();
+        assert_eq!(restored["speedLimitBps"], 65536);
+        assert_eq!(restored["maxRequestsPerOrigin"], 16);
+        settings.speed_limit_bps = 0;
+        assert_eq!(settings.normalized().speed_limit_bps, 0);
     }
 
     #[test]

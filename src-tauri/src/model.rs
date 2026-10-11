@@ -40,6 +40,9 @@ impl DownloadStatus {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct DownloadRecord {
+    // Preserve metadata written by prior local builds during ordinary saves.
+    #[serde(default, flatten)]
+    pub extra: std::collections::BTreeMap<String, serde_json::Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expected_sha256: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -152,6 +155,8 @@ pub enum Accent {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DownloadSettings {
+    #[serde(default, flatten)]
+    pub extra: std::collections::BTreeMap<String, serde_json::Value>,
     #[serde(default)]
     pub torrent: crate::torrent::TorrentSettings,
     /// Shared by all downloads and connections; zero is unlimited.
@@ -184,6 +189,21 @@ pub struct DownloadSettings {
 
 impl DownloadSettings {
     pub fn normalized(mut self) -> Self {
+        if let Some(legacy) = self
+            .extra
+            .get("bandwidthLimitKbps")
+            .and_then(|v| v.as_u64())
+            .filter(|v| *v > 0)
+        {
+            // Consume the migrated cap so a later UI change can remove it.
+            self.extra.remove("bandwidthLimitKbps");
+            let legacy = legacy.saturating_mul(1024);
+            self.speed_limit_bps = if self.speed_limit_bps == 0 {
+                legacy
+            } else {
+                self.speed_limit_bps.min(legacy)
+            };
+        }
         if self.speed_limit_bps > 0 {
             self.speed_limit_bps = self.speed_limit_bps.max(2);
         }
@@ -240,6 +260,8 @@ impl DownloadSettings {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AddDownloadRequest {
+    #[serde(skip)]
+    pub handoff_id: Option<String>,
     pub expected_sha256: Option<String>,
     pub url: String,
     pub directory: Option<String>,
@@ -258,6 +280,7 @@ pub struct AddDownloadRequest {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct BrowserRequestContext {
+    pub origin: Option<String>,
     pub cookie: Option<String>,
     pub authorization: Option<String>,
     pub referer: Option<String>,
@@ -278,8 +301,8 @@ pub struct QueueRecord {
 impl QueueRecord {
     pub fn allows_downloads(&self, now: DateTime<Utc>) -> bool {
         !self.paused
-            && !self.starts_at.is_some_and(|start| now < start)
-            && !self.stops_at.is_some_and(|stop| now >= stop)
+            && self.starts_at.is_none_or(|start| now >= start)
+            && self.stops_at.is_none_or(|stop| now < stop)
     }
 }
 
@@ -398,6 +421,7 @@ mod tests {
             "/tmp/Films"
         };
         let settings = DownloadSettings {
+            extra: Default::default(),
             torrent: Default::default(),
             speed_limit_bps: 0,
             default_download_dir: download_root.into(),
@@ -442,6 +466,7 @@ mod tests {
         assert_eq!(settings.folder_for("data.bin"), base);
         assert_eq!(settings.folder_for("README"), base);
         let flat = DownloadSettings {
+            extra: Default::default(),
             sort_into_category_folders: false,
             ..settings.clone()
         };

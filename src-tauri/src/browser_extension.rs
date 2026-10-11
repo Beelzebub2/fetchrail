@@ -9,6 +9,7 @@ use winreg::{enums::HKEY_CURRENT_USER, RegKey};
 
 use crate::native_host::{
     CHROMIUM_EXTENSION_ID, CHROMIUM_STORE_EXTENSION_ID, FIREFOX_EXTENSION_ID,
+    LOCAL_FIREFOX_EXTENSION_ID,
 };
 
 // These files travel inside fetchrail.exe, so the companion does not depend on a checkout.
@@ -72,7 +73,7 @@ fn native_host_manifests(executable: &Path) -> [serde_json::Value; 2] {
             "description": "Fetchrail browser integration",
             "path": executable,
             "type": "stdio",
-            "allowed_extensions": [FIREFOX_EXTENSION_ID]
+            "allowed_extensions": [FIREFOX_EXTENSION_ID, LOCAL_FIREFOX_EXTENSION_ID]
         }),
     ]
 }
