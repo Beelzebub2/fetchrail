@@ -78,3 +78,28 @@ installed app, and its embedded frontend passes. The local-only collector
 reconnected with its 20 MiB log budget and 15-second active/60-second idle
 cadence. Collector code, raw analytics, test captures, user profile backups
 and the local companion signing package remain ignored development artifacts.
+
+## Parallel HTTP requests and recovery
+
+The connection setting limits parallel range requests. A shared HTTP/2 client
+can carry these requests on one TCP/TLS connection; cloning reqwest's client
+shares its pool. More requests therefore do not necessarily provide more
+independent transports or more bandwidth. File size, range support and an
+unchanged representation still limit the selected range count.
+See [HTTP/2 connection management](https://www.rfc-editor.org/rfc/rfc9113.html#section-9.1)
+and [reqwest's client pooling](https://docs.rs/reqwest/0.13.5/reqwest/struct.Client.html).
+
+The late slow-range guard treats a completed transport's speed as a capacity
+hint shared across the original parallel ranges. It divides that hint by the
+range count instead of expecting every competing request to match a fast
+completed request. Peer-based late recovery applies to the first attempt;
+retries retain their own sustained-speed guard and transport timeouts. The
+early comparison with sustained, currently receiving peers remains unchanged.
+An uneven-rate fixture verifies that four healthy ranges require four requests,
+while the existing trickling-tail and shared-pause fixtures protect recovery.
+
+Assembly progress is emitted before Windows attachment policy and any supplied
+checksum verification. On the same filesystem, the staging hard link avoids
+copying the payload; Windows can still scan it before publication. The file
+remains private until all checks pass. See
+[IAttachmentExecute::Save](https://learn.microsoft.com/en-us/windows/win32/api/shobjidl_core/nf-shobjidl_core-iattachmentexecute-save).

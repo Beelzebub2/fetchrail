@@ -2619,6 +2619,7 @@ impl DownloadManager {
                             segment,
                             probe,
                             peer_rate,
+                            segments.len(),
                             shared,
                             live_peer_rate,
                             attempt == 0 && probe.accepts_ranges && probe.validator.is_some(),
@@ -2746,6 +2747,7 @@ impl DownloadManager {
         segment: &SegmentCounter,
         probe: &ProbeResult,
         peer_rate: &AtomicU64,
+        peer_count: usize,
         shared: bool,
         live_peer_rate: &AtomicU64,
         recover_peer: bool,
@@ -2975,7 +2977,12 @@ impl DownloadManager {
                             progress_at.elapsed(),
                             &mut best_rate,
                             &mut previous_rate,
-                            peer_rate.load(Ordering::Relaxed),
+                            // One completed transport's capacity is shared by the parallel ranges.
+                            if recover_peer {
+                                peer_rate.load(Ordering::Relaxed) / peer_count.max(1) as u64
+                            } else {
+                                0
+                            },
                         );
                         peer_rate.fetch_max(best_rate as u64, Ordering::Relaxed);
                         slow_windows = if slow { slow_windows + 1 } else { 0 };
@@ -3379,6 +3386,15 @@ impl DownloadManager {
             )
             .await?;
         }
+        // Assembly is done; Windows attachment policy can still spend time scanning the file.
+        let snapshot = {
+            let mut record = task.record.write().await;
+            record.merged_bytes = total;
+            record.speed_bps = 0;
+            record.eta_seconds = None;
+            record.clone()
+        };
+        self.emit_record(&snapshot);
         #[cfg(windows)]
         crate::platform::mark_download(&temp_path, &record.url, desired_name).await?;
         if let Some(expected) = record
@@ -3393,14 +3409,6 @@ impl DownloadManager {
                 .await
                 .map_err(|e| EngineError::Message(e.to_string()))??;
         }
-        let snapshot = {
-            let mut record = task.record.write().await;
-            record.merged_bytes = total;
-            record.speed_bps = 0;
-            record.eta_seconds = None;
-            record.clone()
-        };
-        self.emit_record(&snapshot);
         let _dispatch = self.dispatch_lock.lock().await;
         let _lock = self.persist_lock.lock().await;
         task.check_stopped(cancel)?;
