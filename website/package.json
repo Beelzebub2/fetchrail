@@ -1,0 +1,13 @@
+{
+  "name": "fetchrail-website",
+  "private": true,
+  "scripts": {
+    "test": "node test.mjs && node ../scripts/test-release-downloads.mjs",
+    "dev": "wrangler dev",
+    "check": "wrangler deploy --dry-run",
+    "deploy": "wrangler deploy"
+  },
+  "devDependencies": {
+    "wrangler": "4.149.0"
+  }
+}

@@ -7,7 +7,7 @@
   "assets": {
     "directory": "../website/public",
     "binding": "ASSETS",
-    "run_worker_first": ["/api/*"],
+    "run_worker_first": ["/*", "!/fonts/*", "!/styles.css", "!/theme.js", "!/app.js", "!/downloads.mjs", "!/release-feed.mjs", "!/download-ui.mjs", "!/favicon.svg", "!/og.jpg", "!/robots.txt", "!/sitemap.xml"],
     "not_found_handling": "404-page"
   },
   "routes": [{ "pattern": "fetchrail.rrmtools.uk", "custom_domain": true }],

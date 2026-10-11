@@ -16,8 +16,7 @@ const options = {
   modules: ["worker.mjs", "policy.mjs", "bootstrap.mjs"].map(name => ({ type: "ESModule", path: fileURLToPath(new URL(name, import.meta.url)) })),
   compatibilityDate: "2026-10-09",
   durableObjects: { RELEASE_FEED: { className: "ReleaseFeed", useSQLite: true } },
-  resourcePersistencePath: directory,
-  serviceBindings: { ASSETS: () => new Response("<h1>Existing website</h1>", { headers: { "Content-Type": "text/html" } }) },
+  serviceBindings: { ASSETS: "assets-test" },
   outboundService: async request => {
     if (request.url === "https://token.actions.githubusercontent.com/.well-known/jwks") return Response.json({ keys: [jwt.jwk] });
     for (const [tag, fixture] of fixtures) {
@@ -27,7 +26,11 @@ const options = {
     throw Error("Unexpected outbound URL: " + request.url);
   },
 };
-let worker = new Miniflare(convertV4MiniflareOptions(options));
+// Encrypt local test transport so desktop HTTP filters cannot rewrite CSP/body.
+const runtimeOptions = convertV4MiniflareOptions({ https: true, resourcePersistencePath: directory, workers: [options, {
+  name: "assets-test", modules: [{ type: "ESModule", path: fileURLToPath(new URL("test-assets.mjs", import.meta.url)) }],
+}] });
+let worker = new Miniflare(runtimeOptions);
 const get = path => worker.dispatchFetch(`https://fetchrail.rrmtools.uk${path}`);
 async function publish(tag, changes = {}) {
   const token = await jwt.sign({ ref: `refs/tags/${tag}`, workflow_ref: `${REPOSITORY}/.github/workflows/release.yml@refs/tags/${tag}` });
@@ -58,6 +61,28 @@ try {
   assert.equal((await get("/api/updates/notify")).status, 405);
   assert.equal((await get("/api/unknown")).status, 404);
   assert.match(await (await get("/")).text(), /Existing website/);
+  const document = await get("/");
+  const policy = document.headers.get("content-security-policy");
+  const nonce = /'nonce-([^']+)'/.exec(policy)[1];
+  assert.equal(atob(nonce).length, 16);
+  assert.ok(!policy.includes("unsafe-inline"), policy);
+  assert.match(policy, /script-src 'self'.*https:\/\/static.cloudflareinsights.com/);
+  assert.match(policy, /frame-ancestors 'none'/);
+  const body = await document.text();
+  assert.ok(body.includes(`nonce="${nonce}"`));
+  assert.ok(body.includes('<script>alert("blocked")</script>'), "Untrusted executable inline scripts are not authorized");
+  assert.notEqual((await get("/")).headers.get("content-security-policy"), policy, "Each response has a fresh nonce");
+  for (const [header, value] of Object.entries({ "cache-control": "no-store", "x-content-type-options": "nosniff", "x-frame-options": "DENY", "referrer-policy": "strict-origin-when-cross-origin", "permissions-policy": "camera=(), microphone=(), geolocation=()" })) assert.equal(document.headers.get(header), value);
+  for (const header of ["etag", "last-modified", "content-length"]) assert.equal(document.headers.get(header), null);
+  const conditionalDocument = await worker.dispatchFetch("https://fetchrail.rrmtools.uk/", { headers: { "If-None-Match": '"html"', "If-Modified-Since": "Sun, 11 Oct 2026 00:00:00 GMT" } });
+  assert.equal(conditionalDocument.status, 200, "Conditional HTML must receive a matching body and nonce, not 304");
+  const head = await worker.dispatchFetch("https://fetchrail.rrmtools.uk/", { method: "HEAD" });
+  assert.equal(head.status, 200); assert.equal(await head.text(), ""); assert.match(head.headers.get("content-security-policy"), /nonce-/);
+  const missing = await get("/missing");
+  assert.equal(missing.status, 404); assert.equal(missing.headers.get("cache-control"), "no-store");
+  const style = await get("/styles.css");
+  assert.equal(style.status, 200, await style.text());
+  assert.equal(style.headers.get("cache-control"), "public, max-age=3600"); assert.equal(style.headers.get("etag"), '"asset"');
   assert.equal((await publish("v1.2.3", { manifestSha256: "0".repeat(64) })).status, 409);
   const accepted = await publish("v1.2.3");
   assert.equal(accepted.status, 200); assert.deepEqual(await accepted.json(), { version: "1.2.3", changed: true });
@@ -73,7 +98,7 @@ try {
   assert.ok(results.every(result => [200, 409].includes(result.status)));
   assert.equal((await publish("v1.2.3")).status, 409);
   await worker.dispose();
-  worker = new Miniflare(convertV4MiniflareOptions(options));
+  worker = new Miniflare(runtimeOptions);
   await (await worker.getCaches()).default.delete("https://fetchrail.rrmtools.uk/api/updates/latest");
   assert.equal((await (await get("/api/updates/latest")).json()).version, "1.2.5", "SQLite feed survives restart and concurrent notifications retain the newest release");
   const release = await (await get("/api/releases/latest")).json();
