@@ -64,5 +64,9 @@ const args = { issuer: "user:test:123", secret: "test-secret", guid: built.brows
 assert.equal(await syncPrivacyPolicy(args), true, "First AMO submission must populate the privacy policy field");
 assert.equal(await syncPrivacyPolicy(args), false, "Subsequent releases should leave an unchanged privacy policy alone");
 assert.deepEqual(methods, ["GET", "PATCH", "GET", "GET"]);
+const linkedPolicy = policy.replace("https://fetchrail.rrmtools.uk/privacy", '<a href="https://prod.outgoing.example/?url=1">https://fetchrail.rrmtools.uk/privacy</a>');
+assert.equal(await syncPrivacyPolicy({ ...args, fetcher: async () => new Response(JSON.stringify({ privacy_policy: { "en-US": linkedPolicy } }), { status: 200 }) }), false,
+  "Mozilla's display-only links must not force repeat privacy policy updates");
+await assert.rejects(syncPrivacyPolicy({ ...args, fetcher: async (_url, req) => new Response(JSON.stringify({ privacy_policy: { "en-US": req.method === "GET" ? "a different policy" : policy } }), { status: 200 }) }), /did not return the submitted privacy policy/);
 await assert.rejects(syncPrivacyPolicy({ ...args, fetcher: async () => new Response("{}", { status: 403 }) }), /HTTP 403/);
 console.log(`Firefox AMO ${built.version}: identity, manifest, disclosure, metadata, and package checks passed.`);
