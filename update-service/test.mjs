@@ -61,6 +61,7 @@ if (process.argv[1]?.endsWith("test.mjs")) {
   await assert.rejects(authorize("junk", "v1.2.3", jwks, now), error => error.status === 401);
   await assert.rejects(readJson(new Response("x".repeat(2048)), 1024), error => error.status === 413);
   await assert.rejects(readJson(new Response("invalid")), error => error.status === 400);
+  await assert.rejects(readJson(new Response("unavailable", { status: 403 })), error => error.status === 502 && error.message.includes("HTTP 403"));
   let cancelled = false;
   const stalled = new ReadableStream({ cancel() { cancelled = true; } });
   await assert.rejects(readJson(new Response(stalled), 1024, 20), error => error.status === 408);
