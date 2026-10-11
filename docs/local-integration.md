@@ -103,3 +103,23 @@ checksum verification. On the same filesystem, the staging hard link avoids
 copying the payload; Windows can still scan it before publication. The file
 remains private until all checks pass. See
 [IAttachmentExecute::Save](https://learn.microsoft.com/en-us/windows/win32/api/shobjidl_core/nf-shobjidl_core-iattachmentexecute-save).
+
+## Empty metadata and generated exports
+
+Zero-byte HEAD responses and empty range probes must not complete a download
+without retrieving its actual body. Fetchrail now checks zero-length HEAD
+metadata with an ordinary GET, and treats any remaining zero-length probe as
+an unknown-length single stream. A positive HEAD size remains usable when a
+range probe supplies no useful size. Normal validated parallel ranges retain
+their existing path, and genuinely empty files still complete after GET.
+An HTTP 204 response does not contain a file representation and is rejected.
+See [HTTP Content-Length semantics](https://www.rfc-editor.org/rfc/rfc9110.html#section-8.6).
+
+The real-app HTTP fixture checks misleading zero-byte HEAD responses with
+known and streamed payloads, empty range-probe responses, a useful HEAD size,
+and a genuine empty file whose server rejects byte ranges, plus HTTP 204
+failure without publishing a file. It compares the
+downloaded payload's SHA-256 and checks recorded byte counts. The previous
+executable reproduced the bug by publishing an empty file for an 8 MiB payload.
+This covers the failure mode seen in the user's empty Google Slides exports;
+a fresh Google export is still needed to verify that server's live behavior.
