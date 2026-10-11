@@ -89,7 +89,7 @@ npm run browser:host
 npm run browser:install
 ```
 
-Then load the stable extension folder from **Fetchrail Settings → Browser companion**, as described in the [companion guide](../browser-extension/README.md). There is no separate native-host executable.
+Use **Fetchrail Settings → Browser companion → Get from Chrome Web Store** for the official companion. For source development, expand **Manual installation and Firefox** to load the stable bundled folder, as described in the [companion guide](../browser-extension/README.md). There is no separate native-host executable.
 
 To remove development registrations:
 

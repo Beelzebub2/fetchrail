@@ -332,6 +332,15 @@ pub fn open_folder(app: &AppHandle, browser: Browser) -> Result<(), String> {
         .map_err(|error| format!("Could not open the extension folder: {error}"))
 }
 
+pub fn open_store(app: &AppHandle) -> Result<(), String> {
+    install(app)?;
+    tauri_plugin_opener::open_url(
+        format!("https://chromewebstore.google.com/detail/{CHROMIUM_STORE_EXTENSION_ID}"),
+        None::<&str>,
+    )
+    .map_err(|error| format!("Could not open the Chrome Web Store: {error}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

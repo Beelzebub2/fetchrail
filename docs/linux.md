@@ -33,11 +33,11 @@ Writable AppImages use the existing signed updater. `.deb`, `.rpm`, Arch, Nix, F
 
 ## Browser companion
 
-Launch Fetchrail once, then install the embedded companion from Settings. Chromium-family manifests use XDG config roots; Firefox uses its native messaging directory. Both point to a persistent private launcher, preserving the existing extension IDs and protocol. Settings provides **Repair browser integration** and **Copy desktop diagnostics**. Diagnostics omit download URLs, credentials and home paths.
+Launch Fetchrail once, then use **Settings → Browser companion → Get from Chrome Web Store** for the official Chrome companion and automatic store updates. **Manual installation and Firefox** contains the bundled folders. Chromium-family manifests use XDG config roots; Firefox uses its native messaging directory. Both point to a persistent private launcher, preserving the existing extension IDs and protocol. Settings provides **Repair integration** and **Copy desktop diagnostics**. Diagnostics omit download URLs, credentials and home paths.
 
 For Chromium with a custom `--user-data-dir`, start Fetchrail with `FETCHRAIL_BROWSER_ROOTS='["/absolute/profile/root"]'`. For Nix/wrapper installations, `FETCHRAIL_LAUNCHER` must name an existing absolute persistent launcher; the supplied Nix recipe sets it.
 
-Confined Firefox/Chromium packages may need native-messaging portals/proxies that their browser supports. Installing a host manifest outside that sandbox cannot by itself grant access. Native browser packages provide the host route. Failed handoffs leave browser downloads available. Full confined-browser parity, signed Firefox store distribution and Chromium store distribution still require their own qualification/publication.
+Confined Firefox/Chromium packages may need native-messaging portals/proxies that their browser supports. Installing a host manifest outside that sandbox cannot by itself grant access. Native browser packages provide the host route. Failed handoffs leave browser downloads available. Full confined-browser parity, signed Firefox store distribution and real installed-store companion acceptance on each distro still require their own qualification.
 
 ## Build and checks
 
