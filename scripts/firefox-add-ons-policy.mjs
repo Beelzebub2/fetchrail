@@ -32,11 +32,13 @@ export async function verifyCredentials({ issuer, secret, fetcher = fetch }) {
 export async function syncPrivacyPolicy({ issuer, secret, guid, policy, apiBase = "https://addons.mozilla.org/api/v5", fetcher = fetch }) {
   if (!guid || !policy?.trim()) throw new Error("Firefox ID and privacy policy are required.");
   const url = `${apiBase.replace(/\/$/, "")}/addons/addon/${encodeURIComponent(guid)}/eula_policy/`;
+  const matchesPolicy = (value) => typeof value === "string" && value.replace(/\r\n/g, "\n").trim() === policy.replace(/\r\n/g, "\n").trim();
   async function request(method, body) {
     const response = await fetcher(url, {
       method,
       headers: {
         Authorization: authorization(issuer, secret),
+        "Cache-Control": "no-cache",
         ...(body ? { "Content-Type": "application/json" } : {}),
       },
       ...(body ? { body: JSON.stringify(body) } : {}),
@@ -47,13 +49,18 @@ export async function syncPrivacyPolicy({ issuer, secret, guid, policy, apiBase 
   }
 
   const before = await request("GET");
-  if (before?.privacy_policy?.["en-US"] === policy) {
+  if (matchesPolicy(before?.privacy_policy?.["en-US"])) {
     console.log("Mozilla AMO privacy policy already matches the source.");
     return false;
   }
   await request("PATCH", { privacy_policy: { "en-US": policy } });
   const after = await request("GET");
-  if (after?.privacy_policy?.["en-US"] !== policy) throw new Error("Mozilla AMO did not return the submitted privacy policy.");
+  if (!matchesPolicy(after?.privacy_policy?.["en-US"])) {
+    // Privacy policy text is public. Diagnostics deliberately never print API credentials.
+    const remote = after?.privacy_policy?.["en-US"];
+    console.warn(`Mozilla AMO policy response: keys=${JSON.stringify(Object.keys(after?.privacy_policy ?? {}))}, valueType=${typeof remote}, actualLength=${typeof remote === "string" ? remote.length : "unknown"}, sourceLength=${policy.length}, actualBeginning=${JSON.stringify(typeof remote === "string" ? remote.slice(0, 120) : null)}`);
+    throw new Error("Mozilla AMO did not return the submitted privacy policy.");
+  }
   console.log("Mozilla AMO privacy policy updated and verified.");
   return true;
 }
