@@ -288,10 +288,12 @@ impl DownloadTask {
 
 pub struct DownloadManager {
     torrent_engine: TorrentEngine,
+    #[allow(clippy::type_complexity)] // Keep the existing bounded import state together.
     torrent_imports: RwLock<HashMap<Uuid, (String, Option<TorrentMetadata>, Instant)>>,
     torrent_checkpoint: Mutex<Instant>,
     torrent_configuration: tokio::sync::Mutex<serde_json::Value>,
     torrent_import_lock: tokio::sync::Mutex<()>,
+    #[allow(clippy::type_complexity)] // This shared budget is updated under one lock.
     bandwidth_broker: Mutex<(Instant, u64, (bool, bool), (u64, u64))>,
     pending_torrent_sources: Mutex<Vec<String>>,
     app: AppHandle,
@@ -456,31 +458,74 @@ impl DownloadManager {
         self.add_inner(request, true).await
     }
 
+    pub async fn get_handoff(&self, key: &str) -> Vec<DownloadRecord> {
+        let _dispatch = self.dispatch_lock.lock().await;
+        let prefix = format!("{key}:");
+        self.list()
+            .await
+            .into_iter()
+            .filter(|r| {
+                r.extra
+                    .get("handoffId")
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|id| id.starts_with(&prefix))
+            })
+            .collect()
+    }
+
     pub async fn commit_handoff(
         self: &Arc<Self>,
         key: &str,
         auto_start: bool,
     ) -> Result<Vec<DownloadRecord>, String> {
+        let dispatch = self.dispatch_lock.lock().await;
         let prefix = format!("{key}:");
-        let mut records = Vec::new();
-        for record in self.list().await.into_iter().filter(|r| {
-            r.extra
-                .get("handoffId")
-                .and_then(|v| v.as_str())
-                .is_some_and(|id| id.starts_with(&prefix))
-        }) {
-            if record.status == DownloadStatus::Cancelled {
-                return Err("Handoff was rolled back.".into());
-            }
-            let task = self.task(record.id).await?;
-            let mut saved = task.record.write().await;
-            saved.extra.insert("handoffCommitted".into(), json!(true));
-            records.push(saved.clone());
-        }
+        let mut records = self
+            .list()
+            .await
+            .into_iter()
+            .filter(|r| {
+                r.extra
+                    .get("handoffId")
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|id| id.starts_with(&prefix))
+            })
+            .collect::<Vec<_>>();
         if records.is_empty() {
             return Err("Handoff has not been accepted yet.".into());
         }
-        self.persist_records().await.map_err(|e| e.to_string())?;
+        if records
+            .iter()
+            .any(|r| r.status == DownloadStatus::Cancelled)
+        {
+            return Err("Handoff was rolled back.".into());
+        }
+        let previous = records
+            .iter()
+            .map(|r| (r.id, r.extra.get("handoffCommitted").cloned()))
+            .collect::<Vec<_>>();
+        for record in &mut records {
+            let task = self.task(record.id).await?;
+            let mut saved = task.record.write().await;
+            saved.extra.insert("handoffCommitted".into(), json!(true));
+            *record = saved.clone();
+        }
+        if let Err(error) = self.persist_records().await {
+            for (id, value) in previous {
+                let task = self.task(id).await?;
+                let mut saved = task.record.write().await;
+                match value {
+                    Some(value) => {
+                        saved.extra.insert("handoffCommitted".into(), value);
+                    }
+                    None => {
+                        saved.extra.remove("handoffCommitted");
+                    }
+                }
+            }
+            return Err(error.to_string());
+        }
+        drop(dispatch);
         for record in &records {
             if auto_start && record.status == DownloadStatus::Paused {
                 self.resume(record.id).await?;
@@ -692,6 +737,7 @@ impl DownloadManager {
             .await?;
         let record = DownloadRecord {
             id,
+            extra: Default::default(),
             expected_sha256: None,
             url: source,
             file_name: metadata.name,
@@ -1086,11 +1132,9 @@ impl DownloadManager {
                 0
             };
             record.connections = number("peers") as usize;
-            record.eta_seconds = if record.speed_bps > 0 {
-                Some(number("wanted").saturating_sub(number("downloaded")) / record.speed_bps)
-            } else {
-                None
-            };
+            record.eta_seconds = number("wanted")
+                .saturating_sub(number("downloaded"))
+                .checked_div(record.speed_bps);
             let t = record.torrent.as_mut().unwrap();
             t.uploaded_bytes = number("uploaded");
             t.all_downloaded_bytes = number("allDownloaded");
@@ -1507,7 +1551,7 @@ impl DownloadManager {
         for task in tasks {
             records.push(task.record.read().await.clone());
         }
-        records.sort_by(|left, right| right.created_at.cmp(&left.created_at));
+        records.sort_by_key(|record| std::cmp::Reverse(record.created_at));
         records
     }
 
@@ -1608,11 +1652,10 @@ impl DownloadManager {
         let task = self.task(id).await?;
         let snapshot = {
             let mut record = task.record.write().await;
-            if !(record.torrent.is_some() && record.status == DownloadStatus::Completed)
-                && !matches!(
-                    record.status,
-                    DownloadStatus::Paused | DownloadStatus::Failed | DownloadStatus::Cancelled
-                )
+            if !(matches!(
+                record.status,
+                DownloadStatus::Paused | DownloadStatus::Failed | DownloadStatus::Cancelled
+            ) || record.torrent.is_some() && record.status == DownloadStatus::Completed)
             {
                 return Err("Only paused, failed or cancelled downloads can be resumed.".into());
             }
@@ -3337,7 +3380,7 @@ impl DownloadManager {
         if let Some(expected) = record
             .expected_sha256
             .as_ref()
-            .filter(|_| cfg!(windows) || complete_stage)
+            .filter(|_| cfg!(windows) || recovered)
         {
             let path = temp_path.clone();
             let expected = expected.clone();
@@ -3468,7 +3511,7 @@ impl DownloadManager {
                 request_context,
             });
         }
-        records.sort_by(|left, right| left.record.created_at.cmp(&right.record.created_at));
+        records.sort_by_key(|task| task.record.created_at);
         write_json_atomic(&self.data_dir.join(STATE_FILE), &records).await
     }
 
@@ -3777,7 +3820,7 @@ fn record_is_dispatch_ready(
     if paused_queues.iter().any(|name| name == &record.queue) {
         return false;
     }
-    !record.scheduled_for.is_some_and(|when| when > now)
+    record.scheduled_for.is_none_or(|when| when <= now)
 }
 
 #[cfg(target_os = "windows")]
@@ -3852,7 +3895,7 @@ fn safe_file_name(value: &str) -> String {
 
 fn name_from_url(url: &Url) -> String {
     url.path_segments()
-        .and_then(|segments| segments.filter(|segment| !segment.is_empty()).next_back())
+        .and_then(|mut segments| segments.rfind(|segment| !segment.is_empty()))
         .map(safe_file_name)
         .filter(|name| !name.is_empty())
         .unwrap_or_else(|| "download".to_string())
@@ -4078,7 +4121,7 @@ fn suggested_connection_count(total: u64, configured: usize, min_segment: u64) -
     if total == 0 {
         return 1;
     }
-    let by_size = (total / min_segment.max(1)).max(1).min(32) as usize;
+    let by_size = (total / min_segment.max(1)).clamp(1, 32) as usize;
     configured.clamp(1, 32).min(by_size.max(1))
 }
 
@@ -4311,12 +4354,14 @@ mod transfer_tests;
 
 #[cfg(test)]
 mod tests {
-    use super::{context_headers, reject_html_page, StoredDownload};
-    use crate::model::BrowserRequestContext;
+    use super::{context_headers, default_settings, reject_html_page, StoredDownload};
+    use crate::model::{BrowserRequestContext, DownloadSettings};
     use chrono::{DateTime, Duration as ChronoDuration, Utc};
     use reqwest::header::{
         HeaderMap, HeaderValue, CONTENT_DISPOSITION, CONTENT_LENGTH, CONTENT_RANGE,
     };
+    use serde_json::json;
+    use std::path::Path;
     use uuid::Uuid;
 
     use super::{

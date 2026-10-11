@@ -106,7 +106,7 @@ jobs:
         run: npm run engine:bench
       - name: Retain benchmark evidence
         if: inputs.benchmark == true
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: benchmarks-windows
           path: artifacts/benchmarks/*
@@ -122,7 +122,7 @@ jobs:
           cargo build --manifest-path src-tauri/Cargo.toml --release --bin verify-update --features tauri/custom-protocol,test-tools --locked
       - name: Upload Windows release assets
         if: startsWith(github.ref, 'refs/tags/')
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: release-windows
           path: |
@@ -164,7 +164,7 @@ jobs:
       - name: Check Linux portable integration
         run: bash scripts/test-linux-integration.sh
       - name: Cache native dependencies
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             src-tauri/native/vcpkg
@@ -194,8 +194,12 @@ jobs:
           npm run torrent:ui
       - name: Check Rust and native transfer correctness
         run: |
-          cargo fmt --manifest-path src-tauri/Cargo.toml -- --check
-          cargo test --manifest-path src-tauri/Cargo.toml --locked
+          set -euo pipefail
+          mkdir -p artifacts/linux-qualification
+          {
+            cargo fmt --manifest-path src-tauri/Cargo.toml -- --check
+            cargo test --manifest-path src-tauri/Cargo.toml --locked
+          } 2>&1 | tee artifacts/linux-qualification/rust-checks.log
       - name: Build embedded Linux executables
         run: cargo build --manifest-path src-tauri/Cargo.toml --release --bins --features tauri/custom-protocol,test-tools --locked
       - name: Check signed artifact verification
@@ -262,14 +266,14 @@ jobs:
           cp -a browser-extension artifacts/distro-inputs/
       - name: Retain private CI distro fixture inputs
         if: matrix.arch == 'x64'
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: distro-inputs-x64
           path: artifacts/distro-inputs/*
           if-no-files-found: error
       - name: Retain Linux qualification evidence
         if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: qualification-linux-${{ matrix.arch }}
           path: |
@@ -280,7 +284,7 @@ jobs:
           if-no-files-found: warn
       - name: Upload Linux release assets
         if: startsWith(github.ref, 'refs/tags/')
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: release-linux-${{ matrix.arch }}
           path: release-artifacts/*
@@ -299,7 +303,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: distro-inputs-x64
           path: artifacts/distro-inputs
@@ -313,7 +317,7 @@ jobs:
           sudo --preserve-env=FETCHRAIL_SOURCE_REVISION bash scripts/test-linux-distro.sh '${{ matrix.distro }}' artifacts/distro-inputs
       - name: Retain distro evidence
         if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: qualification-${{ matrix.distro }}
           path: artifacts/linux-qualification/${{ matrix.distro }}/*
@@ -354,7 +358,7 @@ jobs:
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
         with:
           node-version: '24'
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: release-*
           path: incoming

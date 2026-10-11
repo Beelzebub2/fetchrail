@@ -1,5 +1,5 @@
 import { DurableObject } from "cloudflare:workers";
-import { AUDIENCE, FeedError, authorize, loadRelease, publicationDecision, readJson, sha256 } from "./policy.mjs";
+import { AUDIENCE, FeedError, authorize, compareTags, loadRelease, publicationDecision, readJson, sha256 } from "./policy.mjs";
 import bootstrap from "./bootstrap.mjs";
 
 export class ReleaseFeed extends DurableObject {
@@ -51,6 +51,12 @@ export default {
         response = new Response(body, { headers: { ...commonHeaders, "Content-Type": "application/json; charset=utf-8",
           "Cache-Control": "public, max-age=30, must-revalidate", ETag: `"${await sha256(new TextEncoder().encode(body))}"` } });
         ctx.waitUntil(caches.default.put(cacheKey, response.clone()));
+      }
+      const installed = url.searchParams.get("current_version");
+      if (url.pathname === "/api/updates/latest" && installed !== null) {
+        const manifest = await response.clone().json();
+        if (compareTags(`v${installed}`, `v${manifest.version}`) >= 0)
+          return new Response(null, { status: 204, headers: commonHeaders });
       }
       // Cloudflare may weaken the public ETag when compressing this response.
       const etag = response.headers.get("etag").replace(/^W\//, "");

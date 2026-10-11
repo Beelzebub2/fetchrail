@@ -73,11 +73,12 @@ fn desktop_quote(path: &Path) -> Result<String, String> {
     if value.contains(['\n', '\r', '\0']) {
         return Err("Desktop path contains a control character.".into());
     }
+    // Desktop string unescaping happens before Exec argument unquoting.
     let escaped = value
         .replace('\\', "\\\\\\\\")
-        .replace('"', "\\\"")
-        .replace('`', "\\`")
-        .replace('$', "\\$")
+        .replace('"', "\\\\\"")
+        .replace('`', "\\\\`")
+        .replace('$', "\\\\$")
         .replace('%', "%%");
     Ok(format!("\"{escaped}\""))
 }
@@ -377,6 +378,13 @@ mod tests {
             desktop_quote(Path::new("/tmp/a% b")).unwrap(),
             "\"/tmp/a%% b\""
         );
+        assert_eq!(
+            desktop_quote(Path::new(r#"/tmp/a% b ' " $ ` \"#)).unwrap(),
+            r#""/tmp/a%% b ' \\" \\$ \\` \\\\""#
+        );
+        for path in ["bad\npath", "bad\rpath", "bad\0path"] {
+            assert!(desktop_quote(Path::new(path)).is_err());
+        }
     }
     #[test]
     fn permissions_and_versions_do_not_invent_support() {

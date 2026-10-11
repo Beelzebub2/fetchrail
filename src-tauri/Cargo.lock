@@ -1070,7 +1070,7 @@ dependencies = [
 
 [[package]]
 name = "fetchrail"
-version = "0.5.3+local.12"
+version = "0.5.3"
 dependencies = [
  "base64 0.22.1",
  "chrono",

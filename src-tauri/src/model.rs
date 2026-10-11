@@ -299,8 +299,8 @@ pub struct QueueRecord {
 impl QueueRecord {
     pub fn allows_downloads(&self, now: DateTime<Utc>) -> bool {
         !self.paused
-            && !self.starts_at.is_some_and(|start| now < start)
-            && !self.stops_at.is_some_and(|stop| now >= stop)
+            && self.starts_at.is_none_or(|start| now >= start)
+            && self.stops_at.is_none_or(|stop| now < stop)
     }
 }
 

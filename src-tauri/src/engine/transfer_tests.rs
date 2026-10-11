@@ -30,6 +30,7 @@ const server = createServer((request, response) => {
   const headers = {'Content-Type': 'application/octet-stream'};
   if (partial) headers['Content-Range'] = `bytes ${start + Number(mode === 'invalid')}-${end}/${total}`;
   if (!['unknown', 'short'].includes(mode)) headers['Content-Length'] = end - start + 1;
+  if (mode === 'drop' && fail) headers.Connection = 'close';
   if (mode === 'compressed') headers['Content-Encoding'] = 'gzip';
   else headers.ETag = mode === 'changed' ? '\"v2\"' : ['trickle', 'validated-slow'].includes(mode) ? '\"v1\"' : '\"fixture\"';
   response.writeHead(partial ? 206 : 200, headers);
@@ -46,9 +47,9 @@ const server = createServer((request, response) => {
       const blocked = !response.write(body.subarray(0, size));
       remaining -= size;
       if (remaining === 0) {
-        // Flush the promised prefix before half-closing the socket, so its resume
-        // offset is deterministic on Windows. The declared body remains incomplete.
-        if (mode === 'drop' && fail) response.write('', () => response.socket?.end());
+        // Give clients time to consume the final prefix before HTTP closes the
+        // truncated response; an immediate Windows reset can discard that packet.
+        if (mode === 'drop' && fail) setTimeout(() => response.end(), 100);
         else response.end();
         return;
       }
@@ -470,12 +471,12 @@ async fn shared_staging_resumes_verified_prefixes_and_repairs_only_corrupted_ran
     );
     assert!(matches!(result, Err(EngineError::Cancelled)));
     let mut saved = Vec::new();
-    for index in 0..4 {
-        let checkpoint = part_checkpoint(&dir, index, ranges[index].len())
+    for (index, range) in ranges.iter().enumerate() {
+        let checkpoint = part_checkpoint(&dir, index, range.len())
             .await
             .unwrap()
             .unwrap();
-        assert!(checkpoint.bytes > 0 && checkpoint.bytes < ranges[index].len());
+        assert!(checkpoint.bytes > 0 && checkpoint.bytes < range.len());
         saved.push(checkpoint.bytes);
     }
     assert_eq!(fs::metadata(dir.join("0.part")).await.unwrap().len(), total);
