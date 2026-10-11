@@ -10,7 +10,7 @@ use std::{
 const HTTP_FIXTURE: &str = r#"
 import { createServer } from 'node:http';
 const total = Number(process.argv[1]), mode = process.argv[2];
-const body = Buffer.alloc(16 * 1024, 0x5a);
+const body = Buffer.alloc(mode === 'uneven-rates' ? 64 * 1024 : 16 * 1024, 0x5a);
 let failed = false;
 const server = createServer((request, response) => {
   const range = /^bytes=(\d+)-(\d*)$/.exec(request.headers.range ?? '');
@@ -43,7 +43,7 @@ const server = createServer((request, response) => {
     if (mode === 'host-pause' && !paused && remaining < count - 1024 * 1024) { paused = true; setTimeout(pump, 12000); return; }
     while (!response.destroyed && remaining > 0) {
       const trickling = mode === 'trickle' && fail && remaining < count - 1024 * 1024;
-      const size = Math.min(remaining, trickling ? 64 : body.length);
+      const size = Math.min(remaining, trickling ? 64 : mode === 'uneven-rates' && start > 0 ? 16 * 1024 : body.length);
       const blocked = !response.write(body.subarray(0, size));
       remaining -= size;
       if (remaining === 0) {
@@ -53,13 +53,14 @@ const server = createServer((request, response) => {
         else response.end();
         return;
       }
-      const delay = trickling ? 50 : ['validated-slow', 'weak', 'host-pause'].includes(mode) ? 10 : ['slow', 'retry', 'drop', 'trickle'].includes(mode) ? 2 : 0;
+      const delay = mode === 'uneven-rates' ? (start === 0 ? 0 : 20) : trickling ? 50 : ['validated-slow', 'weak', 'host-pause'].includes(mode) ? 10 : ['slow', 'retry', 'drop', 'trickle'].includes(mode) ? 2 : 0;
       const next = () => delay ? setTimeout(pump, delay) : pump();
       if (blocked) { response.once('drain', next); return; }
       if (delay) { setTimeout(pump, delay); return; }
     }
   }
-  pump();
+  if (mode === 'uneven-rates' && start === 0) setTimeout(pump, 1000);
+  else pump();
 });
 server.listen(0, '127.0.0.1', () => console.log(JSON.stringify({port: server.address().port})));
 "#;
@@ -388,6 +389,37 @@ async fn shared_host_pause_does_not_renew_healthy_transports() {
     .unwrap();
     assert_eq!(server.requests.lock().unwrap().len(), 4);
     verify_parts(&dir, &segments).await;
+    fs::remove_dir_all(dir).await.unwrap();
+}
+
+#[tokio::test]
+async fn a_fast_completed_range_does_not_restart_steady_peers() {
+    let total = 128 * 1024 * 1024;
+    let server = TestServer::new(total, "uneven-rates");
+    let (dir, segments, mut probe) = parts(total, 4).await;
+    probe.validator = Some("\"fixture\"".into());
+    tokio::time::timeout(
+        Duration::from_secs(90),
+        DownloadManager::download_ranges(
+            &download_client_builder().no_proxy().build().unwrap(),
+            &RateLimiter::new(0),
+            &task(),
+            &CancellationToken::new(),
+            &server.url,
+            &dir,
+            &segments,
+            &probe,
+        ),
+    )
+    .await
+    .expect("Uneven but steady ranges must finish")
+    .unwrap();
+    verify_parts(&dir, &segments).await;
+    assert_eq!(
+        server.requests.lock().unwrap().len(),
+        4,
+        "A finished range's faster rate must not cause healthy peers to retry"
+    );
     fs::remove_dir_all(dir).await.unwrap();
 }
 
