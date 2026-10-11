@@ -20,10 +20,32 @@ export class ReleaseFeed extends DurableObject {
 }
 const commonHeaders = { "X-Content-Type-Options": "nosniff", "Cache-Control": "no-store" };
 function failure(status, message) { return Response.json({ error: message }, { status, headers: commonHeaders }); }
+async function website(request, env) {
+  // Transformed HTML must not revalidate a cached body carrying an older nonce.
+  const assetRequest = new Request(request);
+  assetRequest.headers.delete("if-none-match");
+  assetRequest.headers.delete("if-modified-since");
+  const response = await env.ASSETS.fetch(assetRequest);
+  if (!response.headers.get("content-type")?.startsWith("text/html")) return response;
+  const nonce = btoa(String.fromCharCode(...crypto.getRandomValues(new Uint8Array(16))));
+  const headers = new Headers(response.headers);
+  headers.set("Content-Security-Policy", `default-src 'self'; script-src 'self' 'nonce-${nonce}' https://static.cloudflareinsights.com; style-src 'self'; img-src 'self' data:; font-src 'self'; connect-src 'self' https://cloudflareinsights.com; object-src 'none'; base-uri 'self'; form-action 'none'; frame-ancestors 'none'`);
+  headers.set("Cache-Control", "no-store");
+  headers.set("X-Content-Type-Options", "nosniff");
+  headers.set("X-Frame-Options", "DENY");
+  headers.set("Referrer-Policy", "strict-origin-when-cross-origin");
+  headers.set("Permissions-Policy", "camera=(), microphone=(), geolocation=()");
+  for (const name of ["etag", "last-modified", "content-length"]) headers.delete(name);
+  const document = new Response(response.body, { status: response.status, statusText: response.statusText, headers });
+  // Cloudflare parses the response-header nonce for its own injected JSD bootstrap.
+  return new HTMLRewriter().on('script[type="application/ld+json"]', {
+    element(element) { element.setAttribute("nonce", nonce); },
+  }).transform(document);
+}
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
-    if (!url.pathname.startsWith("/api/")) return env.ASSETS.fetch(request);
+    if (!url.pathname.startsWith("/api/")) return website(request, env);
     try {
       if (url.pathname === "/api/updates/notify") {
         if (request.method !== "POST") return failure(405, "Use POST.");

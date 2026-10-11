@@ -1,13 +1,21 @@
-name: Update feed checks
+name: Website and update feed checks
 on:
   push:
     branches: [main]
     paths:
       - 'update-service/**'
+      - 'website/**'
+      - 'scripts/release-downloads.mjs'
+      - 'scripts/test-release-downloads.mjs'
+      - 'scripts/sync-website-downloads.mjs'
       - '.github/workflows/update-service.yml'
   pull_request:
     paths:
       - 'update-service/**'
+      - 'website/**'
+      - 'scripts/release-downloads.mjs'
+      - 'scripts/test-release-downloads.mjs'
+      - 'scripts/sync-website-downloads.mjs'
       - '.github/workflows/update-service.yml'
 permissions:
   contents: read
@@ -26,6 +34,11 @@ jobs:
         with:
           node-version: '24'
           cache: npm
-          cache-dependency-path: update-service/package-lock.json
+          cache-dependency-path: |
+            update-service/package-lock.json
+            website/package-lock.json
       - run: npm ci --prefix update-service
       - run: npm test --prefix update-service
+      - run: npm ci --prefix website
+      - run: npm test --prefix website
+      - run: npm run check --prefix website
