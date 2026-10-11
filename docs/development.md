@@ -165,9 +165,11 @@ The Windows runner builds the frontend, companions, application, torrent harness
 
 Native Linux x64 and arm64 runners build AppImage, DEB, RPM and portable archives. Both run embedded desktop, HTTP/restart, torrent, signature and native X11/Wayland checks. Separate installed-package gates cover Fedora 44, Mint 22.3, Kali and Arch. The retained Firefox handoff test also runs against each installed distro binary. Publishing requires every platform, distro and update-service gate to pass, then verifies all artifact signatures and combines all three platform manifests into one release.
 
-Pushes to `main` run these checks, package unsigned development downloads and cache compiled Rust dependencies. Windows also saves vcpkg binary archives on `main`; vcpkg validates compiler, port and dependency ABI hashes before restoring them. Tag builds reuse these caches and sign and publish release downloads. A new toolchain or changed dependencies can require rebuilding the cache. Superseded branch builds are cancelled; tag builds finish independently. Update-service-only changes run the separate feed checks without rebuilding the desktop app. Actions display desktop builds as `Build / main` and `Release vVERSION`; pushing a commit and its tag creates one run of each.
+Pushing a tag in the form `vMAJOR.MINOR.PATCH` is the automatic trigger for the release workflow. It builds, signs and publishes the release after all platform, distro and update-service gates pass. The tag must match the version files listed above. For a manual benchmark or qualification run, use **Actions → Release → Run workflow** and enable `benchmark` when needed.
 
-Wait for the `main` build to finish before tagging the same commit so the release run can reuse its saved caches.
+Tag-only runs do not seed the shared `main` Rust and Windows vcpkg caches. A manual Release workflow run on `main` can warm those caches before a release when that is useful; vcpkg still validates compiler, port and dependency ABI hashes before restoring them. Superseded manual runs are cancelled; tag builds finish independently. Update-service-only changes continue to use the separate feed checks without rebuilding the desktop app.
+
+The publisher creates a GitHub draft release with generated notes from merged pull requests. Apply the configured `feat`/`enhancement`, `fix`/`bug` or `perf`/`performance` labels to group entries under Features, Fixes or Performance; unlabeled changes appear under Other Changes.
 
 Release assets are:
 
