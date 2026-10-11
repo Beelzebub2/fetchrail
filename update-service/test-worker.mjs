@@ -38,6 +38,13 @@ try {
   const initial = await get("/api/updates/latest");
   assert.equal(initial.status, 200); assert.equal((await initial.json()).version, "0.5.3");
   assert.equal(initial.headers.get("cache-control"), "public, max-age=30, must-revalidate");
+  const current = await get("/api/updates/latest?current_version=0.5.3");
+  assert.equal(current.status, 204, "An installed Linux AppImage needs no platform asset when already current");
+  assert.equal(await current.text(), "");
+  assert.equal(current.headers.get("cache-control"), "no-store");
+  assert.equal((await get("/api/updates/latest?current_version=0.5.2")).status, 200);
+  assert.equal((await get("/api/updates/latest?current_version=0.5.4")).status, 204);
+  assert.equal((await get("/api/updates/latest?current_version=invalid")).status, 400);
   const cached = await get("/api/updates/latest?ignore=1");
   assert.equal(cached.headers.get("etag"), initial.headers.get("etag"));
   const conditional = await worker.dispatchFetch("https://fetchrail.rrmtools.uk/api/updates/latest", { headers: { "If-None-Match": initial.headers.get("etag") } });
@@ -59,6 +66,9 @@ try {
   const cache = await worker.getCaches();
   await cache.default.delete("https://fetchrail.rrmtools.uk/api/updates/latest");
   assert.equal((await (await get("/api/updates/latest")).json()).version, "1.2.3");
+  const upgrade = await get("/api/updates/latest?current_version=0.5.3");
+  assert.equal(upgrade.status, 200); assert.equal((await upgrade.json()).version, "1.2.3");
+  assert.equal((await get("/api/updates/latest?current_version=1.2.3")).status, 204);
   const results = await Promise.all([publish("v1.2.5"), publish("v1.2.4")]);
   assert.ok(results.every(result => [200, 409].includes(result.status)));
   assert.equal((await publish("v1.2.3")).status, 409);
