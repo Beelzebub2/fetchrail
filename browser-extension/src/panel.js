@@ -167,29 +167,13 @@ function renderDownloads() {
     card.querySelector(".rate").textContent = merging ? [Math.floor(percent) + "%", item.speedBps ? bytes(item.speedBps) + "/s" : "", eta(item.etaSeconds)].filter(Boolean).join(" · ") : downloading ? [item.speedBps ? bytes(item.speedBps) + "/s" : "", eta(item.etaSeconds)].filter(Boolean).join(" · ") : item.status === "completed" ? bytes(item.totalBytes ?? item.downloadedBytes) : item.totalBytes ? percent.toFixed(0) + "%" : "";
     card.querySelector(".transfer-meta").title = item.connections + " connections. Requested up to " + (item.requestedConnections ?? item.connections) + "; adapted to file size and server support.";
     const error = card.querySelector(".transfer-error");
-    error.hidden = !(item.error || item.statusDetail);
-    error.textContent = item.error ?? item.statusDetail ?? "";
+    error.hidden = !item.error;
+    error.textContent = item.error ?? "";
     const actions = card.querySelector(".transfer-actions");
-    const action = ["paused", "failed", "cancelled"].includes(item.status) ? "resume" : ["connecting", "downloading", "queued", "scheduled", "merging"].includes(item.status) ? "pause" : "";
+    const action = ["paused", "failed", "cancelled"].includes(item.status) ? "resume" : ["connecting", "downloading", "queued", "scheduled"].includes(item.status) ? "pause" : "";
     if (actions.dataset.action !== item.status) {
       actions.dataset.action = item.status;
       actions.replaceChildren();
-      if (["paused","failed","cancelled"].includes(item.status)) {
-        const refreshButton = document.createElement("button"); refreshButton.className="text-button"; refreshButton.textContent="Refresh link";
-        refreshButton.addEventListener("click",() => {
-          const form=document.createElement("form"); form.className="refresh-form";
-          const url=document.createElement("input"); url.type="url"; url.required=true; url.placeholder="Paste the fresh download URL"; url.setAttribute("aria-label","Fresh download URL");
-          const restart=document.createElement("input"); restart.type="checkbox";
-          const label=document.createElement("label"); label.append(restart,document.createTextNode(" Restart and discard saved bytes"));
-          const submit=document.createElement("button"); submit.className="primary"; submit.textContent="Verify and refresh";
-          const dismiss=document.createElement("button"); dismiss.type="button"; dismiss.textContent="Cancel"; dismiss.addEventListener("click",() => form.remove());
-          form.append(url,label,submit,dismiss); card.append(form);
-          form.addEventListener("submit",async (event) => { event.preventDefault(); submit.disabled=true;
-            try { await request("refreshDownload",{downloadId:item.id,url:url.value,expectedSha256:$("#expected-hash").value || null,restart:restart.checked}); form.remove(); await refresh(); }
-            catch(error) { notice(error.message,true); } finally { submit.disabled=false; }
-          }); url.focus();
-        }); actions.append(refreshButton);
-      }
       for (const name of action ? [action, ...(item.status === "cancelled" ? [] : ["cancel"])] : []) {
         const retry = name === "resume" && item.status === "failed";
         const button = document.createElement("button");
@@ -371,9 +355,7 @@ async function add(items, fromSelection = false) {
   $("#add").disabled = true;
   updateSelection();
   try {
-    const expectedSha256 = $("#expected-hash").value.trim();
-    if (expectedSha256 && (items.length !== 1 || !/^[a-fA-F0-9]{64}$/.test(expectedSha256))) throw new Error("Use a valid publisher checksum with one download at a time.");
-    const result = await request("addDownloads", { items:items.map((item) => ({...item,...(expectedSha256 ? {expectedSha256} : {})})), ...transferOptions() });
+    const result = await request("addDownloads", { items, ...transferOptions() });
     notice(`${result.accepted} download${result.accepted === 1 ? "" : "s"} added to Fetchrail.` + (result.rejected ? ` ${result.rejected} rejected: ${result.errors[0]?.message}` : ""), !!result.rejected);
     if (fromSelection) {
       const rejected = new Set(result.errors.map((error) => error.url));
@@ -402,7 +384,7 @@ for (const action of ["retry", "skip", "stop"]) $("#batch-" + action).addEventLi
 $("#browser-session").addEventListener("change", async () => {
   const input = $("#browser-session");
   try {
-    if (input.checked && !await api.permissions.request({ origins: ["http://*/*", "https://*/*"], ...(globalThis.browser ? { data_collection: ["authenticationInfo"] } : {}) })) throw new Error("Browser access was not granted.");
+    if (input.checked && !await api.permissions.request({ origins: ["http://*/*", "https://*/*"] })) throw new Error("Browser access was not granted.");
     await api.storage.local.set({ useBrowserSession: input.checked });
   } catch (error) { input.checked = false; notice(error.message, true); }
 });

@@ -31,25 +31,26 @@ pub async fn start(app: AppHandle, manager: Arc<DownloadManager>) -> Result<(), 
         port,
         token: format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple()),
     };
-    let data_dir = crate::data_dir(&app)?;
-    tokio::fs::create_dir_all(&data_dir)
-        .await
-        .map_err(|error| format!("Could not create Fetchrail app data: {error}"))?;
+    let data_dir = crate::platform::app_data_dir()?;
     let config_bytes = serde_json::to_vec(&config)
         .map_err(|error| format!("Could not serialize browser bridge state: {error}"))?;
-    tokio::fs::write(data_dir.join(BRIDGE_CONFIG_FILE), config_bytes)
-        .await
+    crate::platform::write_private_atomic(&data_dir.join(BRIDGE_CONFIG_FILE), &config_bytes)
         .map_err(|error| format!("Could not publish browser bridge state: {error}"))?;
 
+    let connections = Arc::new(tokio::sync::Semaphore::new(64));
     tauri::async_runtime::spawn(async move {
         loop {
             let Ok((stream, _)) = listener.accept().await else {
                 break;
             };
+            let Ok(permit) = connections.clone().try_acquire_owned() else {
+                continue;
+            };
             let app = app.clone();
             let manager = manager.clone();
             let token = config.token.clone();
             tauri::async_runtime::spawn(async move {
+                let _permit = permit;
                 if let Err(error) = handle_connection(stream, app, manager, &token).await {
                     eprintln!("Fetchrail browser bridge: {error}");
                 }
@@ -119,14 +120,20 @@ async fn process_request(
     match request.method {
         NativeMethod::Ping => {
             let settings = manager.settings().await;
+            // WebView URL getters synchronously wait for the UI event loop.
+            // Startup pings must not occupy runtime workers while setup uses it.
+            let ready = app.state::<crate::FrontendReady>();
+            let frontend_url = ready.1.lock().expect("frontend URL poisoned").clone();
+            let frontend_ready =
+                ready.0.load(std::sync::atomic::Ordering::Relaxed) && frontend_url.is_some();
             NativeResponse::success(
                 request.id,
                 json!({
                     "appVersion": env!("CARGO_PKG_VERSION"),
-                    "frontendReady": app.state::<crate::FrontendReady>().0.load(std::sync::atomic::Ordering::Relaxed),
-                    "frontendUrl": app.get_webview_window("main").and_then(|window| window.url().ok()).map(|url| url.to_string()),
-                    "build": "upstream-0.5.3-local.1",
-                    "capabilities": ["addDownloads", "getDownloads", "controlDownload", "showApp", "queues", "scheduling", "connections", "getHandoff", "commitHandoff", "refreshDownload", "sessionHeaders", "sha256", "adaptive", "directWrite", "browserSessions", "speedLimits", "browserBatch"],
+                    "frontendReady": frontend_ready,
+                    "frontendUrl": frontend_url,
+                    "capabilities": ["addDownloads", "addTorrents", "getDownloads", "controlDownload", "showApp", "queues", "scheduling", "connections", "speedLimits", "browserSessions", "getHandoff", "commitHandoff", "sessionHeaders", "sha256"],
+                    "speedLimitBps": settings.speed_limit_bps,
                     "connectionsPerDownload": settings.connections_per_download,
                     "maxConcurrentDownloads": settings.max_concurrent_downloads,
                     "minSegmentSizeMb": settings.min_segment_size_mb,
@@ -149,14 +156,12 @@ async fn process_request(
                 "etaSeconds": record.eta_seconds,
                 "connections": record.connections,
                 "requestedConnections": record.requested_connections,
-                "activeConnections": record.segments.iter().map(|part| part.active_connections).sum::<usize>(),
                 "queue": record.queue,
                 "scheduledFor": record.scheduled_for,
                 "speedLimitBps": record.speed_limit_bps,
                 // [downloaded, length] pairs keep a full list of 32-connection transfers within the response limit.
                 "segments": record.segments.iter().map(|part| json!([part.downloaded_bytes, part.length])).collect::<Vec<_>>(),
                 "error": record.error.as_ref().map(|error| error.chars().take(300).collect::<String>())
-                ,"statusDetail": record.status_detail, "sha256": record.sha256, "finalizingBytes": record.finalizing_bytes
             })).collect::<Vec<_>>();
             NativeResponse::success(
                 request.id,
@@ -183,31 +188,31 @@ async fn process_request(
             }
         }
         NativeMethod::GetHandoff => {
-            let key = format!("{}:", request.params.handoff_id.as_deref().unwrap());
-            let jobs = manager
+            let prefix = format!("{}:", request.params.handoff_id.as_deref().unwrap());
+            let records = manager
                 .list()
                 .await
                 .into_iter()
-                .filter(|record| {
-                    record
-                        .handoff_id
-                        .as_ref()
-                        .is_some_and(|id| id.starts_with(&key))
+                .filter(|r| {
+                    r.extra
+                        .get("handoffId")
+                        .and_then(|v| v.as_str())
+                        .is_some_and(|id| id.starts_with(&prefix))
                 })
                 .collect::<Vec<_>>();
             NativeResponse::success(
                 request.id,
-                json!({"ids":jobs.iter().map(|record|record.id).collect::<Vec<_>>(),"committed":jobs.iter().any(|record|record.handoff_committed),"statuses":jobs.iter().map(|record|&record.status).collect::<Vec<_>>() }),
+                json!({"ids":records.iter().map(|r| r.id).collect::<Vec<_>>(), "statuses":records.iter().map(|r| &r.status).collect::<Vec<_>>(), "committed":!records.is_empty() && records.iter().all(|r| r.extra.get("handoffCommitted").and_then(|v| v.as_bool()) == Some(true))}),
             )
         }
         NativeMethod::CommitHandoff => {
-            let key = format!("{}:", request.params.handoff_id.as_deref().unwrap());
-            let result = manager
-                .commit_handoff(&key, request.params.auto_start.unwrap_or(false))
-                .await;
-            match result {
+            let auto_start = request.params.auto_start.unwrap_or(false);
+            match manager
+                .commit_handoff(request.params.handoff_id.as_deref().unwrap(), auto_start)
+                .await
+            {
                 Ok(records) => {
-                    if !request.params.auto_start.unwrap_or(false)
+                    if !auto_start
                         && !matches!(request.params.source, Some(BrowserSource::BrowserBatch))
                     {
                         for record in &records {
@@ -216,28 +221,33 @@ async fn process_request(
                     }
                     NativeResponse::success(
                         request.id,
-                        json!({"ids":records.iter().map(|record|record.id).collect::<Vec<_>>() }),
+                        json!({"ids":records.iter().map(|r| r.id).collect::<Vec<_>>() }),
                     )
                 }
-                Err(message) => NativeResponse::failure(request.id, "HANDOFF_FAILED", message),
+                Err(error) => NativeResponse::failure(request.id, "HANDOFF_FAILED", error),
             }
         }
-        NativeMethod::RefreshDownload => {
-            match manager
-                .refresh(
-                    request.params.download_id.unwrap(),
-                    request.params.url.unwrap(),
-                    request.params.expected_sha256,
-                    request.params.request_headers,
-                    request.params.restart.unwrap_or(false),
-                )
-                .await
-            {
-                Ok(record) => NativeResponse::success(
-                    request.id,
-                    json!({"id":record.id,"status":record.status}),
-                ),
-                Err(message) => NativeResponse::failure(request.id, "REFRESH_FAILED", message),
+        NativeMethod::AddTorrents => {
+            let sources = request
+                .params
+                .items
+                .iter()
+                .map(|item| item.url.clone())
+                .collect::<Vec<_>>();
+            let count = sources.len();
+            let ready = app
+                .state::<crate::FrontendReady>()
+                .0
+                .load(std::sync::atomic::Ordering::Relaxed);
+            match manager.offer_torrent_sources(sources, ready) {
+                Ok(()) => {
+                    crate::show_main_window(app);
+                    NativeResponse::success(
+                        request.id,
+                        json!({"accepted":count,"rejected":0,"ids":[],"errors":[],"pendingConfirmation":true}),
+                    )
+                }
+                Err(error) => NativeResponse::failure(request.id, "TORRENT_HANDOFF_FAILED", error),
             }
         }
         NativeMethod::ShowApp => {
@@ -245,6 +255,7 @@ async fn process_request(
             NativeResponse::success(request.id, json!({"shown": true}))
         }
         NativeMethod::AddDownloads => {
+            let transactional = request.params.handoff_protocol == Some(2);
             let request_id = request.id;
             let mut accepted = 0usize;
             let mut errors = Vec::new();
@@ -252,52 +263,28 @@ async fn process_request(
             let caught = matches!(request.params.source, Some(BrowserSource::ClickMonitor));
             let captured =
                 caught || matches!(request.params.source, Some(BrowserSource::BrowserBatch));
-            for (index, item) in request.params.items.into_iter().enumerate() {
+            for (index, mut item) in request.params.items.into_iter().enumerate() {
+                if let Some(headers) = item.request_headers.take() {
+                    let context = item.request_context.get_or_insert_with(Default::default);
+                    for (name, value) in headers {
+                        match name.to_ascii_lowercase().as_str() {
+                            "cookie" => context.cookie = Some(value),
+                            "authorization" => context.authorization = Some(value),
+                            "referer" => context.referer = Some(value),
+                            "user-agent" => context.user_agent = Some(value),
+                            "origin" => context.origin = Some(value),
+                            _ => unreachable!("validated header"),
+                        }
+                    }
+                }
                 let result = async {
-                    let key = format!("{request_id}:{index}");
-                    if let Some(existing) = manager
-                        .list()
-                        .await
-                        .into_iter()
-                        .find(|record| record.handoff_id.as_ref() == Some(&key))
-                    {
-                        if existing.status == crate::model::DownloadStatus::Cancelled {
-                            return Err("This handoff was rolled back.".into());
-                        }
-                        if url::Url::parse(&item.url)
-                            .map_err(|_| "Invalid URL.")?
-                            .as_str()
-                            != existing.url
-                        {
-                            return Err("Handoff id already belongs to another URL.".into());
-                        }
-                        if crate::storage::validate_hash(item.expected_sha256.as_deref())?
-                            != existing.expected_sha256
-                        {
-                            return Err("Handoff checksum changed.".into());
-                        }
-                        return Ok(existing);
-                    }
-                    let mut headers = item.request_headers.clone().unwrap_or_default();
-                    if let Some(context) = &item.request_context {
-                        for (name, value) in [
-                            ("cookie", &context.cookie),
-                            ("authorization", &context.authorization),
-                            ("referer", &context.referer),
-                            ("user-agent", &context.user_agent),
-                        ] {
-                            if let Some(value) = value {
-                                headers.insert(name.into(), value.clone());
-                            }
-                        }
-                    }
                     let file_name = if captured {
                         manager
                             .validate_browser_download(
                                 &item.url,
                                 item.expected_bytes,
                                 item.expected_mime.as_deref(),
-                                Some(&headers),
+                                item.request_context.as_ref(),
                             )
                             .await?
                             .or(item.suggested_file_name)
@@ -306,25 +293,23 @@ async fn process_request(
                     };
                     manager
                         .add(AddDownloadRequest {
+                            handoff_id: transactional.then(|| format!("{request_id}:{index}")),
+                            expected_sha256: item.expected_sha256,
                             url: item.url,
                             directory: None,
                             file_name,
                             queue: request.params.queue.clone(),
                             scheduled_for: request.params.scheduled_for,
                             // A caught download waits, paused, for the answer to its prompt.
-                            start_paused: if captured && request.params.handoff_protocol == Some(2)
-                            {
+                            start_paused: if caught || transactional {
                                 Some(true)
                             } else {
                                 request.params.start_paused
                             },
                             connections: request.params.connections,
                             expected_bytes: item.expected_bytes,
-                            expected_sha256: item.expected_sha256,
-                            request_headers: Some(headers),
-                            request_context: None,
                             speed_limit_bps: request.params.speed_limit_bps,
-                            handoff_id: Some(key),
+                            request_context: item.request_context,
                         })
                         .await
                 }
@@ -333,7 +318,7 @@ async fn process_request(
                     Ok(record) => {
                         accepted += 1;
                         ids.push(record.id);
-                        if caught && request.params.handoff_protocol.is_none() {
+                        if caught && !transactional {
                             crate::prompt_for_download(app, record.id);
                         }
                     }

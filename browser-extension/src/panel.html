@@ -68,7 +68,7 @@
         <label id="schedule-row" class="option-row" hidden>Start time <input id="schedule" type="datetime-local" aria-label="Start time" /></label>
         <label class="option-row">File speed limit (KiB/s) <input id="speed-limit" type="number" min="0" max="1000000" step="1" value="0" /></label>
         <label class="capture"><span>Use browser session for captured files</span><input id="browser-session" class="switch" type="checkbox" /></label>
-        <p class="hint">Session support passes the final file's cookies, referrer and authorization to the local app. After an app restart, start the download again to refresh its session. 0 KiB/s means unlimited.</p>
+        <p class="hint">Session support passes the final file's cookies, referrer and authorization to the local app for resume and scheduling. 0 KiB/s means unlimited.</p>
         <p class="hint" id="engine-hint">Connections adapt to the file size and server support.</p>
       </details>
       <button id="download-selected" class="primary" disabled hidden>Download selected</button>

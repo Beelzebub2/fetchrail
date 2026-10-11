@@ -5,7 +5,7 @@ const read = (path) => readFile(new URL("../" + path, import.meta.url), "utf8");
 const json = async (path) => JSON.parse(await read(path));
 const { version } = await json("package.json");
 const tag = process.argv[2] ?? `v${version}`;
-assert.match(tag, /^v\d+\.\d+\.\d+(?:-local\.\d+)?$/, "Tags must use vMAJOR.MINOR.PATCH, optionally -local.N for local builds.");
+assert.match(tag, /^v\d+\.\d+\.\d+(?:[-+]local\.\d+)?$/, "Tags must use vMAJOR.MINOR.PATCH, optionally a local prerelease or build suffix.");
 assert.equal(tag, `v${version}`, "The release tag must match package.json.");
 const lock = await json("package-lock.json");
 const versions = {
@@ -17,5 +17,5 @@ const versions = {
   "Chromium extension": (await json("browser-extension/manifests/chromium.json")).version,
   "Firefox extension": (await json("browser-extension/manifests/firefox.json")).version,
 };
-for (const [file, actual] of Object.entries(versions)) assert.equal(actual, file.includes("extension") ? version.split("-")[0] : version, `${file} must match the build version.`);
+for (const [file, actual] of Object.entries(versions)) assert.equal(actual, file.includes("extension") ? version.split(/[-+]/)[0] : version, `${file} must match the build version.`);
 console.log(`Release ${tag}: all application and extension versions match.`);

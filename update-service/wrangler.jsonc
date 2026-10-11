@@ -1,0 +1,17 @@
+{
+  "$schema": "../website/node_modules/wrangler/config-schema.json",
+  "name": "fetchrail",
+  "main": "worker.mjs",
+  "account_id": "ceb32a583d11c6cc5b64455c2db4a174",
+  "compatibility_date": "2026-10-09",
+  "assets": {
+    "directory": "../website/public",
+    "binding": "ASSETS",
+    "run_worker_first": ["/api/*"],
+    "not_found_handling": "404-page"
+  },
+  "routes": [{ "pattern": "fetchrail.rrmtools.uk", "custom_domain": true }],
+  "durable_objects": { "bindings": [{ "name": "RELEASE_FEED", "class_name": "ReleaseFeed" }] },
+  "migrations": [{ "tag": "release-feed-v1", "new_sqlite_classes": ["ReleaseFeed"] }],
+  "observability": { "enabled": true, "traces": { "enabled": true } }
+}

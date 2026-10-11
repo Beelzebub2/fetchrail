@@ -52,7 +52,7 @@ The batch opens one page at a time. **Follow a single clear download button auto
 
 Captured batch files inherit the queue, connections, speed cap and start time chosen before the batch started. Successful verification advances the batch without opening a separate confirmation window. A failed handoff resumes the browser transfer and keeps the current item available for retry or skipping. **Reopen page**, **Skip item** and **Stop batch** are in the companion. A stopped batch leaves its accepted transfers in Fetchrail.
 
-Enable **Use browser session for captured files** for cookie-dependent downloads. This forwards only the observed final GET's Cookie, Referer, User-Agent and Authorization headers when the browser exposes them. This local build keeps credentials in memory and omits them from history, UI events and bridge responses. Authenticated transfers need a refreshed browser link/session after desktop restart. Credential-bearing requests cannot follow cross-origin redirects. Temporary request observations remain in browser session storage and expire after two minutes.
+Enable **Use browser session for captured files** for cookie-dependent downloads. This forwards only the observed final GET's Cookie, Referer, User-Agent and Authorization headers when the browser exposes them. Headers are stored in the desktop app's local `downloads.json` for unfinished transfers so resume and schedules can survive restarts; they are omitted from UI events and bridge responses and removed from disk on completion or removal. Treat unfinished download history as private. Temporary request observations remain in browser session storage and expire after two minutes.
 
 The companion needs one reload to pick up its new `webRequest` permission. Optional website access is requested by the Browse pages action or session switch. Regular page scanning continues to use `activeTab`.
 
@@ -64,9 +64,8 @@ For an eligible browser download, the companion:
 
 1. Pauses the browser's HTTP(S) transfer.
 2. Asks Fetchrail to verify a GET request against the browser's known size and content type.
-3. Durably records a paused, idempotent engine transfer, then cancels the browser copy.
-4. Commits the ownership handoff; interrupted or lost replies are reconciled from the browser journal.
-5. Opens **Download file info** so you can confirm the category, folder, and filename, then start, keep for later, or cancel the download.
+3. Hands the accepted transfer to Fetchrail's default queue and cancels the browser copy.
+4. Opens **Download file info** so you can confirm the category, folder, and filename, then start, keep for later, or cancel the download.
 
 The caught transfer waits paused for that confirmation. Closing its information window cancels it.
 
@@ -93,7 +92,7 @@ Development unpacked extension: fkmedfamaoejlhddajndhjemiedmnldh
 Chrome Web Store extension: ccmbmcgihlemlheldpkgnidgohlkaipb
 ```
 
-The registration script allow-lists both Chromium IDs for Chrome, Edge, Chromium, Vivaldi, and Brave. This local Firefox fork uses `{bb4d3986-35bd-4e55-bbcb-bb7f67894086}`; the host also accepts `browser@braid.rrmtools.uk`.
+The registration script allow-lists both Chromium IDs for Chrome, Edge, Chromium, Vivaldi, and Brave. Firefox uses `browser@braid.rrmtools.uk`.
 
 ## Companion updates
 

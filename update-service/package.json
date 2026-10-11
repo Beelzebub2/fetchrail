@@ -1,0 +1,7 @@
+{
+  "name": "fetchrail-update-service",
+  "private": true,
+  "type": "module",
+  "scripts": { "test": "node test.mjs && node test-worker.mjs" },
+  "devDependencies": { "miniflare": "5.20261006.1-alpha" }
+}

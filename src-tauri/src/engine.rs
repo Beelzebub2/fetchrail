@@ -1,5 +1,6 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
+    io::{Read, Write},
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -8,12 +9,8 @@ use std::{
     time::Instant,
 };
 
-use crate::{
-    network::{Adaptive, Bandwidth, OriginGate},
-    storage,
-};
 use chrono::{DateTime, Utc};
-use futures_util::{stream::FuturesUnordered, StreamExt};
+use futures_util::{future::join_all, StreamExt};
 use reqwest::{
     header::{
         self, HeaderMap, ACCEPT_ENCODING, CONTENT_DISPOSITION, CONTENT_LENGTH, CONTENT_RANGE,
@@ -21,12 +18,11 @@ use reqwest::{
     },
     Client, StatusCode,
 };
-#[cfg(test)]
-use std::io::{Read, Write};
+use sha2::{Digest, Sha256};
 use tauri::{AppHandle, Emitter, Manager};
 use tokio::{
     fs,
-    io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufWriter},
+    io::{AsyncSeekExt, AsyncWriteExt, BufWriter},
     sync::RwLock,
     time::{interval, Duration},
 };
@@ -39,7 +35,12 @@ use crate::model::{
     BatchDownloadResult, BrowserRequestContext, DownloadRecord, DownloadSettings, DownloadStatus,
     EngineOverview, QueueRecord, SegmentProgress,
 };
+use crate::organize::{self, OrganizeMode, OrganizeReport};
 use crate::rate_limit::RateLimiter;
+use crate::torrent::{
+    TorrentCommitRequest, TorrentEngine, TorrentImportRequest, TorrentMetadata, TorrentSummary,
+};
+use serde_json::json;
 
 const DOWNLOAD_EVENT: &str = "fetchrail://download-updated";
 const SETTINGS_EVENT: &str = "fetchrail://settings-updated";
@@ -62,6 +63,70 @@ fn download_client_builder() -> reqwest::ClientBuilder {
         .read_timeout(Duration::from_secs(30))
 }
 
+fn global_budget() -> &'static tokio::sync::Semaphore {
+    static BUDGET: std::sync::OnceLock<tokio::sync::Semaphore> = std::sync::OnceLock::new();
+    BUDGET.get_or_init(|| tokio::sync::Semaphore::new(64))
+}
+
+fn origin_budget(url: &Url) -> Arc<crate::network::OriginGate> {
+    type Origins = Mutex<HashMap<String, Arc<crate::network::OriginGate>>>;
+    static ORIGINS: std::sync::OnceLock<Origins> = std::sync::OnceLock::new();
+    let mut origins = ORIGINS
+        .get_or_init(Mutex::default)
+        .lock()
+        .expect("origin budget poisoned");
+    if origins.len() > 128 {
+        origins.retain(|_, value| Arc::strong_count(value) > 1 || !value.idle());
+    }
+    let key = url.origin().ascii_serialization();
+    if let Some(budget) = origins.get(&key).cloned() {
+        return budget;
+    }
+    let budget = Arc::new(crate::network::OriginGate::new());
+    origins.insert(key, budget.clone());
+    budget
+}
+
+fn retry_after(headers: &HeaderMap, now: DateTime<Utc>) -> Option<Duration> {
+    let value = headers.get(header::RETRY_AFTER)?.to_str().ok()?.trim();
+    let duration = if let Ok(seconds) = value.parse::<u64>() {
+        Duration::from_secs(seconds)
+    } else {
+        (DateTime::parse_from_rfc2822(value)
+            .ok()?
+            .with_timezone(&Utc)
+            - now)
+            .to_std()
+            .unwrap_or_default()
+    };
+    Some(duration.max(Duration::from_millis(250)))
+}
+
+fn validate_transfer_encoding(headers: &HeaderMap) -> EngineResult<()> {
+    if headers
+        .get_all(header::CONTENT_ENCODING)
+        .iter()
+        .any(|value| {
+            value
+                .to_str()
+                .map_or(true, |value| !value.trim().eq_ignore_ascii_case("identity"))
+        })
+    {
+        return Err(EngineError::Message("Server encoded the download despite requesting identity bytes. File was not published.".into()));
+    }
+    Ok(())
+}
+
+fn normalize_sha256(value: Option<&str>) -> Result<Option<String>, String> {
+    let Some(value) = value.map(str::trim).filter(|v| !v.is_empty()) else {
+        return Ok(None);
+    };
+    if value.len() != 64 || !value.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err("Expected SHA-256 must contain exactly 64 hexadecimal characters.".into());
+    }
+    Ok(Some(value.to_ascii_lowercase()))
+}
+
 #[derive(Debug, thiserror::Error)]
 enum EngineError {
     #[error("request failed: {0}")]
@@ -74,12 +139,14 @@ enum EngineError {
     RangeUnsupported,
     #[error("Server returned HTTP {0}.")]
     Http(StatusCode),
-    #[error("Connection stopped making useful progress; retrying remaining bytes.")]
-    Slow,
-    #[error("Server ended the response early; retrying remaining bytes.")]
-    Incomplete,
+    #[error("Server returned HTTP {status} (retry after {delay:?}).")]
+    RetryAfter { status: StatusCode, delay: Duration },
     #[error("download was cancelled")]
     Cancelled,
+    #[error("A receiving connection stalled; resuming its verified range.")]
+    Slow,
+    #[error("Server ended a range before all requested bytes arrived.")]
+    Incomplete,
     #[error("{0}")]
     Message(String),
 }
@@ -100,26 +167,28 @@ struct ByteRange {
     end: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 struct PartManifest {
     total_bytes: Option<u64>,
     ranges: Vec<ByteRange>,
     validator: Option<String>,
     accepts_ranges: bool,
     #[serde(default)]
-    direct_path: Option<PathBuf>,
-    #[serde(default)]
-    committed: Vec<u64>,
-    #[serde(default)]
-    hashes: Vec<Option<String>>,
+    shared_staging: bool,
 }
 
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
-struct Finalization {
-    stage: PathBuf,
-    destination: PathBuf,
+#[derive(serde::Serialize, serde::Deserialize)]
+struct PartCheckpoint {
     bytes: u64,
     sha256: String,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct MergeCheckpoint {
+    file_name: String,
+    total: u64,
+    fingerprint: String,
+    expected_sha256: Option<String>,
 }
 
 impl ByteRange {
@@ -128,7 +197,7 @@ impl ByteRange {
     }
 }
 
-/// Live byte counter for one queued range, shared with the progress reporter.
+/// Live byte counter for one connection, shared between its transfer and the progress reporter.
 struct SegmentCounter {
     range: ByteRange,
     downloaded: AtomicU64,
@@ -142,31 +211,15 @@ fn current_segments(shared: &Mutex<Segments>) -> Segments {
 }
 
 fn segment_progress(segments: &[SegmentCounter], speeds: &[f64]) -> Vec<SegmentProgress> {
-    let group_size = segments.len().div_ceil(32).max(1);
     segments
-        .chunks(group_size)
+        .iter()
         .enumerate()
-        .map(|(group, parts)| {
-            let active_connections = parts
-                .iter()
-                .filter(|part| part.active.load(Ordering::Relaxed))
-                .count();
-            SegmentProgress {
-                start: parts[0].range.start,
-                length: parts
-                    .iter()
-                    .all(|part| part.range.end != u64::MAX)
-                    .then(|| parts.iter().map(|part| part.range.len()).sum()),
-                downloaded_bytes: parts
-                    .iter()
-                    .map(|part| part.downloaded.load(Ordering::Relaxed))
-                    .sum(),
-                speed_bps: (group * group_size..group * group_size + parts.len())
-                    .map(|index| speeds.get(index).copied().unwrap_or(0.0).max(0.0) as u64)
-                    .sum(),
-                active: active_connections > 0,
-                active_connections,
-            }
+        .map(|(index, segment)| SegmentProgress {
+            start: segment.range.start,
+            length: (segment.range.end != u64::MAX).then(|| segment.range.len()),
+            downloaded_bytes: segment.downloaded.load(Ordering::Relaxed),
+            speed_bps: speeds.get(index).copied().unwrap_or(0.0).max(0.0) as u64,
+            active: segment.active.load(Ordering::Relaxed),
         })
         .collect()
 }
@@ -177,33 +230,31 @@ struct DownloadTask {
     cancelled: AtomicBool,
     cancel_token: Mutex<CancellationToken>,
     running: AtomicBool,
-    headers: RwLock<HeaderMap>,
-    publication_lock: tokio::sync::Mutex<()>,
-    checkpoint_lock: tokio::sync::Mutex<Option<(PartManifest, Instant)>>,
-    checkpoint_write_lock: tokio::sync::Mutex<()>,
+    request_context: Option<BrowserRequestContext>,
     limiter: RateLimiter,
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct StoredDownload {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    torrent_priorities: Option<Arc<Vec<u8>>>,
+    #[serde(flatten)]
+    record: DownloadRecord,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    request_context: Option<BrowserRequestContext>,
+}
+
 impl DownloadTask {
-    fn new(record: DownloadRecord) -> Self {
+    fn new(record: DownloadRecord, request_context: Option<BrowserRequestContext>) -> Self {
         Self {
             limiter: RateLimiter::new(record.speed_limit_bps),
+            request_context,
             paused: AtomicBool::new(record.status == DownloadStatus::Paused),
             record: RwLock::new(record),
             cancelled: AtomicBool::new(false),
             cancel_token: Mutex::new(CancellationToken::new()),
             running: AtomicBool::new(false),
-            headers: RwLock::new(HeaderMap::new()),
-            publication_lock: tokio::sync::Mutex::new(()),
-            checkpoint_lock: tokio::sync::Mutex::new(None),
-            checkpoint_write_lock: tokio::sync::Mutex::new(()),
-        }
-    }
-
-    fn report_connections(&self, target: usize) {
-        // Keep polling range futures; a contended display update can wait for the next sample.
-        if let Ok(mut record) = self.record.try_write() {
-            record.connections = target;
         }
     }
 
@@ -236,6 +287,13 @@ impl DownloadTask {
 }
 
 pub struct DownloadManager {
+    torrent_engine: TorrentEngine,
+    torrent_imports: RwLock<HashMap<Uuid, (String, Option<TorrentMetadata>, Instant)>>,
+    torrent_checkpoint: Mutex<Instant>,
+    torrent_configuration: tokio::sync::Mutex<serde_json::Value>,
+    torrent_import_lock: tokio::sync::Mutex<()>,
+    bandwidth_broker: Mutex<(Instant, u64, (bool, bool), (u64, u64))>,
+    pending_torrent_sources: Mutex<Vec<String>>,
     app: AppHandle,
     client: Client,
     tasks: RwLock<HashMap<Uuid, Arc<DownloadTask>>>,
@@ -243,42 +301,45 @@ pub struct DownloadManager {
     queues: RwLock<Vec<QueueRecord>>,
     data_dir: PathBuf,
     parts_dir: PathBuf,
-    // Collect each history snapshot after the preceding write finishes.
+    // ponytail: serialize state writes and final renames; split locks if disk contention matters.
     persist_lock: tokio::sync::Mutex<()>,
     minimize_to_tray: AtomicBool,
-    add_lock: tokio::sync::Mutex<()>,
-    origins: tokio::sync::Mutex<HashMap<String, Arc<OriginGate>>>,
-    bandwidth: Bandwidth,
     limiter: RateLimiter,
     dispatch_lock: tokio::sync::Mutex<()>,
+    dispatch_suspended: AtomicBool,
 }
 
 impl DownloadManager {
     pub async fn load(app: AppHandle) -> Result<Arc<Self>, String> {
-        let data_dir = crate::data_dir(&app)?;
+        let data_dir = crate::platform::app_data_dir()?;
+        crate::platform::private_dir(&data_dir)
+            .map_err(|error| format!("Could not protect app data directory: {error}"))?;
         let parts_dir = data_dir.join("parts");
         fs::create_dir_all(&parts_dir)
             .await
             .map_err(|error| format!("Could not create app data directory: {error}"))?;
 
-        let default_download_dir = app
-            .path()
-            .download_dir()
-            .unwrap_or_else(|_| data_dir.join("downloads"));
+        let default_download_dir = if let Some(root) = crate::platform::test_root()? {
+            root.join("downloads")
+        } else {
+            app.path()
+                .download_dir()
+                .unwrap_or_else(|_| data_dir.join("downloads"))
+        };
         fs::create_dir_all(&default_download_dir)
             .await
             .map_err(|error| format!("Could not create default download directory: {error}"))?;
 
         let settings_path = data_dir.join(SETTINGS_FILE);
-        let settings = storage::read_json::<DownloadSettings>(&settings_path)
+        let settings = read_saved_json::<DownloadSettings>(&settings_path)
             .await
-            .map_err(|error| error.to_string())?
+            .map_err(|e| e.to_string())?
             .unwrap_or_else(|| default_settings(&default_download_dir))
             .normalized();
 
-        let mut queues = storage::read_json::<Vec<QueueRecord>>(&data_dir.join(QUEUES_FILE))
+        let mut queues = read_saved_json::<Vec<QueueRecord>>(&data_dir.join(QUEUES_FILE))
             .await
-            .map_err(|error| error.to_string())?
+            .map_err(|e| e.to_string())?
             .filter(|queues| !queues.is_empty())
             .unwrap_or_else(default_queues);
         if !queues
@@ -295,7 +356,7 @@ impl DownloadManager {
                 },
             );
         }
-        if settings.launch_on_start && std::env::var_os("FETCHRAIL_DATA_DIR").is_none() {
+        if settings.launch_on_start {
             let _ = sync_startup_registration(true);
         }
 
@@ -305,43 +366,54 @@ impl DownloadManager {
 
         let mut task_map = HashMap::new();
         let state_path = data_dir.join(STATE_FILE);
-        if let Some(records) = storage::read_json::<Vec<DownloadRecord>>(&state_path)
+        if let Some(records) = read_saved_json::<Vec<StoredDownload>>(&state_path)
             .await
-            .map_err(|error| error.to_string())?
+            .map_err(|e| e.to_string())?
         {
-            for mut record in records {
+            for stored in records {
+                let mut record = stored.record;
+                if let (Some(torrent), Some(priorities)) =
+                    (&mut record.torrent, stored.torrent_priorities)
+                {
+                    torrent.priorities = priorities;
+                }
                 if record.status.is_active() {
                     record.status = DownloadStatus::Paused;
                     record.speed_bps = 0;
                     record.eta_seconds = None;
+                    record.merged_bytes = 0;
                 }
                 for segment in &mut record.segments {
                     segment.speed_bps = 0;
                     segment.active = false;
                 }
-                let recovered_dir = parts_dir.join(record.id.to_string());
-                recover_published(&mut record, &recovered_dir)
-                    .await
-                    .map_err(|error| format!("Could not recover finalization: {error}"))?;
-                task_map.insert(record.id, Arc::new(DownloadTask::new(record)));
+                task_map.insert(
+                    record.id,
+                    Arc::new(DownloadTask::new(record, stored.request_context)),
+                );
             }
         }
 
         let manager = Arc::new(Self {
+            torrent_engine: TorrentEngine::new(&data_dir.join("torrents"))?,
+            torrent_imports: RwLock::new(HashMap::new()),
+            torrent_checkpoint: Mutex::new(Instant::now()),
+            torrent_configuration: tokio::sync::Mutex::new(serde_json::Value::Null),
+            pending_torrent_sources: Mutex::new(Vec::new()),
             app,
             client,
             tasks: RwLock::new(task_map),
             minimize_to_tray: AtomicBool::new(settings.minimize_to_tray),
             limiter: RateLimiter::new(settings.speed_limit_bps),
             dispatch_lock: tokio::sync::Mutex::new(()),
+            torrent_import_lock: tokio::sync::Mutex::new(()),
+            bandwidth_broker: Mutex::new((Instant::now(), 0, (false, false), (0, 0))),
+            dispatch_suspended: AtomicBool::new(false),
             settings: RwLock::new(settings),
             queues: RwLock::new(queues),
             data_dir,
             parts_dir,
             persist_lock: tokio::sync::Mutex::new(()),
-            add_lock: tokio::sync::Mutex::new(()),
-            origins: tokio::sync::Mutex::new(HashMap::new()),
-            bandwidth: Bandwidth::new(),
         });
         manager
             .persist_settings()
@@ -355,6 +427,23 @@ impl DownloadManager {
             .persist_queues()
             .await
             .map_err(|error| error.to_string())?;
+        for record in manager.list().await {
+            if let Some(torrent) = &record.torrent {
+                let result = manager.torrent_engine.call(json!({"op":"add", "id":record.id,
+                    "source":torrent.metadata_path, "restore":true, "destination":record.destination,
+                    "priorities":torrent.priorities, "config":manager.settings.read().await.torrent})).await;
+                if result.is_ok() {
+                    manager.torrent_engine.call(json!({"op":"limit", "id":record.id, "downloadLimit":record.speed_limit_bps.min(i32::MAX as u64)})).await?;
+                    manager.torrent_engine.call(json!({"op":"sequential", "id":record.id, "enabled":torrent.sequential})).await?;
+                }
+                if let Err(error) = result {
+                    let task = manager.task(record.id).await?;
+                    let mut record = task.record.write().await;
+                    record.status = DownloadStatus::Failed;
+                    record.error = Some(error);
+                }
+            }
+        }
         manager.start_scheduler();
         Ok(manager)
     }
@@ -363,7 +452,793 @@ impl DownloadManager {
         self: &Arc<Self>,
         request: AddDownloadRequest,
     ) -> Result<DownloadRecord, String> {
+        let _dispatch = self.dispatch_lock.lock().await;
         self.add_inner(request, true).await
+    }
+
+    pub async fn commit_handoff(
+        self: &Arc<Self>,
+        key: &str,
+        auto_start: bool,
+    ) -> Result<Vec<DownloadRecord>, String> {
+        let prefix = format!("{key}:");
+        let mut records = Vec::new();
+        for record in self.list().await.into_iter().filter(|r| {
+            r.extra
+                .get("handoffId")
+                .and_then(|v| v.as_str())
+                .is_some_and(|id| id.starts_with(&prefix))
+        }) {
+            if record.status == DownloadStatus::Cancelled {
+                return Err("Handoff was rolled back.".into());
+            }
+            let task = self.task(record.id).await?;
+            let mut saved = task.record.write().await;
+            saved.extra.insert("handoffCommitted".into(), json!(true));
+            records.push(saved.clone());
+        }
+        if records.is_empty() {
+            return Err("Handoff has not been accepted yet.".into());
+        }
+        self.persist_records().await.map_err(|e| e.to_string())?;
+        for record in &records {
+            if auto_start && record.status == DownloadStatus::Paused {
+                self.resume(record.id).await?;
+            }
+        }
+        Ok(records)
+    }
+
+    pub async fn import_torrent(
+        &self,
+        request: TorrentImportRequest,
+    ) -> Result<serde_json::Value, String> {
+        let _import = self.torrent_import_lock.lock().await;
+        if self.torrent_imports.read().await.len() >= 4 {
+            return Err("Finish or cancel an open torrent import first.".into());
+        }
+        let id = Uuid::new_v4();
+        let source = request.source.trim();
+        let path = self.data_dir.join("torrents").join(format!("{id}.torrent"));
+        let metadata = if source.starts_with("magnet:") {
+            let staging = self.data_dir.join("torrent-imports").join(id.to_string());
+            self.torrent_engine.call(json!({"op":"add", "id":id, "source":source,
+                "destination":staging, "importing":true, "config":self.settings.read().await.torrent})).await?;
+            None
+        } else {
+            let bytes = if source.starts_with("http://") || source.starts_with("https://") {
+                let response = self
+                    .client
+                    .get(source)
+                    .send()
+                    .await
+                    .map_err(|e| e.to_string())?
+                    .error_for_status()
+                    .map_err(|e| e.to_string())?;
+                if response
+                    .content_length()
+                    .is_some_and(|size| size > 32 * 1024 * 1024)
+                {
+                    return Err("Torrent metadata exceeds 32 MiB.".into());
+                }
+                let mut bytes = Vec::new();
+                let mut stream = response.bytes_stream();
+                while let Some(chunk) = stream.next().await {
+                    let chunk = chunk.map_err(|e| e.to_string())?;
+                    if bytes.len() + chunk.len() > 32 * 1024 * 1024 {
+                        return Err("Torrent metadata exceeds 32 MiB.".into());
+                    }
+                    bytes.extend_from_slice(&chunk);
+                }
+                bytes
+            } else {
+                let info = fs::metadata(source).await.map_err(|e| e.to_string())?;
+                if info.len() > 32 * 1024 * 1024 {
+                    return Err("Torrent metadata exceeds 32 MiB.".into());
+                }
+                fs::read(source).await.map_err(|e| e.to_string())?
+            };
+            fs::write(&path, bytes).await.map_err(|e| e.to_string())?;
+            let inspected = self
+                .torrent_engine
+                .call(json!({"op":"inspect", "path":path}))
+                .await;
+            let value = match inspected {
+                Ok(value) => value,
+                Err(error) => {
+                    let _ = fs::remove_file(&path).await;
+                    return Err(error);
+                }
+            };
+            let metadata: TorrentMetadata =
+                serde_json::from_value(value).map_err(|e| e.to_string())?;
+            if let Err(error) = self.check_torrent_duplicate(&metadata.hashes).await {
+                let _ = fs::remove_file(&path).await;
+                return Err(error);
+            }
+            Some(metadata)
+        };
+        self.torrent_imports
+            .write()
+            .await
+            .insert(id, (source.to_owned(), metadata.clone(), Instant::now()));
+        Ok(json!({"id":id, "metadata":metadata}))
+    }
+
+    pub fn offer_torrent_sources(
+        &self,
+        sources: Vec<String>,
+        frontend_ready: bool,
+    ) -> Result<(), String> {
+        let mut pending = self
+            .pending_torrent_sources
+            .lock()
+            .map_err(|e| e.to_string())?;
+        if sources.len() + pending.len() > 100 {
+            return Err("At most 100 torrent sources can wait for import.".into());
+        }
+        pending.extend(sources);
+        if frontend_ready && !pending.is_empty() {
+            self.app
+                .emit("fetchrail://torrent-sources", &*pending)
+                .map_err(|e| e.to_string())?;
+            pending.clear();
+        }
+        Ok(())
+    }
+
+    async fn check_torrent_duplicate(&self, hashes: &[String]) -> Result<(), String> {
+        if self
+            .list()
+            .await
+            .iter()
+            .filter_map(|r| r.torrent.as_ref())
+            .any(|t| t.hashes.iter().any(|hash| hashes.contains(hash)))
+        {
+            return Err("This torrent is already in Fetchrail.".into());
+        }
+        Ok(())
+    }
+
+    pub async fn torrent_import_status(&self, id: Uuid) -> Result<serde_json::Value, String> {
+        let imports = self.torrent_imports.read().await;
+        let (_, metadata, _) = imports
+            .get(&id)
+            .ok_or("Torrent import expired or was cancelled.")?;
+        if metadata.is_none() {
+            self.torrent_engine
+                .call(json!({"op":"details", "id":id}))
+                .await?;
+        }
+        Ok(json!({"id":id, "metadata":metadata}))
+    }
+
+    pub async fn cancel_torrent_import(&self, id: Uuid) -> Result<(), String> {
+        let _dispatch = self.dispatch_lock.lock().await;
+        let entry = self.torrent_imports.read().await.get(&id).cloned();
+        if entry
+            .as_ref()
+            .is_some_and(|(source, _, _)| source.starts_with("magnet:"))
+        {
+            self.torrent_engine
+                .call(json!({"op":"remove", "id":id}))
+                .await?;
+        }
+        self.torrent_imports.write().await.remove(&id);
+        let _ = fs::remove_file(self.data_dir.join("torrents").join(format!("{id}.torrent"))).await;
+        // The engine never downloads payload in the private staging directory.
+        Ok(())
+    }
+
+    pub async fn commit_torrent(
+        &self,
+        request: TorrentCommitRequest,
+    ) -> Result<DownloadRecord, String> {
+        let _dispatch = self.dispatch_lock.lock().await;
+        let (source, metadata, _) = self
+            .torrent_imports
+            .read()
+            .await
+            .get(&request.id)
+            .cloned()
+            .ok_or("Torrent import is not available.")?;
+        let metadata = metadata.ok_or("Wait for torrent metadata before starting.")?;
+        self.check_torrent_duplicate(&metadata.hashes).await?;
+        if request.priorities.len() != metadata.file_count
+            || request.priorities.iter().any(|p| ![0, 1, 4, 7].contains(p))
+        {
+            return Err("Invalid torrent file priorities.".into());
+        }
+        let wanted = metadata
+            .files
+            .iter()
+            .filter(|f| request.priorities[f.index] > 0)
+            .map(|f| f.size)
+            .sum::<u64>();
+        if wanted == 0 {
+            return Err("Select at least one nonempty file.".into());
+        }
+        let queue = self
+            .canonical_queue_name(&request.queue)
+            .await
+            .ok_or("Queue not found.")?;
+        let directory = PathBuf::from(request.directory.trim());
+        if !directory.is_absolute() {
+            return Err("Choose a full destination folder path.".into());
+        }
+        self.validate_torrent_storage(&directory, &metadata, request.verify_existing)
+            .await?;
+        fs::create_dir_all(&directory)
+            .await
+            .map_err(|e| e.to_string())?;
+        let directory = fs::canonicalize(directory)
+            .await
+            .map_err(|e| e.to_string())?;
+        self.validate_torrent_storage(&directory, &metadata, request.verify_existing)
+            .await?;
+        let id = request.id;
+        let path = self.data_dir.join("torrents").join(format!("{id}.torrent"));
+        if source.starts_with("magnet:") {
+            self.torrent_engine
+                .call(json!({"op":"remove", "id":id}))
+                .await?;
+        }
+        let settings = self.settings.read().await.clone();
+        self.torrent_engine
+            .call(
+                json!({"op":"add", "id":id, "source":path, "destination":directory,
+            "priorities":request.priorities, "config":settings.torrent}),
+            )
+            .await?;
+        let record = DownloadRecord {
+            id,
+            expected_sha256: None,
+            url: source,
+            file_name: metadata.name,
+            destination: directory.to_string_lossy().into_owned(),
+            status: if request.start_paused {
+                DownloadStatus::Paused
+            } else if request.scheduled_for.is_some_and(|t| t > Utc::now()) {
+                DownloadStatus::Scheduled
+            } else {
+                DownloadStatus::Queued
+            },
+            total_bytes: Some(wanted),
+            downloaded_bytes: 0,
+            merged_bytes: 0,
+            speed_bps: 0,
+            eta_seconds: None,
+            connections: 0,
+            requested_connections: None,
+            error: None,
+            created_at: Utc::now(),
+            finished_at: None,
+            queue,
+            scheduled_for: request.scheduled_for,
+            segments: Vec::new(),
+            name_locked: true,
+            speed_limit_bps: 0,
+            resume_supported: Some(true),
+            completion_options: Default::default(),
+            progress_requested: false,
+            torrent: Some(TorrentSummary {
+                hashes: metadata.hashes,
+                ratio_limit: settings.torrent.ratio_limit,
+                seed_time_limit: settings.torrent.seed_time_limit,
+                priorities: Arc::new(request.priorities),
+                metadata_path: path.to_string_lossy().into_owned(),
+                ..Default::default()
+            }),
+        };
+        self.tasks
+            .write()
+            .await
+            .insert(id, Arc::new(DownloadTask::new(record.clone(), None)));
+        if let Err(error) = self.persist_records().await {
+            self.tasks.write().await.remove(&id);
+            let _ = self
+                .torrent_engine
+                .call(json!({"op":"remove", "id":id}))
+                .await;
+            return Err(error.to_string());
+        }
+        self.torrent_imports.write().await.remove(&id);
+        self.apply_torrent_budget().await?;
+        self.emit_record(&record);
+        Ok(record)
+    }
+
+    pub async fn torrent_command(
+        &self,
+        id: Uuid,
+        mut request: serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        // Details do not take the scheduler lock; mutating storage/selection does.
+        let _dispatch = if request["op"] != "details" {
+            Some(self.dispatch_lock.lock().await)
+        } else {
+            None
+        };
+        let task = self.task(id).await?;
+        if task.record.read().await.torrent.is_none() {
+            return Err("This transfer is not a torrent.".into());
+        }
+        let op = request["op"]
+            .as_str()
+            .ok_or("Missing torrent command.")?
+            .to_owned();
+        request["id"] = json!(id);
+        if op == "goals" {
+            let ratio = request["ratioLimit"]
+                .as_f64()
+                .ok_or("Invalid ratio limit.")?;
+            if !ratio.is_finite() || ratio < 0.0 {
+                return Err("Ratio must be zero (unlimited) or positive.".into());
+            }
+            let time = request["seedTimeLimit"]
+                .as_u64()
+                .ok_or("Invalid sharing time.")?;
+            let mut record = task.record.write().await;
+            let t = record.torrent.as_mut().unwrap();
+            t.ratio_limit = ratio;
+            t.seed_time_limit = time;
+            drop(record);
+            self.persist_records().await.map_err(|e| e.to_string())?;
+            self.emit_record(&*task.record.read().await);
+            return Ok(json!({}));
+        }
+        if ![
+            "details",
+            "recheck",
+            "priorities",
+            "sequential",
+            "move",
+            "announce",
+            "tracker",
+            "removeTracker",
+            "peer",
+        ]
+        .contains(&op.as_str())
+        {
+            return Err("Unsupported torrent action.".into());
+        }
+        if op == "priorities" {
+            let priorities: Vec<u8> =
+                serde_json::from_value(request["priorities"].clone()).map_err(|e| e.to_string())?;
+            let record = task.record.read().await;
+            if priorities.len() != record.torrent.as_ref().unwrap().priorities.len()
+                || priorities.iter().any(|p| ![0, 1, 4, 7].contains(p))
+                || !priorities.iter().any(|p| *p > 0)
+            {
+                return Err("Select valid priorities and at least one wanted file.".into());
+            }
+        }
+        if op == "move" {
+            if task.running.load(Ordering::Acquire) {
+                return Err("Pause the torrent before moving its files.".into());
+            }
+            let directory = PathBuf::from(request["path"].as_str().ok_or("Missing folder.")?);
+            if !directory.is_absolute() {
+                return Err("Choose a full destination folder path.".into());
+            }
+            let details = self
+                .torrent_engine
+                .call(json!({"op":"details", "id":id}))
+                .await?;
+            let metadata: TorrentMetadata =
+                serde_json::from_value(details["metadata"].clone()).map_err(|e| e.to_string())?;
+            self.validate_torrent_storage(&directory, &metadata, false)
+                .await?;
+            fs::create_dir_all(&directory)
+                .await
+                .map_err(|e| e.to_string())?;
+        }
+        let value = self.torrent_engine.call(request.clone()).await?;
+        if op == "sequential" || op == "priorities" {
+            let mut record = task.record.write().await;
+            let t = record.torrent.as_mut().unwrap();
+            if op == "sequential" {
+                t.sequential = request["enabled"].as_bool().unwrap_or(false);
+            } else {
+                t.priorities = serde_json::from_value(request["priorities"].clone())
+                    .map_err(|e| e.to_string())?;
+            }
+            drop(record);
+            self.persist_records().await.map_err(|e| e.to_string())?;
+            self.emit_record(&*task.record.read().await);
+        }
+        Ok(value)
+    }
+
+    async fn check_torrent_path(&self, path: &Path) -> Result<(), String> {
+        let available = self
+            .torrent_engine
+            .call(json!({"op":"pathAvailable", "path":path}))
+            .await?;
+        if available != json!(true) {
+            return Err("A torrent owns this payload path. Choose another name or folder.".into());
+        }
+        Ok(())
+    }
+
+    async fn validate_torrent_storage(
+        &self,
+        root: &Path,
+        metadata: &TorrentMetadata,
+        allow_existing: bool,
+    ) -> Result<(), String> {
+        validate_torrent_destination(root, metadata, allow_existing).await?;
+        let http_paths = self
+            .list()
+            .await
+            .into_iter()
+            .filter(|r| r.torrent.is_none())
+            .map(|r| storage_path_key(Path::new(&r.destination)))
+            .collect::<std::collections::BTreeSet<_>>();
+        if metadata.files.iter().any(|file| {
+            let path = root.join(&file.path);
+            let key = storage_path_key(&path);
+            let prefix = format!("{key}/");
+            path.ancestors()
+                .any(|ancestor| http_paths.contains(&storage_path_key(ancestor)))
+                || http_paths
+                    .range(prefix.clone()..)
+                    .next()
+                    .is_some_and(|path| path.starts_with(&prefix))
+        }) {
+            return Err("An HTTP transfer owns this payload path. Choose another folder.".into());
+        }
+        Ok(())
+    }
+
+    async fn remove_torrent(&self, id: Uuid, delete_file: bool) -> Result<(), String> {
+        let _dispatch = self.dispatch_lock.lock().await;
+        let task = self.task(id).await?;
+        let record = task.record.read().await.clone();
+        self.torrent_engine
+            .call(json!({"op":"pause", "id":id}))
+            .await?;
+        task.running.store(false, Ordering::Release);
+        task.paused.store(true, Ordering::Release);
+        {
+            let mut paused = task.record.write().await;
+            paused.status = DownloadStatus::Paused;
+            paused.speed_bps = 0;
+            paused.torrent.as_mut().unwrap().upload_speed_bps = 0;
+            self.emit_record(&paused);
+        }
+        let details = self
+            .torrent_engine
+            .call(json!({"op":"details", "id":id}))
+            .await?;
+        let metadata: TorrentMetadata =
+            serde_json::from_value(details["metadata"].clone()).map_err(|e| e.to_string())?;
+        let root = PathBuf::from(&record.destination);
+        if delete_file {
+            validate_torrent_destination(&root, &metadata, true).await?;
+        }
+        self.torrent_engine
+            .call(json!({"op":"remove", "id":id}))
+            .await?;
+        if delete_file {
+            for file in &metadata.files {
+                let path = root.join(&file.path);
+                match fs::remove_file(&path).await {
+                    Ok(_) => (),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => (),
+                    Err(e) => {
+                        let error = format!("Could not delete {}: {e}", file.path);
+                        // Keep a recoverable paused job if a file is locked or read-only.
+                        // Recheck storage: preceding files may already have been deleted.
+                        let torrent = record.torrent.as_ref().unwrap();
+                        let restored: Result<(), String> = async {
+                            self.torrent_engine.call(json!({"op":"add", "id":id,
+                                "source":torrent.metadata_path, "destination":record.destination,
+                                "priorities":torrent.priorities, "config":self.settings.read().await.torrent})).await?;
+                            self.torrent_engine.call(json!({"op":"limit", "id":id,
+                                "downloadLimit":record.speed_limit_bps.min(i32::MAX as u64)})).await?;
+                            self.torrent_engine.call(json!({"op":"sequential", "id":id,
+                                "enabled":torrent.sequential})).await?;
+                            Ok(())
+                        }.await;
+                        let mut paused = task.record.write().await;
+                        paused.error = Some(match restored {
+                            Ok(_) => error.clone(),
+                            Err(e) => format!("{error}. Reload failed: {e}"),
+                        });
+                        self.emit_record(&paused);
+                        drop(paused);
+                        self.persist_records().await.map_err(|e| e.to_string())?;
+                        return Err(error);
+                    }
+                }
+            }
+        }
+        self.tasks.write().await.remove(&id);
+        self.persist_records().await.map_err(|e| e.to_string())?;
+        let _ = fs::remove_file(&record.torrent.as_ref().unwrap().metadata_path).await;
+        let _ = fs::remove_file(self.data_dir.join("torrents").join(format!("{id}.resume"))).await;
+        let _ = self.app.emit(REMOVED_EVENT, id);
+        Ok(())
+    }
+
+    async fn apply_torrent_budget(&self) -> Result<(), String> {
+        let settings = self.settings.read().await.clone();
+        let records = self.list().await;
+        let demand = |r: &&DownloadRecord| {
+            matches!(
+                r.status,
+                DownloadStatus::Connecting
+                    | DownloadStatus::Downloading
+                    | DownloadStatus::Stalled
+                    | DownloadStatus::Checking
+            )
+        };
+        let http = records.iter().filter(demand).any(|r| r.torrent.is_none());
+        let torrent = records
+            .iter()
+            .filter(demand)
+            .any(|r| r.torrent.as_ref().is_some_and(|t| !t.selected_ready))
+            || !self.torrent_imports.read().await.is_empty();
+        let (http_budget, torrent_budget) = {
+            let mut broker = self.bandwidth_broker.lock().unwrap();
+            let limit = settings.speed_limit_bps;
+            if broker.1 != limit || broker.2 != (http, torrent) {
+                *broker = (
+                    Instant::now(),
+                    limit,
+                    (http, torrent),
+                    download_budgets(limit, http, torrent),
+                );
+            } else if limit > 0 && http && torrent && broker.0.elapsed() >= Duration::from_secs(2) {
+                let rate = |native: bool| {
+                    records
+                        .iter()
+                        .filter(|r| r.torrent.is_some() == native)
+                        .map(|r| r.speed_bps)
+                        .sum()
+                };
+                broker.3 = rebalance_download_budgets(limit, broker.3, (rate(false), rate(true)));
+                broker.0 = Instant::now();
+            }
+            broker.3
+        };
+        self.limiter.set_limit(http_budget);
+        if !records.iter().any(|r| r.torrent.is_some())
+            && self.torrent_imports.read().await.is_empty()
+        {
+            return Ok(());
+        }
+        let mut config = serde_json::to_value(&settings.torrent).map_err(|e| e.to_string())?;
+        config["op"] = json!("configure");
+        config["downloadLimit"] = json!(torrent_budget.min(i32::MAX as u64));
+        config["uploadLimit"] = json!(settings.torrent.upload_limit_bps.min(i32::MAX as u64));
+        let mut previous = self.torrent_configuration.lock().await;
+        if *previous != config {
+            self.torrent_engine.call(config.clone()).await?;
+            *previous = config;
+        }
+        Ok(())
+    }
+
+    async fn poll_torrents(&self) -> Result<(), String> {
+        if !self.tasks.read().await.values().any(|t| {
+            t.record
+                .try_read()
+                .ok()
+                .is_some_and(|r| r.torrent.is_some())
+        }) && self.torrent_imports.read().await.is_empty()
+        {
+            return Ok(());
+        }
+        let poll = self.torrent_engine.call(json!({"op":"poll"})).await?;
+        let mut structural = false;
+        for event in poll["events"].as_array().into_iter().flatten() {
+            let Some(id) = event["id"].as_str().and_then(|s| Uuid::parse_str(s).ok()) else {
+                continue;
+            };
+            if event["type"] == "metadata" {
+                let metadata: TorrentMetadata =
+                    serde_json::from_value(event["metadata"].clone()).map_err(|e| e.to_string())?;
+                if let Some(import) = self.torrent_imports.write().await.get_mut(&id) {
+                    import.1 = Some(metadata);
+                }
+            } else if let Ok(task) = self.task(id).await {
+                let mut record = task.record.write().await;
+                if event["type"] == "error" {
+                    record.status = DownloadStatus::Failed;
+                    record.error = event["message"].as_str().map(str::to_owned);
+                    task.running.store(false, Ordering::Release);
+                    let _ = self
+                        .torrent_engine
+                        .call(json!({"op":"pause", "id":id}))
+                        .await;
+                } else if event["type"] == "moved" {
+                    record.destination = event["path"]
+                        .as_str()
+                        .unwrap_or(&record.destination)
+                        .to_owned();
+                }
+                self.emit_record(&record);
+                structural = true;
+            }
+        }
+        let mut updates = Vec::new();
+        for s in poll["states"].as_array().into_iter().flatten() {
+            let Some(id) = s["id"].as_str().and_then(|s| Uuid::parse_str(s).ok()) else {
+                continue;
+            };
+            let Ok(task) = self.task(id).await else {
+                continue;
+            };
+            let mut record = task.record.write().await;
+            let old = record.status.clone();
+            let before = record.clone();
+            let number = |key: &str| s[key].as_u64().unwrap_or(0);
+            let verified = s["verified"].as_bool().unwrap_or(true);
+            if verified {
+                record.total_bytes = Some(number("wanted"));
+                record.downloaded_bytes = number("downloaded");
+            }
+            record.speed_bps = if task.running.load(Ordering::Acquire) {
+                number("downloadSpeed")
+            } else {
+                0
+            };
+            record.connections = number("peers") as usize;
+            record.eta_seconds = if record.speed_bps > 0 {
+                Some(number("wanted").saturating_sub(number("downloaded")) / record.speed_bps)
+            } else {
+                None
+            };
+            let t = record.torrent.as_mut().unwrap();
+            t.uploaded_bytes = number("uploaded");
+            t.all_downloaded_bytes = number("allDownloaded");
+            t.upload_speed_bps = if task.running.load(Ordering::Acquire) {
+                number("uploadSpeed")
+            } else {
+                0
+            };
+            t.peers = number("peers") as usize;
+            t.seeds = number("seeds") as usize;
+            t.active_seconds = number("activeSeconds");
+            t.seed_seconds = number("seedSeconds");
+            let ready = if verified {
+                s["finished"].as_bool().unwrap_or(false)
+            } else {
+                t.selected_ready
+            };
+            structural |= ready != t.selected_ready;
+            t.selected_ready = ready;
+            let goal = ready
+                && ((t.ratio_limit > 0.0
+                    && t.uploaded_bytes as f64
+                        >= t.all_downloaded_bytes.max(number("wanted")).max(1) as f64
+                            * t.ratio_limit)
+                    || (t.seed_time_limit > 0 && t.seed_seconds >= t.seed_time_limit));
+            if task.running.load(Ordering::Acquire) {
+                if goal {
+                    self.torrent_engine
+                        .call(json!({"op":"pause", "id":id}))
+                        .await?;
+                    task.running.store(false, Ordering::Release);
+                    task.paused.store(true, Ordering::Release);
+                    record.status = DownloadStatus::Completed;
+                    record.speed_bps = 0;
+                    record.torrent.as_mut().unwrap().upload_speed_bps = 0;
+                } else {
+                    record.status = match s["state"].as_str().unwrap_or("downloading") {
+                        "checking" => DownloadStatus::Checking,
+                        "metadata" => DownloadStatus::Metadata,
+                        "stalled" => DownloadStatus::Stalled,
+                        "seeding" => DownloadStatus::Seeding,
+                        "failed" => {
+                            record.error = s["error"].as_str().map(str::to_owned);
+                            DownloadStatus::Failed
+                        }
+                        "paused" => record.status.clone(),
+                        _ => DownloadStatus::Downloading,
+                    };
+                }
+            }
+            if ready && record.finished_at.is_none() {
+                record.finished_at = Some(Utc::now());
+                structural = true;
+            }
+            structural |= record.status != old;
+            if *record != before {
+                updates.push(record.clone());
+            }
+        }
+        if !updates.is_empty() {
+            let _ = self.app.emit("fetchrail://torrent-updated", &updates);
+        }
+        let checkpoint = {
+            let mut last = self.torrent_checkpoint.lock().unwrap();
+            if last.elapsed() > Duration::from_secs(30) {
+                *last = Instant::now();
+                true
+            } else {
+                false
+            }
+        };
+        if checkpoint {
+            let _ = self.torrent_engine.call(json!({"op":"checkpoint"})).await;
+        }
+        if structural || checkpoint {
+            self.persist_records().await.map_err(|e| e.to_string())?;
+        }
+        let expired = self
+            .torrent_imports
+            .read()
+            .await
+            .iter()
+            .filter(|(_, (_, _, when))| when.elapsed() > Duration::from_secs(600))
+            .map(|(id, _)| *id)
+            .collect::<Vec<_>>();
+        for id in expired {
+            self.cancel_torrent_import(id).await?;
+        }
+        Ok(())
+    }
+
+    pub async fn shutdown(&self) {
+        self.dispatch_suspended.store(true, Ordering::Release);
+        let _dispatch = self.dispatch_lock.lock().await;
+        let tasks = self
+            .tasks
+            .read()
+            .await
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut active_http = Vec::new();
+        for task in &tasks {
+            let mut record = task.record.write().await;
+            if record.torrent.is_none() && record.status.is_active() {
+                active_http.push(task.clone());
+            }
+            if record.torrent.is_some() && record.status.is_active() {
+                task.running.store(false, Ordering::Release);
+                task.paused.store(true, Ordering::Release);
+                record.status = DownloadStatus::Paused;
+                record.speed_bps = 0;
+            } else if record.torrent.is_none()
+                && record.status.is_active()
+                && record.status != DownloadStatus::Merging
+            {
+                task.paused.store(true, Ordering::Release);
+                task.cancel();
+                record.status = DownloadStatus::Paused;
+                record.speed_bps = 0;
+                record.eta_seconds = None;
+            }
+        }
+        // Cancellation flushes buffered part bytes before the final persisted snapshot.
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while active_http
+            .iter()
+            .any(|task| task.running.load(Ordering::Acquire))
+            && Instant::now() < deadline
+        {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let records = self.list().await;
+        for record in records.iter().filter(|r| r.torrent.is_some()) {
+            let _ = self
+                .torrent_engine
+                .call(json!({"op":"pause", "id":record.id}))
+                .await;
+        }
+        if let Err(error) = self
+            .torrent_engine
+            .call(json!({"op":"checkpoint", "wait":true}))
+            .await
+        {
+            eprintln!("Torrent shutdown checkpoint: {error}");
+        }
+        let _ = self.torrent_engine.call(json!({"op":"poll"})).await;
+        let _ = self.persist_records().await;
     }
 
     async fn add_inner(
@@ -371,38 +1246,24 @@ impl DownloadManager {
         request: AddDownloadRequest,
         persist: bool,
     ) -> Result<DownloadRecord, String> {
-        let _add = self.add_lock.lock().await;
-        let mut headers =
-            context_headers(request.request_context.as_ref()).map_err(|error| error.to_string())?;
-        headers.extend(crate::network::session_headers(
-            request.request_headers.as_ref(),
-        )?);
-        let expected_sha256 = storage::validate_hash(request.expected_sha256.as_deref())?;
         let parsed = Url::parse(request.url.trim()).map_err(|error| error.to_string())?;
         if !matches!(parsed.scheme(), "http" | "https") {
             return Err("Only HTTP and HTTPS URLs are supported.".into());
         }
-        if !parsed.username().is_empty() || parsed.password().is_some() {
-            return Err("Use browser session support instead of credentials in a URL.".into());
-        }
+        context_headers(request.request_context.as_ref()).map_err(|error| error.to_string())?;
+        let expected_sha256 = normalize_sha256(request.expected_sha256.as_deref())?;
         if let Some(key) = &request.handoff_id {
-            if key.len() > 80 {
-                return Err("Invalid handoff id.".into());
-            }
             if let Some(record) = self
                 .list()
                 .await
                 .into_iter()
-                .find(|record| record.handoff_id.as_ref() == Some(key))
+                .find(|r| r.extra.get("handoffId").and_then(|v| v.as_str()) == Some(key))
             {
-                if record.url != parsed.as_str() {
-                    return Err("Handoff id already belongs to another URL.".into());
-                }
-                if record.status == DownloadStatus::Cancelled {
-                    return Err("This handoff was rolled back.".into());
-                }
-                if record.expected_sha256 != expected_sha256 {
-                    return Err("Handoff checksum changed.".into());
+                if record.url != parsed.as_str()
+                    || record.expected_sha256 != expected_sha256
+                    || record.status == DownloadStatus::Cancelled
+                {
+                    return Err("Handoff was rolled back or its resource changed.".into());
                 }
                 return Ok(record);
             }
@@ -436,10 +1297,12 @@ impl DownloadManager {
             .filter(|value| !value.trim().is_empty())
             .map(PathBuf::from)
             .unwrap_or_else(|| settings.folder_for(&file_name));
+        self.check_torrent_path(&directory.join(&file_name)).await?;
         fs::create_dir_all(&directory)
             .await
             .map_err(|error| format!("Could not create destination directory: {error}"))?;
         let destination = unique_destination(&directory, &file_name).await;
+        self.check_torrent_path(&destination).await?;
         let id = Uuid::new_v4();
         let start_paused = request.start_paused.unwrap_or(false);
         let scheduled_for = request.scheduled_for;
@@ -451,7 +1314,18 @@ impl DownloadManager {
             DownloadStatus::Queued
         };
         let record = DownloadRecord {
+            torrent: None,
             id,
+            extra: request
+                .handoff_id
+                .map(|key| {
+                    std::collections::BTreeMap::from([
+                        ("handoffId".into(), json!(key)),
+                        ("handoffCommitted".into(), json!(false)),
+                    ])
+                })
+                .unwrap_or_default(),
+            expected_sha256,
             url: parsed.to_string(),
             file_name: destination
                 .file_name()
@@ -480,30 +1354,19 @@ impl DownloadManager {
             scheduled_for,
             segments: Vec::new(),
             name_locked: false,
-            expected_sha256,
-            sha256: None,
-            status_detail: None,
-            finalizing_bytes: 0,
-            handoff_id: request.handoff_id,
-            handoff_committed: false,
-            requires_session: !headers.is_empty(),
             speed_limit_bps: request.speed_limit_bps.unwrap_or(0),
             resume_supported: None,
             completion_options: Default::default(),
             progress_requested: false,
         };
 
-        let task = Arc::new(DownloadTask::new(record.clone()));
-        // The scheduler cannot start a job until its acceptance is durable.
-        task.paused.store(true, Ordering::Release);
-        *task.headers.write().await = headers;
+        let task = Arc::new(DownloadTask::new(record.clone(), request.request_context));
         self.tasks.write().await.insert(id, task.clone());
         if persist {
             if let Err(error) = self.persist_records().await {
                 self.tasks.write().await.remove(&id);
                 return Err(error.to_string());
             }
-            task.paused.store(start_paused, Ordering::Release);
             self.emit_record(&record);
         }
         Ok(record)
@@ -544,10 +1407,6 @@ impl DownloadManager {
             return Err(error.to_string());
         }
         for record in &result.accepted {
-            self.task(record.id)
-                .await?
-                .paused
-                .store(record.status == DownloadStatus::Paused, Ordering::Release);
             self.emit_record(record);
         }
         Ok(result)
@@ -555,6 +1414,11 @@ impl DownloadManager {
 
     pub async fn set_speed_limit(&self, id: Uuid, limit: u64) -> Result<DownloadRecord, String> {
         let task = self.task(id).await?;
+        if task.record.read().await.torrent.is_some() {
+            self.torrent_engine
+                .call(json!({"op":"limit", "id":id, "downloadLimit":limit.min(i32::MAX as u64)}))
+                .await?;
+        }
         let snapshot = {
             let mut record = task.record.write().await;
             record.speed_limit_bps = limit;
@@ -573,45 +1437,21 @@ impl DownloadManager {
         url: &str,
         expected_bytes: Option<u64>,
         expected_mime: Option<&str>,
-        headers: Option<&std::collections::BTreeMap<String, String>>,
+        context: Option<&BrowserRequestContext>,
     ) -> Result<Option<String>, String> {
         // Verify a replayable GET before the extension gives up its browser transfer.
-        let parsed = Url::parse(url).map_err(|error| error.to_string())?;
-        let gate = self.origin(&parsed).await;
-        let cancel = CancellationToken::new();
-        let limit = self.settings.read().await.max_requests_per_origin;
-        let _permit = tokio::time::timeout(Duration::from_secs(15), gate.acquire(limit, &cancel))
-            .await
-            .map_err(|_| "Browser verification is waiting for this site's request budget.")?
-            .ok_or("Verification cancelled.")?;
         let response = tokio::time::timeout(
             Duration::from_secs(15),
-            self.session_client(crate::network::session_headers(headers)?)?
+            self.client
                 .get(url)
+                .headers(context_headers(context).map_err(|error| error.to_string())?)
                 .header(RANGE, "bytes=0-0")
                 .header(ACCEPT_ENCODING, "identity")
                 .send(),
         )
         .await
         .map_err(|_| "Browser download verification timed out.".to_string())?
-        .map_err(|error| error.without_url().to_string())?;
-        validate_encoding(response.headers()).map_err(|error| error.to_string())?;
-        if matches!(
-            response.status(),
-            StatusCode::TOO_MANY_REQUESTS | StatusCode::SERVICE_UNAVAILABLE
-        ) {
-            gate.cool_down(
-                crate::network::retry_after(
-                    response
-                        .headers()
-                        .get(header::RETRY_AFTER)
-                        .and_then(|value| value.to_str().ok()),
-                    Utc::now(),
-                )
-                .unwrap_or(Duration::from_secs(2)),
-            )
-            .await;
-        }
+        .map_err(|error| error.to_string())?;
         let total = match response.status() {
             StatusCode::PARTIAL_CONTENT => {
                 let (start, end, total) = parse_content_range(response.headers())
@@ -667,158 +1507,22 @@ impl DownloadManager {
         for task in tasks {
             records.push(task.record.read().await.clone());
         }
-        records.sort_by_key(|record| std::cmp::Reverse(record.created_at));
+        records.sort_by(|left, right| right.created_at.cmp(&left.created_at));
         records
-    }
-
-    pub async fn commit_handoff(
-        self: &Arc<Self>,
-        key: &str,
-        auto_start: bool,
-    ) -> Result<Vec<DownloadRecord>, String> {
-        let records = self
-            .list()
-            .await
-            .into_iter()
-            .filter(|record| {
-                record
-                    .handoff_id
-                    .as_ref()
-                    .is_some_and(|id| id.starts_with(key))
-            })
-            .collect::<Vec<_>>();
-        if records.is_empty() {
-            return Err("Handoff has not been accepted yet.".into());
-        }
-        let mut committed = Vec::new();
-        for record in records {
-            if record.status == DownloadStatus::Cancelled {
-                return Err("Handoff was rolled back.".into());
-            }
-            let task = self.task(record.id).await?;
-            {
-                let mut record = task.record.write().await;
-                record.handoff_committed = true;
-                committed.push(record.clone());
-            }
-            if auto_start && record.status == DownloadStatus::Paused {
-                self.resume(record.id).await?;
-            }
-        }
-        self.persist_records()
-            .await
-            .map_err(|error| error.to_string())?;
-        Ok(committed)
-    }
-
-    pub async fn refresh(
-        self: &Arc<Self>,
-        id: Uuid,
-        url: String,
-        expected: Option<String>,
-        headers: Option<std::collections::BTreeMap<String, String>>,
-        restart: bool,
-    ) -> Result<DownloadRecord, String> {
-        let task = self.task(id).await?;
-        if task.running.load(Ordering::Acquire) {
-            return Err("Pause the download before refreshing its link.".into());
-        }
-        let old = task.record.read().await.clone();
-        if old.status == DownloadStatus::Completed {
-            return Err("This download is already complete.".into());
-        }
-        let parsed = Url::parse(&url).map_err(|_| "Invalid refresh URL.")?;
-        if !matches!(parsed.scheme(), "http" | "https")
-            || !parsed.username().is_empty()
-            || parsed.password().is_some()
-        {
-            return Err("Only HTTP/HTTPS URLs without embedded credentials are accepted.".into());
-        }
-        let headers = crate::network::session_headers(headers.as_ref())?;
-        let expected = storage::validate_hash(expected.as_deref())?.or(old.expected_sha256.clone());
-        let client = self.session_client(headers.clone())?;
-        let token = CancellationToken::new();
-        let probe = tokio::time::timeout(
-            Duration::from_secs(25),
-            self.probe(&client, &parsed, &token),
-        )
-        .await
-        .map_err(|_| "Link refresh timed out.")?
-        .map_err(|error| error.to_string())?;
-        let part_dir = self.part_dir(id);
-        let saved: Option<PartManifest> = storage::read_json(&part_dir.join("transfer.json"))
-            .await
-            .map_err(|error| error.to_string())?;
-        let same_resource = old.url == parsed.as_str()
-            && saved.as_ref().is_some_and(|saved| {
-                saved.validator.is_some()
-                    && saved.validator == probe.validator
-                    && saved.total_bytes == probe.total_bytes
-            });
-        let trusted_hash = old.expected_sha256.is_some() && old.expected_sha256 == expected;
-        let has_progress = old.downloaded_bytes > 0
-            || saved
-                .as_ref()
-                .is_some_and(|saved| saved.committed.iter().any(|bytes| *bytes > 0));
-        if has_progress && !same_resource && !trusted_hash && !restart {
-            return Err("Cannot prove that this link is the same file. Choose Restart, or supply the original trusted SHA-256.".into());
-        }
-        if restart {
-            if let Some(saved) = &saved {
-                if let Some(stage) = &saved.direct_path {
-                    if stage.file_name().is_some_and(|name| {
-                        name.to_string_lossy()
-                            .ends_with(&format!(".{id}.fetchrail-part"))
-                    }) {
-                        let _ = fs::remove_file(stage).await;
-                    }
-                }
-            }
-            match fs::remove_dir_all(&part_dir).await {
-                Ok(()) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => return Err(error.to_string()),
-            }
-        } else if trusted_hash && !same_resource {
-            if let Some(mut saved) = saved {
-                saved.validator = probe.validator.clone();
-                saved.total_bytes = probe.total_bytes;
-                saved.accepts_ranges = probe.accepts_ranges;
-                write_json_atomic(&part_dir.join("transfer.json"), &saved)
-                    .await
-                    .map_err(|error| error.to_string())?;
-            }
-        }
-        *task.headers.write().await = headers.clone();
-        let snapshot = {
-            let mut record = task.record.write().await;
-            record.url = parsed.to_string();
-            record.expected_sha256 = expected;
-            record.requires_session = !headers.is_empty();
-            record.status = DownloadStatus::Paused;
-            record.error = None;
-            record.status_detail = Some("Link refreshed; ready to resume.".into());
-            record.finished_at = None;
-            if restart {
-                record.downloaded_bytes = 0;
-                record.segments.clear();
-                record.sha256 = None;
-                record.finalizing_bytes = 0;
-            }
-            record.clone()
-        };
-        task.paused.store(true, Ordering::Release);
-        task.cancelled.store(false, Ordering::Release);
-        self.persist_records()
-            .await
-            .map_err(|error| error.to_string())?;
-        self.emit_record(&snapshot);
-        Ok(snapshot)
     }
 
     pub async fn overview(&self) -> EngineOverview {
         let records = self.list().await;
         EngineOverview {
+            upload_speed_bps: records
+                .iter()
+                .filter_map(|r| r.torrent.as_ref())
+                .map(|t| t.upload_speed_bps)
+                .sum(),
+            seeding: records
+                .iter()
+                .filter(|r| r.status == DownloadStatus::Seeding)
+                .count(),
             active: records
                 .iter()
                 .filter(|record| {
@@ -827,6 +1531,9 @@ impl DownloadManager {
                         DownloadStatus::Connecting
                             | DownloadStatus::Downloading
                             | DownloadStatus::Merging
+                            | DownloadStatus::Checking
+                            | DownloadStatus::Metadata
+                            | DownloadStatus::Stalled
                     )
                 })
                 .count(),
@@ -841,7 +1548,10 @@ impl DownloadManager {
                 .count(),
             completed: records
                 .iter()
-                .filter(|record| record.status == DownloadStatus::Completed)
+                .filter(|record| {
+                    record.status == DownloadStatus::Completed
+                        || record.torrent.as_ref().is_some_and(|t| t.selected_ready)
+                })
                 .count(),
             failed: records
                 .iter()
@@ -856,36 +1566,34 @@ impl DownloadManager {
     }
 
     pub async fn pause(&self, id: Uuid) -> Result<DownloadRecord, String> {
+        let _dispatch = self.dispatch_lock.lock().await;
+        self.pause_inner(id).await
+    }
+
+    async fn pause_inner(&self, id: Uuid) -> Result<DownloadRecord, String> {
         let task = self.task(id).await?;
+        if task.record.read().await.torrent.is_some() {
+            self.torrent_engine
+                .call(json!({"op":"pause", "id":id}))
+                .await?;
+            task.running.store(false, Ordering::Release);
+        }
         let snapshot = {
-            let _publication = task.publication_lock.try_lock().map_err(|_| {
-                "This download is being finalized; wait for publication.".to_string()
-            })?;
             let mut record = task.record.write().await;
             if matches!(
                 record.status,
-                DownloadStatus::Completed | DownloadStatus::Cancelled
+                DownloadStatus::Completed | DownloadStatus::Cancelled | DownloadStatus::Merging
             ) {
                 return Err("This download cannot be paused.".into());
             }
             task.paused.store(true, Ordering::Release);
             task.cancel();
             record.status = DownloadStatus::Paused;
-            record.status_detail = Some("Saving paused transfer…".into());
             record.speed_bps = 0;
             record.eta_seconds = None;
-            record.clone()
-        };
-        self.persist_records()
-            .await
-            .map_err(|error| error.to_string())?;
-        self.emit_record(&snapshot);
-        tokio::time::timeout(Duration::from_secs(15),async {
-            while task.running.load(Ordering::Acquire) { tokio::time::sleep(Duration::from_millis(25)).await; }
-        }).await.map_err(|_|"Pause requested; disk cleanup is still finishing. Wait a moment before resuming or refreshing.".to_string())?;
-        let snapshot = {
-            let mut record = task.record.write().await;
-            record.status_detail = None;
+            if let Some(torrent) = &mut record.torrent {
+                torrent.upload_speed_bps = 0;
+            }
             record.clone()
         };
         self.persist_records()
@@ -896,13 +1604,16 @@ impl DownloadManager {
     }
 
     pub async fn resume(self: &Arc<Self>, id: Uuid) -> Result<DownloadRecord, String> {
+        let _dispatch = self.dispatch_lock.lock().await;
         let task = self.task(id).await?;
         let snapshot = {
             let mut record = task.record.write().await;
-            if !matches!(
-                record.status,
-                DownloadStatus::Paused | DownloadStatus::Failed | DownloadStatus::Cancelled
-            ) {
+            if !(record.torrent.is_some() && record.status == DownloadStatus::Completed)
+                && !matches!(
+                    record.status,
+                    DownloadStatus::Paused | DownloadStatus::Failed | DownloadStatus::Cancelled
+                )
+            {
                 return Err("Only paused, failed or cancelled downloads can be resumed.".into());
             }
             task.cancelled.store(false, Ordering::Release);
@@ -921,13 +1632,20 @@ impl DownloadManager {
     }
 
     pub async fn cancel(&self, id: Uuid) -> Result<DownloadRecord, String> {
+        let _dispatch = self.dispatch_lock.lock().await;
         let task = self.task(id).await?;
+        if task.record.read().await.torrent.is_some() {
+            self.torrent_engine
+                .call(json!({"op":"pause", "id":id}))
+                .await?;
+            task.running.store(false, Ordering::Release);
+        }
         let snapshot = {
-            let _publication = task.publication_lock.try_lock().map_err(|_| {
-                "This download is being finalized; wait for publication.".to_string()
-            })?;
             let mut record = task.record.write().await;
-            if matches!(record.status, DownloadStatus::Completed) {
+            if matches!(
+                record.status,
+                DownloadStatus::Completed | DownloadStatus::Merging
+            ) {
                 return Err("This download is already complete or being finalized.".into());
             }
             task.cancelled.store(true, Ordering::Release);
@@ -936,6 +1654,9 @@ impl DownloadManager {
             record.status = DownloadStatus::Cancelled;
             record.speed_bps = 0;
             record.eta_seconds = None;
+            if let Some(torrent) = &mut record.torrent {
+                torrent.upload_speed_bps = 0;
+            }
             record.finished_at = Some(Utc::now());
             record.clone()
         };
@@ -953,7 +1674,11 @@ impl DownloadManager {
         directory: String,
         file_name: String,
     ) -> Result<DownloadRecord, String> {
+        let _dispatch = self.dispatch_lock.lock().await;
         let task = self.task(id).await?;
+        if task.record.read().await.torrent.is_some() {
+            return Err("Use Move storage to relocate torrent payload files.".into());
+        }
         if task.running.load(Ordering::Acquire) {
             return Err("Pause the download before changing where it is saved.".into());
         }
@@ -961,6 +1686,8 @@ impl DownloadManager {
         if !directory.is_absolute() {
             return Err("Choose a full folder path.".into());
         }
+        self.check_torrent_path(&directory.join(safe_file_name(&file_name)))
+            .await?;
         fs::create_dir_all(&directory)
             .await
             .map_err(|error| format!("Could not create destination directory: {error}"))?;
@@ -973,6 +1700,7 @@ impl DownloadManager {
             let renamed = name != record.file_name;
             if renamed || Path::new(&record.destination).parent() != Some(directory.as_path()) {
                 let destination = unique_destination(&directory, &name).await;
+                self.check_torrent_path(&destination).await?;
                 record.file_name = destination
                     .file_name()
                     .and_then(|value| value.to_str())
@@ -992,6 +1720,9 @@ impl DownloadManager {
 
     pub async fn remove(&self, id: Uuid, delete_file: bool) -> Result<(), String> {
         let task = self.task(id).await?;
+        if task.record.read().await.torrent.is_some() {
+            return self.remove_torrent(id, delete_file).await;
+        }
         if task.running.load(Ordering::Acquire) {
             return Err("Pause or cancel the download before removing it.".into());
         }
@@ -1011,6 +1742,91 @@ impl DownloadManager {
 
     pub async fn settings(&self) -> DownloadSettings {
         self.settings.read().await.clone()
+    }
+
+    /// Move files already in the default Downloads folder according to the saved
+    /// category rules, or move them back out of configured category folders.
+    pub async fn organize_existing_downloads(
+        &self,
+        mode: OrganizeMode,
+    ) -> Result<OrganizeReport, String> {
+        // New download creation and filename reassignment must not race the scan.
+        let _dispatch = self.dispatch_lock.lock().await;
+        let settings = self.settings.read().await.clone();
+        if matches!(mode, OrganizeMode::Flatten) && settings.sort_into_category_folders {
+            return Err(
+                "Turn off automatic category folders and save settings before moving files back."
+                    .into(),
+            );
+        }
+
+        let records = self.list().await;
+        let root = organize::path_key(Path::new(&settings.default_download_dir));
+        let mut protected = HashSet::new();
+        let mut completed = HashMap::<PathBuf, Vec<Uuid>>::new();
+        for record in &records {
+            let path = organize::path_key(Path::new(&record.destination));
+            if record.torrent.is_some() {
+                if root.starts_with(&path) || path.starts_with(&root) {
+                    let details = self
+                        .torrent_engine
+                        .call(json!({"op":"details", "id":record.id}))
+                        .await
+                        .map_err(|error| {
+                            format!("Could not check torrent files before organizing: {error}")
+                        })?;
+                    let metadata: TorrentMetadata =
+                        serde_json::from_value(details["metadata"].clone()).map_err(|error| {
+                            format!("Could not check torrent files before organizing: {error}")
+                        })?;
+                    for file in metadata.files {
+                        protected.insert(organize::path_key(&path.join(file.path)));
+                    }
+                }
+            } else if record.status == DownloadStatus::Completed {
+                completed.entry(path).or_default().push(record.id);
+            } else {
+                protected.insert(path);
+            }
+        }
+
+        let result = tauri::async_runtime::spawn_blocking(move || {
+            organize::organize_existing(&settings, &protected, mode)
+        })
+        .await
+        .map_err(|error| format!("Could not finish organizing downloads: {error}"))??;
+
+        if !result.moves.is_empty() {
+            let tasks = self.tasks.read().await;
+            let mut changed = Vec::new();
+            for (source, destination) in &result.moves {
+                if let Some(ids) = completed.get(&organize::path_key(source)) {
+                    for id in ids {
+                        if let Some(task) = tasks.get(id) {
+                            let mut record = task.record.write().await;
+                            if record.status != DownloadStatus::Completed {
+                                continue;
+                            }
+                            record.destination = destination.to_string_lossy().into_owned();
+                            if let Some(name) = destination.file_name() {
+                                record.file_name = name.to_string_lossy().into_owned();
+                            }
+                            changed.push(record.clone());
+                        }
+                    }
+                }
+            }
+            drop(tasks);
+            if !changed.is_empty() {
+                self.persist_records().await.map_err(|error| {
+                    format!("Files moved, but the download history could not be saved: {error}")
+                })?;
+                for record in changed {
+                    self.emit_record(&record);
+                }
+            }
+        }
+        Ok(result.report)
     }
 
     pub async fn list_queues(&self) -> Vec<QueueRecord> {
@@ -1194,12 +2010,10 @@ impl DownloadManager {
         fs::create_dir_all(&path)
             .await
             .map_err(|error| format!("Could not use that download directory: {error}"))?;
-        if std::env::var_os("FETCHRAIL_DATA_DIR").is_none() {
-            sync_startup_registration(settings.launch_on_start)?;
-        }
+        sync_startup_registration(settings.launch_on_start)?;
 
         *self.settings.write().await = settings.clone();
-        self.limiter.set_limit(settings.speed_limit_bps);
+        self.apply_torrent_budget().await?;
         self.minimize_to_tray
             .store(settings.minimize_to_tray, Ordering::Release);
         self.persist_settings()
@@ -1240,6 +2054,28 @@ impl DownloadManager {
         id: Uuid,
         mut options: crate::model::CompletionOptions,
     ) -> Result<DownloadRecord, String> {
+        #[cfg(target_os = "linux")]
+        if options.hang_up || options.turn_off_computer {
+            let capabilities = crate::platform::capabilities(false).await;
+            if options.turn_off_computer && !capabilities.shutdown.available {
+                return Err(capabilities.shutdown.reason);
+            }
+            if options.force_shutdown && !capabilities.force_shutdown.available {
+                return Err(capabilities.force_shutdown.reason);
+            }
+            if options.hang_up {
+                if !capabilities.disconnect.available {
+                    return Err(capabilities.disconnect.reason);
+                }
+                if !capabilities
+                    .connections
+                    .iter()
+                    .any(|c| Some(&c.id) == options.connection_id.as_ref())
+                {
+                    return Err("Choose an active connection to disconnect.".into());
+                }
+            }
+        }
         let task = self.task(id).await?;
         let snapshot = {
             let mut record = task.record.write().await;
@@ -1282,8 +2118,7 @@ impl DownloadManager {
         }
         #[cfg(not(target_os = "windows"))]
         {
-            let _ = target;
-            return Err("Reveal is currently implemented for Windows only.".into());
+            crate::platform::reveal(&target)?;
         }
         Ok(())
     }
@@ -1314,13 +2149,22 @@ impl DownloadManager {
             let mut ticker = interval(Duration::from_millis(400));
             loop {
                 ticker.tick().await;
+                if let Err(error) = manager.poll_torrents().await {
+                    eprintln!("Torrent telemetry: {error}");
+                }
                 manager.dispatch_ready_downloads().await;
             }
         });
     }
 
     async fn dispatch_ready_downloads(self: &Arc<Self>) {
+        if self.dispatch_suspended.load(Ordering::Acquire) {
+            return;
+        }
         let _dispatch = self.dispatch_lock.lock().await;
+        if self.dispatch_suspended.load(Ordering::Acquire) {
+            return;
+        }
         let max_concurrent = self.settings.read().await.max_concurrent_downloads;
         let tasks = self
             .tasks
@@ -1329,10 +2173,41 @@ impl DownloadManager {
             .values()
             .cloned()
             .collect::<Vec<_>>();
-        let mut running = tasks
-            .iter()
-            .filter(|task| task.running.load(Ordering::Acquire))
-            .count();
+        let mut running = 0;
+        let mut seeds = 0;
+        let max_seeds = self.settings.read().await.torrent.max_seeds;
+        for task in &tasks {
+            if task.running.load(Ordering::Acquire) {
+                if task
+                    .record
+                    .read()
+                    .await
+                    .torrent
+                    .as_ref()
+                    .is_some_and(|t| t.selected_ready)
+                {
+                    if seeds >= max_seeds {
+                        let mut record = task.record.write().await;
+                        if self
+                            .torrent_engine
+                            .call(json!({"op":"pause", "id":record.id}))
+                            .await
+                            .is_ok()
+                        {
+                            task.running.store(false, Ordering::Release);
+                            record.status = DownloadStatus::Queued;
+                            record.speed_bps = 0;
+                            record.torrent.as_mut().unwrap().upload_speed_bps = 0;
+                            self.emit_record(&record);
+                        }
+                    } else {
+                        seeds += 1;
+                    }
+                } else {
+                    running += 1;
+                }
+            }
+        }
         let now = Utc::now();
         let paused_queues = self
             .queues
@@ -1347,20 +2222,25 @@ impl DownloadManager {
             let mut record = task.record.write().await;
             if task.running.load(Ordering::Acquire)
                 && paused_queues.contains(&record.queue)
-                && matches!(
-                    record.status,
-                    DownloadStatus::Connecting | DownloadStatus::Downloading
-                )
+                && (record.torrent.is_some()
+                    || matches!(
+                        record.status,
+                        DownloadStatus::Connecting | DownloadStatus::Downloading
+                    ))
             {
+                if record.torrent.is_some() {
+                    let _ = self
+                        .torrent_engine
+                        .call(json!({"op":"pause", "id":record.id}))
+                        .await;
+                    task.running.store(false, Ordering::Release);
+                }
                 record.status = DownloadStatus::Queued;
                 record.speed_bps = 0;
                 record.eta_seconds = None;
                 task.cancel();
                 self.emit_record(&record);
             }
-        }
-        if running >= max_concurrent {
-            return;
         }
         let mut candidates = Vec::new();
         for task in tasks {
@@ -1379,8 +2259,18 @@ impl DownloadManager {
         candidates.sort_by_key(|(created_at, _)| *created_at);
 
         for (_, task) in candidates {
-            if running >= max_concurrent {
-                break;
+            let is_seed = task
+                .record
+                .read()
+                .await
+                .torrent
+                .as_ref()
+                .is_some_and(|t| t.selected_ready);
+            if is_seed && seeds >= max_seeds {
+                continue;
+            }
+            if !is_seed && running >= max_concurrent {
+                continue;
             }
             {
                 let mut record = task.record.write().await;
@@ -1389,9 +2279,51 @@ impl DownloadManager {
                     self.emit_record(&record);
                 }
             }
-            self.spawn(task);
-            running += 1;
+            let record = task.record.read().await.clone();
+            task.record.write().await.status = if is_seed {
+                DownloadStatus::Seeding
+            } else {
+                DownloadStatus::Connecting
+            };
+            // Set both engines' positive allocations before network work begins.
+            if let Err(error) = self.apply_torrent_budget().await {
+                let mut record = task.record.write().await;
+                record.status = DownloadStatus::Failed;
+                record.error = Some(error);
+                self.emit_record(&record);
+                continue;
+            }
+            if record.torrent.is_some() {
+                match self
+                    .torrent_engine
+                    .call(json!({"op":"resume", "id":record.id}))
+                    .await
+                {
+                    Ok(_) => {
+                        task.running.store(true, Ordering::Release);
+                        task.record.write().await.status = if is_seed {
+                            DownloadStatus::Seeding
+                        } else {
+                            DownloadStatus::Connecting
+                        };
+                    }
+                    Err(error) => {
+                        let mut r = task.record.write().await;
+                        r.status = DownloadStatus::Failed;
+                        r.error = Some(error);
+                        self.emit_record(&r);
+                    }
+                }
+            } else {
+                self.spawn(task);
+            }
+            if is_seed {
+                seeds += 1;
+            } else {
+                running += 1;
+            }
         }
+        let _ = self.apply_torrent_budget().await;
     }
 
     async fn run(
@@ -1407,16 +2339,8 @@ impl DownloadManager {
             let record = task.record.read().await;
             Url::parse(&record.url)?
         };
-        if self.finish_staged(&task, &cancel).await? {
-            return Ok(());
-        }
-        let headers = task.headers.read().await.clone();
-        if task.record.read().await.requires_session && headers.is_empty() {
-            return Err(EngineError::Message("Browser session expired after restart. Refresh the link/session from the browser before resuming.".into()));
-        }
-        let client = self.session_client(headers).map_err(EngineError::Message)?;
         let probe = tokio::select! {
-            result = self.probe(&client, &url, &cancel) => result?,
+            result = self.probe(&url, task.request_context.as_ref()) => result?,
             _ = cancel.cancelled() => return Err(EngineError::Cancelled),
         };
 
@@ -1441,6 +2365,12 @@ impl DownloadManager {
         };
 
         {
+            // Filename changes and torrent storage claims share admission order.
+            // Shutdown can cancel this wait while holding the dispatch lock.
+            let _dispatch = tokio::select! {
+                guard = self.dispatch_lock.lock() => guard,
+                _ = cancel.cancelled() => return Err(EngineError::Cancelled),
+            };
             let mut record = task.record.write().await;
             task.check_stopped(&cancel)?;
             record.total_bytes = probe.total_bytes;
@@ -1462,6 +2392,9 @@ impl DownloadManager {
                             parent
                         };
                         let candidate = unique_destination(parent, &name).await;
+                        self.check_torrent_path(&candidate)
+                            .await
+                            .map_err(EngineError::Message)?;
                         record.file_name = candidate
                             .file_name()
                             .and_then(|value| value.to_str())
@@ -1486,65 +2419,16 @@ impl DownloadManager {
         let part_dir = self.part_dir(task.record.read().await.id);
 
         let mut ranges = match total {
-            Some(total) if probe.accepts_ranges => queued_ranges(
-                total,
-                settings.min_segment_size_mb * 1024 * 1024,
-                connection_count,
-            ),
-            Some(total) => split_ranges(total, 1),
+            Some(total) => split_ranges(total, connection_count),
             None => vec![ByteRange {
                 start: 0,
                 end: u64::MAX,
             }],
         };
 
-        if let Some(saved) = matching_manifest(&part_dir, &probe).await? {
-            ranges = saved.ranges;
-        }
         prepare_parts(&part_dir, &probe, &ranges).await?;
-        let destination = PathBuf::from(&task.record.read().await.destination);
-        let parent = destination
-            .parent()
-            .ok_or_else(|| EngineError::Message("Invalid destination.".into()))?;
-        let mut manifest: PartManifest = storage::read_json(&part_dir.join("transfer.json"))
-            .await?
-            .unwrap();
-        let has_legacy = fs::try_exists(part_dir.join("0.part")).await?;
-        if let Some(total) = probe.total_bytes.filter(|total| {
-            *total > 0 && settings.direct_write && manifest.direct_path.is_none() && !has_legacy
-        }) {
-            storage::check_space(parent, total)?;
-            let stage = parent.join(format!(
-                ".{}.{}.fetchrail-part",
-                Uuid::new_v4(),
-                task.record.read().await.id
-            ));
-            storage::create_stage(&stage, total).await?;
-            manifest.direct_path = Some(stage);
-            manifest.committed = vec![0; ranges.len()];
-            manifest.hashes = vec![None; ranges.len()];
-            write_json_atomic(&part_dir.join("transfer.json"), &manifest).await?;
-        } else if let Some(total) = probe.total_bytes {
-            if manifest.direct_path.is_none() {
-                let existing = task.record.read().await.downloaded_bytes;
-                storage::check_part_space(
-                    &part_dir,
-                    parent,
-                    total.saturating_sub(existing),
-                    total,
-                )?;
-            }
-        }
 
-        let initial = segment_counters(&part_dir, &ranges).await?;
-        if manifest.committed.is_empty() {
-            manifest.committed = initial
-                .iter()
-                .map(|part| part.downloaded.load(Ordering::Relaxed))
-                .collect();
-        }
-        *task.checkpoint_lock.lock().await = Some((manifest, Instant::now()));
-        let segments = Arc::new(Mutex::new(initial));
+        let segments = Arc::new(Mutex::new(segment_counters(&part_dir, &ranges).await?));
         self.update_progress_record(
             &task,
             segment_progress(&current_segments(&segments), &[]),
@@ -1560,17 +2444,17 @@ impl DownloadManager {
         );
 
         let transfer_result = async {
-            let first_result = self
-                .download_ranges(
-                    &task,
-                    &cancel,
-                    &client,
-                    &url,
-                    &part_dir,
-                    &current_segments(&segments),
-                    &probe,
-                )
-                .await;
+            let first_result = Self::download_ranges(
+                &self.client,
+                &self.limiter,
+                &task,
+                &cancel,
+                &url,
+                &part_dir,
+                &current_segments(&segments),
+                &probe,
+            )
+            .await;
 
             if matches!(first_result, Err(EngineError::RangeUnsupported)) {
                 {
@@ -1591,16 +2475,19 @@ impl DownloadManager {
                     ..probe.clone()
                 };
                 prepare_parts(&part_dir, &fallback, &ranges).await?;
-                let manifest = storage::read_json(&part_dir.join("transfer.json"))
-                    .await?
-                    .ok_or_else(|| {
-                        EngineError::Message("Transfer checkpoint is missing.".into())
-                    })?;
-                *task.checkpoint_lock.lock().await = Some((manifest, Instant::now()));
                 let single = segment_counters(&part_dir, &ranges).await?;
                 *segments.lock().expect("segments mutex poisoned") = single.clone();
-                self.download_ranges(&task, &cancel, &client, &url, &part_dir, &single, &fallback)
-                    .await?;
+                Self::download_ranges(
+                    &self.client,
+                    &self.limiter,
+                    &task,
+                    &cancel,
+                    &url,
+                    &part_dir,
+                    &single,
+                    &fallback,
+                )
+                .await?;
             } else {
                 first_result?;
             }
@@ -1641,8 +2528,8 @@ impl DownloadManager {
             record.finished_at = Some(Utc::now());
             record.clone()
         };
-        self.persist_records().await?;
         let _ = fs::remove_dir_all(&part_dir).await;
+        self.persist_records().await?;
         self.emit_record(&snapshot);
         crate::download_window::on_completion(&self.app, &snapshot).await;
         Ok(())
@@ -1650,318 +2537,271 @@ impl DownloadManager {
 
     #[allow(clippy::too_many_arguments)]
     async fn download_ranges(
-        &self,
+        client: &Client,
+        limiter: &RateLimiter,
         task: &Arc<DownloadTask>,
         cancel: &CancellationToken,
-        client: &Client,
         url: &Url,
         part_dir: &Path,
         segments: &[SegmentCounter],
         probe: &ProbeResult,
     ) -> EngineResult<()> {
-        let settings = self.settings.read().await.clone();
-        let maximum = task
-            .record
-            .read()
-            .await
-            .connections
-            .min(settings.max_requests_per_origin)
-            .max(1);
-        // Cloned clients share an HTTP/2 transport; keep a reusable pool for each worker instead.
-        let mut clients = if maximum == 1 {
-            vec![client.clone()]
-        } else {
-            let headers = task.headers.read().await.clone();
-            (0..maximum)
-                .map(|_| Self::new_session_client(headers.clone()))
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(EngineError::Message)?
-        };
-        let mut slots = (0..maximum).collect::<std::collections::VecDeque<_>>();
-        let mut auto = Adaptive::new(
-            maximum,
-            settings.adaptive_connections && probe.accepts_ranges,
-        );
-        task.report_connections(auto.target);
-        let origin = self.origin(url).await;
-        let mut last_throttles = origin.throttles();
-        let mut last_waits = origin.waits();
-        let mut pending = (0..segments.len()).collect::<std::collections::VecDeque<_>>();
-        let batch = cancel.child_token();
-        let tail_rate = AtomicU64::new(0);
+        task.check_stopped(cancel)?;
+        let batch_cancel = cancel.child_token();
         let peer_rate = AtomicU64::new(0);
-        let mut previous_peer_rate = 0.0_f64;
-        let mut best_peer_rate = 0.0_f64;
-        let mut active = FuturesUnordered::new();
-        let mut sample = interval(Duration::from_secs(4));
-        sample.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        sample.tick().await;
-        let mut last_sample = Instant::now();
-        let mut sample_ready = true;
-        let mut last_bytes = segments
-            .iter()
-            .map(|part| part.downloaded.load(Ordering::Relaxed))
-            .sum::<u64>();
-        let mut failure = None;
-        loop {
-            while failure.is_none() && active.len() < auto.target {
-                let Some(index) = pending.pop_front() else {
-                    break;
-                };
-                let slot = slots.pop_front().expect("A worker slot is available");
-                let mut client = clients[slot].clone();
-                let segment = &segments[index];
-                let batch = &batch;
-                let tail_rate = &tail_rate;
-                let peer_rate = &peer_rate;
-                active.push(async move {
-                    let result = self
-                        .download_with_retries(
+        let live_peer_rate = AtomicU64::new(0);
+        let shared = shared_staging(part_dir).await?;
+        let futures = segments.iter().enumerate().map(|(index, segment)| {
+            let batch_cancel = &batch_cancel;
+            let peer_rate = &peer_rate;
+            let live_peer_rate = &live_peer_rate;
+            async move {
+                let mut client = client.clone();
+                // Retry only this range so healthy connections keep their throughput.
+                let result = async {
+                    for attempt in 0..3 {
+                        task.check_stopped(batch_cancel)?;
+                        let result = Self::download_segment(
+                            &client,
+                            limiter,
                             task,
-                            batch,
-                            &mut client,
+                            batch_cancel,
                             url,
                             part_dir,
                             index,
                             segment,
                             probe,
-                            tail_rate,
                             peer_rate,
+                            shared,
+                            live_peer_rate,
+                            attempt == 0 && probe.accepts_ranges && probe.validator.is_some(),
                         )
                         .await;
-                    (slot, client, result)
-                });
-            }
-            if active.is_empty() {
-                break;
-            }
-            // Lower targets drain existing requests before their throughput can be compared.
-            sample_ready &= active.len() == auto.target && !origin.is_waiting();
-            tokio::select! {
-                result = active.next() => {
-                    if let Some((slot, client, result)) = result {
-                        clients[slot] = client;
-                        slots.push_front(slot);
-                        if let Err(error) = result {
-                            if failure.is_none() { failure = Some(error); batch.cancel(); }
+                        let Err(error) = result else {
+                            return Ok(());
+                        };
+                        #[cfg(test)]
+                        eprintln!("Range {index}, attempt {attempt}: {error:?}");
+                        let transient = match &error {
+                            EngineError::Slow | EngineError::Incomplete => true,
+                            EngineError::Request(error) => {
+                                error.is_timeout()
+                                    || error.is_connect()
+                                    || error.is_request()
+                                    || error.is_body()
+                                    || error.is_decode()
+                            }
+                            EngineError::Http(status) => {
+                                status.is_server_error()
+                                    || *status == StatusCode::TOO_MANY_REQUESTS
+                                    || *status == StatusCode::REQUEST_TIMEOUT
+                            }
+                            EngineError::RetryAfter { delay, .. } => {
+                                *delay <= Duration::from_secs(3600)
+                            }
+                            _ => false,
+                        };
+                        if !transient || attempt == 2 {
+                            return Err(error);
+                        }
+                        if matches!(error, EngineError::Slow) {
+                            client = download_client_builder().build()?;
+                            // Re-establish available throughput on the new transport. A link
+                            // capacity change must not repeatedly reject a steady slower source.
+                            peer_rate.store(0, Ordering::Relaxed);
+                        }
+                        let delay = match &error {
+                            EngineError::RetryAfter { delay, .. } => *delay,
+                            _ => Duration::from_millis(
+                                (500u64 << attempt) + u64::from(Uuid::new_v4().as_bytes()[0]),
+                            ),
+                        };
+                        tokio::select! {
+                            _ = tokio::time::sleep(delay) => {},
+                            _ = batch_cancel.cancelled() => return Err(EngineError::Cancelled),
+                        }
+                        // Appending requires both range support and an unchanged representation.
+                        if !probe.accepts_ranges || probe.validator.is_none() {
+                            match fs::remove_file(part_dir.join(format!("{index}.part"))).await {
+                                Ok(()) => {}
+                                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                                Err(error) => return Err(error.into()),
+                            }
+                            segment.downloaded.store(0, Ordering::Relaxed);
                         }
                     }
-                },
-                _ = sample.tick(), if failure.is_none() => {
-                    let bytes = segments.iter().map(|part| part.downloaded.load(Ordering::Relaxed)).sum::<u64>();
-                    let now = Instant::now();
-                    let rate = bytes.saturating_sub(last_bytes) as f64 / now.duration_since(last_sample).as_secs_f64().max(0.001);
-                    let throttles = origin.throttles();
-                    let throttled = throttles != last_throttles;
-                    let waits = origin.waits();
-                    let uncontended = !throttled && waits == last_waits && !origin.is_waiting();
-                    let receiving = segments.iter().filter(|part| part.active.load(Ordering::Relaxed)).count();
-                    // Use current peers for recovery; a host-wide slowdown must lower the reference.
-                    peer_rate.store(if sample_ready && uncontended && receiving >= 2 { previous_peer_rate.min(rate / receiving as f64) as u64 } else { 0 }, Ordering::Relaxed);
-                    // Two full peer windows expose a final request that was slow from its first byte.
-                    if sample_ready && uncontended && receiving >= 2 {
-                        let peer_rate = rate / receiving as f64;
-                        if receiving >= 4 { best_peer_rate = best_peer_rate.max(previous_peer_rate.min(peer_rate)); }
-                        previous_peer_rate = peer_rate;
-                    } else { previous_peer_rate = 0.0; }
-                    tail_rate.store(if pending.is_empty() && active.len() == 1 && receiving == 1 && uncontended { best_peer_rate as u64 } else { 0 }, Ordering::Relaxed);
-                    // Shared-budget waits must not look like a slower connection-count trial.
-                    if !pending.is_empty() && (throttled || (sample_ready && waits == last_waits && !origin.is_waiting())) { auto.sample(rate, throttled); }
-                    task.report_connections(auto.target);
-                    last_bytes = bytes;
-                    last_sample = now;
-                    last_throttles = throttles;
-                    last_waits = waits;
-                    sample_ready = true;
+                    unreachable!()
                 }
-            }
-        }
-        if let Some(error) = failure {
-            return Err(error);
-        }
-        task.check_stopped(cancel)
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    async fn download_with_retries(
-        &self,
-        task: &Arc<DownloadTask>,
-        cancel: &CancellationToken,
-        client: &mut Client,
-        url: &Url,
-        part_dir: &Path,
-        index: usize,
-        segment: &SegmentCounter,
-        probe: &ProbeResult,
-        tail_rate: &AtomicU64,
-        peer_rate: &AtomicU64,
-    ) -> EngineResult<()> {
-        let attempts = self.settings.read().await.retry_attempts;
-        for attempt in 0..attempts {
-            task.check_stopped(cancel)?;
-            let result = self
-                .download_segment(
-                    task,
-                    cancel,
-                    client,
-                    url,
-                    part_dir,
-                    index,
-                    segment,
-                    probe,
-                    tail_rate,
-                    peer_rate,
-                    attempt == 0 && attempts > 1 && probe.accepts_ranges && probe.validator.is_some(),
-                )
                 .await;
-            match result {
-                Ok(()) => return Ok(()),
-                Err(error) if is_transient(&error) && attempt + 1 < attempts => {
-                    if matches!(&error, EngineError::Slow | EngineError::Request(_)) {
-                        // Do not resume on a transport that stalled or failed mid-response.
-                        *client = Self::new_session_client(task.headers.read().await.clone())
-                            .map_err(EngineError::Message)?;
-                    }
-                    let delay = crate::network::backoff(attempt);
-                    task.record.write().await.status_detail =
-                        Some(format!("Retry {}/{}: {}", attempt + 1, attempts, error));
-                    tokio::select! { _ = tokio::time::sleep(delay) => {}, _ = cancel.cancelled() => return Err(EngineError::Cancelled) }
-                    if !probe.accepts_ranges {
-                        let _ = fs::remove_file(part_dir.join(format!("{index}.part"))).await;
-                        segment.downloaded.store(0, Ordering::Relaxed);
-                        let mut guard = task.checkpoint_lock.lock().await;
-                        let mut manifest: PartManifest =
-                            storage::read_json(&part_dir.join("transfer.json"))
-                                .await?
-                                .unwrap();
-                        manifest.committed = vec![0; manifest.ranges.len()];
-                        manifest.hashes = vec![None; manifest.ranges.len()];
-                        write_json_atomic(&part_dir.join("transfer.json"), &manifest).await?;
-                        *guard = Some((manifest, Instant::now()));
-                    }
+                if result.is_err() {
+                    batch_cancel.cancel();
                 }
-                Err(error) => return Err(error),
+                result
             }
+        });
+        let receiving_rates = async {
+            let mut previous = segments
+                .iter()
+                .map(|s| s.downloaded.load(Ordering::Relaxed))
+                .collect::<Vec<_>>();
+            let mut previous_rate = 0;
+            let mut sampled_at = Instant::now();
+            loop {
+                tokio::time::sleep(Duration::from_secs(4)).await;
+                let elapsed = sampled_at.elapsed().as_secs_f64();
+                let (mut bytes, mut receiving) = (0u64, 0usize);
+                for (segment, prior) in segments.iter().zip(&mut previous) {
+                    let current = segment.downloaded.load(Ordering::Relaxed);
+                    let delta = current.saturating_sub(*prior);
+                    if segment.active.load(Ordering::Relaxed) && delta > 0 {
+                        bytes += delta;
+                        receiving += 1;
+                    }
+                    *prior = current;
+                }
+                let rate = if receiving >= 2
+                    && limiter.quantum() == usize::MAX
+                    && task.limiter.quantum() == usize::MAX
+                {
+                    (bytes as f64 / elapsed / receiving as f64) as u64
+                } else {
+                    0
+                };
+                live_peer_rate.store(rate.min(previous_rate), Ordering::Relaxed);
+                previous_rate = rate;
+                sampled_at = Instant::now();
+            }
+        };
+        let results = tokio::select! { results = join_all(futures) => results, _ = receiving_rates => unreachable!() };
+        let mut errors = results
+            .into_iter()
+            .filter_map(Result::err)
+            .collect::<Vec<_>>();
+        if errors.is_empty() {
+            return Ok(());
         }
-        unreachable!()
+        let index = errors
+            .iter()
+            .position(|error| !matches!(error, EngineError::Cancelled))
+            .unwrap_or(0);
+        Err(errors.swap_remove(index))
     }
 
     #[allow(clippy::too_many_arguments)]
     async fn download_segment(
-        &self,
+        client: &Client,
+        limiter: &RateLimiter,
         task: &Arc<DownloadTask>,
         cancel: &CancellationToken,
-        client: &Client,
         url: &Url,
         part_dir: &Path,
         index: usize,
         segment: &SegmentCounter,
         probe: &ProbeResult,
-        tail_rate: &AtomicU64,
         peer_rate: &AtomicU64,
+        shared: bool,
+        live_peer_rate: &AtomicU64,
         recover_peer: bool,
     ) -> EngineResult<()> {
-        use sha2::{Digest, Sha256};
         let range = segment.range;
-        let manifest = task
-            .checkpoint_lock
-            .lock()
-            .await
-            .as_ref()
-            .ok_or_else(|| EngineError::Message("Transfer checkpoint is missing.".into()))?
-            .0
-            .clone();
-        let direct = manifest.direct_path.is_some();
-        let part_path = manifest
-            .direct_path
-            .clone()
-            .unwrap_or_else(|| part_dir.join(format!("{index}.part")));
-        let expected_len = (range.end != u64::MAX).then(|| range.len());
-        let file_len = fs::metadata(&part_path)
-            .await
-            .map(|metadata| metadata.len())
-            .unwrap_or(0);
-        let mut existing =
-            manifest
-                .committed
-                .get(index)
-                .copied()
-                .unwrap_or(if direct { 0 } else { file_len });
-        if expected_len.is_some_and(|expected| existing > expected)
-            || (!direct && existing > file_len)
-        {
-            existing = 0;
-        }
-        let mut hasher = Sha256::new();
-        if existing > 0 {
-            let mut input = fs::File::open(&part_path).await?;
-            if direct {
-                input.seek(std::io::SeekFrom::Start(range.start)).await?;
+        let part_path = part_dir.join(format!("{}.part", if shared { 0 } else { index }));
+        let expected_len = if range.end == u64::MAX {
+            None
+        } else {
+            Some(range.len())
+        };
+        let saved = if shared {
+            part_checkpoint(part_dir, index, range.len()).await?
+        } else {
+            None
+        };
+        let existing = if shared {
+            saved.as_ref().map_or(0, |saved| saved.bytes)
+        } else {
+            match fs::metadata(&part_path).await {
+                Ok(metadata) => metadata.len(),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
+                Err(error) => return Err(error.into()),
             }
-            let mut left = existing;
-            let mut buffer = vec![0; 128 * 1024];
-            while left > 0 {
-                let capacity = left.min(buffer.len() as u64) as usize;
-                let read = input.read(&mut buffer[..capacity]).await?;
-                if read == 0 {
-                    return Err(EngineError::Message("Saved part is incomplete.".into()));
-                }
-                hasher.update(&buffer[..read]);
-                left -= read as u64;
-            }
-            if let Some(Some(saved)) = manifest.hashes.get(index) {
-                if format!("{:x}", hasher.clone().finalize()) != *saved {
-                    return Err(EngineError::Message(
-                        "Saved part checksum mismatch. Restart this download with a fresh link."
-                            .into(),
-                    ));
-                }
+        };
+
+        if let Some(expected_len) = expected_len {
+            if existing > expected_len {
+                fs::remove_file(&part_path).await?;
             }
         }
+        let mut existing = if expected_len.is_some_and(|expected| existing > expected) {
+            0
+        } else {
+            existing
+        };
+        let mut part_hash = if shared {
+            let hash = crate::staging::prefix_hasher(&part_path, range.start, existing, cancel)
+                .await
+                .map_err(|error| {
+                    if cancel.is_cancelled() {
+                        EngineError::Cancelled
+                    } else {
+                        EngineError::Io(error)
+                    }
+                })?;
+            if saved
+                .as_ref()
+                .is_some_and(|saved| format!("{:x}", hash.clone().finalize()) != saved.sha256)
+            {
+                existing = 0;
+                Some(Sha256::new())
+            } else {
+                Some(hash)
+            }
+        } else {
+            None
+        };
         segment.downloaded.store(existing, Ordering::Relaxed);
         if expected_len == Some(existing) {
             return Ok(());
         }
+
         task.check_stopped(cancel)?;
-        let gate = self.origin(url).await;
-        let settings = self.settings.read().await.clone();
-        let permit = gate
-            .acquire(settings.max_requests_per_origin, cancel)
-            .await
-            .ok_or(EngineError::Cancelled)?;
+        let origin = origin_budget(url);
+        let _origin_permit = tokio::select! { permit = origin.acquire(32, cancel) => permit.ok_or(EngineError::Cancelled)?, _ = cancel.cancelled() => return Err(EngineError::Cancelled) };
+        let _global_permit = tokio::select! { permit = global_budget().acquire() => permit.map_err(|e| EngineError::Message(e.to_string()))?, _ = cancel.cancelled() => return Err(EngineError::Cancelled) };
         let absolute_start = range.start.saturating_add(existing);
-        let mut request = client.get(url.clone()).header(ACCEPT_ENCODING, "identity");
+        let mut request = client
+            .get(url.clone())
+            .headers(context_headers(task.request_context.as_ref())?)
+            .header(ACCEPT_ENCODING, "identity");
+        if probe.accepts_ranges && range.end != u64::MAX {
+            request = request.header(RANGE, format!("bytes={absolute_start}-{}", range.end));
+        } else if probe.accepts_ranges && existing > 0 {
+            request = request.header(RANGE, format!("bytes={absolute_start}-"));
+        }
         if probe.accepts_ranges {
-            request = request.header(
-                RANGE,
-                if range.end == u64::MAX {
-                    format!("bytes={absolute_start}-")
-                } else {
-                    format!("bytes={absolute_start}-{}", range.end)
-                },
-            );
             if let Some(validator) = &probe.validator {
                 request = request.header(IF_RANGE, validator);
             }
         }
-        let response = tokio::select! { result = request.send() => result.map_err(|error| EngineError::Request(error.without_url()))?, _ = cancel.cancelled() => return Err(EngineError::Cancelled) };
+
+        let response = tokio::select! {
+            result = request.send() => result?,
+            _ = cancel.cancelled() => return Err(EngineError::Cancelled),
+        };
+
         if !response.status().is_success() {
             if response.status() == StatusCode::TOO_MANY_REQUESTS
                 || response.status() == StatusCode::SERVICE_UNAVAILABLE
             {
-                let duration = crate::network::retry_after(
-                    response
-                        .headers()
-                        .get(header::RETRY_AFTER)
-                        .and_then(|value| value.to_str().ok()),
-                    Utc::now(),
-                )
-                .unwrap_or(Duration::from_secs(2));
-                gate.cool_down(duration).await;
+                let delay =
+                    retry_after(response.headers(), Utc::now()).unwrap_or(Duration::from_secs(2));
+                origin.cool_down(delay).await;
+                return Err(EngineError::RetryAfter {
+                    status: response.status(),
+                    delay,
+                });
             }
             return Err(EngineError::Http(response.status()));
         }
-        validate_encoding(response.headers())?;
+        reject_html_page(response.headers())?;
         if let Some(expected) = &probe.validator {
             if representation_validator(response.headers()).as_ref() != Some(expected) {
                 return Err(EngineError::Message(
@@ -1973,178 +2813,186 @@ impl DownloadManager {
             return Err(EngineError::RangeUnsupported);
         }
         if response.status() == StatusCode::PARTIAL_CONTENT {
-            let (start, end, total) = parse_content_range(response.headers()).ok_or_else(|| {
-                EngineError::Message("Server returned an invalid Content-Range.".into())
-            })?;
-            if start != absolute_start
-                || (range.end != u64::MAX && end != range.end)
-                || total != probe.total_bytes
+            let (actual_start, actual_end, actual_total) = parse_content_range(response.headers())
+                .ok_or_else(|| {
+                    EngineError::Message("Server returned an invalid Content-Range.".into())
+                })?;
+            let expected_end = if range.end == u64::MAX {
+                actual_end
+            } else {
+                range.end
+            };
+            if actual_start != absolute_start
+                || actual_end != expected_end
+                || actual_total != probe.total_bytes
             {
                 return Err(EngineError::Message(
                     "Server returned bytes outside the requested range.".into(),
                 ));
             }
         }
-        let mut file = fs::OpenOptions::new()
-            .create(!direct)
+
+        let mut output = fs::OpenOptions::new()
+            .create(!shared)
+            .append(!shared && existing > 0)
             .write(true)
+            .truncate(!shared && existing == 0)
             .open(&part_path)
             .await?;
-        if !direct {
-            file.set_len(existing).await?;
+        if shared {
+            output
+                .seek(std::io::SeekFrom::Start(range.start + existing))
+                .await?;
         }
-        file.seek(std::io::SeekFrom::Start(if direct {
-            range.start + existing
-        } else {
-            existing
-        }))
-        .await?;
-        let mut output = BufWriter::with_capacity(TRANSFER_BUFFER_SIZE, file);
+        // Batch small network chunks into disk writes; flush even on cancellation or failure.
+        let mut output = BufWriter::with_capacity(TRANSFER_BUFFER_SIZE, output);
         let mut stream = response.bytes_stream();
         segment.active.store(true, Ordering::Relaxed);
-        task.record.write().await.status_detail = None;
-        let mut written = existing;
-        let mut checkpoint_at = Instant::now();
         let started = Instant::now();
         let mut progress_at = started;
-        let mut progress_bytes = written;
-        let mut best_rate = 0.0;
-        let mut peer_wait = Duration::ZERO;
-        let mut peer_bytes = written;
-        let mut weak_windows = 0;
+        let mut progress_bytes = existing;
+        let (mut best_rate, mut previous_rate) = (0.0, 0.0);
+        let mut slow_windows = 0;
+        let mut checkpoint_at = Instant::now();
+        let (mut response_wait, mut watched_bytes, mut weak_windows) =
+            (Duration::ZERO, existing, 0usize);
         let transfer = async {
+            let mut written = existing;
             loop {
                 task.check_stopped(cancel)?;
                 let waiting_at = Instant::now();
-                let mut window_expired = false;
                 let item = tokio::select! {
-                    item = stream.next() => item,
-                    _ = tokio::time::sleep(Duration::from_secs(5).saturating_sub(peer_wait)), if recover_peer => { window_expired = true; None },
+                    item = stream.next() => Some(item),
                     _ = cancel.cancelled() => return Err(EngineError::Cancelled),
+                    _ = tokio::time::sleep(Duration::from_secs(5).saturating_sub(response_wait)), if recover_peer => None,
                 };
-                // Disk writes, checkpoint flushes and limiter waits are not network stalls.
-                peer_wait += waiting_at.elapsed();
-                if recover_peer && peer_wait >= Duration::from_secs(5) {
-                    let globally_limited = { let settings = self.settings.read().await; settings.bandwidth_limit_kbps != 0 || settings.speed_limit_bps != 0 };
-                    let limited = globally_limited || task.record.read().await.speed_limit_bps != 0;
-                    if !limited {
-                        let weak = crate::network::weak_peer(written - peer_bytes, peer_wait, peer_rate.load(Ordering::Relaxed), &mut weak_windows);
-                        // Only one speculative recovery per range; ordinary retries keep their budget.
-                        if weak { return Err(EngineError::Slow); }
-                    } else { weak_windows = 0; }
-                    peer_wait = Duration::ZERO;
-                    peer_bytes = written;
+                response_wait += waiting_at.elapsed();
+                if recover_peer && response_wait >= Duration::from_secs(5) {
+                    let peer = if limiter.quantum() == usize::MAX && task.limiter.quantum() == usize::MAX { live_peer_rate.load(Ordering::Relaxed) } else { 0 };
+                    if crate::network::weak_peer(written.saturating_sub(watched_bytes), response_wait, peer, &mut weak_windows) { return Err(EngineError::Slow); }
+                    watched_bytes = written;
+                    response_wait = Duration::ZERO;
                 }
-                if window_expired { continue; }
+                let Some(item) = item else { continue; };
                 let Some(chunk) = item else { break; };
-                let chunk = chunk.map_err(|error| EngineError::Request(error.without_url()))?;
-                if expected_len.is_some_and(|expected| written.saturating_add(chunk.len() as u64) > expected) {
-                    return Err(EngineError::Message("Server sent more bytes than requested.".into()));
+                let chunk = chunk?;
+                written = written.saturating_add(chunk.len() as u64);
+                if expected_len.is_some_and(|expected| written > expected) {
+                    return Err(EngineError::Message(
+                        "Server sent more bytes than requested.".into(),
+                    ));
                 }
-                let limit = self.settings.read().await.bandwidth_limit_kbps;
-                if !self.bandwidth.consume(chunk.len(), limit, cancel).await { return Err(EngineError::Cancelled); }
-                if expected_len.is_none() { storage::check_space(part_path.parent().unwrap(), chunk.len() as u64)?; }
-                for bytes in chunk.chunks(self.limiter.quantum().min(task.limiter.quantum())) {
-                    self.limiter.acquire(bytes.len(), cancel).await.map_err(|_| EngineError::Cancelled)?;
-                    task.limiter.acquire(bytes.len(), cancel).await.map_err(|_| EngineError::Cancelled)?;
-                    output.write_all(bytes).await?;
-                    hasher.update(bytes); written += bytes.len() as u64;
-                    segment.downloaded.store(written, Ordering::Relaxed);
+                let mut offset = 0;
+                while offset < chunk.len() {
+                    let size = limiter
+                        .quantum()
+                        .min(task.limiter.quantum())
+                        .min(chunk.len() - offset);
+                    limiter
+                        .acquire(size, cancel)
+                        .await
+                        .map_err(|_| EngineError::Cancelled)?;
+                    task.limiter
+                        .acquire(size, cancel)
+                        .await
+                        .map_err(|_| EngineError::Cancelled)?;
+                    task.check_stopped(cancel)?;
+                    output.write_all(&chunk[offset..offset + size]).await?;
+                    if let Some(hash) = &mut part_hash {
+                        hash.update(&chunk[offset..offset + size]);
+                    }
+                    segment.downloaded.fetch_add(size as u64, Ordering::Relaxed);
+                    offset += size;
                 }
-                segment.downloaded.store(written, Ordering::Relaxed);
-                if checkpoint_at.elapsed().as_secs() >= 5 {
-                    output.flush().await?; if !direct { output.get_ref().sync_all().await?; }
-                    self.checkpoint(task, part_dir, index, written, format!("{:x}", hasher.clone().finalize()),false).await?;
+                if shared && checkpoint_at.elapsed() >= Duration::from_secs(5) {
+                    output.flush().await?;
+                    output.get_ref().sync_data().await?;
+                    write_json_atomic(
+                        &part_dir.join(format!("{index}.progress.json")),
+                        &PartCheckpoint {
+                            bytes: segment.downloaded.load(Ordering::Relaxed),
+                            sha256: format!("{:x}", part_hash.as_ref().unwrap().clone().finalize()),
+                        },
+                    )
+                    .await?;
                     checkpoint_at = Instant::now();
                 }
-                if progress_at.elapsed().as_secs() >= 10 {
-                    if limit == 0 && self.settings.read().await.speed_limit_bps == 0 && task.record.read().await.speed_limit_bps == 0 {
-                        let slow = crate::network::slow_progress(written - progress_bytes, progress_at.elapsed(), &mut best_rate, tail_rate.load(Ordering::Relaxed));
-                        // Initial fast bytes must not hide a trickling tail indefinitely.
-                        if slow && started.elapsed().as_secs() >= 30 { return Err(EngineError::Slow); }
-                    } else { best_rate = 0.0; }
-                    progress_at = Instant::now();
+                if progress_at.elapsed() >= Duration::from_secs(10) {
+                    if probe.accepts_ranges
+                        && probe.validator.is_some()
+                        && limiter.quantum() == usize::MAX
+                        && task.limiter.quantum() == usize::MAX
+                    {
+                        let slow = crate::network::slow_progress(
+                            written - progress_bytes,
+                            progress_at.elapsed(),
+                            &mut best_rate,
+                            &mut previous_rate,
+                            peer_rate.load(Ordering::Relaxed),
+                        );
+                        peer_rate.fetch_max(best_rate as u64, Ordering::Relaxed);
+                        slow_windows = if slow { slow_windows + 1 } else { 0 };
+                        if slow_windows >= 2 && started.elapsed() >= Duration::from_secs(30) {
+                            return Err(EngineError::Slow);
+                        }
+                    } else {
+                        best_rate = 0.0;
+                        previous_rate = 0.0;
+                        slow_windows = 0;
+                        peer_rate.store(0, Ordering::Relaxed);
+                    }
                     progress_bytes = written;
+                    progress_at = Instant::now();
                 }
             }
-            Ok::<(),EngineError>(())
-        }.await;
+            Ok::<(), EngineError>(())
+        }
+        .await;
         segment.active.store(false, Ordering::Relaxed);
-        drop(stream);
-        drop(permit);
         output.flush().await?;
-        if !direct {
-            output.get_ref().sync_all().await?;
+        if transfer.is_err() || shared {
+            output.get_ref().sync_data().await?;
         }
-        self.checkpoint(
-            task,
-            part_dir,
-            index,
-            written,
-            format!("{:x}", hasher.finalize()),
-            transfer.is_err() || expected_len != Some(written) || cancel.is_cancelled(),
-        )
-        .await?;
+        if let Some(hash) = part_hash {
+            write_json_atomic(
+                &part_dir.join(format!("{index}.progress.json")),
+                &PartCheckpoint {
+                    bytes: segment.downloaded.load(Ordering::Relaxed),
+                    sha256: format!("{:x}", hash.finalize()),
+                },
+            )
+            .await?;
+        }
         transfer?;
-        if expected_len.is_some_and(|expected| written != expected) {
-            return Err(EngineError::Incomplete);
-        }
-        Ok(())
-    }
 
-    async fn checkpoint(
-        &self,
-        task: &Arc<DownloadTask>,
-        part_dir: &Path,
-        index: usize,
-        written: u64,
-        hash: String,
-        force: bool,
-    ) -> EngineResult<()> {
-        let mut guard = task.checkpoint_lock.lock().await;
-        let path = part_dir.join("transfer.json");
-        let (manifest, last_saved) = guard
-            .as_mut()
-            .ok_or_else(|| EngineError::Message("Transfer checkpoint is missing.".into()))?;
-        manifest.committed.resize(manifest.ranges.len(), 0);
-        manifest.hashes.resize(manifest.ranges.len(), None);
-        manifest.committed[index] = written;
-        manifest.hashes[index] = Some(hash);
-        let complete = manifest.ranges.iter().enumerate().all(|(index, range)| {
-            range.end != u64::MAX && manifest.committed[index] == range.len()
-        });
-        if !force && !complete && last_saved.elapsed().as_secs() < 5 {
-            return Ok(());
+        // Completed peers also establish sustained speed for a range slow from its first byte.
+        let received = segment
+            .downloaded
+            .load(Ordering::Relaxed)
+            .saturating_sub(existing);
+        if received >= 256 * 1024
+            && started.elapsed() >= Duration::from_millis(500)
+            && limiter.quantum() == usize::MAX
+            && task.limiter.quantum() == usize::MAX
+        {
+            peer_rate.fetch_max(
+                (received as f64 / started.elapsed().as_secs_f64()) as u64,
+                Ordering::Relaxed,
+            );
         }
-        drop(guard);
-        // Coalesce routine saves; pause/errors and the last completed piece wait for durability.
-        let _saving = if force || complete {
-            task.checkpoint_write_lock.lock().await
-        } else {
-            match task.checkpoint_write_lock.try_lock() {
-                Ok(saving) => saving,
-                Err(_) => return Ok(()),
+
+        if let Some(expected_len) = expected_len {
+            let actual = if shared {
+                segment.downloaded.load(Ordering::Relaxed)
+            } else {
+                // Query the writer's handle: Windows path metadata can lag an open writer.
+                output.get_ref().metadata().await?.len()
+            };
+            if actual != expected_len {
+                output.get_ref().sync_data().await?;
+                return Err(EngineError::Incomplete);
             }
-        };
-        let manifest = {
-            let guard = task.checkpoint_lock.lock().await;
-            let (manifest, last_saved) = guard.as_ref().unwrap();
-            if !force && !complete && last_saved.elapsed().as_secs() < 5 {
-                return Ok(());
-            }
-            manifest.clone()
-        };
-        // Range data is synced first; batch ledger writes to avoid an NTFS flush for every tiny range.
-        if let Some(stage) = &manifest.direct_path {
-            fs::OpenOptions::new()
-                .write(true)
-                .open(stage)
-                .await?
-                .sync_all()
-                .await?;
         }
-        write_json_atomic(&path, &manifest).await?;
-        task.checkpoint_lock.lock().await.as_mut().unwrap().1 = Instant::now();
         Ok(())
     }
 
@@ -2229,116 +3077,139 @@ impl DownloadManager {
         self.emit_record(&snapshot);
     }
 
-    async fn origin(&self, url: &Url) -> Arc<OriginGate> {
-        self.origins
-            .lock()
-            .await
-            .entry(url.origin().ascii_serialization())
-            .or_insert_with(|| Arc::new(OriginGate::new()))
-            .clone()
-    }
-
-    fn session_client(&self, headers: HeaderMap) -> Result<Client, String> {
-        if headers.is_empty() {
-            return Ok(self.client.clone());
-        }
-        Self::new_session_client(headers)
-    }
-
-    fn new_session_client(headers: HeaderMap) -> Result<Client, String> {
-        let session = !headers.is_empty();
-        let builder = download_client_builder();
-        builder.default_headers(headers)
-            .redirect(reqwest::redirect::Policy::custom(move |attempt| {
-                if attempt.previous().len() >= 10 { return attempt.error("Too many redirects"); }
-                if session && attempt.previous().first().is_some_and(|first| first.origin() != attempt.url().origin()) {
-                    attempt.error("Browser credentials cannot follow a cross-origin redirect; continue in the browser.")
-                } else { attempt.follow() }
-            }))
-            .build().map_err(|_| "Could not initialize browser session.".into())
-    }
-
     async fn probe(
         &self,
-        client: &Client,
         url: &Url,
-        cancel: &CancellationToken,
+        context: Option<&BrowserRequestContext>,
     ) -> EngineResult<ProbeResult> {
-        let settings = self.settings.read().await.clone();
-        for attempt in 0..settings.retry_attempts {
-            let gate = self.origin(url).await;
-            let permit = gate
-                .acquire(settings.max_requests_per_origin, cancel)
-                .await
-                .ok_or(EngineError::Cancelled)?;
-            let result = tokio::select! { result = client.get(url.clone()).header(RANGE,"bytes=0-0").header(ACCEPT_ENCODING,"identity").send() => result.map_err(|error| EngineError::Request(error.without_url())), _ = cancel.cancelled() => return Err(EngineError::Cancelled) };
-            let result: EngineResult<()> = match result {
-                Ok(response)
-                    if response.status() == StatusCode::RANGE_NOT_SATISFIABLE
-                        && response
-                            .headers()
-                            .get(CONTENT_RANGE)
-                            .and_then(|value| value.to_str().ok())
-                            == Some("bytes */0") =>
-                {
-                    return Ok(ProbeResult {
-                        total_bytes: Some(0),
-                        accepts_ranges: false,
-                        suggested_file_name: file_name_from_headers(response.headers()),
-                        validator: representation_validator(response.headers()),
-                    });
-                }
-                Ok(response) if response.status().is_success() => {
-                    reject_html_page(response.headers())?;
-                    validate_encoding(response.headers())?;
-                    let validator = representation_validator(response.headers());
-                    let total_bytes = if response.status() == StatusCode::PARTIAL_CONTENT {
-                        let (start, end, total) = parse_content_range(response.headers())
-                            .ok_or_else(|| EngineError::Message("Invalid probe range.".into()))?;
-                        if start != 0 || end != 0 {
-                            return Err(EngineError::Message("Invalid probe range.".into()));
-                        }
-                        total
-                    } else {
-                        content_length_from_headers(response.headers())
-                    };
-                    return Ok(ProbeResult {
-                        total_bytes,
-                        accepts_ranges: response.status() == StatusCode::PARTIAL_CONTENT
-                            && validator.is_some(),
-                        suggested_file_name: file_name_from_headers(response.headers()),
-                        validator,
-                    });
-                }
-                Ok(response) => {
-                    if matches!(
-                        response.status(),
-                        StatusCode::TOO_MANY_REQUESTS | StatusCode::SERVICE_UNAVAILABLE
-                    ) {
-                        gate.cool_down(
-                            crate::network::retry_after(
-                                response
-                                    .headers()
-                                    .get(header::RETRY_AFTER)
-                                    .and_then(|value| value.to_str().ok()),
-                                Utc::now(),
-                            )
-                            .unwrap_or(Duration::from_secs(2)),
-                        )
-                        .await;
-                    }
-                    Err(EngineError::Http(response.status()))
-                }
-                Err(error) => Err(error),
-            };
-            drop(permit);
-            match result {
-                Err(error) if is_transient(&error) && attempt + 1 < settings.retry_attempts => {
-                    tokio::select! { _ = tokio::time::sleep(crate::network::backoff(attempt)) => {}, _ = cancel.cancelled() => return Err(EngineError::Cancelled) }
-                }
-                Err(error) => return Err(error),
-                _ => unreachable!(),
+        let mut total_bytes = None;
+        let mut accepts_ranges = false;
+        let mut suggested_file_name = None;
+        let mut validator = None;
+
+        let head = self
+            .metadata_request(
+                self.client
+                    .head(url.clone())
+                    .headers(context_headers(context)?)
+                    .header(ACCEPT_ENCODING, "identity"),
+                url,
+            )
+            .await;
+        if matches!(&head, Err(EngineError::RetryAfter { .. })) {
+            return Err(head.unwrap_err());
+        }
+        if let Ok(response) = head {
+            if response.status().is_success() {
+                reject_html_page(response.headers())?;
+                total_bytes = content_length_from_headers(response.headers());
+                accepts_ranges = header_has_bytes(response.headers());
+                suggested_file_name = file_name_from_headers(response.headers());
+                validator = representation_validator(response.headers());
             }
+        }
+
+        if total_bytes.is_none() || !accepts_ranges {
+            let response = self
+                .metadata_request(
+                    self.client
+                        .get(url.clone())
+                        .headers(context_headers(context)?)
+                        .header(RANGE, "bytes=0-0")
+                        .header(ACCEPT_ENCODING, "identity"),
+                    url,
+                )
+                .await?;
+            if response.status() == StatusCode::PARTIAL_CONTENT {
+                let (start, end, total) =
+                    parse_content_range(response.headers()).ok_or_else(|| {
+                        EngineError::Message("Server returned an invalid Content-Range.".into())
+                    })?;
+                if start != 0 || end != 0 {
+                    return Err(EngineError::Message(
+                        "Server returned an invalid probe range.".into(),
+                    ));
+                }
+                accepts_ranges = true;
+                total_bytes = total.or(total_bytes);
+            } else if response.status().is_success() && total_bytes.is_none() {
+                total_bytes = content_length_from_headers(response.headers());
+            }
+            if !response.status().is_success() {
+                return Err(EngineError::Http(response.status()));
+            }
+            reject_html_page(response.headers())?;
+            validator = representation_validator(response.headers()).or(validator);
+            suggested_file_name =
+                file_name_from_headers(response.headers()).or(suggested_file_name);
+        } else if suggested_file_name.is_none() {
+            // Some hosts include the filename only on GET; metadata already found by HEAD stays usable.
+            if let Ok(response) = self
+                .metadata_request(
+                    self.client
+                        .get(url.clone())
+                        .headers(context_headers(context)?)
+                        .header(RANGE, "bytes=0-0")
+                        .header(ACCEPT_ENCODING, "identity"),
+                    url,
+                )
+                .await
+            {
+                if response.status().is_success() {
+                    suggested_file_name = file_name_from_headers(response.headers());
+                }
+            }
+        }
+
+        Ok(ProbeResult {
+            total_bytes,
+            accepts_ranges,
+            suggested_file_name,
+            validator,
+        })
+    }
+
+    async fn metadata_request(
+        &self,
+        request: reqwest::RequestBuilder,
+        url: &Url,
+    ) -> EngineResult<reqwest::Response> {
+        let origin = origin_budget(url);
+        for attempt in 0..3 {
+            let response = {
+                let _origin = origin
+                    .acquire(32, &CancellationToken::new())
+                    .await
+                    .ok_or(EngineError::Cancelled)?;
+                let _global = global_budget()
+                    .acquire()
+                    .await
+                    .map_err(|e| EngineError::Message(e.to_string()))?;
+                request
+                    .try_clone()
+                    .ok_or_else(|| {
+                        EngineError::Message("Metadata request cannot be replayed.".into())
+                    })?
+                    .send()
+                    .await?
+            };
+            let status = response.status();
+            if !matches!(
+                status,
+                StatusCode::TOO_MANY_REQUESTS | StatusCode::SERVICE_UNAVAILABLE
+            ) {
+                return Ok(response);
+            }
+            let delay = retry_after(response.headers(), Utc::now()).unwrap_or_else(|| {
+                Duration::from_millis((500u64 << attempt) + u64::from(Uuid::new_v4().as_bytes()[0]))
+            });
+            origin.cool_down(delay).await;
+            drop(response);
+            if attempt == 2 || delay > Duration::from_secs(3600) {
+                return Err(EngineError::RetryAfter { status, delay });
+            }
+            // The caller selects against cancellation, including this server cooldown.
+            tokio::time::sleep(delay).await;
         }
         unreachable!()
     }
@@ -2355,180 +3226,163 @@ impl DownloadManager {
         let parent = requested
             .parent()
             .ok_or_else(|| EngineError::Message("Invalid destination path.".into()))?;
-        let manifest: PartManifest = storage::read_json(&part_dir.join("transfer.json"))
-            .await?
-            .unwrap();
-        let stage = if let Some(stage) = manifest.direct_path {
-            let snapshot = {
-                let mut record = task.record.write().await;
-                record.merged_bytes = record.downloaded_bytes;
-                record.clone()
-            };
-            self.emit_record(&snapshot);
-            stage
+        fs::create_dir_all(parent).await?;
+        let desired_name = requested
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or("download");
+        let total = record.total_bytes.unwrap_or(record.downloaded_bytes);
+        let ranges = if shared_staging(part_dir).await? {
+            vec![ByteRange {
+                start: 0,
+                end: total - 1,
+            }]
         } else {
-            storage::check_space(parent, record.downloaded_bytes)?;
-            let stage = parent.join(format!(".{}.{}.fetchrail-part", Uuid::new_v4(), record.id));
-            let file = fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&stage)
-                .await?;
-            let mut output = BufWriter::with_capacity(MERGE_BUFFER_SIZE, file);
-            let copied = async {
-                let mut buffer = vec![0; MERGE_BUFFER_SIZE];
-                for index in 0..ranges.len() {
-                    let mut input = fs::File::open(part_dir.join(format!("{index}.part"))).await?;
-                    loop {
-                        task.check_stopped(cancel)?;
-                        let count = input.read(&mut buffer).await?;
-                        if count == 0 {
-                            break;
-                        }
-                        output.write_all(&buffer[..count]).await?;
+            ranges.to_vec()
+        };
+        let fingerprint = format!(
+            "{:x}",
+            Sha256::digest(fs::read(part_dir.join("transfer.json")).await?)
+        );
+        let checkpoint_path = part_dir.join("merge.json");
+        let prefix = format!(".{}.{}.", safe_file_name(desired_name), record.id);
+        let checkpoint = fs::read(&checkpoint_path)
+            .await
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<MergeCheckpoint>(&bytes).ok())
+            .filter(|saved| {
+                saved.total == total
+                    && saved.fingerprint == fingerprint
+                    && saved.expected_sha256 == record.expected_sha256
+                    && saved.file_name.starts_with(&prefix)
+                    && saved.file_name.ends_with(".fetchrail-part")
+                    && Path::new(&saved.file_name).components().count() == 1
+            });
+        let temp_name = checkpoint
+            .as_ref()
+            .map(|c| c.file_name.clone())
+            .unwrap_or_else(|| format!("{prefix}{}.fetchrail-part", Uuid::new_v4()));
+        let mut temp_path = parent.join(temp_name);
+        let recovered = checkpoint.is_some()
+            && fs::symlink_metadata(&temp_path)
+                .await
+                .is_ok_and(|m| m.is_file() && m.len() == total);
+        if !recovered {
+            // Never truncate a stale checkpoint or a file planted at its saved path.
+            temp_path = parent.join(format!("{prefix}{}.fetchrail-part", Uuid::new_v4()));
+            let merged = Arc::new(AtomicU64::new(0));
+            // Batch disk I/O on one worker instead of scheduling every small read and write.
+            let mut worker = tokio::task::spawn_blocking({
+                let part_dir = part_dir.to_owned();
+                let temp_path = temp_path.clone();
+                let ranges = ranges.to_vec();
+                let merged = merged.clone();
+                let expected = if cfg!(windows) {
+                    None
+                } else {
+                    record.expected_sha256.clone()
+                };
+                let cancel = cancel.clone();
+                move || {
+                    join_parts_cancellable(
+                        &part_dir,
+                        &temp_path,
+                        &ranges,
+                        total,
+                        &merged,
+                        expected.as_deref(),
+                        &cancel,
+                    )
+                }
+            });
+            let started = Instant::now();
+            let mut ticker = interval(Duration::from_millis(180));
+            let result = loop {
+                tokio::select! {
+                    result = &mut worker => break result
+                        .map_err(|error| EngineError::Message(format!("Joining parts failed: {error}")))
+                        .and_then(|result| result),
+                    _ = ticker.tick() => {
+                        let joined = merged.load(Ordering::Relaxed);
+                        let speed = (joined as f64 / started.elapsed().as_secs_f64().max(0.001)) as u64;
                         let snapshot = {
                             let mut record = task.record.write().await;
-                            record.finalizing_bytes += count as u64;
-                            record.merged_bytes += count as u64;
+                            record.merged_bytes = joined;
+                            record.speed_bps = speed;
+                            record.eta_seconds = (speed > 0 && joined < total)
+                                .then(|| (total - joined).div_ceil(speed));
                             record.clone()
                         };
                         self.emit_record(&snapshot);
                     }
                 }
-                output.flush().await?;
-                output.get_ref().sync_all().await?;
-                Ok::<(), EngineError>(())
-            }
-            .await;
-            drop(output);
-            if let Err(error) = copied {
-                let _ = fs::remove_file(&stage).await;
+            };
+            if let Err(error) = result {
+                let _ = fs::remove_file(&temp_path).await;
                 return Err(error);
             }
-            stage
-        };
-        task.check_stopped(cancel)?;
-        task.record.write().await.status_detail =
-            Some("Applying Windows attachment policy…".into());
-        if let Err(error) = storage::mark_download(&stage, &record.url, &record.file_name).await {
-            return Err(EngineError::Message(format!("Windows attachment processing blocked completion: {error}. File was not published.")));
+            write_json_atomic(
+                &checkpoint_path,
+                &MergeCheckpoint {
+                    file_name: temp_path.file_name().unwrap().to_str().unwrap().into(),
+                    total,
+                    fingerprint,
+                    expected_sha256: record.expected_sha256.clone(),
+                },
+            )
+            .await?;
         }
-        task.check_stopped(cancel)?;
-        task.record.write().await.status_detail = Some("Verifying file integrity…".into());
-        let hash = storage::sha256_cancellable(&stage, cancel)
-            .await
-            .map_err(|error| {
-                if cancel.is_cancelled() {
-                    EngineError::Cancelled
-                } else {
-                    EngineError::Io(error)
-                }
-            })?;
-        if record
+        #[cfg(windows)]
+        crate::platform::mark_download(&temp_path, &record.url, desired_name).await?;
+        if let Some(expected) = record
             .expected_sha256
             .as_ref()
-            .is_some_and(|expected| expected != &hash)
+            .filter(|_| cfg!(windows) || complete_stage)
         {
-            return Err(EngineError::Message(
-                "SHA-256 mismatch. The file was not published.".into(),
-            ));
+            let path = temp_path.clone();
+            let expected = expected.clone();
+            let cancel = cancel.clone();
+            tokio::task::spawn_blocking(move || verify_file_hash(&path, &expected, &cancel))
+                .await
+                .map_err(|e| EngineError::Message(e.to_string()))??;
         }
-        let mut finalization = Finalization {
-            stage,
-            destination: requested.clone(),
-            bytes: record.downloaded_bytes,
-            sha256: hash,
+        let snapshot = {
+            let mut record = task.record.write().await;
+            record.merged_bytes = total;
+            record.speed_bps = 0;
+            record.eta_seconds = None;
+            record.clone()
         };
-        let destination = self
-            .publish_staged(task, cancel, part_dir, &mut finalization)
-            .await?;
-        task.record.write().await.sha256 = Some(finalization.sha256);
-        Ok(destination)
-    }
-
-    async fn publish_staged(
-        &self,
-        task: &Arc<DownloadTask>,
-        cancel: &CancellationToken,
-        part_dir: &Path,
-        finalization: &mut Finalization,
-    ) -> EngineResult<PathBuf> {
-        // Serialize cancellation with publication without blocking progress readers on Windows I/O.
-        let _publication = task.publication_lock.lock().await;
-        let requested = finalization.destination.clone();
-        let parent = requested
-            .parent()
-            .ok_or_else(|| EngineError::Message("Invalid publication path.".into()))?;
-        let name = requested
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("download");
-        for _ in 0..100 {
-            task.check_stopped(cancel)?;
-            finalization.destination = unique_destination(parent, name).await;
-            task.check_stopped(cancel)?;
-            write_json_atomic(&part_dir.join("finalization.json"), finalization).await?;
-            task.record.write().await.status_detail = Some("Publishing verified file…".into());
-            match storage::publish(&finalization.stage, &finalization.destination).await {
-                Ok(()) => {
-                    apply_publication(&mut *task.record.write().await, finalization);
-                    return Ok(finalization.destination.clone());
-                }
+        self.emit_record(&snapshot);
+        let _dispatch = self.dispatch_lock.lock().await;
+        let _lock = self.persist_lock.lock().await;
+        task.check_stopped(cancel)?;
+        for _ in 0..1000 {
+            let destination = unique_destination(parent, desired_name).await;
+            self.check_torrent_path(&destination)
+                .await
+                .map_err(EngineError::Message)?;
+            let from = temp_path.clone();
+            let to = destination.clone();
+            match tokio::task::spawn_blocking(move || {
+                crate::platform::publish_noreplace(&from, &to)
+            })
+            .await
+            .map_err(|e| EngineError::Message(e.to_string()))?
+            {
+                Ok(()) => return Ok(destination),
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
                 Err(error) => return Err(error.into()),
             }
         }
         Err(EngineError::Message(
-            "Destination keeps changing; resume when it is available.".into(),
+            "Too many destination filename collisions. Choose another name and resume.".into(),
         ))
-    }
-
-    async fn finish_staged(
-        &self,
-        task: &Arc<DownloadTask>,
-        cancel: &CancellationToken,
-    ) -> EngineResult<bool> {
-        let part_dir = self.part_dir(task.record.read().await.id);
-        let Some(mut journal) =
-            storage::read_json::<Finalization>(&part_dir.join("finalization.json")).await?
-        else {
-            return Ok(false);
-        };
-        let already_published = fs::try_exists(&journal.destination).await?
-            && storage::sha256(&journal.destination).await? == journal.sha256;
-        if !already_published {
-            if !fs::try_exists(&journal.stage).await?
-                || storage::sha256(&journal.stage).await? != journal.sha256
-            {
-                return Err(EngineError::Message(
-                    "Finalization staging file changed; manual recovery is required.".into(),
-                ));
-            }
-            self.publish_staged(task, cancel, &part_dir, &mut journal)
-                .await?;
-        }
-        let snapshot = {
-            let mut record = task.record.write().await;
-            apply_publication(&mut record, &journal);
-            record.clone()
-        };
-        self.persist_records().await?;
-        let _ = fs::remove_dir_all(&part_dir).await;
-        self.emit_record(&snapshot);
-        Ok(true)
     }
 
     async fn handle_run_error(&self, task: &Arc<DownloadTask>, error: EngineError) {
         let snapshot = {
             let mut record = task.record.write().await;
-            if record.status == DownloadStatus::Completed {
-                // Publication already succeeded; the journal must recover a failed history write.
-                record.status_detail = Some(format!(
-                    "File published; saved state needs recovery: {error}"
-                ));
-                self.emit_record(&record);
-                return;
-            }
             if record.status == DownloadStatus::Queued && matches!(error, EngineError::Cancelled) {
                 return;
             }
@@ -2539,11 +3393,6 @@ impl DownloadManager {
             } else if task.paused.load(Ordering::Acquire) {
                 record.status = DownloadStatus::Paused;
                 record.error = None;
-            } else if is_transient(&error) {
-                record.status = DownloadStatus::Queued;
-                record.scheduled_for = Some(Utc::now() + chrono::Duration::seconds(60));
-                record.error = None;
-                record.status_detail = Some("Waiting for the network/server; retrying in one minute. You can pause or cancel.".into());
             } else {
                 record.status = DownloadStatus::Failed;
                 record.error = Some(error.to_string());
@@ -2607,9 +3456,19 @@ impl DownloadManager {
             .collect::<Vec<_>>();
         let mut records = Vec::with_capacity(tasks.len());
         for task in tasks {
-            records.push(task.record.read().await.clone());
+            let record = task.record.read().await.clone();
+            let request_context = if record.status == DownloadStatus::Completed {
+                None
+            } else {
+                task.request_context.clone()
+            };
+            records.push(StoredDownload {
+                torrent_priorities: record.torrent.as_ref().map(|t| t.priorities.clone()),
+                record,
+                request_context,
+            });
         }
-        records.sort_by_key(|record| record.created_at);
+        records.sort_by(|left, right| left.record.created_at.cmp(&right.record.created_at));
         write_json_atomic(&self.data_dir.join(STATE_FILE), &records).await
     }
 
@@ -2634,8 +3493,66 @@ impl DownloadManager {
     }
 }
 
+impl DownloadManager {
+    pub fn resume_dispatch(&self) {
+        self.dispatch_suspended.store(false, Ordering::Release);
+    }
+
+    #[cfg(target_os = "linux")]
+    pub async fn suspend_transfers(&self) -> Vec<Uuid> {
+        self.dispatch_suspended.store(true, Ordering::Release);
+        let _dispatch = self.dispatch_lock.lock().await;
+        let mut paused = Vec::new();
+        for record in self
+            .list()
+            .await
+            .into_iter()
+            .filter(|r| r.status.is_active() && r.status != DownloadStatus::Merging)
+        {
+            if self.pause_inner(record.id).await.is_ok() {
+                paused.push(record.id);
+            }
+        }
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < deadline {
+            let tasks = self.tasks.read().await;
+            if !paused.iter().any(|id| {
+                tasks
+                    .get(id)
+                    .is_some_and(|task| task.running.load(Ordering::Acquire))
+            }) {
+                break;
+            }
+            drop(tasks);
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        let _ = self
+            .torrent_engine
+            .call(json!({"op":"checkpoint", "wait":true}))
+            .await;
+        let _ = self.persist_records().await;
+        paused
+    }
+
+    #[cfg(target_os = "linux")]
+    pub async fn resume_after_suspend(self: &Arc<Self>, ids: Vec<Uuid>) {
+        for id in ids {
+            if self
+                .get_download(id)
+                .await
+                .is_ok_and(|r| r.status == DownloadStatus::Paused)
+            {
+                let _ = self.resume(id).await;
+            }
+        }
+        self.resume_dispatch();
+    }
+}
+
 fn default_settings(download_dir: &Path) -> DownloadSettings {
     DownloadSettings {
+        extra: Default::default(),
+        torrent: Default::default(),
         speed_limit_bps: 0,
         default_download_dir: download_dir.to_string_lossy().to_string(),
         max_concurrent_downloads: 3,
@@ -2646,13 +3563,127 @@ fn default_settings(download_dir: &Path) -> DownloadSettings {
         theme: Default::default(),
         accent: Default::default(),
         categories: default_categories(),
+        sort_into_category_folders: true,
         auto_update: true,
-        adaptive_connections: true,
-        max_requests_per_origin: crate::model::default_origin_limit(),
-        retry_attempts: crate::model::default_retries(),
-        bandwidth_limit_kbps: 0,
-        direct_write: true,
+        delete_files_on_remove: None,
     }
+}
+
+fn download_budgets(limit: u64, http: bool, torrent: bool) -> (u64, u64) {
+    if limit == 0 {
+        return (0, 0);
+    }
+    match (http, torrent) {
+        (true, true) => {
+            let native = (limit / 2).max(1);
+            (limit.saturating_sub(native).max(1), native)
+        }
+        (false, true) => (1, limit),
+        _ => (limit, 1),
+    }
+}
+
+fn rebalance_download_budgets(limit: u64, current: (u64, u64), rates: (u64, u64)) -> (u64, u64) {
+    // Reclaim unused capacity gradually, retaining a probe allocation for a stalled engine.
+    let floor = (limit / 10).max(1);
+    let step = (limit / 10).max(1);
+    let saturated = |rate: u64, budget: u64| rate as f64 >= budget as f64 * 0.8;
+    let http = match (saturated(rates.0, current.0), saturated(rates.1, current.1)) {
+        (true, false) => current
+            .0
+            .saturating_add(step)
+            .min(limit.saturating_sub(floor)),
+        (false, true) => current.0.saturating_sub(step).max(floor),
+        _ => current.0,
+    };
+    (http, limit.saturating_sub(http))
+}
+
+async fn validate_torrent_destination(
+    root: &Path,
+    metadata: &TorrentMetadata,
+    allow_existing: bool,
+) -> Result<(), String> {
+    let root = root.to_path_buf();
+    let metadata = metadata.clone();
+    tokio::task::spawn_blocking(move || {
+        validate_torrent_destination_blocking(&root, &metadata, allow_existing)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+fn validate_torrent_destination_blocking(
+    root: &Path,
+    metadata: &TorrentMetadata,
+    allow_existing: bool,
+) -> Result<(), String> {
+    fn reparse(path: &Path) -> Result<bool, String> {
+        match std::fs::symlink_metadata(path) {
+            Ok(meta) => {
+                #[cfg(windows)]
+                {
+                    use std::os::windows::fs::MetadataExt;
+                    if meta.file_attributes() & 0x400 != 0 {
+                        return Ok(true);
+                    }
+                }
+                Ok(meta.file_type().is_symlink())
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(e.to_string()),
+        }
+    }
+    if root
+        .ancestors()
+        .any(|ancestor| reparse(ancestor).unwrap_or(true))
+    {
+        return Err("Destination is a symlink or reparse point. Choose its real folder.".into());
+    }
+    for file in &metadata.files {
+        let path = Path::new(&file.path);
+        if path.is_absolute()
+            || path
+                .components()
+                .any(|c| !matches!(c, std::path::Component::Normal(_)))
+        {
+            return Err("Torrent contains an unsafe file path.".into());
+        }
+        let mut current = root.to_path_buf();
+        for part in path.components() {
+            current.push(part.as_os_str());
+            if reparse(&current)? {
+                return Err(format!(
+                    "Torrent destination contains a reparse point: {}",
+                    file.path
+                ));
+            }
+        }
+        if current.is_dir() {
+            return Err(format!(
+                "A directory occupies the torrent file path: {}",
+                file.path
+            ));
+        }
+        if !allow_existing && current.exists() {
+            return Err(format!(
+                "A file already exists at {}. Choose another folder to prevent overwriting it.",
+                file.path
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn storage_path_key(path: &Path) -> String {
+    let path = path
+        .to_string_lossy()
+        .replace("\\\\?\\", "")
+        .replace('\\', "/");
+    #[cfg(windows)]
+    return path.to_lowercase();
+    #[cfg(not(windows))]
+    path
 }
 
 fn context_headers(context: Option<&BrowserRequestContext>) -> EngineResult<HeaderMap> {
@@ -2663,6 +3694,7 @@ fn context_headers(context: Option<&BrowserRequestContext>) -> EngineResult<Head
             (header::AUTHORIZATION, context.authorization.as_deref()),
             (header::REFERER, context.referer.as_deref()),
             (header::USER_AGENT, context.user_agent.as_deref()),
+            (header::ORIGIN, context.origin.as_deref()),
         ] {
             if let Some(value) = value {
                 if value.len() > 16 * 1024 {
@@ -2679,6 +3711,7 @@ fn context_headers(context: Option<&BrowserRequestContext>) -> EngineResult<Head
 }
 
 fn reject_html_page(headers: &HeaderMap) -> EngineResult<()> {
+    validate_transfer_encoding(headers)?;
     let mime = headers
         .get(header::CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
@@ -2744,12 +3777,16 @@ fn record_is_dispatch_ready(
     if paused_queues.iter().any(|name| name == &record.queue) {
         return false;
     }
-    record.scheduled_for.is_none_or(|when| when <= now)
+    !record.scheduled_for.is_some_and(|when| when > now)
 }
 
 #[cfg(target_os = "windows")]
 fn sync_startup_registration(enabled: bool) -> Result<(), String> {
     use winreg::{enums::HKEY_CURRENT_USER, RegKey};
+
+    if crate::platform::test_root()?.is_some() {
+        return Ok(());
+    }
 
     let current_exe =
         std::env::current_exe().map_err(|error| format!("Could not locate Fetchrail: {error}"))?;
@@ -2777,13 +3814,29 @@ fn sync_startup_registration(enabled: bool) -> Result<(), String> {
     Ok(())
 }
 
-#[cfg(not(target_os = "windows"))]
-fn sync_startup_registration(_enabled: bool) -> Result<(), String> {
-    Ok(())
+#[cfg(target_os = "linux")]
+fn sync_startup_registration(enabled: bool) -> Result<(), String> {
+    crate::platform::sync_startup_registration(enabled)
+}
+
+async fn read_saved_json<T: serde::de::DeserializeOwned>(path: &Path) -> EngineResult<Option<T>> {
+    match fs::read(path).await {
+        Ok(bytes) => serde_json::from_slice(&bytes).map(Some).map_err(|error| EngineError::Message(format!(
+            "Saved {} is invalid at line {}, column {}. Data was preserved; restore a valid backup.",
+            path.file_name().unwrap_or_default().to_string_lossy(), error.line(), error.column()
+        ))),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
 }
 
 async fn write_json_atomic<T: serde::Serialize>(path: &Path, value: &T) -> EngineResult<()> {
-    storage::write_json(path, value).await?;
+    let bytes = serde_json::to_vec_pretty(value)
+        .map_err(|error| EngineError::Message(format!("Could not serialize state: {error}")))?;
+    let path = path.to_owned();
+    tokio::task::spawn_blocking(move || crate::platform::write_private_atomic(&path, &bytes))
+        .await
+        .map_err(|e| EngineError::Message(e.to_string()))??;
     Ok(())
 }
 
@@ -2799,7 +3852,7 @@ fn safe_file_name(value: &str) -> String {
 
 fn name_from_url(url: &Url) -> String {
     url.path_segments()
-        .and_then(|mut segments| segments.rfind(|segment| !segment.is_empty()))
+        .and_then(|segments| segments.filter(|segment| !segment.is_empty()).next_back())
         .map(safe_file_name)
         .filter(|name| !name.is_empty())
         .unwrap_or_else(|| "download".to_string())
@@ -2851,6 +3904,13 @@ fn file_name_from_headers(headers: &HeaderMap) -> Option<String> {
     plain_name
 }
 
+fn header_has_bytes(headers: &HeaderMap) -> bool {
+    headers
+        .get(header::ACCEPT_RANGES)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.to_ascii_lowercase().contains("bytes"))
+}
+
 fn content_length_from_headers(headers: &HeaderMap) -> Option<u64> {
     headers
         .get(CONTENT_LENGTH)?
@@ -2862,71 +3922,46 @@ fn content_length_from_headers(headers: &HeaderMap) -> Option<u64> {
 }
 
 fn representation_validator(headers: &HeaderMap) -> Option<String> {
-    // Dates are not necessarily strong validators. Use a strong ETag for segmented resume.
     headers
         .get(header::ETAG)
         .and_then(|value| value.to_str().ok())
-        .filter(|value| value.len() >= 2 && value.starts_with('"') && value.ends_with('"'))
+        .filter(|value| value.starts_with('"') && value.ends_with('"'))
+        .or_else(|| {
+            headers
+                .get(header::LAST_MODIFIED)
+                .and_then(|value| value.to_str().ok())
+        })
         .map(str::to_owned)
 }
 
-fn validate_encoding(headers: &HeaderMap) -> EngineResult<()> {
-    if headers
-        .get(header::CONTENT_ENCODING)
-        .is_some_and(|value| value != "identity")
-    {
-        return Err(EngineError::Message(
-            "Server ignored identity encoding; byte offsets cannot be trusted.".into(),
-        ));
-    }
-    Ok(())
-}
-
-fn is_transient(error: &EngineError) -> bool {
-    match error {
-        EngineError::Request(error) => {
-            error.is_timeout()
-                || error.is_connect()
-                || error.is_request()
-                || error.is_body()
-                || error.is_decode()
-        }
-        EngineError::Http(status) => {
-            status.is_server_error()
-                || matches!(
-                    *status,
-                    StatusCode::TOO_MANY_REQUESTS | StatusCode::REQUEST_TIMEOUT
-                )
-        }
-        EngineError::Slow | EngineError::Incomplete => true,
-        _ => false,
+async fn shared_staging(part_dir: &Path) -> EngineResult<bool> {
+    match fs::read(part_dir.join("transfer.json")).await {
+        Ok(bytes) => serde_json::from_slice::<PartManifest>(&bytes)
+            .map(|manifest| manifest.shared_staging)
+            .map_err(|_| {
+                EngineError::Message("Transfer checkpoint is damaged. Restart safely.".into())
+            }),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error.into()),
     }
 }
 
-async fn matching_manifest(
+async fn part_checkpoint(
     part_dir: &Path,
-    probe: &ProbeResult,
-) -> EngineResult<Option<PartManifest>> {
-    let stored: Option<PartManifest> = storage::read_json(&part_dir.join("transfer.json")).await?;
-    Ok(stored.filter(|stored| {
-        probe.accepts_ranges
-            && probe.validator.is_some()
-            && stored.validator == probe.validator
-            && stored.total_bytes == probe.total_bytes
-            && stored.accepts_ranges
-            && valid_layout(&stored.ranges, probe.total_bytes.unwrap_or(0))
-    }))
-}
-
-fn valid_layout(ranges: &[ByteRange], total: u64) -> bool {
-    let mut next = 0;
-    for range in ranges {
-        if range.start != next || range.end < range.start || range.end >= total {
-            return false;
-        }
-        next = range.end + 1;
+    index: usize,
+    length: u64,
+) -> EngineResult<Option<PartCheckpoint>> {
+    match fs::read(part_dir.join(format!("{index}.progress.json"))).await {
+        Ok(bytes) => Ok(serde_json::from_slice::<PartCheckpoint>(&bytes)
+            .ok()
+            .filter(|saved| {
+                saved.bytes <= length
+                    && saved.sha256.len() == 64
+                    && saved.sha256.bytes().all(|b| b.is_ascii_hexdigit())
+            })),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
     }
-    next == total
 }
 
 async fn prepare_parts(
@@ -2934,89 +3969,88 @@ async fn prepare_parts(
     probe: &ProbeResult,
     ranges: &[ByteRange],
 ) -> EngineResult<()> {
-    if let Some(saved) = matching_manifest(part_dir, probe).await? {
-        if saved.ranges == ranges {
-            return Ok(());
+    if let Ok(bytes) = fs::read(part_dir.join("transfer.json")).await {
+        if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) {
+            if value.get("direct_path").is_some_and(|v| !v.is_null())
+                || value.get("committed").is_some()
+            {
+                return Err(EngineError::Message("This partial transfer belongs to an older local engine. Its bytes were preserved; finish it with that build before upgrading.".into()));
+            }
         }
     }
-    let stored: Option<PartManifest> = storage::read_json(&part_dir.join("transfer.json")).await?;
-    if let Some(stage) = stored.and_then(|stored| stored.direct_path) {
-        // Only remove files carrying this job's ownership suffix.
-        if part_dir.file_name().is_some_and(|id| {
-            stage.file_name().is_some_and(|name| {
-                name.to_string_lossy()
-                    .ends_with(&format!(".{}.fetchrail-part", id.to_string_lossy()))
-            })
-        }) {
-            let _ = fs::remove_file(stage).await;
+    let stored = fs::read(part_dir.join("transfer.json"))
+        .await
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<PartManifest>(&bytes).ok());
+    let mut manifest = PartManifest {
+        total_bytes: probe.total_bytes,
+        ranges: ranges.to_vec(),
+        validator: probe.validator.clone(),
+        accepts_ranges: probe.accepts_ranges,
+        shared_staging: stored.as_ref().is_some_and(|saved| saved.shared_staging),
+    };
+    let reusable = probe.accepts_ranges
+        && probe.validator.is_some()
+        && probe.total_bytes.is_some()
+        && stored.as_ref() == Some(&manifest);
+    if !reusable {
+        match fs::remove_dir_all(part_dir).await {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
         }
-    }
-    match fs::remove_dir_all(part_dir).await {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error.into()),
+        // Keep legacy layouts on resume. New large multipart jobs use one private sparse file.
+        manifest.shared_staging = ranges.len() > 1
+            && probe.accepts_ranges
+            && probe.validator.is_some()
+            && probe
+                .total_bytes
+                .is_some_and(|total| total >= 8 * 1024 * 1024);
     }
     fs::create_dir_all(part_dir).await?;
-    write_json_atomic(
-        &part_dir.join("transfer.json"),
-        &PartManifest {
-            total_bytes: probe.total_bytes,
-            ranges: ranges.to_vec(),
-            validator: probe.validator.clone(),
-            accepts_ranges: probe.accepts_ranges,
-            direct_path: None,
-            committed: vec![],
-            hashes: vec![],
-        },
-    )
-    .await
-}
-
-fn apply_publication(record: &mut DownloadRecord, journal: &Finalization) {
-    record.destination = journal.destination.to_string_lossy().to_string();
-    record.file_name = journal
-        .destination
-        .file_name()
-        .unwrap_or_default()
-        .to_string_lossy()
-        .to_string();
-    record.downloaded_bytes = journal.bytes;
-    record.merged_bytes = journal.bytes;
-    record.total_bytes = Some(journal.bytes);
-    record.sha256 = Some(journal.sha256.clone());
-    record.status = DownloadStatus::Completed;
-    record.finished_at = Some(Utc::now());
-    record.speed_bps = 0;
-    record.eta_seconds = Some(0);
-    record.error = None;
-    record.status_detail = None;
-    record.segments.clear();
-    record.finalizing_bytes = journal.bytes;
-}
-
-async fn recover_published(record: &mut DownloadRecord, part_dir: &Path) -> EngineResult<()> {
-    if let Some(journal) =
-        storage::read_json::<Finalization>(&part_dir.join("finalization.json")).await?
-    {
-        if fs::try_exists(&journal.destination).await?
-            && fs::metadata(&journal.destination).await?.len() == journal.bytes
-            && storage::sha256(&journal.destination).await? == journal.sha256
-        {
-            apply_publication(record, &journal);
+    // Merge checkpoints fingerprint the original bytes, including legacy JSON layouts.
+    if !reusable {
+        write_json_atomic(&part_dir.join("transfer.json"), &manifest).await?;
+    }
+    if let Some(total) = probe.total_bytes {
+        let available = crate::platform::available_space(part_dir)?;
+        if manifest.shared_staging {
+            let path = part_dir.join("0.part");
+            match fs::symlink_metadata(&path).await {
+                Ok(metadata) if metadata.is_file() && metadata.len() == total => {}
+                Ok(_) => {
+                    return Err(EngineError::Message(
+                        "Shared staging file changed. Restart the download safely.".into(),
+                    ))
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    if available < total {
+                        return Err(EngineError::Message(format!("Download storage has {available} bytes available but the remaining parts need {total}. Free space and resume this download.")));
+                    }
+                    crate::staging::create(&path, total).await?;
+                }
+                Err(error) => return Err(error.into()),
+            }
+            let remaining = total.saturating_sub(crate::staging::allocated(&path).await?);
+            if crate::platform::available_space(part_dir)? < remaining {
+                return Err(EngineError::Message(
+                    "Insufficient space for the unwritten staging ranges. Free space and resume."
+                        .into(),
+                ));
+            }
+        } else {
+            let committed = segment_counters(part_dir, ranges)
+                .await?
+                .iter()
+                .map(|segment| segment.downloaded.load(Ordering::Relaxed))
+                .sum::<u64>();
+            let remaining = total.saturating_sub(committed);
+            if available < remaining {
+                return Err(EngineError::Message(format!("Download storage has {available} bytes available but the remaining parts need {remaining}. Free space and resume this download.")));
+            }
         }
     }
     Ok(())
-}
-
-fn queued_ranges(total: u64, minimum: u64, connections: usize) -> Vec<ByteRange> {
-    // Keep work to steal at the tail without thousands of tiny HTTP requests on large files.
-    let piece_size = minimum.max(
-        total
-            .div_ceil(connections.max(1) as u64 * 8)
-            .min(32 * 1024 * 1024),
-    );
-    let count = total.div_ceil(piece_size.max(1)).clamp(1, 4096) as usize;
-    split_ranges(total, count)
 }
 
 fn parse_content_range(headers: &HeaderMap) -> Option<(u64, u64, Option<u64>)> {
@@ -3044,7 +4078,7 @@ fn suggested_connection_count(total: u64, configured: usize, min_segment: u64) -
     if total == 0 {
         return 1;
     }
-    let by_size = (total / min_segment.max(1)).clamp(1, 32) as usize;
+    let by_size = (total / min_segment.max(1)).max(1).min(32) as usize;
     configured.clamp(1, 32).min(by_size.max(1))
 }
 
@@ -3065,22 +4099,20 @@ fn split_ranges(total: u64, count: usize) -> Vec<ByteRange> {
 }
 
 async fn segment_counters(part_dir: &Path, ranges: &[ByteRange]) -> EngineResult<Segments> {
-    let manifest: Option<PartManifest> =
-        storage::read_json(&part_dir.join("transfer.json")).await?;
+    let shared = shared_staging(part_dir).await?;
     let mut segments = Vec::with_capacity(ranges.len());
     for (index, range) in ranges.iter().enumerate() {
         let path = part_dir.join(format!("{index}.part"));
         let mut downloaded = 0;
-        if let Ok(metadata) = fs::metadata(&path).await {
+        if shared {
+            downloaded = part_checkpoint(part_dir, index, range.len())
+                .await?
+                .map_or(0, |saved| saved.bytes);
+        } else if let Ok(metadata) = fs::metadata(&path).await {
             if range.end != u64::MAX && metadata.len() > range.len() {
                 fs::remove_file(&path).await?;
             } else {
                 downloaded = metadata.len();
-            }
-        }
-        if let Some(manifest) = &manifest {
-            if let Some(committed) = manifest.committed.get(index) {
-                downloaded = *committed;
             }
         }
         segments.push(SegmentCounter {
@@ -3094,7 +4126,7 @@ async fn segment_counters(part_dir: &Path, ranges: &[ByteRange]) -> EngineResult
 
 async fn unique_destination(directory: &Path, file_name: &str) -> PathBuf {
     let candidate = directory.join(file_name);
-    if !fs::try_exists(&candidate).await.unwrap_or(false) {
+    if !candidate.exists() {
         return candidate;
     }
 
@@ -3110,7 +4142,7 @@ async fn unique_destination(directory: &Path, file_name: &str) -> PathBuf {
             None => format!("{stem} ({index})"),
         };
         let candidate = directory.join(name);
-        if !fs::try_exists(&candidate).await.unwrap_or(false) {
+        if !candidate.exists() {
             return candidate;
         }
     }
@@ -3124,8 +4156,74 @@ fn join_parts(
     ranges: &[ByteRange],
     total: u64,
     merged: &AtomicU64,
+    expected_sha256: Option<&str>,
 ) -> EngineResult<()> {
-    let mut output = std::fs::File::create(temp_path)?;
+    join_parts_cancellable(
+        part_dir,
+        temp_path,
+        ranges,
+        total,
+        merged,
+        expected_sha256,
+        &CancellationToken::new(),
+    )
+}
+
+fn join_parts_cancellable(
+    part_dir: &Path,
+    temp_path: &Path,
+    ranges: &[ByteRange],
+    total: u64,
+    merged: &AtomicU64,
+    expected_sha256: Option<&str>,
+    cancel: &CancellationToken,
+) -> EngineResult<()> {
+    if cancel.is_cancelled() {
+        return Err(EngineError::Cancelled);
+    }
+    if ranges.len() == 1 {
+        let source = part_dir.join("0.part");
+        let metadata = std::fs::symlink_metadata(&source)?;
+        let expected = if ranges[0].end == u64::MAX {
+            total
+        } else {
+            ranges[0].len()
+        };
+        if !metadata.is_file() || metadata.len() != expected || expected != total {
+            return Err(EngineError::Message(
+                "Part 0 has an unexpected size. Retry the download.".into(),
+            ));
+        }
+        // Keep the original resume file until publication. On the same filesystem
+        // a hard link avoids reading and writing the entire payload a second time.
+        // Other filesystems and destinations keep the checked copy path below.
+        if std::fs::hard_link(&source, temp_path).is_ok() {
+            let output = std::fs::OpenOptions::new().write(true).open(temp_path)?;
+            if let Some(expected) = expected_sha256 {
+                verify_file_hash(temp_path, expected, cancel)?;
+            }
+            if output.metadata()?.len() != total {
+                return Err(EngineError::Message(
+                    "Part size changed while joining.".into(),
+                ));
+            }
+            merged.store(total, Ordering::Relaxed);
+            output.sync_all()?;
+            return Ok(());
+        }
+    }
+    let parent = temp_path
+        .parent()
+        .ok_or_else(|| EngineError::Message("Invalid destination path.".into()))?;
+    let available = crate::platform::available_space(parent)?;
+    if available < total {
+        return Err(EngineError::Message(format!("The destination has {available} bytes available but finalization needs {total}. Free space and resume this download.")));
+    }
+    let mut output = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(temp_path)?;
+    let mut hash = expected_sha256.map(|_| Sha256::new());
     let mut buffer = vec![0; MERGE_BUFFER_SIZE];
     let mut joined = 0;
     for (index, range) in ranges.iter().enumerate() {
@@ -3142,6 +4240,9 @@ fn join_parts(
         }
         let mut copied = 0;
         loop {
+            if cancel.is_cancelled() {
+                return Err(EngineError::Cancelled);
+            }
             let read = match input.read(&mut buffer) {
                 Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
                 result => result?,
@@ -3156,6 +4257,9 @@ fn join_parts(
                 ));
             }
             output.write_all(&buffer[..read])?;
+            if let Some(hash) = &mut hash {
+                hash.update(&buffer[..read]);
+            }
             joined += read as u64;
             merged.store(joined, Ordering::Relaxed);
         }
@@ -3170,7 +4274,35 @@ fn join_parts(
             "Joined file has an unexpected size.".into(),
         ));
     }
+    if let (Some(hash), Some(expected)) = (hash, expected_sha256) {
+        if format!("{:x}", hash.finalize()) != expected {
+            return Err(EngineError::Message("SHA-256 verification failed. The file was not published; check the source and expected checksum.".into()));
+        }
+    }
     output.sync_all()?;
+    Ok(())
+}
+
+fn verify_file_hash(path: &Path, expected: &str, cancel: &CancellationToken) -> EngineResult<()> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        options.custom_flags(windows::Win32::Storage::FileSystem::FILE_FLAG_SEQUENTIAL_SCAN.0);
+    }
+    let actual = crate::integrity::sha256_reader(options.open(path)?, cancel).map_err(|error| {
+        if cancel.is_cancelled() {
+            EngineError::Cancelled
+        } else {
+            EngineError::Io(error)
+        }
+    })?;
+    if actual != expected {
+        return Err(EngineError::Message(
+            "Output failed SHA-256 verification. The file was not published.".into(),
+        ));
+    }
     Ok(())
 }
 
@@ -3179,9 +4311,9 @@ mod transfer_tests;
 
 #[cfg(test)]
 mod tests {
-    use super::{context_headers, reject_html_page};
+    use super::{context_headers, reject_html_page, StoredDownload};
     use crate::model::BrowserRequestContext;
-    use chrono::{Duration as ChronoDuration, Utc};
+    use chrono::{DateTime, Duration as ChronoDuration, Utc};
     use reqwest::header::{
         HeaderMap, HeaderValue, CONTENT_DISPOSITION, CONTENT_LENGTH, CONTENT_RANGE,
     };
@@ -3193,69 +4325,125 @@ mod tests {
     };
     use crate::model::{DownloadRecord, DownloadStatus};
 
-    #[tokio::test]
-    async fn connection_reporting_keeps_polling_queued_range_workers() {
-        use futures_util::{stream::FuturesUnordered, FutureExt, StreamExt};
-        use std::time::Duration;
+    #[test]
+    fn mixed_engine_budgets_reclaim_capacity_without_exceeding_the_cap() {
+        for limit in [2, 3, 10, 1024, 1048576] {
+            let mut allocation = super::download_budgets(limit, true, true);
+            for _ in 0..20 {
+                allocation = super::rebalance_download_budgets(limit, allocation, (limit, 0));
+                assert_eq!(allocation.0 + allocation.1, limit);
+                assert!(allocation.0 > 0 && allocation.1 > 0);
+            }
+            assert!(allocation.0 >= limit / 2);
+            for _ in 0..20 {
+                allocation = super::rebalance_download_budgets(limit, allocation, (0, limit));
+                assert_eq!(allocation.0 + allocation.1, limit);
+                assert!(allocation.0 > 0 && allocation.1 > 0);
+            }
+            assert!(allocation.1 >= limit / 2);
+        }
+        assert_eq!(super::download_budgets(0, true, true), (0, 0));
+        assert_eq!(super::download_budgets(1024, false, true), (1, 1024));
+    }
 
-        let task = super::DownloadTask::new(queued_record(DownloadStatus::Queued, "Default", None));
-        let held = task.record.write().await;
-        let mut workers = FuturesUnordered::new();
-        workers.push(async {
-            task.record.write().await.speed_bps = 42;
-        });
-        assert!(workers.next().now_or_never().is_none());
-        drop(held);
-        assert!(
-            tokio::time::timeout(Duration::from_millis(25), task.record.write())
-                .await
-                .is_err()
-        );
-        task.report_connections(16);
-        tokio::time::timeout(Duration::from_secs(1), workers.next())
-            .await
+    #[test]
+    fn retry_after_and_origin_budgets_keep_server_cooldowns() {
+        let now = DateTime::parse_from_rfc3339("2026-10-09T12:00:00Z")
             .unwrap()
-            .unwrap();
-        task.report_connections(16);
-        let record = task.record.read().await;
-        assert_eq!(record.connections, 16);
-        assert_eq!(record.speed_bps, 42);
+            .with_timezone(&Utc);
+        let mut headers = HeaderMap::new();
+        headers.insert(reqwest::header::RETRY_AFTER, HeaderValue::from_static("2"));
+        assert_eq!(
+            super::retry_after(&headers, now),
+            Some(std::time::Duration::from_secs(2))
+        );
+        headers.insert(
+            reqwest::header::RETRY_AFTER,
+            HeaderValue::from_static("Fri, 09 Oct 2026 12:00:03 GMT"),
+        );
+        assert_eq!(
+            super::retry_after(&headers, now),
+            Some(std::time::Duration::from_secs(3))
+        );
+        headers.insert(
+            reqwest::header::RETRY_AFTER,
+            HeaderValue::from_static("invalid"),
+        );
+        assert_eq!(super::retry_after(&headers, now), None);
+        headers.insert(
+            reqwest::header::RETRY_AFTER,
+            HeaderValue::from_static("Fri, 09 Oct 2026 12:00:03 GMT"),
+        );
+        assert_eq!(
+            super::retry_after(&headers, now + ChronoDuration::milliseconds(500)),
+            Some(std::time::Duration::from_millis(2500))
+        );
+        let first = super::origin_budget(&url::Url::parse("https://example.com/a").unwrap());
+        let second = super::origin_budget(&url::Url::parse("https://example.com/b").unwrap());
+        let third = super::origin_budget(&url::Url::parse("https://example.com:8443/a").unwrap());
+        assert!(std::sync::Arc::ptr_eq(&first, &second));
+        assert!(!std::sync::Arc::ptr_eq(&first, &third));
     }
 
     #[tokio::test]
-    async fn request_disconnects_retry_but_invalid_requests_and_auth_failures_do_not() {
-        use tokio::io::AsyncReadExt;
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let server = tokio::spawn(async move {
-            let (mut socket, _) = listener.accept().await.unwrap();
-            assert!(socket.read(&mut [0; 1024]).await.unwrap() > 0);
-        });
-        let error = reqwest::Client::builder()
-            .retry(reqwest::retry::never())
-            .timeout(std::time::Duration::from_secs(5))
-            .build()
-            .unwrap()
-            .get(format!("http://{address}/disconnect"))
-            .send()
-            .await
-            .unwrap_err()
-            .without_url();
-        server.await.unwrap();
-        assert!(error.is_request() && !error.is_connect() && !error.is_timeout());
-        assert!(!error.is_body() && !error.is_decode());
-        assert!(super::is_transient(&super::EngineError::Request(error)));
-        let invalid = reqwest::Client::new()
-            .get("invalid URL")
-            .build()
-            .unwrap_err();
-        assert!(!super::is_transient(&super::EngineError::Request(invalid)));
-        for status in [
-            reqwest::StatusCode::UNAUTHORIZED,
-            reqwest::StatusCode::FORBIDDEN,
-        ] {
-            assert!(!super::is_transient(&super::EngineError::Http(status)));
-        }
+    async fn origin_cooldown_survives_the_last_request() {
+        use tokio_util::sync::CancellationToken;
+        let url = url::Url::parse(&format!("http://{}.test/file", uuid::Uuid::new_v4())).unwrap();
+        let gate = super::origin_budget(&url);
+        gate.cool_down(std::time::Duration::from_millis(100)).await;
+        let weak = std::sync::Arc::downgrade(&gate);
+        drop(gate);
+        let shared = super::origin_budget(&url);
+        assert!(std::sync::Arc::ptr_eq(&shared, &weak.upgrade().unwrap()));
+        let cancel = CancellationToken::new();
+        assert!(tokio::time::timeout(
+            std::time::Duration::from_millis(30),
+            shared.acquire(32, &cancel)
+        )
+        .await
+        .is_err());
+        assert!(shared.acquire(32, &cancel).await.is_some());
+    }
+
+    #[test]
+    fn expected_hashes_are_validated_and_mismatches_reject_final_output() {
+        use sha2::{Digest, Sha256};
+        assert!(super::normalize_sha256(Some("invalid")).is_err());
+        assert_eq!(
+            super::normalize_sha256(Some(&"A".repeat(64)))
+                .unwrap()
+                .unwrap(),
+            "a".repeat(64)
+        );
+        let root = std::env::temp_dir().join(format!("fetchrail-hash-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("0.part"), b"bytes").unwrap();
+        let merged = std::sync::atomic::AtomicU64::new(0);
+        let hash = format!("{:x}", Sha256::digest(b"bytes"));
+        let output = root.join("complete.tmp");
+        super::join_parts(
+            &root,
+            &output,
+            &super::split_ranges(5, 1),
+            5,
+            &merged,
+            Some(&hash),
+        )
+        .unwrap();
+        super::verify_file_hash(&output, &hash, &tokio_util::sync::CancellationToken::new())
+            .unwrap();
+        std::fs::remove_file(&output).unwrap();
+        let error = super::join_parts(
+            &root,
+            &output,
+            &super::split_ranges(5, 1),
+            5,
+            &merged,
+            Some(&"0".repeat(64)),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("SHA-256"));
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -3276,15 +4464,30 @@ mod tests {
     #[test]
     fn browser_headers_are_validated_and_kept_out_of_public_records() {
         let context = BrowserRequestContext {
+            origin: None,
             cookie: Some("session=secret".into()),
             ..Default::default()
         };
         let headers = context_headers(Some(&context)).unwrap();
         assert!(headers[reqwest::header::COOKIE].is_sensitive());
         let record = queued_record(DownloadStatus::Scheduled, "Default", None);
-        let disk = serde_json::to_string(&record).unwrap();
-        assert!(!disk.contains("secret"));
+        let stored = StoredDownload {
+            torrent_priorities: None,
+            record,
+            request_context: Some(context),
+        };
+        let disk = serde_json::to_string(&stored).unwrap();
+        assert!(disk.contains("session=secret"));
+        let loaded: StoredDownload = serde_json::from_str(&disk).unwrap();
+        assert!(!serde_json::to_string(&loaded.record)
+            .unwrap()
+            .contains("secret"));
+        assert_eq!(
+            loaded.request_context.unwrap().cookie.as_deref(),
+            Some("session=secret")
+        );
         assert!(context_headers(Some(&BrowserRequestContext {
+            origin: None,
             referer: Some("bad\r\nheader".into()),
             ..Default::default()
         }))
@@ -3370,6 +4573,9 @@ mod tests {
         scheduled_for: Option<chrono::DateTime<Utc>>,
     ) -> DownloadRecord {
         DownloadRecord {
+            extra: Default::default(),
+            torrent: None,
+            expected_sha256: None,
             id: Uuid::new_v4(),
             url: "https://example.com/file.bin".into(),
             file_name: "file.bin".into(),
@@ -3389,18 +4595,38 @@ mod tests {
             scheduled_for,
             segments: Vec::new(),
             name_locked: false,
-            expected_sha256: None,
-            sha256: None,
-            status_detail: None,
-            finalizing_bytes: 0,
-            handoff_id: None,
-            handoff_committed: false,
-            requires_session: false,
             speed_limit_bps: 0,
             resume_supported: None,
             completion_options: Default::default(),
             progress_requested: false,
         }
+    }
+
+    #[test]
+    fn local_history_preserves_checksums_and_private_context_stays_private() {
+        let record = queued_record(DownloadStatus::Completed, "Default", None);
+        let mut value = serde_json::to_value(record).unwrap();
+        value["sha256"] = json!("a".repeat(64));
+        value["handoffCommitted"] = json!(true);
+        value["requestContext"] = json!({"cookie":"private-session"});
+        let stored: StoredDownload = serde_json::from_value(value).unwrap();
+        let public = serde_json::to_value(&stored.record).unwrap();
+        assert_eq!(public["sha256"], "a".repeat(64));
+        assert_eq!(public["handoffCommitted"], true);
+        assert!(public.get("requestContext").is_none());
+        assert_eq!(
+            stored.request_context.as_ref().unwrap().cookie.as_deref(),
+            Some("private-session")
+        );
+        let roundtrip = serde_json::to_value(stored).unwrap();
+        assert_eq!(roundtrip["requestContext"]["cookie"], "private-session");
+        let mut settings = serde_json::to_value(default_settings(Path::new("Downloads"))).unwrap();
+        settings["bandwidthLimitKbps"] = json!(64);
+        settings["maxRequestsPerOrigin"] = json!(16);
+        let settings: DownloadSettings = serde_json::from_value(settings).unwrap();
+        let restored = serde_json::to_value(settings.normalized()).unwrap();
+        assert_eq!(restored["speedLimitBps"], 65536);
+        assert_eq!(restored["maxRequestsPerOrigin"], 16);
     }
 
     #[test]
@@ -3470,61 +4696,6 @@ mod tests {
         tokio::fs::remove_dir_all(dir).await.unwrap();
     }
 
-    #[test]
-    fn compact_sections_preserve_all_receiving_connections() {
-        use std::sync::atomic::{AtomicBool, AtomicU64};
-        let counters = (0..320)
-            .map(|index| super::SegmentCounter {
-                range: super::ByteRange {
-                    start: index * 100,
-                    end: index * 100 + 99,
-                },
-                downloaded: AtomicU64::new(10),
-                active: AtomicBool::new(index < 8),
-            })
-            .collect::<Vec<_>>();
-        let sections = super::segment_progress(&counters, &vec![100.0; 320]);
-        assert_eq!(sections.len(), 32);
-        assert_eq!(sections.iter().filter(|part| part.active).count(), 1);
-        assert_eq!(
-            sections
-                .iter()
-                .map(|part| part.active_connections)
-                .sum::<usize>(),
-            8
-        );
-        assert_eq!(
-            sections
-                .iter()
-                .map(|part| part.downloaded_bytes)
-                .sum::<u64>(),
-            3200
-        );
-        assert_eq!(
-            sections.iter().map(|part| part.speed_bps).sum::<u64>(),
-            32000
-        );
-    }
-
-    #[test]
-    fn large_files_use_bounded_pieces_with_enough_work_for_every_worker() {
-        let total = 5 * 1024 * 1024 * 1024;
-        let ranges = super::queued_ranges(total, 4 * 1024 * 1024, 8);
-        assert!(ranges.len() >= 8 * 8 && ranges.len() < 1280 / 4);
-        assert_eq!(ranges[0].start, 0);
-        assert_eq!(ranges.last().unwrap().end, total - 1);
-        assert_eq!(ranges.iter().map(|range| range.len()).sum::<u64>(), total);
-        assert!(ranges
-            .windows(2)
-            .all(|pair| pair[0].end + 1 == pair[1].start));
-        assert!(ranges.iter().all(|range| range.len() <= 32 * 1024 * 1024));
-        assert_eq!(
-            super::queued_ranges(8 * 1024 * 1024, 1024 * 1024, 4).len(),
-            8
-        );
-        assert!(super::queued_ranges(0, 0, 0).is_empty());
-    }
-
     #[tokio::test]
     async fn joining_preserves_order_and_counts_bytes_across_buffers() {
         let dir = std::env::temp_dir().join(format!("fetchrail-join-test-{}", Uuid::new_v4()));
@@ -3541,7 +4712,7 @@ mod tests {
         }
         let output = dir.join("joined");
         let merged = std::sync::atomic::AtomicU64::new(0);
-        super::join_parts(&dir, &output, &ranges, total, &merged).unwrap();
+        super::join_parts(&dir, &output, &ranges, total, &merged, None).unwrap();
         let bytes = tokio::fs::read(&output).await.unwrap();
         assert_eq!(bytes.len() as u64, total);
         assert!(bytes[..ranges[0].len() as usize]
@@ -3571,19 +4742,34 @@ mod tests {
         tokio::fs::write(dir.join("0.part"), b"single stream")
             .await
             .unwrap();
-        super::join_parts(&dir, &output, &unknown, 13, &merged).unwrap();
+        super::join_parts(&dir, &output, &unknown, 13, &merged, None).unwrap();
         assert_eq!(tokio::fs::read(&output).await.unwrap(), b"single stream");
         assert_eq!(merged.load(std::sync::atomic::Ordering::Relaxed), 13);
+        assert!(super::join_parts(&dir, &output, &[], 0, &merged, None).is_err());
+        assert_eq!(
+            tokio::fs::read(&output).await.unwrap(),
+            b"single stream",
+            "Existing output must not be truncated"
+        );
+        tokio::fs::remove_file(&output).await.unwrap();
 
         merged.store(0, std::sync::atomic::Ordering::Relaxed);
-        super::join_parts(&dir, &output, &[], 0, &merged).unwrap();
+        super::join_parts(&dir, &output, &[], 0, &merged, None).unwrap();
         assert_eq!(tokio::fs::metadata(&output).await.unwrap().len(), 0);
+        tokio::fs::remove_file(&output).await.unwrap();
         for invalid_size in [12, 14] {
-            assert!(super::join_parts(&dir, &output, &unknown, invalid_size, &merged).is_err());
+            assert!(
+                super::join_parts(&dir, &output, &unknown, invalid_size, &merged, None).is_err()
+            );
             assert_eq!(merged.load(std::sync::atomic::Ordering::Relaxed), 0);
+            assert!(
+                !output.exists(),
+                "Invalid single parts must not create output"
+            );
         }
-        assert!(super::join_parts(&dir, &output, &split_ranges(26, 2), 26, &merged).is_err());
-        assert!(super::join_parts(&dir, &output, &[], 1, &merged).is_err());
+        assert!(super::join_parts(&dir, &output, &split_ranges(26, 2), 26, &merged, None).is_err());
+        tokio::fs::remove_file(&output).await.unwrap();
+        assert!(super::join_parts(&dir, &output, &[], 1, &merged, None).is_err());
         let mut old_record =
             serde_json::to_value(queued_record(DownloadStatus::Paused, "Default", None)).unwrap();
         old_record.as_object_mut().unwrap().remove("mergedBytes");
@@ -3592,6 +4778,117 @@ mod tests {
                 .unwrap()
                 .merged_bytes,
             0
+        );
+        tokio::fs::remove_dir_all(dir).await.unwrap();
+    }
+
+    #[test]
+    fn single_part_finalization_preserves_resume_bytes_and_rejects_hashes_and_collisions() {
+        use sha2::{Digest, Sha256};
+        let dir = std::env::temp_dir().join(format!("fetchrail-link-test-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let payload = b"committed resume bytes";
+        let part = dir.join("0.part");
+        let output = dir.join("joined");
+        std::fs::write(&part, payload).unwrap();
+        let total = payload.len() as u64;
+        let ranges = split_ranges(total, 1);
+        let merged = std::sync::atomic::AtomicU64::new(0);
+        let expected = format!("{:x}", Sha256::digest(payload));
+        super::join_parts(&dir, &output, &ranges, total, &merged, Some(&expected)).unwrap();
+        assert_eq!(std::fs::read(&output).unwrap(), payload);
+        assert_eq!(std::fs::read(&part).unwrap(), payload);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            assert_eq!(
+                std::fs::metadata(&part).unwrap().ino(),
+                std::fs::metadata(&output).unwrap().ino()
+            );
+        }
+        std::fs::remove_file(&output).unwrap();
+        assert!(super::join_parts(
+            &dir,
+            &output,
+            &ranges,
+            total,
+            &merged,
+            Some(&"0".repeat(64))
+        )
+        .is_err());
+        std::fs::remove_file(&output).unwrap();
+        assert_eq!(
+            std::fs::read(&part).unwrap(),
+            payload,
+            "Hash rejection keeps resume data"
+        );
+        std::fs::write(&output, b"existing destination").unwrap();
+        assert!(super::join_parts(&dir, &output, &ranges, total, &merged, None).is_err());
+        assert_eq!(std::fs::read(&output).unwrap(), b"existing destination");
+        assert_eq!(std::fs::read(&part).unwrap(), payload);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn single_part_finalization_copies_across_filesystems() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = std::env::temp_dir().join(format!("fetchrail-cross-device-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let Some(shared) = std::fs::metadata("/dev/shm").ok() else {
+            std::fs::remove_dir_all(dir).unwrap();
+            return;
+        };
+        if shared.dev() == std::fs::metadata(&dir).unwrap().dev() {
+            std::fs::remove_dir_all(dir).unwrap();
+            return;
+        }
+        let output = std::path::Path::new("/dev/shm")
+            .join(format!("fetchrail-cross-device-{}", Uuid::new_v4()));
+        std::fs::write(dir.join("0.part"), b"cross-device bytes").unwrap();
+        super::join_parts(
+            &dir,
+            &output,
+            &split_ranges(18, 1),
+            18,
+            &std::sync::atomic::AtomicU64::new(0),
+            None,
+        )
+        .unwrap();
+        assert_eq!(std::fs::read(&output).unwrap(), b"cross-device bytes");
+        assert_eq!(
+            std::fs::read(dir.join("0.part")).unwrap(),
+            b"cross-device bytes"
+        );
+        std::fs::remove_file(output).unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn insufficient_part_space_preserves_validated_resume_bytes() {
+        let dir = std::env::temp_dir().join(format!("fetchrail-space-test-{}", Uuid::new_v4()));
+        let total = u64::MAX - 1;
+        let probe = super::ProbeResult {
+            total_bytes: Some(total),
+            accepts_ranges: true,
+            suggested_file_name: None,
+            validator: Some("\"v1\"".into()),
+        };
+        let ranges = split_ranges(total, 1);
+        let error = super::prepare_parts(&dir, &probe, &ranges)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("remaining parts need"));
+        tokio::fs::write(dir.join("0.part"), b"partial")
+            .await
+            .unwrap();
+        let error = super::prepare_parts(&dir, &probe, &ranges)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("remaining parts need"));
+        assert_eq!(
+            tokio::fs::read(dir.join("0.part")).await.unwrap(),
+            b"partial"
         );
         tokio::fs::remove_dir_all(dir).await.unwrap();
     }

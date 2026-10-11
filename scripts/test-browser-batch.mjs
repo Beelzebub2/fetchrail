@@ -39,7 +39,7 @@ for (const browser of ["chromium", "firefox"]) {
     },
     downloads: {
       onCreated: { addListener(fn) { created = fn; } },
-      async pause() { events.push("pause"); current.paused = true; if (browser === "firefox") Object.assign(current, { state: "interrupted", canResume: true, error: "USER_CANCELED" }); },
+      async pause() { events.push("pause"); current.paused = true; },
       async search() { return [{ ...current }]; },
       async cancel() { events.push("cancel"); if (failure === "cancel") throw new Error("Cannot cancel"); },
       async erase() { events.push("erase"); },
@@ -56,7 +56,7 @@ for (const browser of ["chromium", "firefox"]) {
   };
   if (browser === "firefox") api.runtime.sendNativeMessage = native;
   else api.runtime.sendNativeMessage = (host, request, callback) => void native(host, request).then(callback);
-  const context = vm.createContext({ [browser === "firefox" ? "browser" : "chrome"]: api, crypto: { randomUUID }, URL, Date });
+  const context = vm.createContext({ [browser === "firefox" ? "browser" : "chrome"]: api, crypto: { randomUUID }, URL });
   let liveContext = context;
   vm.runInContext(await readFile(new URL(`../browser-extension/dist/${browser}/background.js`, import.meta.url), "utf8"), context);
   const sender = { id: api.runtime.id, url: api.runtime.getURL("panel.html") };
@@ -77,9 +77,8 @@ for (const browser of ["chromium", "firefox"]) {
   // Five intermediate buttons/redirects do not enqueue their HTML pages.
   for (let i = 0; i < 5; i++) webRequest({ url: `https://host.test/step/${i}`, tabId: 10, method: "GET" });
   assert.equal(requests.filter((r) => r.method === "addDownloads").length, 0);
-  let nextDownloadId = 42;
   const capture = async (tabId = 10, method = "GET") => {
-    current = { id: nextDownloadId++, state: "in_progress", paused: false, incognito: false, danger: "safe", url: "https://host.test/redirect", finalUrl: "https://cdn.test/final.zip?token=123", totalBytes: 1234, bytesReceived: 1, mime: "application/zip", filename: "final.zip" };
+    current = { id: 42, state: "in_progress", paused: false, incognito: false, danger: "safe", url: "https://host.test/redirect", finalUrl: "https://cdn.test/final.zip?token=123", totalBytes: 1234, bytesReceived: 1024, mime: "application/zip", filename: "final.zip" };
     webRequest({ url: current.finalUrl, tabId, method, requestHeaders: [
       { name: "Cookie", value: "session=test" }, { name: "Referer", value: "https://host.test/step/5" },
       { name: "User-Agent", value: "Browser test" }, { name: "X-Unrelated", value: "do-not-forward" },

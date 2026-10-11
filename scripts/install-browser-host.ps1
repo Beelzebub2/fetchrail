@@ -35,7 +35,7 @@ $firefoxManifest = Join-Path $manifestDir "com.rrmtools.braid.firefox.json"
     description = "Fetchrail browser integration"
     path = $hostPath
     type = "stdio"
-    allowed_extensions = @("{bb4d3986-35bd-4e55-bbcb-bb7f67894086}", "browser@braid.rrmtools.uk")
+    allowed_extensions = @("browser@braid.rrmtools.uk")
 } | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $firefoxManifest -Encoding UTF8
 
 $registrations = @(
