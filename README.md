@@ -70,7 +70,7 @@ And it does more than catch:
 - **Works through download pages.** For sites with countdowns, it opens each page in turn, follows a single clear download button and captures the final file. Logins and CAPTCHAs stay with you.
 - **One right-click away.** Choose **Download with Fetchrail** on any link, or control running transfers from the toolbar.
 
-The companion ships inside Fetchrail and is loaded as an unpacked extension for now. [Read the companion guide](browser-extension/README.md).
+Install the official [Chrome Web Store companion](https://chromewebstore.google.com/detail/ccmbmcgihlemlheldpkgnidgohlkaipb) for automatic browser updates. Fetchrail also bundles companions for manual installation and Firefox. [Read the companion guide](browser-extension/README.md).
 
 ## Make it yours
 

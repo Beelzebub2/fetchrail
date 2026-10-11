@@ -6,7 +6,9 @@ Send downloads to Fetchrail, choose files from a page, and control live transfer
 
 ## Install the companion
 
-Fetchrail ships both extension builds on Windows and Linux. Launch it once to register the native host, then open the stable extension folder from **Settings → Browser companion**.
+Launch Fetchrail once to register the native host on Windows or Linux. For Chrome, use **Settings → Browser companion → Get from Chrome Web Store** to install the official [Fetchrail Browser Integration](https://chromewebstore.google.com/detail/ccmbmcgihlemlheldpkgnidgohlkaipb). This is the recommended installation: the browser automatically installs approved store updates.
+
+If you already loaded the unpacked companion, disable or remove it before enabling the store version so both copies do not capture the same download. Fetchrail also bundles both extension builds for manual installation:
 
 | System | Stable folder |
 | --- | --- |
@@ -15,9 +17,9 @@ Fetchrail ships both extension builds on Windows and Linux. Launch it once to re
 
 For Linux browser packages, custom profiles and sandbox limits, see the [Linux companion guide](../docs/linux.md#browser-companion).
 
-### Chrome, Edge, Chromium, Vivaldi, and Brave
+### Manual installation: Chrome, Edge, Chromium, Vivaldi, and Brave
 
-1. In Fetchrail, open **Settings → Browser companion → Open extension folder**. The folder action is also available in the tray.
+1. In Fetchrail, open **Settings → Browser companion → Manual installation and Firefox → Open extension folder**. The tray's **Get browser companion** action opens the official store listing.
 2. Open your browser's extensions page, such as `chrome://extensions`, `edge://extensions`, or `vivaldi://extensions`.
 3. Enable **Developer mode**, choose **Load unpacked**, and select the opened folder.
 

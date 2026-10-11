@@ -1,10 +1,17 @@
 changelog:
   categories:
     - title: Features
-      labels: [feat, enhancement]
+      labels:
+        - feat
+        - enhancement
     - title: Fixes
-      labels: [fix, bug]
+      labels:
+        - fix
+        - bug
     - title: Performance
-      labels: [perf, performance]
+      labels:
+        - perf
+        - performance
     - title: Other Changes
-      labels: ["*"]
+      labels:
+        - "*"
