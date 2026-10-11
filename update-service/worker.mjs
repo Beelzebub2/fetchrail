@@ -32,7 +32,7 @@ export default {
         if (!request.headers.get("content-type")?.startsWith("application/json")) return failure(415, "Use application/json.");
         const { data } = await readJson(new Response(request.body, { headers: request.headers }), 1024);
         await authorize(token, data.tag);
-        // Permit an exact replay of the already published Windows-only bootstrap release.
+        // Permit an exact replay of the published bootstrap release that predates Linux packages.
         // All new versions must pass the complete Windows/Linux inventory checks.
         const bootstrapReplay = data.tag === bootstrap.release.tag_name && data.manifestSha256 === bootstrap.manifestSha256;
         const next = await loadRelease(data.tag, data.manifestSha256, fetch, !bootstrapReplay);

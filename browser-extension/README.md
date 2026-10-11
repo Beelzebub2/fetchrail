@@ -6,12 +6,14 @@ Send downloads to Fetchrail, choose files from a page, and control live transfer
 
 ## Install the companion
 
-Fetchrail ships both extension builds and maintains stable folders under:
+Fetchrail ships both extension builds on Windows and Linux. Launch it once to register the native host, then open the stable extension folder from **Settings → Browser companion**.
 
-```text
-%APPDATA%\com.rrmtools.braid\browser-extension\chromium
-%APPDATA%\com.rrmtools.braid\browser-extension\firefox
-```
+| System | Stable folder |
+| --- | --- |
+| Windows | `%APPDATA%\com.rrmtools.braid\browser-extension\chromium` or `firefox` |
+| Linux | `${XDG_DATA_HOME:-$HOME/.local/share}/com.rrmtools.braid/browser-extension/chromium` or `firefox` |
+
+For Linux browser packages, custom profiles and sandbox limits, see the [Linux companion guide](../docs/linux.md#browser-companion).
 
 ### Chrome, Edge, Chromium, Vivaldi, and Brave
 
@@ -104,7 +106,7 @@ Existing builds from before this update mechanism need one manual reload to enab
 
 ## Development and troubleshooting
 
-Build the browser-capable application and register its native host for the current Windows user:
+Build the browser-capable application and register its native host for the current user on Windows or Linux. Install the [platform dependencies](../docs/development.md#requirements) first:
 
 ```powershell
 npm run browser:host

@@ -14,7 +14,7 @@ const cli = join(root, "node_modules", "@tauri-apps", "cli", "tauri.js");
 const render = (source, ...args) => execFileSync(process.execPath, [cli, "icon", join(icons, source), ...args], { cwd: root, stdio: "ignore" });
 
 render("icon.svg");
-// The desktop app ships for Windows only; the generator's mobile sets and extra sizes are not used.
+// The desktop app targets Windows and Linux; the generator's mobile sets and extra sizes are not used.
 for (const unused of ["android", "ios", "64x64.png"]) rmSync(join(icons, unused), { recursive: true, force: true });
 render("icon.svg", "-o", join(temp, "full"), "-p", "48");
 render("icon-small.svg", "-o", join(temp, "small"));

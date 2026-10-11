@@ -46,11 +46,11 @@ The following table records the source findings before implementation, including
 | Reveal downloaded file | `engine.rs::reveal` invokes Explorer; the non-Windows branch returns an error | Add file-manager selection with a parent-folder fallback |
 | Completion actions | `download_window.rs::completion_actions` uses `rasdial.exe` and `shutdown.exe`; Linux returns an error | Implement shutdown and selected modem/connection disconnection through available Linux services |
 | Tray and close | `lib.rs` requires tray creation to succeed, uses a mouse-click handler, and hides on close by default | Make tray failure nonfatal, use menu actions, and keep a way to recover the window |
-| Updates | Update state and periodic checks live in Windows-only `install.rs`; Linux reports `unmanaged` | Introduce installation-aware Linux update policy and UI |
+| Updates | Update state and periodic checks live in `install.rs` behind Windows guards; Linux reports `unmanaged` | Introduce installation-aware Linux update policy and UI |
 | Installation | Custom Windows setup, shortcuts, registry, replacement, and removal | Preserve that path; introduce Linux packages and managed portable integration separately |
 | Frontend | Startup/settings text names Windows; Programs defaults to `exe msi`; some setup joins use backslashes | Use platform capabilities/text and Linux category defaults without resetting existing categories |
 | Test scripts | Real engine/native tests assume `.exe` and `APPDATA`; progress UI check launches Microsoft Edge | Parameterize executable, state root, browser, and frontend transport expectations |
-| Releases and website | One Windows workflow; `package-release.ps1` writes a Windows-only `latest.json`; website selects only the Windows setup asset | Add Linux build jobs, one combined publication stage, and explicit platform/architecture downloads |
+| Releases and website | One Windows workflow; `package-release.ps1` writes `latest.json` with a Windows target; website selects the Windows setup asset | Add Linux build jobs, one combined publication stage, and explicit platform/architecture downloads |
 
 Relevant sources: [application startup and commands](../src-tauri/src/lib.rs), [native helper](../src-tauri/src/native_host.rs), [browser deployment](../src-tauri/src/browser_extension.rs), [engine](../src-tauri/src/engine.rs), [completion actions](../src-tauri/src/download_window.rs), [settings models](../src-tauri/src/model.rs), [native build](../src-tauri/build.rs), [torrent dependency preparation](../scripts/build-torrent-deps.ps1), [release workflow](../.github/workflows/release.yml), and [release packaging](../scripts/package-release.ps1).
 

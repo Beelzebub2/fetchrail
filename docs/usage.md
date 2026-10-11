@@ -55,14 +55,26 @@ For sites with several buttons or countdowns, use **Browse download pages**. See
 **Start download** opens a separate progress window with live speed, time left, resume support, and individual connections. Reopen it through a download's **More → Download progress** menu. Closing the progress window keeps the transfer running.
 
 - **Speed limiter** controls that download's bandwidth.
-- **Options on completion** can show the completed window, disconnect a modem, exit Fetchrail, or shut down Windows.
+- **Options on completion** can show the completed window, exit Fetchrail, or use the shutdown and disconnect actions available on your system. Linux actions depend on desktop services and authorization; see [desktop behavior](linux.md#desktop-behavior).
 
 ## Installation, updates, and removal
 
-Setup installs for your Windows account without an administrator prompt. The default location is `%LOCALAPPDATA%\Programs\Fetchrail`. The app requires the Microsoft Edge WebView2 Runtime.
+Fetchrail runs on Windows and Linux. Choose the package for your system and CPU; see the [Linux guide](linux.md) for package availability, source builds and current qualification coverage.
 
 Existing Braid installations retain their history, queues, settings, and partial downloads.
+
+### Windows
+
+Setup installs for your Windows account without an administrator prompt. The default location is `%LOCALAPPDATA%\Programs\Fetchrail`. The app requires the Microsoft Edge WebView2 Runtime.
 
 Run a newer setup to update an existing installation, or let Fetchrail download signed updates in the background. Updates take effect on the next launch; **Restart to update** applies them immediately. Automatic updates and a manual **Check for updates** button are in **Settings → Background behavior**.
 
 To uninstall, use **Windows Settings → Apps → Installed apps → Fetchrail**. Downloaded files stay on disk; removing history and settings is optional.
+
+### Linux
+
+Use a `.deb` for Ubuntu, Mint, Kali or Debian, an `.rpm` for Fedora, or the Arch PKGBUILD. AppImages and native archives cover other compatible glibc desktops. The [Linux installation guide](linux.md#choose-an-artifact) lists runtime requirements and installation commands.
+
+Writable AppImages use signed automatic updates. Native packages update through their package manager; native archives and extracted AppImages use manual updates.
+
+Remove a native package through its package manager. For portable installations, follow the [Linux removal instructions](linux.md#removal-and-troubleshooting). Downloaded files and saved data remain unless you explicitly remove them.
