@@ -1,6 +1,6 @@
 # Linux installation and development
 
-Linux support is implemented in source and has automated release gates. The x64 build and virtual desktop/package checks pass on Ubuntu 22.04.5 through WSL2, without Docker. Installed-app transfer, torrent, extension and native X11/Wayland checks also pass in official Fedora 44, Mint 22.3, Kali 2026.2 and current Arch userspaces on that kernel. Full distro certification, ARM64 execution and signed release publication remain pending. Check [qualification results](linux-support-matrix.md) for the exact coverage.
+Linux support has automated release gates. Native x64 and arm64 builds, virtual desktop checks and all four package formats passed GitHub Actions for the integrated 0.6.0 source. Installed-app transfer, torrent, extension and native X11/Wayland checks also passed in official Fedora 44, Mint 22.3, Kali and Arch userspaces. Full desktop/hardware certification and signed release publication remain separate checks. Check [qualification results](linux-support-matrix.md) for the exact coverage.
 
 ## Choose an artifact
 

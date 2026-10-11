@@ -78,11 +78,14 @@ try {
       // details use libtorrent's piece_granularity and count hash-verified bytes.
       const savedFiles = (await receive.call({ op: "details", id, view: "files" })).metadata.files.filter(file => file.priority > 0);
       assert.ok(savedFiles.some(file => file.downloaded > 0), "Checkpoint must contain verified pieces");
+      // The seeder caches this endpoint; keep it valid across the receiver restart.
+      const receivePort = (await receive.call({ op: "details", id, view: "peers" })).port;
       await receive.close(); receive = harness("receive-state");
-      await receive.call({ op: "add", id, source: path, destination, priorities, config, restore: true });
+      await receive.call({ op: "add", id, source: path, destination, priorities, config: { ...config, listenInterfaces: `127.0.0.1:${receivePort}` }, restore: true });
+      await until(async () => (await receive.call({ op: "details", id, view: "peers" })).port === receivePort, "restored receiver listening endpoint");
       await receive.call({ op: "inspect", path: join(root, "receive-state", id + ".torrent") });
-      // libtorrent validates fast resume when started. Discovery is disabled and
-      // no peer is added until after this assertion, so restored bytes are local.
+      // libtorrent validates fast resume when started. Pause the seeder so
+      // cached peers cannot supply payload while checking restored local bytes.
       await seed.call({ op: "pause", id });
       await until(async () => (await seed.call({ op: "poll" })).states.find(s => s.id === id && s.state === "paused"), "seeder pause acknowledgement");
       await receive.call({ op: "resume", id });
@@ -143,8 +146,10 @@ try {
       await until(async () => (await receive.call({ op: "poll" })).states.find(s => s.id === importId && s.downloaded > 1024 * 1024), "hybrid magnet payload");
       await receive.call({ op: "pause", id: importId });
       await receive.call({ op: "checkpoint", wait: true });
+      const receivePort = (await receive.call({ op: "details", id: importId, view: "peers" })).port;
       await receive.close(); receive = harness("receive-state");
-      await receive.call({ op: "add", id: importId, source: cached, destination: payload, priorities, config, restore: true });
+      await receive.call({ op: "add", id: importId, source: cached, destination: payload, priorities, config: { ...config, listenInterfaces: `127.0.0.1:${receivePort}` }, restore: true });
+      await until(async () => (await receive.call({ op: "details", id: importId, view: "peers" })).port === receivePort, "restored magnet receiver listening endpoint");
       await receive.call({ op: "inspect", path: cached });
       // Failed-deletion recovery must be able to reload metadata without resume.
       await receive.call({ op: "remove", id: importId });
