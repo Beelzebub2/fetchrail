@@ -15,6 +15,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use crate::model::{Accent, Theme};
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager};
 use tauri_plugin_updater::UpdaterExt;
@@ -85,6 +86,54 @@ fn setup_mode_for(exe: &Path, args: impl IntoIterator<Item = String>) -> Option<
 pub struct InstallOptions {
     pub dir: String,
     pub desktop_shortcut: bool,
+    /// Where setup was asked to save downloads; it is only made sure of here, the app is told later.
+    #[serde(default)]
+    pub download_dir: Option<String>,
+}
+
+/// What setup's steps chose for the app itself. The installed app receives it as launch
+/// arguments and saves it with its settings.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetupChoices {
+    pub launch_on_start: bool,
+    pub theme: Theme,
+    pub accent: Accent,
+    pub download_dir: String,
+}
+
+impl SetupChoices {
+    fn arguments(&self) -> Vec<String> {
+        // The settings file spells a theme and an accent the same way.
+        let name = |value: serde_json::Result<serde_json::Value>| {
+            value
+                .ok()
+                .and_then(|value| value.as_str().map(str::to_owned))
+                .unwrap_or_default()
+        };
+        let mut arguments = vec![
+            format!("--theme={}", name(serde_json::to_value(self.theme))),
+            format!("--accent={}", name(serde_json::to_value(self.accent))),
+            format!("--download-dir={}", self.download_dir.trim()),
+        ];
+        if self.launch_on_start {
+            arguments.push("--launch-on-start".into());
+        } else {
+            arguments.push("--launch-on-start=false".into());
+        }
+        arguments
+    }
+}
+
+/// The folder setup was asked to save downloads to, when it named one.
+fn chosen_download_dir(options: &InstallOptions) -> Result<Option<PathBuf>, String> {
+    let Some(folder) = options.download_dir.as_deref().map(str::trim) else {
+        return Ok(None);
+    };
+    if !Path::new(folder).is_absolute() {
+        return Err("Choose a full folder path for your downloads.".into());
+    }
+    Ok(Some(PathBuf::from(folder)))
 }
 
 fn known_folder(id: &GUID) -> Result<PathBuf, String> {
@@ -272,6 +321,11 @@ pub fn install(options: &InstallOptions) -> Result<PathBuf, String> {
     if !dir.is_absolute() {
         return Err("Choose a full folder path.".into());
     }
+    // A download folder that cannot be used is reported while setup still shows where it was typed.
+    if let Some(folder) = chosen_download_dir(options)? {
+        fs::create_dir_all(&folder)
+            .map_err(|error| format!("Could not use that download folder: {error}"))?;
+    }
     let source = std::env::current_exe().map_err(|error| error.to_string())?;
     let target = dir.join(EXE_NAME);
     stop_running()?;
@@ -352,6 +406,7 @@ pub fn run_silent(mode: SetupMode) -> Result<(), String> {
                 dir: dir.to_string_lossy().into_owned(),
                 // Nobody is asked, so an existing shortcut stays and none is added.
                 desktop_shortcut: has_desktop_shortcut(),
+                download_dir: None,
             })
             .map(drop)
         }
@@ -359,14 +414,11 @@ pub fn run_silent(mode: SetupMode) -> Result<(), String> {
     }
 }
 
-/// Starts the installed app once setup is done.
-pub fn launch(launch_on_start: bool) -> Result<(), String> {
+/// Starts the installed app once setup is done, and tells it what was chosen in setup.
+pub fn launch(choices: &SetupChoices) -> Result<(), String> {
     let exe = installed_executable(&installed_dir().ok_or("Fetchrail is not installed.")?);
-    let mut command = Command::new(exe);
-    if launch_on_start {
-        command.arg("--launch-on-start");
-    }
-    command
+    Command::new(exe)
+        .args(choices.arguments())
         .spawn()
         .map(drop)
         .map_err(|error| format!("Could not start Fetchrail: {error}"))
@@ -667,6 +719,55 @@ mod tests {
         fs::write(dir.join(EXE_NAME), b"renamed").unwrap();
         assert_eq!(installed_executable(&dir), dir.join(EXE_NAME));
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn setup_hands_its_choices_to_the_installed_app() {
+        let choices: SetupChoices = serde_json::from_str(
+            r#"{"launchOnStart":true,"theme":"light","accent":"iris","downloadDir":"E:\\My Files"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            choices.arguments(),
+            [
+                "--theme=light",
+                "--accent=iris",
+                r"--download-dir=E:\My Files",
+                "--launch-on-start"
+            ]
+        );
+        let mut settings: crate::model::DownloadSettings = serde_json::from_str(
+            r#"{"defaultDownloadDir":"D:\\Downloads","maxConcurrentDownloads":3,"connectionsPerDownload":8,"minSegmentSizeMb":4}"#,
+        )
+        .unwrap();
+        assert!(settings.apply_setup_arguments(&choices.arguments()));
+        assert_eq!(settings.accent, Accent::Iris);
+        assert_eq!(settings.default_download_dir, r"E:\My Files");
+
+        let quiet = SetupChoices {
+            launch_on_start: false,
+            ..choices
+        };
+        assert!(!quiet.arguments().contains(&"--launch-on-start".to_string()));
+        assert!(settings.launch_on_start);
+        assert!(settings.apply_setup_arguments(&quiet.arguments()));
+        assert!(!settings.launch_on_start);
+    }
+
+    #[test]
+    fn the_download_folder_must_be_a_full_path() {
+        let options = |download_dir: Option<&str>| InstallOptions {
+            dir: r"C:\Apps\Fetchrail".into(),
+            desktop_shortcut: false,
+            download_dir: download_dir.map(str::to_owned),
+        };
+        assert_eq!(chosen_download_dir(&options(None)), Ok(None));
+        assert_eq!(
+            chosen_download_dir(&options(Some(r" E:\Files "))),
+            Ok(Some(PathBuf::from(r"E:\Files")))
+        );
+        assert!(chosen_download_dir(&options(Some("Files"))).is_err());
+        assert!(chosen_download_dir(&options(Some(""))).is_err());
     }
 
     #[test]
