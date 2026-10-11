@@ -32,7 +32,13 @@ export async function verifyCredentials({ issuer, secret, fetcher = fetch }) {
 export async function syncPrivacyPolicy({ issuer, secret, guid, policy, apiBase = "https://addons.mozilla.org/api/v5", fetcher = fetch }) {
   if (!guid || !policy?.trim()) throw new Error("Firefox ID and privacy policy are required.");
   const url = `${apiBase.replace(/\/$/, "")}/addons/addon/${encodeURIComponent(guid)}/eula_policy/`;
-  const matchesPolicy = (value) => typeof value === "string" && value.replace(/\r\n/g, "\n").trim() === policy.replace(/\r\n/g, "\n").trim();
+  // AMO wraps plain-text URLs in outgoing-link HTML when returning localized fields.
+  // Compare the displayed text, while rejecting any unexpected changes to the policy.
+  const visibleText = (value) => typeof value === "string" ? value
+    .replace(/<a\b[^>]*>([\s\S]*?)<\/a>/gi, "$1")
+    .replace(/&(amp|lt|gt|quot|#39|#x27);/gi, (_, entity) => ({ amp: "&", lt: "<", gt: ">", quot: '"', "#39": "'", "#x27": "'" })[entity.toLowerCase()])
+    .replace(/\r\n/g, "\n").trim() : null;
+  const matchesPolicy = (value) => visibleText(value) === visibleText(policy);
   async function request(method, body) {
     const response = await fetcher(url, {
       method,
