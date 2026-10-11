@@ -101,3 +101,25 @@ cryptographic policy, publisher retries and real Workers-runtime tests. Runtime
 fixtures exercise persistence across restart, concurrent ordering, forged-token
 rejection, repeated notifications, checksum mismatch, ETag/cache handling and
 static routing, without Docker or production storage writes.
+
+## Verified deployment
+
+On 11 October 2026 (Europe/Lisbon), the live API served the existing v0.5.3
+manifest and website release inventory. Unauthenticated and forged notifications
+returned 401; conditional requests using Cloudflare's compressed ETag returned
+304. A headless Microsoft Edge check verified the current installer link, release
+refresh without reloading, package availability fallback and preservation of
+valid links when the feed becomes unavailable.
+
+The [real GitHub OIDC notification](https://github.com/Beelzebub2/fetchrail/actions/runs/38095202735)
+succeeded with `Update feed acknowledged 0.5.3 (already published)`.
+The [update-feed security and Workers-runtime CI job](https://github.com/Beelzebub2/fetchrail/actions/runs/38095180542/job/114339514357)
+also passed on Ubuntu 24.04. No new release tag was needed to verify publication
+authentication. Metadata body reads additionally cancel after ten seconds,
+including a notification client that stops sending its request body.
+
+Native release-mode tests passed on Windows (55 tests) and Linux (57 tests),
+including exact partial-download resume. One throughput benchmark is deliberately
+excluded from each correctness suite. The Windows truncated-response fixture
+uses HTTP connection closure after delivering its prefix; this avoids a flaky
+low-level socket close without relaxing its exact-byte assertions.

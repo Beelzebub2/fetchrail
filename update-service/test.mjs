@@ -60,6 +60,10 @@ if (process.argv[1]?.endsWith("test.mjs")) {
   await assert.rejects(authorize("junk", "v1.2.3", jwks, now), error => error.status === 401);
   await assert.rejects(readJson(new Response("x".repeat(2048)), 1024), error => error.status === 413);
   await assert.rejects(readJson(new Response("invalid")), error => error.status === 400);
+  let cancelled = false;
+  const stalled = new ReadableStream({ cancel() { cancelled = true; } });
+  await assert.rejects(readJson(new Response(stalled), 1024, 20), error => error.status === 408);
+  assert.equal(cancelled, true, "A stalled metadata/request body is cancelled within its time limit");
   assert.equal(compareTags("v1.10.0", "v1.9.99"), 1);
   assert.throws(() => compareTags("v1.2.3-beta", "v1.2.3"), FeedError);
 

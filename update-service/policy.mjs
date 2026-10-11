@@ -20,20 +20,23 @@ export function compareTags(left, right) {
 export async function sha256(bytes) {
   return [...new Uint8Array(await crypto.subtle.digest("SHA-256", bytes))].map(x => x.toString(16).padStart(2, "0")).join("");
 }
-export async function readJson(response, limit = 65536) {
+export async function readJson(response, limit = 65536, timeoutMs = 10000) {
   require(response.ok, 502, "Upstream metadata is unavailable.");
   require(response.body && !(Number(response.headers.get("content-length")) > limit), 413, "Metadata is too large.");
   const reader = response.body.getReader(), chunks = []; let size = 0;
+  let timedOut = false;
+  const timer = setTimeout(() => { timedOut = true; void reader.cancel().catch(() => {}); }, timeoutMs);
   try {
     for (;;) {
       const { value, done } = await reader.read();
+      require(!timedOut, 408, "Metadata read timed out.");
       if (done) break;
       size += value.length;
       require(size <= limit, 413, "Metadata is too large.");
       chunks.push(value);
     }
   } catch (error) { await reader.cancel().catch(() => {}); throw error; }
-  finally { reader.releaseLock(); }
+  finally { clearTimeout(timer); reader.releaseLock(); }
   const bytes = new Uint8Array(size); let offset = 0;
   for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.length; }
   try { return { bytes, data: JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes)) }; }
