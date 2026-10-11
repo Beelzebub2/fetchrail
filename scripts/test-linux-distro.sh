@@ -149,7 +149,7 @@ chroot --userspec=1000:1000 "$root" env HOME=/home/fetchrail XDG_RUNTIME_DIR=/ru
   FETCHRAIL_SOURCE_ARCHIVE_SHA256="${FETCHRAIL_SOURCE_ARCHIVE_SHA256:-}" \
   FETCHRAIL_QUALIFICATION_ENVIRONMENT="$distro official userspace in native chroot; host kernel; physical desktop and machine actions pending" \
   FETCHRAIL_TORRENT_HARNESS=/home/fetchrail/distro-check/src-tauri/target/release/torrent-harness \
-  bash -c 'set -e; cd /home/fetchrail/distro-check; xvfb-run -n "$FETCHRAIL_TEST_DISPLAY" -a dbus-run-session -- node scripts/qualify-linux.mjs /usr/bin/fetchrail; xvfb-run -n "$FETCHRAIL_TEST_DISPLAY" -a dbus-run-session -- node scripts/test-linux-desktop.mjs /usr/bin/fetchrail; bash scripts/test-linux-wayland.sh /usr/bin/fetchrail'
+  bash -c 'set -e; cd /home/fetchrail/distro-check; xvfb-run -n "$FETCHRAIL_TEST_DISPLAY" -a -s "-screen 0 1280x1024x24 -noreset" dbus-run-session -- node scripts/qualify-linux.mjs /usr/bin/fetchrail; xvfb-run -n "$FETCHRAIL_TEST_DISPLAY" -a -s "-screen 0 1280x1024x24 -noreset" dbus-run-session -- node scripts/test-linux-desktop.mjs /usr/bin/fetchrail; bash scripts/test-linux-wayland.sh /usr/bin/fetchrail'
 case "$distro" in
   fedora44) chroot "$root" dnf -y remove fetchrail ;;
   arch) chroot "$root" pacman -R --noconfirm fetchrail-bin ;;
