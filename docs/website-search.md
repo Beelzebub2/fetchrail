@@ -12,6 +12,10 @@ HTML passes through the Worker with a fresh 128-bit CSP nonce. Cloudflare parses
 
 Transformed HTML uses `Cache-Control: no-store` and removes HTML validators; conditional document requests are fetched without validators so an old body cannot be paired with a new nonce on a 304. This trades browser/output HTML caching for correct nonce isolation. The ASSETS binding still caches the original static source, and explicit CSS, JavaScript, image, sitemap and font routes bypass the Worker; immutable font caching remains intact. Check production TTFB after deployment because local tests do not measure the Cloudflare edge or injected JSD. API caching, ETags and Durable Object storage are unchanged.
 
+## Latest production verification
+
+The deployed `version957e8f66-ca76-436a-9de5-f2f35f90e400` response propagated the exact CSP nonce to Cloudflare's injected bootstrap and the JSON-LD script, with strict `no unsafe-inline`. API v0.6.1 and its 12 assets retained their ETags; fonts remained immutable with an edge HIT; all seven sitemap URLs returned live pages; and unknown paths remained genuine 404s. The clean Lighthouse baseline was mobile performance 98, accessibility 100, SEO 100 (LCP 1.535s, TBT 149ms) and desktop performance 100, SEO 100 (LCP 0.454s, TBT 0ms). Desktop accessibility is being remeasured after the explanatory-step contrast fix. Best Practices was 81 on both runs solely because Cloudflare's enabled `/cdn-cgi/challenge-platform/scripts/jsd/main.js` probes use deprecated Shared Storage, Protected Audience and `StorageType.persistent` APIs; the site's protections remain enabled.
+
 ## Search owner checklist
 
 1. Keep the homepage's Google verification tag in place. Verify the URL-prefix property `https://fetchrail.rrmtools.uk/` in Google Search Console after deployment. Add a DNS Domain property only with owner access to the domain. Verification alone does not imply indexing.
