@@ -8,7 +8,8 @@ const server = spawn(process.execPath, ["node_modules/vite/bin/vite.js", "previe
 let browser;
 try {
   for (let i = 0; i < 100; i++) { if (await fetch("http://127.0.0.1:1428").then(r => r.ok, () => false)) break; await delay(100); }
-  browser = await chromium.launch({ headless: true, ...(process.env.PLAYWRIGHT_CHANNEL ? { channel: process.env.PLAYWRIGHT_CHANNEL } : process.platform === "win32" ? { channel: "chrome" } : {}) });
+  // Measure rendering work without the hosted runner's virtual-display frame pacing.
+  browser = await chromium.launch({ headless: true, args: ["--disable-frame-rate-limit"], ...(process.env.PLAYWRIGHT_CHANNEL ? { channel: process.env.PLAYWRIGHT_CHANNEL } : process.platform === "win32" ? { channel: "chrome" } : {}) });
   const page = await browser.newPage({ viewport: { width: 1440, height: 1000 } });
   const errors = []; page.on("pageerror", error => errors.push(error.message));
   await page.addInitScript(() => {
@@ -56,7 +57,13 @@ try {
   assert.ok(renderedTransfers < 40, `1,000 records must remain virtualized (${renderedTransfers} rendered)`);
   const latencies = [];
   for (let i = 0; i < 10; i++) {
-    const elapsed = await page.evaluate(async () => { const start = performance.now(); document.querySelector('.torrent-row .icon-button').click(); await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))); return performance.now() - start; });
+    const elapsed = await page.evaluate(async () => {
+      const start = performance.now();
+      document.querySelector('.torrent-row .icon-button').click();
+      await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+      if (!document.querySelector('.torrent-inspector')?.getBoundingClientRect().height) throw Error("Torrent details did not render during the measured frames.");
+      return performance.now() - start;
+    });
     latencies.push(elapsed);
     await page.getByRole("button", { name: "Close torrent details", exact: true }).click();
   }
@@ -102,6 +109,7 @@ try {
   const p95 = [...latencies].sort((a, b) => a - b)[Math.ceil(latencies.length * 0.95) - 1];
   const metrics = { records: 1000, files: 10000, peers: 2000, telemetryHz: 4, steadyTelemetrySeconds: 15, steadyStallsMs: steadyStalls, actionPaintP95Ms: p95, actionPaintSamplesMs: latencies, errors };
   await writeFile("artifacts/torrent-ui-performance.json", JSON.stringify(metrics, null, 2));
+  console.log("Torrent UI performance: " + JSON.stringify(metrics));
   assert.deepEqual(errors, []);
   assert.ok(p95 < 100, `UI action p95 was ${p95.toFixed(1)} ms`);
   assert.ok(steadyStalls.filter(ms => ms > 50).length <= 1, `Repeated steady-state UI stalls: ${JSON.stringify(steadyStalls)}`);

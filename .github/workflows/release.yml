@@ -64,20 +64,23 @@ jobs:
           }
       - name: Install frontend dependencies
         run: npm ci
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          repository: microsoft/vcpkg
-          ref: 96d5fb3de135b86d7222c53f2352ca92827a156b
-          path: .native-vcpkg
-          persist-credentials: false
-      - name: Build native torrent dependencies
-        run: |
-          ./.native-vcpkg/bootstrap-vcpkg.bat -disableMetrics
-          ./scripts/build-torrent-deps.ps1 -VcpkgRoot "$PWD/.native-vcpkg"
       - name: Build frontend and extensions
         run: npm run build
       - name: Check extension behaviour
         run: npm run browser:check
+      - name: Test progress and torrent interfaces
+        run: |
+          npm run ui:test
+          if ($LASTEXITCODE -ne 0) { throw 'Progress interface checks failed.' }
+          npm run torrent:ui
+          if ($LASTEXITCODE -ne 0) { throw 'Torrent interface checks failed.' }
+      - name: Retain Windows interface evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: qualification-windows-ui
+          path: artifacts/torrent-ui-*
+          if-no-files-found: warn
       - name: Check release tooling and build store package
         run: |
           npm run release:test
@@ -89,6 +92,16 @@ jobs:
           node scripts/prepare-chrome-web-store.mjs "v$version"
           if ($LASTEXITCODE -ne 0) { throw 'Production extension packaging failed.' }
           Compress-Archive -Path "$env:CWS_OUTPUT/*" -DestinationPath "artifacts/chrome-web-store-$version.zip"
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: microsoft/vcpkg
+          ref: 96d5fb3de135b86d7222c53f2352ca92827a156b
+          path: .native-vcpkg
+          persist-credentials: false
+      - name: Build native torrent dependencies
+        run: |
+          ./.native-vcpkg/bootstrap-vcpkg.bat -disableMetrics
+          ./scripts/build-torrent-deps.ps1 -VcpkgRoot "$PWD/.native-vcpkg"
       - name: Generate dependency inventory and notices
         run: node scripts/release-notices.mjs
       - name: Check Rust formatting
@@ -108,13 +121,8 @@ jobs:
           npm run torrent:test
           if ($LASTEXITCODE -ne 0) { throw 'Torrent swarm checks failed.' }
           npm run torrent:listeners
-      - name: Test torrent UI and packaged integration
-        run: |
-          npm run ui:test
-          if ($LASTEXITCODE -ne 0) { throw 'Progress interface checks failed.' }
-          npm run torrent:ui
-          if ($LASTEXITCODE -ne 0) { throw 'Torrent interface checks failed.' }
-          node scripts/test-torrent-desktop.mjs src-tauri/target/release/fetchrail.exe src-tauri/target/release/torrent-harness.exe
+      - name: Test packaged torrent integration
+        run: node scripts/test-torrent-desktop.mjs src-tauri/target/release/fetchrail.exe src-tauri/target/release/torrent-harness.exe
       - name: Test setup and removal
         run: npm run setup:test
       - name: Package Windows build without release secrets
