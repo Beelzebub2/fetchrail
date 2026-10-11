@@ -1,4 +1,4 @@
-import { CSSProperties, FormEvent, useEffect, useMemo, useRef, useState } from "react";
+import { CSSProperties, FormEvent, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { getVersion } from "@tauri-apps/api/app";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
@@ -6,6 +6,7 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import { open } from "@tauri-apps/plugin-dialog";
 import {
   Activity,
+  ArrowLeft,
   ArrowRight,
   CalendarClock,
   Check,
@@ -16,13 +17,18 @@ import {
   FolderOpen,
   Globe,
   Link,
+  ListChecks,
   Minus,
+  Monitor,
   Moon,
+  PanelBottom,
   Pause,
   Play,
   Plus,
+  Power,
   RotateCw,
   Search,
+  Settings,
   Settings2,
   Share2,
   Sun,
@@ -113,6 +119,12 @@ type SetupInfo = {
   dir: string;
   installed: boolean;
   desktopShortcut: boolean;
+  // What is saved from an earlier installation, or what a new one starts with.
+  theme: Theme;
+  accent: Accent;
+  downloadDir: string;
+  sortsIntoFolders: boolean;
+  launchOnStart: boolean;
 };
 
 export type DownloadSettings = Appearance & {
@@ -243,6 +255,63 @@ function folderOf(category: Category | null, settings: DownloadSettings) {
   if (!category?.folder) return base;
   if (/^([a-z]:[\\/]|[\\/])/i.test(category.folder)) return category.folder;
   return base.replace(/[\\/]+$/, "") + (base.includes("/") ? "/" : "\\") + category.folder;
+}
+
+const differ = (a: unknown, b: unknown) => JSON.stringify(a ?? null) !== JSON.stringify(b ?? null);
+
+// How many settings the draft changes. The look applies at once, so it never counts.
+function unsavedCount(draft: DownloadSettings, saved: DownloadSettings) {
+  const keys = (Object.keys(draft) as (keyof DownloadSettings)[]).filter((key) => !["theme", "accent", "torrent"].includes(key));
+  const torrentKeys = Object.keys(draft.torrent) as (keyof TorrentSettings)[];
+  return (
+    keys.filter((key) => differ(draft[key], saved[key])).length +
+    torrentKeys.filter((key) => differ(draft.torrent[key], saved.torrent[key])).length
+  );
+}
+
+// The rail's one underline: it glides to whichever tab is current, in either set of tabs.
+// `layout` names everything that can move a tab, so the bar is only measured when one may have moved.
+function useTabGlide(layout: string) {
+  const strip = useRef<HTMLDivElement>(null);
+  const bar = useRef<HTMLSpanElement>(null);
+  useLayoutEffect(() => {
+    const place = () => {
+      if (!strip.current || !bar.current) return;
+      const tab = strip.current.querySelector<HTMLElement>(".rail-tab:is(.active,[aria-selected=true])");
+      if (!tab) {
+        bar.current.style.opacity = "0";
+        return;
+      }
+      // Offsets ignore transforms, so a tab that is still rising into place is measured where it will rest.
+      let x = 0;
+      let y = 0;
+      for (let at: HTMLElement | null = tab; at && at !== strip.current; at = at.offsetParent as HTMLElement | null) {
+        x += at.offsetLeft;
+        y += at.offsetTop;
+      }
+      bar.current.style.opacity = "1";
+      bar.current.style.transform = `translate(${x + 12}px,${y + tab.offsetHeight - 2}px) scaleX(${(tab.offsetWidth - 24) / 100})`;
+    };
+    place();
+    let live = true;
+    window.addEventListener("resize", place);
+    void document.fonts.ready.then(() => live && place());
+    return () => {
+      live = false;
+      window.removeEventListener("resize", place);
+    };
+  }, [layout]);
+  return { strip, bar };
+}
+
+// True for a moment after `view` changes, so a list plays its entrance once rather than on every scroll.
+function useEntering(view: string) {
+  const [settled, setSettled] = useState<string | null>(null);
+  useEffect(() => {
+    const timer = setTimeout(() => setSettled(view), 900);
+    return () => clearTimeout(timer);
+  }, [view]);
+  return settled !== view;
 }
 
 function updateNote(update: UpdateStatus) {
@@ -459,6 +528,13 @@ function App() {
   const [showAdd, setShowAdd] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
   const [settingsSection, setSettingsSection] = useState<SettingsSection>("general");
+  // Unsaved settings are kept as changes on top of what is saved, so they outlive a visit to the downloads.
+  const [edits, setEdits] = useState<Partial<DownloadSettings>>({});
+  const [saveState, setSaveState] = useState<"idle" | "saving" | "done">("idle");
+  const [organizing, setOrganizing] = useState<"sort" | "flatten" | null>(null);
+  const saveTimer = useRef(0);
+  const savingSettings = useRef<DownloadSettings | null>(null);
+  const savedBar = useRef({ done: false, text: "" });
   const [url, setUrl] = useState("");
   const [downloadLimit, setDownloadLimit] = useState(0);
   const [expectedSha256, setExpectedSha256] = useState("");
@@ -744,20 +820,38 @@ function App() {
     if (typeof selected === "string") setDirectory(selected);
   }
 
-  async function saveSettings(next: DownloadSettings) {
+  async function saveSettings() {
+    if (!draft || !unsaved || organizing || savingSettings.current) return;
+    savingSettings.current = draft;
     setBusy(true);
+    setSaveState("saving");
     setMessage(null);
     try {
-      const saved = await invoke<DownloadSettings>("update_settings", {
-        settings: next,
-      });
-      setSettings(saved);
-      setShowSettings(false);
+      setSettings(await invoke<DownloadSettings>("update_settings", { settings: draft }));
+      setEdits((current) => Object.fromEntries(
+        Object.entries(current).filter(([key, value]) => differ(value, draft[key as keyof DownloadSettings]))
+      ) as Partial<DownloadSettings>);
+      setSaveState("done");
+      // The bar says so for a moment, then leaves.
+      clearTimeout(saveTimer.current);
+      saveTimer.current = window.setTimeout(() => setSaveState("idle"), 1300);
     } catch (error) {
       setMessage(String(error));
+      setSaveState("idle");
     } finally {
+      savingSettings.current = null;
       setBusy(false);
     }
+  }
+
+  // A change back to what is saved is dropped; kept, it would undo a value that is saved from elsewhere later.
+  function editSettings(change: Partial<DownloadSettings>) {
+    if (!settings) return;
+    setEdits((current) => {
+      if (savingSettings.current) return { ...current, ...change };
+      const changed = Object.entries({ ...current, ...change }).filter(([key, value]) => differ(value, settings[key as keyof DownloadSettings]));
+      return Object.fromEntries(changed) as Partial<DownloadSettings>;
+    });
   }
 
   // The look and a remembered answer apply at once, on top of the saved settings rather than an unsaved draft.
@@ -799,8 +893,20 @@ function App() {
     setStartMode("now");
   }
 
-  const shown = (id: string) => !showSettings && activeFilter === id;
+  const draft = useMemo(() => (settings ? { ...settings, ...edits } : null), [settings, edits]);
+  const unsaved = settings && draft ? unsavedCount(draft, settings) : 0;
+  const inSettings = showSettings && settings != null && draft != null;
+  // The bar keeps its last message while it slides away, so it never reads "0 unsaved changes".
+  if (unsaved) savedBar.current = { done: false, text: `${unsaved} unsaved ${unsaved === 1 ? "change" : "changes"}` };
+  else if (saveState === "done") savedBar.current = { done: true, text: "Settings saved" };
+  const barShown = inSettings && (unsaved > 0 || saveState !== "idle");
+
+  const shown = (id: string) => !inSettings && activeFilter === id;
   const tabClass = (id: string) => (shown(id) ? "rail-tab active" : "rail-tab");
+  const torrentCount = useMemo(() => downloads.filter((item) => item.torrent).length, [downloads]);
+  const tabCounts = [downloads.length, overview.active + overview.queued, overview.completed, overview.failed, torrentCount, overview.seeding];
+  const glide = useTabGlide([inSettings, settingsSection, activeFilter, ...tabCounts].join());
+  const entering = useEntering(inSettings ? "" : activeFilter + groupBy);
   const dark = (settings?.theme ?? "dark") === "dark";
   const dialogConnections = connections || settings?.connectionsPerDownload || 8;
   // Without a chosen folder, the engine files the download under its category.
@@ -864,88 +970,124 @@ function App() {
               {dark ? <Sun size={16} /> : <Moon size={16} />}
             </button>
             <button
-              className={showSettings ? "icon-button active" : "icon-button"}
-              onClick={() => openSettings("general")}
-              title="Settings"
+              className="icon-button"
+              onClick={() => setShowSettings(!showSettings)}
+              title={unsaved && !inSettings ? "Settings, with unsaved changes" : "Settings"}
               aria-label="Settings"
+              aria-pressed={inSettings}
             >
-              <Settings2 size={16} />
+              <Settings size={16} className="gear" />
+              <span className={unsaved && !inSettings ? "dot on" : "dot"} aria-hidden="true" />
             </button>
           </div>
         </div>
 
-        <div className="rail-tabs">
-          <nav className="view-tabs" aria-label="Views">
-            <button className={tabClass("all")} onClick={() => show("all")}>
-              All downloads <span className="count">{downloads.length}</span>
-            </button>
-            <button className={tabClass("active")} onClick={() => show("active")}>
-              Active <span className="count">{overview.active + overview.queued}</span>
-            </button>
-            <button className={tabClass("completed")} onClick={() => show("completed")}>
-              Completed <span className="count">{overview.completed}</span>
-            </button>
-            <button className={tabClass("failed")} onClick={() => show("failed")}>
-              Failed <span className={overview.failed ? "count alert" : "count"}>{overview.failed}</span>
-            </button>
-            <span className="rail-divider" aria-hidden="true" />
-            <button className={tabClass("torrents")} onClick={() => show("torrents")}>
-              Torrents <span className="count">{downloads.filter((item) => item.torrent).length}</span>
-            </button>
-            <button className={tabClass("seeding")} onClick={() => show("seeding")}>
-              Seeding <span className="count">{overview.seeding}</span>
-            </button>
-            <button className={tabClass("paused")} onClick={() => show("paused")}>Paused</button>
-          </nav>
-
-          <nav className="queue-pills" aria-label="Queues">
-            <span className="overline">Queues</span>
-            {queues.map((queue) => {
-              const items = downloads.filter((item) => item.queue === queue.name);
-              const id = "queue:" + queue.name;
-              return (
-                <button
-                  key={queue.name}
-                  className={shown(id) ? "queue-pill active" : "queue-pill"}
-                  onClick={() => show(shown(id) ? "all" : id)}
-                  title={queueWaitNote(queue) || undefined}
-                >
-                  {queue.paused ? (
-                    <Pause size={12} />
-                  ) : (
-                    <span className={items.some((item) => runningStatuses.has(item.status)) ? "queue-dot live" : "queue-dot"} />
-                  )}
-                  {queue.name}
-                  {queue.paused && <small>paused</small>}
-                  <span className="count">{items.length}</span>
+        <div className="rail-tabs" data-mode={inSettings ? "settings" : "downloads"} ref={glide.strip}>
+          {inSettings ? (
+            <>
+              <button className="back-chip" onClick={() => setShowSettings(false)}>
+                <ArrowLeft size={16} /> Downloads
+              </button>
+              <span className="rail-divider" aria-hidden="true" />
+              <div className="view-tabs" role="tablist" aria-label="Settings sections">
+                {settingsSections.map(([id, label, Icon]) => (
+                  <button
+                    key={id}
+                    role="tab"
+                    className="rail-tab"
+                    id={"settings-tab-" + id}
+                    aria-selected={settingsSection === id}
+                    aria-controls="settings-panel"
+                    onClick={() => setSettingsSection(id)}
+                  >
+                    <Icon size={16} />
+                    {label}
+                  </button>
+                ))}
+              </div>
+              <span className={unsaved ? "save-state dirty" : "save-state"} role="status">
+                <i aria-hidden="true" />
+                {unsaved ? savedBar.current.text : "All changes saved"}
+              </span>
+            </>
+          ) : (
+            <>
+              <nav className="view-tabs" aria-label="Views">
+                <button className={tabClass("all")} onClick={() => show("all")}>
+                  All downloads <span className="count">{downloads.length}</span>
                 </button>
-              );
-            })}
-            <button
-              className="icon-button small"
-              onClick={() => openSettings("queues")}
-              title="Add or manage queues"
-              aria-label="Add or manage queues"
-            >
-              <Plus size={16} />
-            </button>
-          </nav>
+                <button className={tabClass("active")} onClick={() => show("active")}>
+                  Active <span className="count">{overview.active + overview.queued}</span>
+                </button>
+                <button className={tabClass("completed")} onClick={() => show("completed")}>
+                  Completed <span className="count">{overview.completed}</span>
+                </button>
+                <button className={tabClass("failed")} onClick={() => show("failed")}>
+                  Failed <span className={overview.failed ? "count alert" : "count"}>{overview.failed}</span>
+                </button>
+                <span className="rail-divider" aria-hidden="true" />
+                <button className={tabClass("torrents")} onClick={() => show("torrents")}>
+                  Torrents <span className="count">{torrentCount}</span>
+                </button>
+                <button className={tabClass("seeding")} onClick={() => show("seeding")}>
+                  Seeding <span className="count">{overview.seeding}</span>
+                </button>
+                <button className={tabClass("paused")} onClick={() => show("paused")}>Paused</button>
+              </nav>
+
+              <nav className="queue-pills" aria-label="Queues">
+                <span className="overline">Queues</span>
+                {queues.map((queue) => {
+                  const items = downloads.filter((item) => item.queue === queue.name);
+                  const id = "queue:" + queue.name;
+                  return (
+                    <button
+                      key={queue.name}
+                      className={shown(id) ? "queue-pill active" : "queue-pill"}
+                      onClick={() => show(shown(id) ? "all" : id)}
+                      title={queueWaitNote(queue) || undefined}
+                    >
+                      {queue.paused ? (
+                        <Pause size={12} />
+                      ) : (
+                        <span className={items.some((item) => runningStatuses.has(item.status)) ? "queue-dot live" : "queue-dot"} />
+                      )}
+                      {queue.name}
+                      {queue.paused && <small>paused</small>}
+                      <span className="count">{items.length}</span>
+                    </button>
+                  );
+                })}
+                <button
+                  className="icon-button small"
+                  onClick={() => openSettings("queues")}
+                  title="Add or manage queues"
+                  aria-label="Add or manage queues"
+                >
+                  <Plus size={16} />
+                </button>
+              </nav>
+            </>
+          )}
+          <span className="tab-glide" ref={glide.bar} aria-hidden="true" />
         </div>
       </header>
 
-      <main className={showSettings && settings ? "content" : "content transfers"}>
-        {showSettings && settings ? (
+      <main className={inSettings ? "content" : "content transfers"}>
+        {inSettings ? (
           <SettingsPage
             settings={settings}
+            draft={draft}
             queues={queues}
             busy={busy}
             version={version}
             update={update}
             samples={samples}
             section={settingsSection}
-            onSection={setSettingsSection}
-            onClose={() => setShowSettings(false)}
-            onSave={saveSettings}
+            organizing={organizing}
+            onOrganizing={setOrganizing}
+            onChange={editSettings}
+            onSave={() => void saveSettings()}
             onRestart={() => void invoke("restart_app").catch((error) => setMessage(String(error)))}
             onAppearance={applySettings}
             onCreateQueue={(name) => queueCommand("create_queue", { name })}
@@ -1001,9 +1143,9 @@ function App() {
                 )}
               </div>
             ) : (
-              <div className="download-list transfer-scroll" ref={listScroll}>
+              <div className={entering ? "download-list transfer-scroll entering" : "download-list transfer-scroll"} ref={listScroll}>
                 <div style={{ height: virtualRows.getTotalSize(), position: "relative" }}>
-                  {virtualRows.getVirtualItems().map(row => { const entry = entries[row.index]; return <div key={row.key} data-index={row.index} ref={virtualRows.measureElement} style={{ position: "absolute", top: 0, left: 0, width: "100%", transform: `translateY(${row.start}px)` }}>
+                  {virtualRows.getVirtualItems().map(row => { const entry = entries[row.index]; return <div key={row.key} data-index={row.index} ref={virtualRows.measureElement} style={{ position: "absolute", top: 0, left: 0, width: "100%", transform: `translateY(${row.start}px)`, "--i": row.index } as CSSProperties}>
                     {entry.kind === "section"
                       ? <ListSection entry={entry} busy={busy} onToggleQueue={(name, paused) => queueCommand("set_queue_paused", { name, paused })} />
                       : entry.item.torrent ? <TorrentRow item={entry.item} selected={selectedTorrent === entry.item.id} onSelect={() => setSelectedTorrent(entry.item.id)} command={command} /> : <DownloadRow item={entry.item} queues={queues} command={command} onRemove={requestRemove} />}
@@ -1013,8 +1155,25 @@ function App() {
             )}
           </>
         )}
-        {!showSettings && torrentSelected && <TorrentInspector key={torrentSelected.id} item={torrentSelected} onClose={() => setSelectedTorrent(null)} command={command} onError={setMessage} />}
+        {!inSettings && torrentSelected && <TorrentInspector key={torrentSelected.id} item={torrentSelected} onClose={() => setSelectedTorrent(null)} command={command} onError={setMessage} />}
       </main>
+
+      <div className={barShown ? "save-dock shown" : "save-dock"} role="region" aria-label="Unsaved settings" inert={!barShown}>
+        <span>
+          {savedBar.current.done ? <Check size={18} /> : <i aria-hidden="true" />}
+          {savedBar.current.text}
+        </span>
+        {!savedBar.current.done && (
+          <>
+            <button type="button" className="ghost-button" disabled={busy || organizing !== null} onClick={() => setEdits({})}>
+              Discard
+            </button>
+            <button className="primary-button" form="settings-form" disabled={busy || organizing !== null}>
+              {saveState === "saving" ? "Saving…" : "Save settings"}
+            </button>
+          </>
+        )}
+      </div>
 
       {message && (
         <div className="toast" role="alert">
@@ -1683,16 +1842,60 @@ function DownloadRow({
   );
 }
 
+// The theme and accent pickers, shared by Settings and by setup.
+function LookFields({ look, onChange }: { look: Appearance; onChange: (look: Partial<Appearance>) => void }) {
+  return (
+    <div className="looks">
+      <fieldset className="choice-field">
+        <legend>Theme</legend>
+        <div className="theme-cards">
+          {(["dark", "light"] as Theme[]).map((theme) => (
+            <label key={theme} className="look-card">
+              <input type="radio" name="theme" checked={look.theme === theme} onChange={() => onChange({ theme })} />
+              <span className={"theme-preview " + theme} aria-hidden="true">
+                <span><i /><i /><i /></span>
+                {[62, 34, 81].map((width) => (
+                  <span key={width}><i /><i /><i style={{ "--w": width + "%" } as CSSProperties} /></span>
+                ))}
+              </span>
+              <span className="look-name">
+                {theme === "dark" ? <Moon size={15} /> : <Sun size={15} />}
+                {theme === "dark" ? "Dark" : "Light"}
+              </span>
+              <span className="tick" aria-hidden="true"><Check size={13} /></span>
+            </label>
+          ))}
+        </div>
+      </fieldset>
+      <fieldset className="choice-field">
+        <legend>Accent</legend>
+        <div className="accent-cards">
+          {accents.map((accent) => (
+            <label key={accent} className="look-card" data-accent={accent}>
+              <input type="radio" name="accent" checked={look.accent === accent} onChange={() => onChange({ accent })} />
+              <span className="accent-strands" aria-hidden="true"><i /><i /><i /></span>
+              <span className="look-name">{accent[0].toUpperCase() + accent.slice(1)}</span>
+              <span className="tick" aria-hidden="true"><Check size={13} /></span>
+            </label>
+          ))}
+        </div>
+      </fieldset>
+    </div>
+  );
+}
+
 function SettingsPage({
   settings,
+  draft,
   queues,
   busy,
   version,
   update,
   samples,
   section,
-  onSection,
-  onClose,
+  organizing,
+  onOrganizing,
+  onChange,
   onSave,
   onRestart,
   onAppearance,
@@ -1702,15 +1905,18 @@ function SettingsPage({
   onScheduleQueue,
 }: {
   settings: DownloadSettings;
+  // The saved settings with the unsaved changes on top.
+  draft: DownloadSettings;
   queues: QueueRecord[];
   busy: boolean;
   version: string;
   update: UpdateStatus;
   samples: number[];
   section: SettingsSection;
-  onSection: (section: SettingsSection) => void;
-  onClose: () => void;
-  onSave: (settings: DownloadSettings) => Promise<void>;
+  organizing: "sort" | "flatten" | null;
+  onOrganizing: (mode: "sort" | "flatten" | null) => void;
+  onChange: (change: Partial<DownloadSettings>) => void;
+  onSave: () => void;
   onRestart: () => void;
   onAppearance: (look: Partial<Appearance>) => Promise<void>;
   onCreateQueue: (name: string) => Promise<boolean>;
@@ -1718,13 +1924,11 @@ function SettingsPage({
   onToggleQueue: (name: string, paused: boolean) => Promise<boolean>;
   onScheduleQueue: (name: string, startsAt: string | null, stopsAt: string | null) => Promise<boolean>;
 }) {
-  const [draft, setDraft] = useState(settings);
   const capabilities = usePlatformCapabilities();
   const [queueName, setQueueName] = useState("");
   const [openingExtension, setOpeningExtension] = useState(false);
   const [extensionError, setExtensionError] = useState<string | null>(null);
   const [integrationNote, setIntegrationNote] = useState<string | null>(null);
-  const [organizing, setOrganizing] = useState<"sort" | "flatten" | null>(null);
   const [organizeNote, setOrganizeNote] = useState<string | null>(null);
   const [organizeError, setOrganizeError] = useState<string | null>(null);
   const folderSettingsChanged = draft.defaultDownloadDir !== settings.defaultDownloadDir
@@ -1740,7 +1944,7 @@ function SettingsPage({
       setOrganizeError("Save your folder and category settings before organizing existing files.");
       return;
     }
-    setOrganizing(mode);
+    onOrganizing(mode);
     setOrganizeNote(null);
     setOrganizeError(null);
     try {
@@ -1753,7 +1957,7 @@ function SettingsPage({
     } catch (error) {
       setOrganizeError(String(error));
     } finally {
-      setOrganizing(null);
+      onOrganizing(null);
     }
   }
 
@@ -1772,287 +1976,256 @@ function SettingsPage({
 
   async function chooseDefaultDirectory() {
     const selected = await open({ directory: true, multiple: false });
-    if (typeof selected === "string") {
-      setDraft((current) => ({ ...current, defaultDownloadDir: selected }));
-    }
-  }
-
-  // Saving the rest of the form later must not undo a look that was already applied.
-  function setLook(look: Partial<Appearance>) {
-    setDraft((current) => ({ ...current, ...look }));
-    void onAppearance(look);
+    if (typeof selected === "string") onChange({ defaultDownloadDir: selected });
   }
 
   return (
     <form
       className="settings form"
+      id="settings-form"
       onSubmit={(event) => {
         event.preventDefault();
-        if (!organizing) void onSave(draft);
+        onSave();
       }}
     >
-      <div className="page-head">
-        <div>
-          <h1>Settings</h1>
-          <p>Tune downloads, queues and background behavior.</p>
-        </div>
-        <div>
-          <button type="button" className="ghost-button" disabled={organizing !== null} onClick={onClose}>Discard</button>
-          <button className="primary-button" disabled={busy || organizing !== null}>{busy ? "Saving…" : "Save settings"}</button>
-        </div>
-      </div>
-
-      <div className="settings-tabs" role="tablist" aria-label="Settings sections">
-        {settingsSections.map(([id, label, Icon]) => (
-          <button
-            key={id}
-            type="button"
-            role="tab"
-            className="rail-tab"
-            id={"settings-tab-" + id}
-            aria-selected={section === id}
-            aria-controls="settings-panel"
-            onClick={() => onSection(id)}
-          >
-            <Icon size={16} />
-            {label}
-          </button>
-        ))}
-      </div>
-
-      <div className="settings-panel" id="settings-panel" role="tabpanel" aria-labelledby={"settings-tab-" + section}>
+      {/* Keyed by section, so each one rises in when it is opened. */}
+      <div className="settings-panel" id="settings-panel" role="tabpanel" aria-labelledby={"settings-tab-" + section} key={section}>
         {section === "general" && (
-          <>
-            <section className="card major" aria-labelledby="appearance-settings-title">
-              <div className="card-head">
-                <h2 id="appearance-settings-title">Appearance</h2>
-                <p>Applies right away, to the app and the browser companion.</p>
+          <section aria-labelledby="general-settings-title">
+            <div className="page-head rise">
+              <div>
+                <h1 id="general-settings-title">General</h1>
+                <p>How Fetchrail looks, starts and keeps itself up to date.</p>
               </div>
-              <div className="looks">
-                <fieldset className="choice-field">
-                  <legend>Theme</legend>
-                  <div className="theme-cards">
-                    {(["dark", "light"] as Theme[]).map((theme) => (
-                      <label key={theme} className="look-card">
-                        <input type="radio" name="theme" checked={draft.theme === theme} onChange={() => setLook({ theme })} />
-                        <span className={"theme-preview " + theme} aria-hidden="true">
-                          <span><i /><i /><i /></span>
-                          {[62, 34, 81].map((width) => (
-                            <span key={width}><i /><i /><i style={{ "--w": width + "%" } as CSSProperties} /></span>
-                          ))}
-                        </span>
-                        <span>
-                          {theme === "dark" ? <Moon size={15} /> : <Sun size={15} />}
-                          {theme === "dark" ? "Dark" : "Light"}
-                        </span>
-                      </label>
-                    ))}
-                  </div>
-                </fieldset>
-                <fieldset className="choice-field">
-                  <legend>Accent</legend>
-                  <div className="accent-cards">
-                    {accents.map((accent) => (
-                      <label key={accent} className="look-card" data-accent={accent}>
-                        <input type="radio" name="accent" checked={draft.accent === accent} onChange={() => setLook({ accent })} />
-                        <span className="accent-strands" aria-hidden="true"><i /><i /><i /></span>
-                        {accent[0].toUpperCase() + accent.slice(1)}
-                      </label>
-                    ))}
-                  </div>
-                </fieldset>
-              </div>
-            </section>
-
-            <section className="card minor" aria-labelledby="background-settings-title">
-              <div className="card-head">
-                <h2 id="background-settings-title">Background behavior</h2>
-                <p>Keep scheduled downloads available with less interruption.</p>
-              </div>
-              <div className="rows">
-                <label>
-                  <span className="grow">
-                    <strong>Launch when you sign in</strong>
-                    <small>{capabilities?.startup.reason ?? "Checking desktop startup support…"}</small>
-                  </span>
-                  <input
-                    className="switch"
-                    type="checkbox"
-                    checked={draft.launchOnStart}
-                    disabled={!capabilities?.startup.available}
-                    onChange={(event) => setDraft({ ...draft, launchOnStart: event.target.checked })}
-                  />
-                </label>
-                <label>
-                  <span className="grow">
-                    <strong>Minimize to tray on close</strong>
-                    <small>{capabilities?.tray.available ? "Keep downloads and schedules running when the window closes." : "Close minimizes to the taskbar when the desktop has no usable tray."}</small>
-                  </span>
-                  <input
-                    className="switch"
-                    type="checkbox"
-                    checked={draft.minimizeToTray}
-                    onChange={(event) => setDraft({ ...draft, minimizeToTray: event.target.checked })}
-                  />
-                </label>
-                <label>
-                  <span className="grow">
-                    <strong>Install updates automatically</strong>
-                    <small>New versions are downloaded in the background and start with the next launch.</small>
-                  </span>
-                  <input
-                    className="switch"
-                    type="checkbox"
-                    checked={draft.autoUpdate}
-                    disabled={update.state === "unmanaged"}
-                    onChange={(event) => setDraft({ ...draft, autoUpdate: event.target.checked })}
-                  />
-                </label>
-                <div className="update-row">
-                  <div className="grow">
-                    <strong>Fetchrail {version}</strong>
-                    <small role="status">{updateNote(update)}</small>
-                  </div>
-                  {update.state === "ready" ? (
-                    <button type="button" className="primary-button" onClick={onRestart}>
-                      <RotateCw size={16} /> Restart to update
-                    </button>
-                  ) : (
-                    <button
-                      type="button"
-                      className="secondary-button"
-                      disabled={["unmanaged", "checking", "downloading"].includes(update.state)}
-                      onClick={() => void invoke("check_for_update")}
-                    >
-                      Check for updates
-                    </button>
-                  )}
+            </div>
+            <div className="board">
+              <section className="card major rise d1" aria-labelledby="appearance-settings-title">
+                <div className="card-head">
+                  <h2 id="appearance-settings-title">Appearance</h2>
+                  <p>Applies right away, to the app and the browser companion.</p>
                 </div>
+                {/* The look applies at once, so it is never one of the unsaved changes. */}
+                <LookFields look={draft} onChange={(look) => void onAppearance(look)} />
+              </section>
+
+              <div className="card-stack minor">
+                <section className="card rise d2" aria-labelledby="background-settings-title">
+                  <div className="card-head">
+                    <h2 id="background-settings-title">Background behavior</h2>
+                    <p>Keep scheduled downloads available with less interruption.</p>
+                  </div>
+                  <div className="rows">
+                    <label>
+                      <span className="tile" aria-hidden="true"><Power size={18} /></span>
+                      <span className="grow">
+                        <strong>Launch when you sign in</strong>
+                        <small>{capabilities?.startup.reason ?? "Checking desktop startup support…"}</small>
+                      </span>
+                      <input
+                        className="switch"
+                        type="checkbox"
+                        checked={draft.launchOnStart}
+                        disabled={!capabilities?.startup.available}
+                        onChange={(event) => onChange({ launchOnStart: event.target.checked })}
+                      />
+                    </label>
+                    <label>
+                      <span className="tile" aria-hidden="true"><PanelBottom size={18} /></span>
+                      <span className="grow">
+                        <strong>Minimize to tray on close</strong>
+                        <small>{capabilities?.tray.available ? "Keep downloads and schedules running when the window closes." : "Close minimizes to the taskbar when the desktop has no usable tray."}</small>
+                      </span>
+                      <input
+                        className="switch"
+                        type="checkbox"
+                        checked={draft.minimizeToTray}
+                        onChange={(event) => onChange({ minimizeToTray: event.target.checked })}
+                      />
+                    </label>
+                    <label>
+                      <span className="tile" aria-hidden="true"><RotateCw size={18} /></span>
+                      <span className="grow">
+                        <strong>Install updates automatically</strong>
+                        <small>New versions are downloaded in the background and start with the next launch.</small>
+                      </span>
+                      <input
+                        className="switch"
+                        type="checkbox"
+                        checked={draft.autoUpdate}
+                        disabled={update.state === "unmanaged"}
+                        onChange={(event) => onChange({ autoUpdate: event.target.checked })}
+                      />
+                    </label>
+                  </div>
+                </section>
+
+                <section className="card version-card rise d3" aria-label="Version and updates">
+                  <div className="update-row">
+                    <Logo size={40} />
+                    <div className="grow">
+                      <strong>Fetchrail {version}</strong>
+                      <small role="status">{updateNote(update)}</small>
+                    </div>
+                    {update.state === "ready" ? (
+                      <button type="button" className="primary-button" onClick={onRestart}>
+                        <RotateCw size={16} /> Restart to update
+                      </button>
+                    ) : (
+                      <button
+                        type="button"
+                        className="secondary-button"
+                        disabled={["unmanaged", "checking", "downloading"].includes(update.state)}
+                        onClick={() => void invoke("check_for_update")}
+                      >
+                        <RotateCw size={16} className={update.state === "checking" ? "spin" : undefined} /> Check for updates
+                      </button>
+                    )}
+                  </div>
+                </section>
               </div>
-            </section>
-          </>
+            </div>
+          </section>
         )}
 
         {section === "downloads" && (
-          <>
-            <section className="card major" aria-labelledby="download-settings-title">
-              <div className="card-head">
-                <h2 id="download-settings-title">Downloads</h2>
+          <section aria-labelledby="download-settings-title">
+            <div className="page-head rise">
+              <div>
+                <h1 id="download-settings-title">Downloads</h1>
                 <p>Where files land and how many connections Fetchrail opens.</p>
               </div>
-              <label>
-                Default download folder
-                <div className="path-input">
-                  <input
-                    value={draft.defaultDownloadDir}
-                    onChange={(e) => setDraft({ ...draft, defaultDownloadDir: e.target.value })}
-                  />
-                  <button type="button" className="secondary-button" onClick={chooseDefaultDirectory}>
-                    <FolderOpen size={16} /> Browse
-                  </button>
-                </div>
-              </label>
-              <div className="setting-grid">
-                <Stepper
-                  label="Simultaneous downloads"
-                  min={1}
-                  max={12}
-                  value={draft.maxConcurrentDownloads}
-                  onChange={(value) => setDraft({ ...draft, maxConcurrentDownloads: value })}
-                />
-                <Stepper
-                  label="Connections per download"
-                  min={1}
-                  max={32}
-                  value={draft.connectionsPerDownload}
-                  onChange={(value) => setDraft({ ...draft, connectionsPerDownload: value })}
-                />
-                <Stepper
-                  label="Minimum part size (MB)"
-                  min={1}
-                  max={128}
-                  value={draft.minSegmentSizeMb}
-                  onChange={(value) => setDraft({ ...draft, minSegmentSizeMb: value })}
-                />
-              </div>
-              <div>
-                <div className="load-preview" key={files + ":" + parts} aria-hidden="true">
-                  {Array.from({ length: files }, (_, file) => (
-                    <div key={file} className="strands preview">
-                      {Array.from({ length: parts }, (_, index) => <span key={index} />)}
+              <span className="fact">Up to <b>{files * parts}</b> open connections</span>
+            </div>
+            <div className="board">
+              <div className="card-stack major">
+                <section className="card rise d1" aria-labelledby="connection-settings-title">
+                  <div className="card-head">
+                    <h2 id="connection-settings-title">Connections</h2>
+                    <p>Each file is split into parts that download side by side, then join into one file.</p>
+                  </div>
+                  <div className="setting-grid">
+                    <Stepper
+                      label="Simultaneous downloads"
+                      min={1}
+                      max={12}
+                      value={draft.maxConcurrentDownloads}
+                      onChange={(value) => onChange({ maxConcurrentDownloads: value })}
+                    />
+                    <Stepper
+                      label="Connections per download"
+                      min={1}
+                      max={32}
+                      value={draft.connectionsPerDownload}
+                      onChange={(value) => onChange({ connectionsPerDownload: value })}
+                    />
+                    <Stepper
+                      label="Minimum part size (MB)"
+                      min={1}
+                      max={128}
+                      value={draft.minSegmentSizeMb}
+                      onChange={(value) => onChange({ minSegmentSizeMb: value })}
+                    />
+                  </div>
+                  <div>
+                    {/* Not keyed by its size: strands that stay keep still, and only the new ones grow in. */}
+                    <div className="load-preview" aria-hidden="true">
+                      {Array.from({ length: files }, (_, file) => (
+                        <div key={file} className="strands preview">
+                          {Array.from({ length: parts }, (_, index) => <span key={index} />)}
+                        </div>
+                      ))}
                     </div>
-                  ))}
-                </div>
-                <p className="load-note">
-                  <b className="mono">{files}</b> at once, <b className="mono">{parts}</b> {parts === 1 ? "connection" : "connections"} each:
-                  up to <b className="mono">{files * parts}</b> open connections.
-                </p>
-                <p className="hint">
-                  Each file is split into up to {parts} {parts === 1 ? "part" : "parts"}. Fetchrail falls back to one connection
-                  when a server does not support byte ranges.
-                </p>
-              </div>
-              <fieldset className="choice-field">
-                <legend>
-                  Removing a download from the list
-                  <small>
-                    {draft.deleteFilesOnRemove == null
-                      ? "Asks what to do with its file"
-                      : draft.deleteFilesOnRemove
-                        ? "Deletes its file too, without asking"
-                        : "Leaves its file on disk, without asking"}
-                  </small>
-                </legend>
-                <div className="choices">
-                  {([[null, "Ask each time"], [false, "Keep the file"], [true, "Delete the file"]] as const).map(([choice, label]) => (
-                    <label key={label} className="choice">
-                      <input
-                        type="radio"
-                        name="remove-files"
-                        checked={(draft.deleteFilesOnRemove ?? null) === choice}
-                        onChange={() => setDraft({ ...draft, deleteFilesOnRemove: choice })}
-                      />
-                      {label}
-                    </label>
-                  ))}
-                </div>
-              </fieldset>
-            </section>
+                    <p className="load-note">
+                      <b className="mono">{files}</b> at once, <b className="mono">{parts}</b> {parts === 1 ? "connection" : "connections"} each:
+                      up to <b className="mono">{files * parts}</b> open connections.
+                    </p>
+                    <p className="hint">
+                      Each file is split into up to {parts} {parts === 1 ? "part" : "parts"}. Fetchrail falls back to one connection
+                      when a server does not support byte ranges.
+                    </p>
+                  </div>
+                </section>
 
-            <section className="card minor" aria-labelledby="limit-settings-title">
-              <div className="card-head">
-                <h2 id="limit-settings-title">Speed limit</h2>
-                <p>Shared across every file and connection; changes apply when saved.</p>
+                <section className="card rise d2" aria-labelledby="file-settings-title">
+                  <div className="card-head">
+                    <h2 id="file-settings-title">Files</h2>
+                    <p>Where new downloads are saved, and what happens to a file when you remove its download.</p>
+                  </div>
+                  <label>
+                    Default download folder
+                    <div className="path-input">
+                      <input
+                        value={draft.defaultDownloadDir}
+                        onChange={(e) => onChange({ defaultDownloadDir: e.target.value })}
+                      />
+                      <button type="button" className="secondary-button" onClick={chooseDefaultDirectory}>
+                        <FolderOpen size={16} /> Browse
+                      </button>
+                    </div>
+                  </label>
+                  <fieldset className="choice-field">
+                    <legend>
+                      Removing a download from the list
+                      <small>
+                        {draft.deleteFilesOnRemove == null
+                          ? "Asks what to do with its file"
+                          : draft.deleteFilesOnRemove
+                            ? "Deletes its file too, without asking"
+                            : "Leaves its file on disk, without asking"}
+                      </small>
+                    </legend>
+                    <div className="choices">
+                      {([[null, "Ask each time"], [false, "Keep the file"], [true, "Delete the file"]] as const).map(([choice, label]) => (
+                        <label key={label} className="choice">
+                          <input
+                            type="radio"
+                            name="remove-files"
+                            checked={(draft.deleteFilesOnRemove ?? null) === choice}
+                            onChange={() => onChange({ deleteFilesOnRemove: choice })}
+                          />
+                          {label}
+                        </label>
+                      ))}
+                    </div>
+                  </fieldset>
+                </section>
               </div>
-              <strong className="limit-readout mono">{draft.speedLimitBps > 0 ? formatSpeed(draft.speedLimitBps) : "Unlimited"}</strong>
-              <LimitGraph samples={samples} limit={draft.speedLimitBps} />
-              <div className="choices" role="group" aria-label="Speed limit presets">
-                {[0, 1, 5, 10].map((megabytes) => (
-                  <button
-                    key={megabytes}
-                    type="button"
-                    className="choice"
-                    aria-pressed={draft.speedLimitBps === megabytes * 1024 * 1024}
-                    onClick={() => setDraft({ ...draft, speedLimitBps: megabytes * 1024 * 1024 })}
-                  >
-                    {megabytes ? `${megabytes} MB/s` : "Unlimited"}
-                  </button>
-                ))}
-              </div>
-              <label>
-                Total speed limit (KiB/s)
-                <input type="number" min={0} max={1_000_000} step={1} value={draft.speedLimitBps / 1024} onChange={(event) => setDraft({ ...draft, speedLimitBps: Math.round(Number(event.target.value) * 1024) })} />
-                <small>0 = unlimited.</small>
-              </label>
-            </section>
-          </>
+
+              <section className="card minor rise d2" aria-labelledby="limit-settings-title">
+                <div className="card-head">
+                  <h2 id="limit-settings-title">Speed limit</h2>
+                  <p>Shared across every file and connection; changes apply when saved.</p>
+                </div>
+                <strong className="limit-readout mono">{draft.speedLimitBps > 0 ? formatSpeed(draft.speedLimitBps) : "Unlimited"}</strong>
+                <LimitGraph samples={samples} limit={draft.speedLimitBps} />
+                <div className="choices" role="group" aria-label="Speed limit presets">
+                  {[0, 1, 5, 10].map((megabytes) => (
+                    <button
+                      key={megabytes}
+                      type="button"
+                      className="choice"
+                      aria-pressed={draft.speedLimitBps === megabytes * 1024 * 1024}
+                      onClick={() => onChange({ speedLimitBps: megabytes * 1024 * 1024 })}
+                    >
+                      {megabytes ? `${megabytes} MB/s` : "Unlimited"}
+                    </button>
+                  ))}
+                </div>
+                <label>
+                  Total speed limit (KiB/s)
+                  <input type="number" min={0} max={1_000_000} step={1} value={draft.speedLimitBps / 1024} onChange={(event) => onChange({ speedLimitBps: Math.round(Number(event.target.value) * 1024) })} />
+                  <small>0 = unlimited.</small>
+                </label>
+              </section>
+            </div>
+          </section>
         )}
 
         {section === "queues" && (
-          <section className="card" aria-labelledby="queue-settings-title">
-            <div className="card-head split">
+          <section aria-labelledby="queue-settings-title">
+            <div className="page-head rise">
               <div>
-                <h2 id="queue-settings-title">Queues</h2>
+                <h1 id="queue-settings-title">Queues</h1>
                 <p>Queue schedules start and stop transfers automatically. Keep Fetchrail running; times use your local timezone.</p>
               </div>
               <div className="queue-create">
@@ -2075,221 +2248,253 @@ function SettingsPage({
                 </button>
               </div>
             </div>
-            <div>
-              <div className="queue-settings-item axis" aria-hidden="true">
-                <span />
-                <div className="mono"><span>Now</span><span>+6 h</span><span>+12 h</span><span>+18 h</span><span>+24 h</span></div>
-                <span />
-              </div>
-              {queues.map((queue) => {
-                const span = scheduleWindow(queue, now);
-                const scheduled = queue.startsAt || queue.stopsAt;
-                return (
-                  <div className="queue-settings-item" key={queue.name}>
-                    <div className="grow">
-                      <strong>{queue.name}</strong>
-                      <small>{queueWaitNote(queue) || (queue.stopsAt ? `Runs until ${formatDateTime(queue.stopsAt)}` : "Ready to start downloads")}</small>
-                    </div>
-                    <div className="queue-plan">
-                      <div className={queue.paused ? "queue-track paused" : "queue-track"} aria-hidden="true">
-                        {span && (
-                          <i className={scheduled ? "" : "open"} style={{ left: span.left + "%", width: span.width + "%" }}>
-                            {scheduled ? scheduleLabel(queue) : "No schedule"}
-                          </i>
-                        )}
+            <section className="card rise d1" aria-label="Queue schedules">
+              <div>
+                <div className="queue-settings-item axis" aria-hidden="true">
+                  <span className="overline">Queue</span>
+                  <div className="mono"><span>Now</span><span>+6 h</span><span>+12 h</span><span>+18 h</span><span>+24 h</span></div>
+                  <span />
+                </div>
+                {queues.map((queue) => {
+                  const span = scheduleWindow(queue, now);
+                  const scheduled = queue.startsAt || queue.stopsAt;
+                  return (
+                    <div className="queue-settings-item" key={queue.name}>
+                      <div className="grow">
+                        <strong>{queue.name}</strong>
+                        <small>{queueWaitNote(queue) || (queue.stopsAt ? `Runs until ${formatDateTime(queue.stopsAt)}` : "Ready to start downloads")}</small>
                       </div>
-                      <QueueSchedule key={`${queue.name}:${queue.startsAt}:${queue.stopsAt}`} queue={queue} busy={busy} save={onScheduleQueue} />
+                      <div className="queue-plan">
+                        <div className={queue.paused ? "queue-track paused" : "queue-track"} aria-hidden="true">
+                          {span && (
+                            <i className={scheduled ? "" : "open"} style={{ left: span.left + "%", width: span.width + "%" }}>
+                              {scheduled ? scheduleLabel(queue) : "No schedule"}
+                            </i>
+                          )}
+                        </div>
+                        <QueueSchedule key={`${queue.name}:${queue.startsAt}:${queue.stopsAt}`} queue={queue} busy={busy} save={onScheduleQueue} />
+                      </div>
+                      <div className="queue-controls">
+                        <label className="switch-label">
+                          {queue.paused ? "Paused" : "Active"}
+                          <input
+                            className="switch"
+                            type="checkbox"
+                            checked={!queue.paused}
+                            disabled={busy}
+                            onChange={(event) => void onToggleQueue(queue.name, !event.target.checked)}
+                          />
+                        </label>
+                        <button
+                          type="button"
+                          className="icon-button"
+                          disabled={busy || queue.name.toLowerCase() === "default"}
+                          onClick={() => void onDeleteQueue(queue.name)}
+                          aria-label={`Delete ${queue.name} queue`}
+                          title={queue.name.toLowerCase() === "default" ? "The Default queue cannot be deleted" : "Delete queue"}
+                        >
+                          <Trash2 size={16} />
+                        </button>
+                      </div>
                     </div>
-                    <div className="queue-controls">
-                      <label className="switch-label">
-                        {queue.paused ? "Paused" : "Active"}
-                        <input
-                          className="switch"
-                          type="checkbox"
-                          checked={!queue.paused}
-                          disabled={busy}
-                          onChange={(event) => void onToggleQueue(queue.name, !event.target.checked)}
-                        />
-                      </label>
-                      <button
-                        type="button"
-                        className="icon-button"
-                        disabled={busy || queue.name.toLowerCase() === "default"}
-                        onClick={() => void onDeleteQueue(queue.name)}
-                        aria-label={`Delete ${queue.name} queue`}
-                        title={queue.name.toLowerCase() === "default" ? "The Default queue cannot be deleted" : "Delete queue"}
-                      >
-                        <Trash2 size={16} />
-                      </button>
-                    </div>
-                  </div>
-                );
-              })}
-            </div>
+                  );
+                })}
+              </div>
+              <p className="hint">Adding, pausing, scheduling and deleting a queue apply right away. The Default queue cannot be deleted.</p>
+            </section>
           </section>
         )}
 
         {section === "categories" && (
-          <section className="card" aria-labelledby="category-settings-title">
-            <div className="card-head">
-              <h2 id="category-settings-title">File categories</h2>
-              <p>
-                Use these file endings for automatic sorting or to organize files you already have. A folder name
-                means a folder inside the default Downloads directory; an absolute path uses that exact folder.
-              </p>
-            </div>
-            <div className="rows">
-              <label>
-                <span className="grow">
-                  <strong>Automatically sort new downloads into folders</strong>
-                  <small>Turn this off to save every new download directly into your default Downloads folder. Manually chosen destinations still apply.</small>
-                </span>
-                <input
-                  className="switch"
-                  type="checkbox"
-                  checked={draft.sortIntoCategoryFolders}
-                  onChange={(event) => setDraft({ ...draft, sortIntoCategoryFolders: event.target.checked })}
-                />
-              </label>
-            </div>
-            <div className="categories">
-              <div className="category overline" aria-hidden="true">
-                <span>Category</span>
-                <span>File endings</span>
-                <span />
-                <span>Folder</span>
+          <section aria-labelledby="category-settings-title">
+            <div className="page-head rise">
+              <div>
+                <h1 id="category-settings-title">File categories</h1>
+                <p>
+                  Use these file endings for automatic sorting or to organize files you already have. A folder name
+                  means a folder inside the default Downloads directory; an absolute path uses that exact folder.
+                </p>
               </div>
-              {draft.categories.map((category, index) => {
-                const change = (patch: Partial<Category>) =>
-                  setDraft({
-                    ...draft,
-                    categories: draft.categories.map((entry, at) => (at === index ? { ...entry, ...patch } : entry)),
-                  });
-                return (
-                  <div key={index} className="category">
+            </div>
+            <div className="card-stack">
+              <section className="card slim rise d1" aria-label="Automatic sorting">
+                <div className="rows">
+                  <label>
+                    <span className="tile" aria-hidden="true"><ListChecks size={18} /></span>
+                    <span className="grow">
+                      <strong>Automatically sort new downloads into folders</strong>
+                      <small>Turn this off to save every new download directly into your default Downloads folder. Manually chosen destinations still apply.</small>
+                    </span>
                     <input
-                      value={category.name}
-                      onChange={(event) => change({ name: event.target.value })}
-                      placeholder="Name"
-                      aria-label="Category name"
-                      maxLength={32}
+                      className="switch"
+                      type="checkbox"
+                      checked={draft.sortIntoCategoryFolders}
+                      onChange={(event) => onChange({ sortIntoCategoryFolders: event.target.checked })}
                     />
-                    <EndingsField
-                      label={`File endings for ${category.name || "this category"}`}
-                      value={category.extensions}
-                      onChange={(extensions) => change({ extensions })}
-                    />
-                    <ArrowRight size={16} className="route" aria-hidden="true" />
-                    <input
-                      className="mono"
-                      value={category.folder}
-                      onChange={(event) => change({ folder: event.target.value })}
-                      placeholder="Folder"
-                      aria-label={`Folder for ${category.name || "this category"}`}
-                      spellCheck={false}
-                    />
-                    <button
-                      type="button"
-                      className="icon-button"
-                      onClick={async () => {
-                        const selected = await open({ directory: true, multiple: false });
-                        if (typeof selected === "string") change({ folder: selected });
-                      }}
-                      title="Choose folder"
-                      aria-label={`Choose folder for ${category.name || "this category"}`}
-                    >
-                      <FolderOpen size={16} />
-                    </button>
-                    <button
-                      type="button"
-                      className="icon-button"
-                      onClick={() => setDraft({ ...draft, categories: draft.categories.filter((_, at) => at !== index) })}
-                      title="Remove category"
-                      aria-label={`Remove ${category.name || "this category"}`}
-                    >
-                      <Trash2 size={16} />
-                    </button>
+                  </label>
+                </div>
+              </section>
+
+              <section className="card rise d2" aria-label="Category rules">
+                <div className="categories">
+                  <div className="category overline" aria-hidden="true">
+                    <span>Category</span>
+                    <span>File endings</span>
+                    <span />
+                    <span>Folder</span>
                   </div>
-                );
-              })}
-              <div className="category rest">
-                <strong>General</strong>
-                <span>Every other file</span>
-                <ArrowRight size={16} className="route" aria-hidden="true" />
-                <span className="mono" title={draft.defaultDownloadDir}>{draft.defaultDownloadDir}</span>
-              </div>
+                  {draft.categories.map((category, index) => {
+                    const change = (patch: Partial<Category>) =>
+                      onChange({ categories: draft.categories.map((entry, at) => (at === index ? { ...entry, ...patch } : entry)) });
+                    return (
+                      <div key={index} className="category">
+                        <input
+                          value={category.name}
+                          onChange={(event) => change({ name: event.target.value })}
+                          placeholder="Name"
+                          aria-label="Category name"
+                          maxLength={32}
+                        />
+                        <EndingsField
+                          label={`File endings for ${category.name || "this category"}`}
+                          value={category.extensions}
+                          onChange={(extensions) => change({ extensions })}
+                        />
+                        <ArrowRight size={16} className="route" aria-hidden="true" />
+                        <input
+                          className="mono"
+                          value={category.folder}
+                          onChange={(event) => change({ folder: event.target.value })}
+                          placeholder="Folder"
+                          aria-label={`Folder for ${category.name || "this category"}`}
+                          spellCheck={false}
+                        />
+                        <button
+                          type="button"
+                          className="icon-button"
+                          onClick={async () => {
+                            const selected = await open({ directory: true, multiple: false });
+                            if (typeof selected === "string") change({ folder: selected });
+                          }}
+                          title="Choose folder"
+                          aria-label={`Choose folder for ${category.name || "this category"}`}
+                        >
+                          <FolderOpen size={16} />
+                        </button>
+                        <button
+                          type="button"
+                          className="icon-button"
+                          onClick={() => onChange({ categories: draft.categories.filter((_, at) => at !== index) })}
+                          title="Remove category"
+                          aria-label={`Remove ${category.name || "this category"}`}
+                        >
+                          <Trash2 size={16} />
+                        </button>
+                      </div>
+                    );
+                  })}
+                  <div className="category rest">
+                    <strong>General</strong>
+                    <span>Every other file</span>
+                    <ArrowRight size={16} className="route" aria-hidden="true" />
+                    <span className="mono" title={draft.defaultDownloadDir}>{draft.defaultDownloadDir}</span>
+                  </div>
+                </div>
+                <div className="extension-actions">
+                  <button
+                    type="button"
+                    className="secondary-button"
+                    onClick={() => onChange({ categories: [...draft.categories, { name: "", extensions: [], folder: "" }] })}
+                  >
+                    <Plus size={16} /> Add category
+                  </button>
+                  <button type="button" className="secondary-button" disabled={busy || organizing !== null || folderSettingsChanged} onClick={() => void organizeExisting("sort")}>
+                    <FolderOpen size={16} /> {organizing === "sort" ? "Organizing…" : "Organize existing files"}
+                  </button>
+                  <button type="button" className="ghost-button" disabled={busy || organizing !== null || folderSettingsChanged || draft.sortIntoCategoryFolders} onClick={() => void organizeExisting("flatten")}>
+                    <RotateCw size={16} /> {organizing === "flatten" ? "Moving files back…" : "Move files back to Downloads"}
+                  </button>
+                </div>
+                <p className="hint">Organize checks loose files in your default Downloads folder using the saved rules. Moving files back also removes empty category folders inside Downloads. Files in use, unfinished downloads, and unrelated subfolders are left alone; existing filenames are never overwritten.</p>
+                {folderSettingsChanged && <p className="hint">Save your category settings before organizing existing files.</p>}
+                {organizeNote && <p className="hint" role="status">{organizeNote}</p>}
+                {organizeError && <p className="extension-error" role="alert">{organizeError}</p>}
+              </section>
             </div>
-            <div className="extension-actions">
-              <button
-                type="button"
-                className="secondary-button"
-                onClick={() => setDraft({ ...draft, categories: [...draft.categories, { name: "", extensions: [], folder: "" }] })}
-              >
-                <Plus size={16} /> Add category
-              </button>
-              <button type="button" className="secondary-button" disabled={busy || organizing !== null || folderSettingsChanged} onClick={() => void organizeExisting("sort")}>
-                <FolderOpen size={16} /> {organizing === "sort" ? "Organizing…" : "Organize existing files"}
-              </button>
-              <button type="button" className="secondary-button" disabled={busy || organizing !== null || folderSettingsChanged || draft.sortIntoCategoryFolders} onClick={() => void organizeExisting("flatten")}>
-                <RotateCw size={16} /> {organizing === "flatten" ? "Moving files back…" : "Move files back to Downloads"}
-              </button>
-            </div>
-            <p className="hint">Organize checks loose files in your default Downloads folder using the saved rules. Moving files back also removes empty category folders inside Downloads. Files in use, unfinished downloads, and unrelated subfolders are left alone; existing filenames are never overwritten.</p>
-            {folderSettingsChanged && <p className="hint">Save your category settings before organizing existing files.</p>}
-            {organizeNote && <p className="hint" role="status">{organizeNote}</p>}
-            {organizeError && <p className="extension-error" role="alert">{organizeError}</p>}
           </section>
         )}
 
-        {section === "torrents" && <TorrentSettingsFields value={draft.torrent} onChange={torrent => setDraft({ ...draft, torrent })} />}
+        {section === "torrents" && <TorrentSettingsFields value={draft.torrent} onChange={(torrent) => onChange({ torrent })} />}
 
         {section === "browser" && (
-          <section className="card" aria-labelledby="extension-settings-title">
-            <div className="card-head">
-              <h2 id="extension-settings-title">Browser companion</h2>
-              <p>Sends downloads from your browser to Fetchrail.</p>
+          <section aria-labelledby="extension-settings-title">
+            <div className="page-head rise">
+              <div>
+                <h1 id="extension-settings-title">Browser companion</h1>
+                <p>Sends downloads from your browser to Fetchrail.</p>
+              </div>
             </div>
-            <div className="companion-store">
-              <strong>Chrome Web Store · Recommended</strong>
-              <p>Get the official companion. Chrome updates it automatically when approved updates are published.</p>
-              <button type="button" className="primary-button" disabled={openingExtension} onClick={() => void openExtension("store")}>
-                <Globe size={16} /> Get from Chrome Web Store
-              </button>
-              <p className="hint">If you loaded the unpacked companion before, disable it when installing the store version to avoid duplicate download capture.</p>
-            </div>
-            <details className="companion-manual">
-              <summary>Manual installation and Firefox</summary>
-              <ol className="steps">
-                <li>
-                  <span className="mono" aria-hidden="true">1</span>
-                  <div>
+            <div className="board">
+              <section className="card major rise d1" aria-labelledby="companion-store-title">
+                <span className="overline">Recommended</span>
+                <div className="card-head">
+                  <h2 id="companion-store-title">Chrome Web Store</h2>
+                  <p>Get the official companion. Chrome updates it automatically when approved updates are published.</p>
+                </div>
+                <div>
+                  <button type="button" className="primary-button" disabled={openingExtension} onClick={() => void openExtension("store")}>
+                    <Globe size={16} /> Get from Chrome Web Store
+                  </button>
+                </div>
+                <p className="hint">If you loaded the unpacked companion before, disable it when installing the store version to avoid duplicate download capture.</p>
+              </section>
+
+              <section className="card minor rise d2" aria-labelledby="companion-manual-title">
+                <div className="card-head">
+                  <h2 id="companion-manual-title">Manual installation and Firefox</h2>
+                  <p>For Chrome or Edge without the store, and for Firefox.</p>
+                </div>
+                <ol className="steps">
+                  <li>
+                    <span className="mono" aria-hidden="true">1</span>
                     <strong>Open the extension folder</strong>
                     <button type="button" className="secondary-button" disabled={openingExtension} onClick={() => void openExtension("chromium")}>
                       <FolderOpen size={16} /> Open extension folder
                     </button>
+                  </li>
+                  <li>
+                    <span className="mono" aria-hidden="true">2</span>
+                    <strong>In Chrome or Edge, enable Developer mode</strong>
+                  </li>
+                  <li>
+                    <span className="mono" aria-hidden="true">3</span>
+                    <strong>Choose Load unpacked and select this folder</strong>
+                  </li>
+                </ol>
+                <div>
+                  <button type="button" className="ghost-button" disabled={openingExtension} onClick={() => void openExtension("firefox")}>
+                    Firefox folder
+                  </button>
+                </div>
+                <p className="hint">Unpacked companions follow the version bundled with Fetchrail after their panels close. Firefox temporary add-ons use Load Temporary Add-on in about:debugging and must be loaded again after a browser restart.</p>
+              </section>
+
+              <section className="card rise d3" aria-labelledby="companion-repair-title">
+                <div className="card-head split">
+                  <div>
+                    <h2 id="companion-repair-title">Not catching downloads?</h2>
+                    <p>Repair registers Fetchrail with your browsers again. Diagnostics leave out URLs, cookies, tokens and private paths.</p>
                   </div>
-                </li>
-                <li>
-                  <span className="mono" aria-hidden="true">2</span>
-                  <strong>In Chrome or Edge, enable Developer mode</strong>
-                </li>
-                <li>
-                  <span className="mono" aria-hidden="true">3</span>
-                  <strong>Choose Load unpacked and select this folder</strong>
-                </li>
-              </ol>
-              <button type="button" className="ghost-button" disabled={openingExtension} onClick={() => void openExtension("firefox")}>
-                Firefox folder
-              </button>
-              <p className="hint">Unpacked companions follow the version bundled with Fetchrail after their panels close. Firefox temporary add-ons use Load Temporary Add-on in about:debugging and must be loaded again after a browser restart.</p>
-            </details>
-            <div className="extension-actions">
-              <button type="button" className="ghost-button" disabled={openingExtension} onClick={async () => { setOpeningExtension(true); setExtensionError(null); try { const status = await invoke<{reason:string}>("repair_browser_integration"); setIntegrationNote(status.reason); } catch(error) { setExtensionError(String(error)); } finally { setOpeningExtension(false); } }}>Repair integration</button>
-              <button type="button" className="ghost-button" onClick={async () => { try { const diagnostics = await invoke("platform_diagnostics"); await navigator.clipboard.writeText(JSON.stringify(diagnostics, null, 2)); setIntegrationNote("Desktop diagnostics copied. URLs, cookies, tokens and private paths are excluded."); } catch(error) { setExtensionError(String(error)); } }}>Copy desktop diagnostics</button>
+                  <div className="extension-actions">
+                    <button type="button" className="secondary-button" disabled={openingExtension} onClick={async () => { setOpeningExtension(true); setExtensionError(null); try { const status = await invoke<{reason:string}>("repair_browser_integration"); setIntegrationNote(status.reason); } catch(error) { setExtensionError(String(error)); } finally { setOpeningExtension(false); } }}>Repair integration</button>
+                    <button type="button" className="ghost-button" onClick={async () => { try { const diagnostics = await invoke("platform_diagnostics"); await navigator.clipboard.writeText(JSON.stringify(diagnostics, null, 2)); setIntegrationNote("Desktop diagnostics copied. URLs, cookies, tokens and private paths are excluded."); } catch(error) { setExtensionError(String(error)); } }}>Copy desktop diagnostics</button>
+                  </div>
+                </div>
+                {extensionError && <p className="extension-error" role="alert">{extensionError}</p>}
+                {integrationNote && <p className="hint" role="status">{integrationNote}</p>}
+                {capabilities?.os === "linux" && <p className="hint">{capabilities.browserIntegration.reason} Firefox Snap/Flatpak needs the native-messaging portal supplied by its desktop. If capture is unavailable, the companion keeps the download in the browser.</p>}
+              </section>
             </div>
-            {extensionError && <p className="extension-error" role="alert">{extensionError}</p>}
-            {integrationNote && <p className="hint" role="status">{integrationNote}</p>}
-            {capabilities?.os === "linux" && <p className="hint">{capabilities.browserIntegration.reason} Firefox Snap/Flatpak needs the native-messaging portal supplied by its desktop. If capture is unavailable, the companion keeps the download in the browser.</p>}
           </section>
         )}
       </div>
@@ -2584,15 +2789,49 @@ export function DownloadPrompt({ id }: { id: string }) {
   );
 }
 
+const setupSteps = ["Location", "Make it yours", "Install"];
+// What the install does, with the share of the progress each part is shown for.
+const setupTasks: [string, number, number][] = [
+  ["Copying Fetchrail", 0, 40],
+  ["Adding shortcuts", 40, 72],
+  ["Saving your preferences", 72, 100],
+];
+// Where each strand of the drawing starts, and how far into its loop its dashes begin.
+const setupStrands = [[12, 0], [34, .4], [56, 1.1], [78, .7], [102, 1.5], [124, .2], [146, .9], [168, 1.3]];
+
+// Eight bars fill one after another, and close into one when the work is done.
+function SetupBars({ percent }: { percent: number }) {
+  return (
+    <div className="setup-bars" aria-hidden="true">
+      {Array.from({ length: 8 }, (_, index) => (
+        <span key={index}><i style={{ width: Math.max(0, Math.min(100, percent * 1.6 - index * 8)) + "%" }} /></span>
+      ))}
+    </div>
+  );
+}
+
 // The setup program: this window is all there is to installing or removing Fetchrail.
 export function Setup() {
   const [info, setInfo] = useState<SetupInfo | null>(null);
+  const [step, setStep] = useState(1);
   const [dir, setDir] = useState("");
   const [desktopShortcut, setDesktopShortcut] = useState(true);
   const [launchOnStart, setLaunchOnStart] = useState(false);
+  const [look, setLook] = useState<Appearance>({ theme: "dark", accent: "ember" });
+  const [downloadDir, setDownloadDir] = useState("");
   const [removeData, setRemoveData] = useState(false);
   const [phase, setPhase] = useState<"ready" | "working" | "done">("ready");
+  const [percent, setPercent] = useState(0);
   const [message, setMessage] = useState<string | null>(null);
+  const starting = useRef(0);
+  const started = useRef(false);
+
+  // Setup wears the look that is picked in it.
+  function choose(change: Partial<Appearance>) {
+    const next = { ...look, ...change };
+    setLook(next);
+    applyLook(next);
+  }
 
   useEffect(() => {
     invoke<SetupInfo>("setup_info")
@@ -2600,32 +2839,56 @@ export function Setup() {
         setInfo(current);
         setDir(current.dir);
         setDesktopShortcut(current.desktopShortcut);
+        setLaunchOnStart(current.launchOnStart);
+        setDownloadDir(current.downloadDir);
+        choose({ theme: current.theme, accent: current.accent });
       })
       .catch((error) => setMessage(String(error)));
   }, []);
 
   const removing = info?.mode === "uninstall";
 
+  // Starts the installed app with what was chosen here; this window closes with it.
+  function finish() {
+    if (started.current) return;
+    started.current = true;
+    clearTimeout(starting.current);
+    setMessage(null);
+    invoke("setup_finish", { choices: { launchOnStart, ...look, downloadDir } }).catch((error) => {
+      started.current = false;
+      setMessage(String(error));
+    });
+  }
+
   async function run() {
     setPhase("working");
     setMessage(null);
+    setPercent(0);
     try {
       if (removing) {
         // The process ends itself a moment after this returns.
         await invoke("setup_uninstall", { removeData });
-        setPhase("done");
       } else {
-        // Copying takes an instant; give the strands time to be seen weaving.
-        await Promise.all([
-          invoke("setup_install", { options: { dir, desktopShortcut } }),
-          new Promise((resolve) => setTimeout(resolve, 1100)),
-        ]);
-        setPhase("done");
-        setTimeout(() => void invoke("setup_finish", { launchOnStart }).catch((error) => setMessage(String(error))), 900);
+        setStep(3);
+        // Copying takes an instant; the bars get a moment to be seen filling, and wait near the end when it does not.
+        const work = { done: false, failed: false };
+        const install = invoke("setup_install", { options: { dir, desktopShortcut, downloadDir } });
+        install.then(() => (work.done = true), () => (work.failed = true));
+        for (let filled = 0; filled < 100 && !work.failed; ) {
+          await new Promise((resolve) => setTimeout(resolve, 90));
+          filled = Math.min(work.done ? 100 : 96, filled + 4);
+          setPercent(filled);
+        }
+        await install;
+        starting.current = window.setTimeout(finish, 900);
       }
+      setPercent(100);
+      setPhase("done");
     } catch (error) {
       setMessage(String(error));
       setPhase("ready");
+      setPercent(0);
+      if (!removing) setStep(2);
     }
   }
 
@@ -2633,7 +2896,7 @@ export function Setup() {
     phase === "done"
       ? removing
         ? "Fetchrail was removed."
-        : "Fetchrail is installed. Starting it now…"
+        : "Fetchrail is installed."
       : removing
         ? "Remove Fetchrail from this PC?"
         : "Many connections, one file.";
@@ -2644,7 +2907,8 @@ export function Setup() {
       data-phase={phase}
       onSubmit={(event) => {
         event.preventDefault();
-        void run();
+        if (removing || step === 2) void run();
+        else if (step === 1) setStep(2);
       }}
     >
       <header data-tauri-drag-region>
@@ -2662,76 +2926,209 @@ export function Setup() {
           <X size={16} />
         </button>
       </header>
-      <div className="setup-hero">
-        <Logo size={76} />
-        <h1>Fetchrail</h1>
-        <p role="status">{tagline}</p>
-      </div>
-      <div className="setup-body">
-        {info && phase !== "done" && !removing && (
-          <>
-            <label>
-              <span className="label-line">
-                Install to
-                {info.installed && <small>Replaces the copy already here</small>}
-              </span>
-              <div className="path-input">
-                <input value={dir} onChange={(event) => setDir(event.target.value)} disabled={info.installed || phase !== "ready"} required spellCheck={false} />
-                <button
-                  type="button"
-                  className="secondary-button"
-                  disabled={info.installed || phase !== "ready"}
-                  onClick={async () => {
-                    const selected = await open({ directory: true, multiple: false });
-                    if (typeof selected === "string") setDir(selected.replace(/[\\/]+$/, "") + "\\Fetchrail");
-                  }}
-                >
-                  <FolderOpen size={16} /> Browse
-                </button>
-              </div>
-            </label>
-            <div className="rows">
-              <label>
-                <span className="grow"><strong>Desktop shortcut</strong></span>
-                <input className="switch" type="checkbox" checked={desktopShortcut} disabled={phase !== "ready"} onChange={(event) => setDesktopShortcut(event.target.checked)} />
-              </label>
-              <label>
-                <span className="grow"><strong>Start with Windows</strong></span>
-                <input className="switch" type="checkbox" checked={launchOnStart} disabled={phase !== "ready"} onChange={(event) => setLaunchOnStart(event.target.checked)} />
-              </label>
-            </div>
-          </>
-        )}
-        {info && phase !== "done" && removing && (
-          <div className="rows">
-            <label>
-              <span className="grow">
-                <strong>Also delete my download history and settings</strong>
-                <small>The files you downloaded stay where they are.</small>
-              </span>
-              <input className="switch" type="checkbox" checked={removeData} disabled={phase !== "ready"} onChange={(event) => setRemoveData(event.target.checked)} />
-            </label>
-          </div>
-        )}
-        {message && <p className="extension-error" role="alert">{message}</p>}
-      </div>
-      <div className="setup-foot">
-        <div className={"strands weave" + (phase === "done" ? " merged" : "")} aria-hidden="true">
-          {Array.from({ length: 8 }, (_, index) => (
-            <span key={index} style={{ "--i": index } as CSSProperties}>
-              <i className="fill done" />
-            </span>
-          ))}
-        </div>
-        <div className="setup-actions">
+      <div className="setup-panes">
+        <aside className="setup-side">
+          <Logo size={64} />
+          <h1>Fetchrail</h1>
+          <p role="status">{tagline}</p>
+          <svg className="setup-art" viewBox="0 0 280 180" aria-hidden="true">
+            {["base", "flow"].map((layer) => (
+              <g key={layer} className={layer}>
+                {setupStrands.map(([y, delay]) => (
+                  <path key={y} d={`M4 ${y}C110 ${y} 120 90 204 90`} style={{ animationDelay: -delay + "s" }} />
+                ))}
+              </g>
+            ))}
+            <path className="out" d="M204 90H270" />
+            {setupStrands.map(([y]) => <circle key={y} cx="4" cy={y} r="3" />)}
+          </svg>
           <small>{info ? `Version ${info.version} · for this Windows account only` : ""}</small>
-          {phase !== "done" && (
-            <button className="primary-button" disabled={!info || phase !== "ready"} autoFocus>
-              {removing
-                ? phase === "working" ? "Removing…" : "Uninstall"
-                : phase === "working" ? "Installing…" : info?.installed ? "Update" : "Install"}
-            </button>
+        </aside>
+
+        <div className="setup-main">
+          {!removing && (
+            <div className="setup-steps" data-step={step}>
+              <ol>
+                {setupSteps.map((name, index) => {
+                  const state = step > index + 1 || phase === "done" ? "done" : step === index + 1 ? "now" : "wait";
+                  return (
+                    <li key={name} data-state={state} aria-current={state === "now" ? "step" : undefined}>
+                      <span aria-hidden="true"><b>{index + 1}</b><Check size={13} /></span>
+                      {name}
+                    </li>
+                  );
+                })}
+              </ol>
+              <div className="setup-track" aria-hidden="true"><i /></div>
+            </div>
           )}
+
+          {/* Keyed by step, so each one rises in when it is reached. */}
+          <div className="setup-body" key={removing ? 0 : step}>
+            {info && removing && (
+              <>
+                <div className="rise">
+                  <h2>{phase === "done" ? "Fetchrail was removed" : "Remove Fetchrail from this PC?"}</h2>
+                  <p role="status">
+                    {phase === "done"
+                      ? "Thanks for trying it. Setup closes by itself."
+                      : phase === "working"
+                        ? "Removing…"
+                        : "The app, its shortcuts and its browser integration will be removed."}
+                  </p>
+                </div>
+                <div className="rows rise d1">
+                  <label>
+                    <span className="tile" aria-hidden="true"><Trash2 size={18} /></span>
+                    <span className="grow">
+                      <strong>Also delete my download history and settings</strong>
+                      <small>The files you downloaded stay where they are.</small>
+                    </span>
+                    <input className="switch" type="checkbox" checked={removeData} disabled={phase !== "ready"} onChange={(event) => setRemoveData(event.target.checked)} />
+                  </label>
+                </div>
+                <div className="rise d2"><SetupBars percent={percent} /></div>
+              </>
+            )}
+            {info && !removing && step === 1 && (
+              <>
+                <div className="rise">
+                  <h2>Where should Fetchrail live?</h2>
+                  <p>Pick the folder, then choose how you want to reach it.</p>
+                </div>
+                <label className="rise d1">
+                  <span className="label-line">
+                    Install to
+                    {info.installed && <small>Replaces the copy already here</small>}
+                  </span>
+                  <div className="path-input">
+                    <input value={dir} onChange={(event) => setDir(event.target.value)} disabled={info.installed} required spellCheck={false} />
+                    <button
+                      type="button"
+                      className="secondary-button"
+                      disabled={info.installed}
+                      onClick={async () => {
+                        const selected = await open({ directory: true, multiple: false });
+                        if (typeof selected === "string") setDir(selected.replace(/[\\/]+$/, "") + "\\Fetchrail");
+                      }}
+                    >
+                      <FolderOpen size={16} /> Browse
+                    </button>
+                  </div>
+                </label>
+                <div className="rows rise d2">
+                  <label>
+                    <span className="tile" aria-hidden="true"><Monitor size={18} /></span>
+                    <span className="grow">
+                      <strong>Desktop shortcut</strong>
+                      <small>Put Fetchrail on your desktop.</small>
+                    </span>
+                    <input className="switch" type="checkbox" checked={desktopShortcut} onChange={(event) => setDesktopShortcut(event.target.checked)} />
+                  </label>
+                  <label>
+                    <span className="tile" aria-hidden="true"><Power size={18} /></span>
+                    <span className="grow">
+                      <strong>Start with Windows</strong>
+                      <small>Launch after you sign in, so scheduled queues can start on time.</small>
+                    </span>
+                    <input className="switch" type="checkbox" checked={launchOnStart} onChange={(event) => setLaunchOnStart(event.target.checked)} />
+                  </label>
+                </div>
+              </>
+            )}
+            {info && !removing && step === 2 && (
+              <>
+                <div className="rise">
+                  <h2>Make it yours</h2>
+                  <p>Everything here can be changed later in Settings.</p>
+                </div>
+                <div className="rise d1">
+                  <LookFields look={look} onChange={choose} />
+                </div>
+                <label className="rise d2">
+                  <span className="label-line">
+                    Save downloads to
+                    {info.sortsIntoFolders && <small>Sorted into folders by file type</small>}
+                  </span>
+                  <div className="path-input">
+                    <input value={downloadDir} onChange={(event) => setDownloadDir(event.target.value)} required spellCheck={false} />
+                    <button
+                      type="button"
+                      className="secondary-button"
+                      onClick={async () => {
+                        const selected = await open({ directory: true, multiple: false, defaultPath: downloadDir });
+                        if (typeof selected === "string") setDownloadDir(selected);
+                      }}
+                    >
+                      <FolderOpen size={16} /> Browse
+                    </button>
+                  </div>
+                </label>
+              </>
+            )}
+            {info && !removing && step === 3 && (
+              <>
+                <div className="rise">
+                  <h2>{phase === "done" ? "Fetchrail is installed" : info.installed ? "Updating Fetchrail…" : "Installing Fetchrail…"}</h2>
+                  <p role="status">{phase === "done" ? "Starting it now…" : "This takes a few seconds."}</p>
+                </div>
+                <div
+                  className="setup-progress rise d1"
+                  role="progressbar"
+                  aria-label={info.installed ? "Updating Fetchrail" : "Installing Fetchrail"}
+                  aria-valuemin={0}
+                  aria-valuemax={100}
+                  aria-valuenow={percent}
+                >
+                  <strong className="mono">{percent}%</strong>
+                  <SetupBars percent={percent} />
+                </div>
+                <div className="rise d2">
+                  {setupTasks.map(([name, from, to]) => (
+                    <div key={name} className="setup-task" data-state={percent >= to ? "done" : phase === "working" && percent >= from ? "busy" : "wait"}>
+                      <span aria-hidden="true"><Check size={12} /></span>
+                      {name}
+                    </div>
+                  ))}
+                </div>
+              </>
+            )}
+            {message && <p className="extension-error" role="alert">{message}</p>}
+          </div>
+
+          <div className="setup-foot">
+            {removing ? (
+              <>
+                <span />
+                {phase !== "done" && (
+                  <button className="primary-button danger" disabled={phase !== "ready"} autoFocus>
+                    {phase === "working" ? "Removing…" : "Uninstall"}
+                  </button>
+                )}
+              </>
+            ) : step === 1 ? (
+              <>
+                <span />
+                <button className="primary-button" disabled={!info} autoFocus>
+                  Continue <ArrowRight size={16} />
+                </button>
+              </>
+            ) : step === 2 ? (
+              <>
+                <button type="button" className="ghost-button" onClick={() => setStep(1)}>
+                  <ArrowLeft size={16} /> Back
+                </button>
+                <button className="primary-button">{info?.installed ? "Update" : "Install"}</button>
+              </>
+            ) : (
+              <>
+                <span>{phase === "done" ? "Setup closes by itself." : ""}</span>
+                <button type="button" className="primary-button" disabled={phase !== "done"} onClick={finish}>
+                  Open Fetchrail
+                </button>
+              </>
+            )}
+          </div>
         </div>
       </div>
     </form>

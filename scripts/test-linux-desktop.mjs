@@ -113,11 +113,14 @@ try {
     const toggle = '[aria-labelledby="background-settings-title"] input[type="checkbox"]';
     await until(() => evaluate("const element = document.querySelector(arguments[0]); return Boolean(element && !element.disabled)", [toggle]), "startup capability");
     await click(toggle);
-    await click(".settings .page-head .primary-button");
+    // The save bar slides in once something has changed; saving keeps Settings open, the gear closes it.
+    await until(() => evaluate('const bar = document.querySelector(".save-dock.shown"); return Boolean(bar && new DOMMatrix(getComputedStyle(bar).transform).m42 === 0)'), "save bar");
+    await click(".save-dock .primary-button");
     await until(async () => (await invoke("get_settings")).launchOnStart === enabled, "saved startup preference");
     if (enabled) assert.match(await readFile(startup, "utf8"), /Exec=\/usr\/bin\/env .+ --background/);
     else await assert.rejects(access(startup), { code: "ENOENT" });
-    await until(() => evaluate('return !document.querySelector(".settings")'), "saved settings view");
+    await click('button[aria-label="Settings"]');
+    await until(() => evaluate('return !document.querySelector(".settings")'), "closed settings view");
   }
   const theme = await evaluate("return document.documentElement.dataset.theme");
   await click(`button[aria-label="Switch to ${theme === "dark" ? "light" : "dark"} theme"]`);

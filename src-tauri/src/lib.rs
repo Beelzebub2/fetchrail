@@ -418,12 +418,19 @@ struct SetupInfo {
     /// An earlier setup put Fetchrail in `dir`; this one replaces it there.
     installed: bool,
     desktop_shortcut: bool,
+    /// What an earlier installation saved, or what a new one starts with.
+    theme: model::Theme,
+    accent: model::Accent,
+    download_dir: String,
+    sorts_into_folders: bool,
+    launch_on_start: bool,
 }
 
 #[cfg(windows)]
 #[tauri::command]
-fn setup_info(mode: State<'_, install::SetupMode>) -> Result<SetupInfo, String> {
+fn setup_info(app: AppHandle, mode: State<'_, install::SetupMode>) -> Result<SetupInfo, String> {
     let installed = install::installed_dir();
+    let saved = engine::saved_settings();
     Ok(SetupInfo {
         mode: *mode,
         version: env!("CARGO_PKG_VERSION"),
@@ -434,6 +441,22 @@ fn setup_info(mode: State<'_, install::SetupMode>) -> Result<SetupInfo, String> 
             .map_or_else(install::default_dir, Ok)?
             .to_string_lossy()
             .into_owned(),
+        theme: saved.as_ref().map(|saved| saved.theme).unwrap_or_default(),
+        accent: saved.as_ref().map(|saved| saved.accent).unwrap_or_default(),
+        launch_on_start: saved.as_ref().is_some_and(|saved| saved.launch_on_start),
+        sorts_into_folders: saved
+            .as_ref()
+            .is_none_or(|saved| saved.sort_into_category_folders),
+        // Without saved settings this is the folder the app itself would start with.
+        download_dir: saved.map_or_else(
+            || {
+                app.path()
+                    .download_dir()
+                    .map(|folder| folder.to_string_lossy().into_owned())
+                    .unwrap_or_default()
+            },
+            |saved| saved.default_download_dir,
+        ),
     })
 }
 
@@ -461,8 +484,8 @@ async fn setup_uninstall(app: AppHandle, remove_data: bool) -> Result<(), String
 
 #[cfg(windows)]
 #[tauri::command]
-fn setup_finish(app: AppHandle, launch_on_start: bool) -> Result<(), String> {
-    install::launch(launch_on_start)?;
+fn setup_finish(app: AppHandle, choices: install::SetupChoices) -> Result<(), String> {
+    install::launch(&choices)?;
     app.exit(0);
     Ok(())
 }
@@ -488,7 +511,7 @@ pub fn run_setup(mode: install::SetupMode) {
             };
             tauri::WebviewWindowBuilder::new(app, "setup", tauri::WebviewUrl::App(page.into()))
                 .title("Fetchrail Setup")
-                .inner_size(520.0, 620.0)
+                .inner_size(920.0, 600.0)
                 .resizable(false)
                 .maximizable(false)
                 .decorations(false)
@@ -568,11 +591,14 @@ pub fn run() {
                 std::env::args().collect(),
                 std::env::current_dir().ok().as_deref(),
             );
-            // Setup passes this on when "Start with Windows" was ticked.
-            if std::env::args().any(|argument| argument == "--launch-on-start") {
-                let mut settings = tauri::async_runtime::block_on(manager.settings());
-                settings.launch_on_start = true;
-                let _ = tauri::async_runtime::block_on(manager.update_settings(settings));
+            // Setup passes on what was chosen in it: the look, the download folder and "Start with Windows".
+            let mut settings = tauri::async_runtime::block_on(manager.settings());
+            if settings.apply_setup_arguments(&std::env::args().collect::<Vec<_>>()) {
+                if let Err(error) =
+                    tauri::async_runtime::block_on(manager.update_settings(settings))
+                {
+                    eprintln!("Fetchrail setup choices: {error}");
+                }
             }
             #[cfg(windows)]
             {

@@ -188,6 +188,36 @@ pub struct DownloadSettings {
 }
 
 impl DownloadSettings {
+    /// Takes over what setup handed to this launch: the look and the download folder chosen
+    /// there, and "Start with Windows". Says whether that changed anything.
+    pub fn apply_setup_arguments(&mut self, arguments: &[String]) -> bool {
+        let chosen = |settings: &Self| {
+            (
+                settings.theme,
+                settings.accent,
+                settings.launch_on_start,
+                settings.default_download_dir.clone(),
+            )
+        };
+        let before = chosen(self);
+        for argument in arguments {
+            if argument == "--launch-on-start" {
+                self.launch_on_start = true;
+            } else if argument == "--launch-on-start=false" {
+                self.launch_on_start = false;
+            } else if let Some(theme) = argument.strip_prefix("--theme=") {
+                self.theme = serde_json::from_value(theme.into()).unwrap_or(self.theme);
+            } else if let Some(accent) = argument.strip_prefix("--accent=") {
+                self.accent = serde_json::from_value(accent.into()).unwrap_or(self.accent);
+            } else if let Some(folder) = argument.strip_prefix("--download-dir=") {
+                if !folder.trim().is_empty() {
+                    self.default_download_dir = folder.trim().into();
+                }
+            }
+        }
+        chosen(self) != before
+    }
+
     pub fn normalized(mut self) -> Self {
         if let Some(legacy) = self
             .extra
@@ -392,6 +422,42 @@ mod tests {
         let old: QueueRecord =
             serde_json::from_str(r#"{"name":"Default","paused":false}"#).unwrap();
         assert!(old.allows_downloads(now));
+    }
+
+    #[test]
+    fn setup_choices_arrive_as_launch_arguments() {
+        let saved = r#"{"defaultDownloadDir":"D:\\Downloads","maxConcurrentDownloads":3,"connectionsPerDownload":8,"minSegmentSizeMb":4}"#;
+        let args = |list: &[&str]| list.iter().map(|a| a.to_string()).collect::<Vec<_>>();
+        let mut settings: DownloadSettings = serde_json::from_str(saved).unwrap();
+        assert!(
+            !settings.apply_setup_arguments(&args(&["Fetchrail.exe", "--background"])),
+            "an ordinary start changes nothing"
+        );
+        assert!(settings.apply_setup_arguments(&args(&[
+            "Fetchrail.exe",
+            "--theme=light",
+            "--accent=jade",
+            r"--download-dir=E:\My Files",
+            "--launch-on-start",
+        ])));
+        assert_eq!(settings.theme, Theme::Light);
+        assert_eq!(settings.accent, Accent::Jade);
+        assert_eq!(settings.default_download_dir, r"E:\My Files");
+        assert!(settings.launch_on_start);
+        assert!(
+            !settings.apply_setup_arguments(&args(&["--theme=light", "--launch-on-start"])),
+            "repeating what is already saved is not a change"
+        );
+        assert!(
+            !settings.apply_setup_arguments(&args(&[
+                "--theme=neon",
+                "--accent=",
+                "--download-dir= "
+            ])),
+            "values setup cannot have sent are ignored"
+        );
+        assert_eq!(settings.theme, Theme::Light);
+        assert_eq!(settings.default_download_dir, r"E:\My Files");
     }
 
     #[test]
