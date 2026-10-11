@@ -13,6 +13,7 @@ dist-ssr
 release-artifacts/
 artifacts/
 /.native-vcpkg/
+/.vcpkg-binary-cache/
 # Hosted separately on Cloudflare Workers
 /website/
 /update-service/.wrangler/

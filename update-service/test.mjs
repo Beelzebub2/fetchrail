@@ -21,7 +21,7 @@ export async function tokenFixture(tag = "v1.2.3") {
 export function releaseFixture(tag = "v1.2.3") {
   const version = tag.slice(1), base = `https://github.com/${REPOSITORY}/releases/download/${tag}/`;
   // Match the packagers: Windows setup is also the installed app's updater asset.
-  const names = ["latest.json", `Fetchrail-Setup-${tag}-windows-x64.exe`];
+  const names = ["latest.json", `Fetchrail-Setup-${tag}-windows-x64.exe`, "SHA256SUMS", "release-metadata.tar.gz"];
   for (const arch of ["x64", "arm64"]) for (const format of ["deb", "rpm", "AppImage", "tar.gz"])
     names.push(`Fetchrail-${tag}-linux-${arch}.${format}`);
   const release = { tag_name: tag, draft: false, prerelease: false, published_at: "2026-10-10T00:00:00Z",
@@ -76,6 +76,7 @@ if (process.argv[1]?.endsWith("test.mjs")) {
     return new Response(fixture.bytes);
   };
   const snapshot = await loadRelease("v1.2.3", digest, upstream);
+  assert.equal(snapshot.release.assets.length, 12, "The compact release retains all downloads and updater platforms.");
   const rawBinary = structuredClone(fixture.manifest);
   rawBinary.platforms["windows-x86_64"].url = `https://github.com/${REPOSITORY}/releases/download/v1.2.3/Fetchrail-v1.2.3-windows-x64.exe`;
   const withRawBinary = { ...fixture.release, assets: [...fixture.release.assets,

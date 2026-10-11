@@ -12,6 +12,8 @@ on:
     paths-ignore:
       - '**/*.md'
       - 'website/**'
+      - 'update-service/**'
+      - '.github/workflows/update-service.yml'
   push:
     branches:
       - main
@@ -20,6 +22,8 @@ on:
     paths-ignore:
       - '**/*.md'
       - 'website/**'
+      - 'update-service/**'
+      - '.github/workflows/update-service.yml'
       - '.gitignore'
       - '.claude/**'
 
@@ -28,13 +32,15 @@ permissions:
 
 concurrency:
   group: release-${{ github.ref }}
-  cancel-in-progress: false
+  cancel-in-progress: ${{ github.ref_type != 'tag' }}
 
 jobs:
   windows:
     name: Windows x64
     runs-on: windows-2022
     timeout-minutes: 90
+    env:
+      VCPKG_BINARY_SOURCES: clear;files,${{ github.workspace }}/.vcpkg-binary-cache,readwrite
     defaults:
       run:
         shell: pwsh
@@ -99,10 +105,29 @@ jobs:
           ref: 96d5fb3de135b86d7222c53f2352ca92827a156b
           path: .native-vcpkg
           persist-credentials: false
+      - name: Identify native build cache
+        id: native-cache-image
+        run: |
+          if (-not $env:ImageVersion) { throw 'Hosted Windows image version is missing.' }
+          "version=$env:ImageVersion" >> $env:GITHUB_OUTPUT
+      - name: Restore Windows native binary cache
+        id: native-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .vcpkg-binary-cache
+          key: native-windows-2022-96d5fb3-${{ steps.native-cache-image.outputs.version }}-${{ hashFiles('src-tauri/native/ports/**', 'src-tauri/native/triplets/x64-windows-static.cmake', 'scripts/build-torrent-deps.ps1') }}
+          # vcpkg checks compiler, port and dependency ABI hashes before reuse.
+          restore-keys: native-windows-2022-96d5fb3-
       - name: Build native torrent dependencies
         run: |
           ./.native-vcpkg/bootstrap-vcpkg.bat -disableMetrics
           ./scripts/build-torrent-deps.ps1 -VcpkgRoot "$PWD/.native-vcpkg"
+      - name: Save Windows native binary cache
+        if: github.ref == 'refs/heads/main' && steps.native-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .vcpkg-binary-cache
+          key: ${{ steps.native-cache.outputs.cache-primary-key }}
       - name: Generate dependency inventory and notices
         run: node scripts/release-notices.mjs
       - name: Check Rust formatting
@@ -206,10 +231,11 @@ jobs:
           path: |
             src-tauri/native/vcpkg
             src-tauri/native/installed-secure
-          key: native-${{ matrix.runner }}-96d5fb3-${{ hashFiles('src-tauri/native/ports/**', 'src-tauri/native/triplets/**', 'scripts/build-torrent-deps.sh') }}
+          key: native-${{ matrix.runner }}-96d5fb3-${{ hashFiles('src-tauri/native/ports/**', 'src-tauri/native/triplets/*-linux.cmake', 'scripts/build-torrent-deps.sh') }}
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
         with:
           workspaces: src-tauri -> target
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Validate version and install frontend
         run: |
           if [[ "$GITHUB_REF_TYPE" == tag ]]; then node scripts/check-release.mjs "$GITHUB_REF_NAME"; else node scripts/check-release.mjs; fi
@@ -258,15 +284,16 @@ jobs:
         run: npm run linux:wayland
       - name: Build Linux packages without release secrets
         if: github.ref_type != 'tag'
-        run: npm run linux:build
+        run: |
+          npm run tauri -- bundle --config src-tauri/tauri.linux.unsigned.conf.json
+          node scripts/package-linux.mjs --unsigned
       - name: Build and sign Linux packages
         if: startsWith(github.ref, 'refs/tags/')
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
         run: |
           test -n "$TAURI_SIGNING_PRIVATE_KEY"
-          node scripts/release-notices.mjs
-          npm run tauri -- build
+          npm run tauri -- bundle
           node scripts/package-linux.mjs "$GITHUB_REF_NAME"
       - name: Inspect package contents and desktop entries
         run: |
@@ -429,7 +456,9 @@ jobs:
           $tag = $env:GITHUB_REF_NAME
           gh release view $tag --repo "$env:GITHUB_REPOSITORY" *> $null
           if ($LASTEXITCODE -eq 0) { throw 'Refusing to overwrite an existing immutable release. Use a new version tag.' }
-          $assets = Get-ChildItem release-artifacts -File | Where-Object { $_.Name -notmatch '^(verify-update\.exe|latest\.json|windows\.json|linux-(x64|arm64)\.json)$' } | ForEach-Object { $_.FullName }
+          $inventory = Get-Content -LiteralPath release-artifacts/release-inventory.json -Raw | ConvertFrom-Json
+          $assetNames = @($inventory.files.name) + @('release-metadata.tar.gz', 'SHA256SUMS')
+          $assets = $assetNames | ForEach-Object { (Get-Item -LiteralPath (Join-Path release-artifacts $_)).FullName }
           gh release create $tag @assets --draft --verify-tag --title "Fetchrail $tag" --generate-notes --repo "$env:GITHUB_REPOSITORY"
           if ($LASTEXITCODE -ne 0) { throw 'Draft release creation failed.' }
           gh release upload $tag release-artifacts/latest.json --repo "$env:GITHUB_REPOSITORY"

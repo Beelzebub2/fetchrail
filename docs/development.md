@@ -165,19 +165,23 @@ The Windows runner builds the frontend, companions, application, torrent harness
 
 Native Linux x64 and arm64 runners build AppImage, DEB, RPM and portable archives. Both run embedded desktop, HTTP/restart, torrent, signature and native X11/Wayland checks. Separate installed-package gates cover Fedora 44, Mint 22.3, Kali and Arch. The retained Firefox handoff test also runs against each installed distro binary. Publishing requires every platform, distro and update-service gate to pass, then verifies all artifact signatures and combines all three platform manifests into one release.
 
-Pushes to `main` run these checks, package unsigned development downloads and cache compiled Rust dependencies. Tag builds reuse the cache from `main` and sign and publish release downloads. A new Rust toolchain or changed dependencies can require rebuilding the cache. Actions display these as `Build / main` and `Release vVERSION`; pushing a commit and its tag creates one run of each.
+Pushes to `main` run these checks, package unsigned development downloads and cache compiled Rust dependencies. Windows also saves vcpkg binary archives on `main`; vcpkg validates compiler, port and dependency ABI hashes before restoring them. Tag builds reuse these caches and sign and publish release downloads. A new toolchain or changed dependencies can require rebuilding the cache. Superseded branch builds are cancelled; tag builds finish independently. Update-service-only changes run the separate feed checks without rebuilding the desktop app. Actions display desktop builds as `Build / main` and `Release vVERSION`; pushing a commit and its tag creates one run of each.
 
 Release assets are:
 
 | Asset | Purpose |
 | --- | --- |
 | `Fetchrail-Setup-vVERSION-windows-x64.exe` | Per-user setup with the desktop app, companions, and native host. |
-| `Fetchrail-Setup-vVERSION-windows-x64.sha256` | Checksum for the setup executable. |
 | `Fetchrail-vVERSION-linux-ARCH.AppImage` | Portable Linux desktop download for `x64` or `arm64`. |
 | `Fetchrail-vVERSION-linux-ARCH.deb` / `.rpm` | Native packages with package-manager dependency resolution. |
 | `Fetchrail-vVERSION-linux-ARCH.tar.gz` | Native binary, desktop integration scripts, icon and notices. |
-| Linux `.sig` / `.sha256` files and dependency inventories | Artifact verification and bundled dependency notices. |
 | `latest.json` | Signed update manifest read by installed copies. |
+| `SHA256SUMS` | One checksum list for the nine downloads, update manifest and metadata archive. |
+| `release-metadata.tar.gz` | Nine detached signatures, verified release inventory, three dependency inventories/notices and the Arch PKGBUILD. |
+
+The publisher uploads only these 12 assets. Per-platform fragments, individual checksum files and the signature verifier stay in CI. All nine downloads still pass signature, hash and size verification before publication, and `latest.json` retains the three updater signatures inline. Existing published releases remain immutable; this layout applies to future releases.
+
+The 0.6.0 release's first successful native run took 32m26s on Windows (18m11s for native dependencies), 14m06s on Linux x64 and 14m55s on Linux arm64. Windows now builds only the Release native libraries that `build.rs` and the fixtures link, matching Linux's existing configuration. Linux x64 spent another 2m37s recompiling before bundling; CI now runs `tauri bundle` on the already-qualified release binary, preserving the package-content checks that reject developer tools. It still builds all four Linux formats and runs every native/distro gate. Windows cache savings depend on a compatible warmed cache; cold builds still compile the required Release dependencies. The Windows native build was the release's critical path, so reducing release attachment count alone does not materially shorten compilation.
 
 AppImage is the portable Linux option; native packages offer ordinary package-manager installation and removal. Build against the oldest supported Linux base with WebKitGTK 4.1, and build each AppImage on its native architecture. Current CI uses Ubuntu 22.04 for x64 and Ubuntu 24.04 for arm64, so older ARM distributions need separate compatibility qualification. See [Tauri's AppImage guidance](https://v2.tauri.app/distribute/appimage/) and the [Linux artifact guide](linux.md).
 

@@ -39,6 +39,8 @@ export async function aggregate(directory, version, publicKey, verify) {
   for (const arch of ["x64", "arm64"]) for (const format of ["deb", "rpm", "AppImage", "tar.gz"]) {
     assert.ok(files.has(`Fetchrail-v${version}-linux-${arch}.${format}`), `Required Linux ${arch} ${format} asset missing`);
   }
+  assert.ok(files.has(`Fetchrail-Setup-v${version}-windows-x64.exe`), "Required Windows setup asset missing");
+  assert.equal(files.size, 9, "Only the nine verified native downloads may be published");
   const template = await readFile(new URL("../src-tauri/linux/PKGBUILD.in", import.meta.url), "utf8");
   const archives = ["x64", "arm64"].map(arch => files.get(`Fetchrail-v${version}-linux-${arch}.tar.gz`));
   assert.ok(archives.every(Boolean), "Both verified native archives are required for the Arch recipe");
@@ -48,6 +50,15 @@ export async function aggregate(directory, version, publicKey, verify) {
   const manifest = { version, pub_date: new Date().toISOString(), platforms };
   await writeFile(join(directory, "latest.json"), JSON.stringify(manifest, null, 2) + "\n");
   await writeFile(join(directory, "release-inventory.json"), JSON.stringify({ version, files: [...files.values()] }, null, 2) + "\n");
+  const metadata = ["PKGBUILD", "release-inventory.json", ...[...files.keys()].map(name => name + ".sig"),
+    ...["windows", "linux-x64", "linux-arm64"].flatMap(platform =>
+      ["dependency-inventory.json", "THIRD_PARTY_NOTICES.txt"].map(name => `release-${platform}-${name}`))];
+  execFileSync("tar", ["-czf", join(directory, "release-metadata.tar.gz"), "-C", directory, ...metadata], { stdio: "inherit" });
+  const sums = [...files.values()].map(file => `${file.sha256}  ${file.name}`);
+  for (const name of ["latest.json", "release-metadata.tar.gz"]) {
+    sums.push(`${createHash("sha256").update(await readFile(join(directory, name))).digest("hex")}  ${name}`);
+  }
+  await writeFile(join(directory, "SHA256SUMS"), sums.sort().join("\n") + "\n");
   return manifest;
 }
 

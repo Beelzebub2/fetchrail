@@ -8,7 +8,7 @@ Linux support has automated release gates. Native x64 and arm64 builds, virtual 
 | --- | --- | --- |
 | Ubuntu, Mint, Kali, Debian and derivatives | `.deb` matching `amd64`/`arm64` | AppImage or native archive |
 | Fedora | `.rpm` matching `x86_64`/`aarch64` | AppImage or native archive |
-| Arch and derivatives | Release `PKGBUILD`, then `makepkg -si` | AppImage |
+| Arch and derivatives | Extract `PKGBUILD` from `release-metadata.tar.gz`, then `makepkg -si` | AppImage |
 | NixOS | `src-tauri/linux/nix/default.nix` with the verified archive URL/hash | Source build in a suitable Nix development environment |
 | Other glibc desktops | AppImage or native archive with GTK3/WebKitGTK 4.1 | Source build with matching system dependencies |
 | musl/Alpine, older WebKitGTK systems | Separate native source build and qualification required | glibc release artifacts are not certified for these systems |
