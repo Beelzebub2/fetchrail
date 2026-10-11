@@ -3608,6 +3608,15 @@ impl DownloadManager {
     }
 }
 
+/// The settings as they were last saved, read without starting the engine: setup shows them
+/// before the app runs.
+#[cfg(windows)]
+pub(crate) fn saved_settings() -> Option<DownloadSettings> {
+    let path = crate::platform::app_data_dir().ok()?.join(SETTINGS_FILE);
+    let saved = serde_json::from_slice::<DownloadSettings>(&std::fs::read(path).ok()?).ok()?;
+    Some(saved.normalized())
+}
+
 fn default_settings(download_dir: &Path) -> DownloadSettings {
     DownloadSettings {
         extra: Default::default(),
