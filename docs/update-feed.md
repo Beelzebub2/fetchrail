@@ -60,7 +60,7 @@ as the fallback endpoint. The locked updater clears the timeout for artifact
 downloads, so large or slow update downloads do not inherit that metadata limit.
 The app supplies Tauri's `current_version` query variable. Already current or
 newer clients receive an uncached `204 No Content`, preventing the updater from
-looking for a missing Linux asset in the older Windows-only bootstrap release.
+looking for a missing Linux asset in the bootstrap release, which predates Linux packages.
 Older clients receive the signed release manifest; the generic endpoint without
 that variable remains available to inspect the feed. See
 [Tauri's updater endpoint protocol](https://v2.tauri.app/plugin/updater/).
@@ -74,7 +74,7 @@ installed binaries acquire the new endpoint through their next signed app update
 ## Bootstrap, deployment and repair
 
 `update-service/bootstrap.mjs` records the public v0.5.3 release and its original
-manifest digest. This existing Windows-only release is served immediately and
+manifest digest. This existing release, which predates Linux packages, is served immediately and
 may be replayed only with exactly that digest; every new release requires the
 complete Windows/Linux inventory. This exception cannot publish a different
 partial release or replace a newer stored release.
