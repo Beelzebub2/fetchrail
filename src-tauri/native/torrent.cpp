@@ -150,6 +150,7 @@ struct Job {
     bool flushed = false;
     bool flushing = false;
     int pending_saves = 0;
+    bool removing = false;
     bool removed = false;
     std::set<std::string> paths;
     std::set<std::string> moving_paths;
@@ -267,6 +268,11 @@ struct Engine {
                 continue;
             }
             auto& j = it->second;
+            if (j.removing) {
+                // Alerts queued before removal can outlive the native handle.
+                if (lt::alert_cast<lt::torrent_removed_alert>(a)) j.removed = true;
+                continue;
+            }
             if (!lt::alert_cast<lt::save_resume_data_alert>(a)) {
                 j.activity.push_back({{"time", std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count()}, {"message", a->message()}});
                 if (j.activity.size() > 100) j.activity.pop_front();
@@ -339,7 +345,7 @@ struct Engine {
             drain(); json states = json::array();
             if (session) session->post_torrent_updates(lt::torrent_handle::query_accurate_download_counters);
             for (auto& pair : jobs) {
-                if (pair.second.importing || !pair.second.cached) continue;
+                if (pair.second.importing || pair.second.removing || !pair.second.cached) continue;
                 auto const& s = *pair.second.cached;
                 if (!s.is_finished) pair.second.flushed = false;
                 if (s.is_finished && !pair.second.flushed && !pair.second.flushing) {
@@ -382,6 +388,7 @@ struct Engine {
             if (p.ti) metadata(*p.ti);
             auto h = p.ti ? p.ti->info_hashes() : p.info_hashes;
             for (auto const& pair : jobs) {
+                if (pair.second.removing) continue;
                 auto other = pair.second.handle.info_hashes();
                 if ((h.has_v1() && other.has_v1() && h.v1 == other.v1) || (h.has_v2() && other.has_v2() && h.v2 == other.v2))
                     throw std::runtime_error("This torrent is already in Fetchrail");
@@ -426,13 +433,14 @@ struct Engine {
             session->apply_settings(p); return json::object();
         }
         if (op == "checkpoint") {
-            for (auto& pair : jobs) if (!pair.second.importing && !pair.second.pending_saves) save(pair.second, true);
+            for (auto& pair : jobs) if (!pair.second.importing && !pair.second.removing && !pair.second.pending_saves) save(pair.second, true);
             if (session && c.value("wait", false)) wait([&] { for (auto const& pair : jobs) if (pair.second.pending_saves) return false; return true; });
             return json::object();
         }
         auto id = c.at("id").get<std::string>();
         if (op == "remove" && !jobs.count(id)) return json::object();
         auto& j = job(id); auto h = j.handle;
+        if (j.removing && op != "remove") throw std::runtime_error("Torrent removal is pending. Retry removal.");
         if (op == "pause") { h.pause(); save(j); }
         else if (op == "resume") { j.error.clear(); h.resume(); }
         else if (op == "recheck") { j.flushed = false; h.force_recheck(); }
@@ -465,10 +473,12 @@ struct Engine {
             h.replace_trackers(trackers); save(j);
         }
         else if (op == "remove") {
-            h.pause();
-            wait([&] { return j.pending_saves == 0; });
-            j.flushed = false; j.flushing = true;
-            session->remove_torrent(h);
+            if (!j.removing) {
+                h.pause();
+                wait([&] { return j.pending_saves == 0; });
+                j.removing = true; j.flushed = false; j.flushing = true;
+                session->remove_torrent(h);
+            }
             // 2.1 emits torrent_removed_alert after async_stop_torrent closes storage.
             wait([&] { return j.removed; });
             release(j.paths); release(j.moving_paths);

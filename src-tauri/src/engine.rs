@@ -504,13 +504,15 @@ impl DownloadManager {
             .iter()
             .map(|r| (r.id, r.extra.get("handoffCommitted").cloned()))
             .collect::<Vec<_>>();
+        // Background saves must not publish provisional handoff flags.
+        let persist = self.persist_lock.lock().await;
         for record in &mut records {
             let task = self.task(record.id).await?;
             let mut saved = task.record.write().await;
             saved.extra.insert("handoffCommitted".into(), json!(true));
             *record = saved.clone();
         }
-        if let Err(error) = self.persist_records().await {
+        if let Err(error) = self.persist_records_locked().await {
             for (id, value) in previous {
                 let task = self.task(id).await?;
                 let mut saved = task.record.write().await;
@@ -525,6 +527,7 @@ impl DownloadManager {
             }
             return Err(error.to_string());
         }
+        drop(persist);
         drop(dispatch);
         for record in &records {
             if auto_start && record.status == DownloadStatus::Paused {
@@ -1766,6 +1769,7 @@ impl DownloadManager {
         if task.record.read().await.torrent.is_some() {
             return self.remove_torrent(id, delete_file).await;
         }
+        let _dispatch = self.dispatch_lock.lock().await;
         if task.running.load(Ordering::Acquire) {
             return Err("Pause or cancel the download before removing it.".into());
         }
@@ -3490,6 +3494,10 @@ impl DownloadManager {
 
     async fn persist_records(&self) -> EngineResult<()> {
         let _lock = self.persist_lock.lock().await;
+        self.persist_records_locked().await
+    }
+
+    async fn persist_records_locked(&self) -> EngineResult<()> {
         let tasks = self
             .tasks
             .read()
@@ -4669,9 +4677,12 @@ mod tests {
         settings["bandwidthLimitKbps"] = json!(64);
         settings["maxRequestsPerOrigin"] = json!(16);
         let settings: DownloadSettings = serde_json::from_value(settings).unwrap();
-        let restored = serde_json::to_value(settings.normalized()).unwrap();
+        let mut settings = settings.normalized();
+        let restored = serde_json::to_value(&settings).unwrap();
         assert_eq!(restored["speedLimitBps"], 65536);
         assert_eq!(restored["maxRequestsPerOrigin"], 16);
+        settings.speed_limit_bps = 0;
+        assert_eq!(settings.normalized().speed_limit_bps, 0);
     }
 
     #[test]

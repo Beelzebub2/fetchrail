@@ -4,6 +4,10 @@
 
 ## Requirements
 
+Fetchrail can be developed on Windows and Linux. Both use Node.js 24, Rust stable and the checked-in lockfiles. For Linux dependencies, native builds and desktop checks, follow the [Linux development guide](linux.md#build-and-checks).
+
+### Windows
+
 Use Windows with:
 
 - Node.js 24, matching the release workflow.
@@ -13,6 +17,8 @@ Use Windows with:
 - Microsoft Edge WebView2 Runtime.
 
 ## Run locally
+
+On Windows:
 
 ```powershell
 git clone https://github.com/Beelzebub2/fetchrail.git
