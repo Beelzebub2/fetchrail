@@ -107,10 +107,9 @@ export function validateRelease(release, manifest, tag, complete = true) {
       && typeof target?.signature === "string" && target.signature.length <= 4096
       && /^[A-Za-z0-9+/]+={0,2}$/.test(target.signature), 400, "Invalid updater platform signature.");
     const asset = assets.find(asset => asset.browser_download_url === target.url);
-    const expected = key === "windows-x86_64" ? `Fetchrail-v${manifest.version}-windows-x64.exe`
+    const expected = key === "windows-x86_64" ? `Fetchrail-Setup-${tag}-windows-x64.exe`
       : `Fetchrail-v${manifest.version}-linux-${key.includes("aarch64") ? "arm64" : "x64"}.AppImage`;
-    require(asset && (asset.name === expected || (!complete && key === "windows-x86_64"
-      && asset.name === `Fetchrail-Setup-${tag}-windows-x64.exe`)), 400, "Updater asset is not in the published release.");
+    require(asset && asset.name === expected, 400, "Updater asset is not in the published release.");
     platforms[key] = { signature: target.signature, url: target.url };
   }
   if (complete) {
