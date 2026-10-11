@@ -1,0 +1,20 @@
+# Firefox Add-ons publishing
+
+Fetchrail ships a separate Firefox Manifest V3 extension. Its permanent add-on ID is `browser@braid.rrmtools.uk`, the ID permitted by the existing native messaging host. The extension needs Firefox 140 or newer for the built-in data collection consent prompt. The first listed submission creates the Mozilla Add-ons (AMO) listing; Mozilla reviews it before the public can install it.
+
+## Connect your Mozilla developer account
+
+1. Sign in to the [Mozilla Add-ons Developer Hub](https://addons.mozilla.org/en-US/developers/addons) with the account that should own the extension. Create a developer profile if necessary.
+2. Generate **JWT credentials** at [AMO API keys](https://addons.mozilla.org/en-US/developers/addon/api/key/). The issuer is an ID such as `user:123:456`; the secret is separate. Never commit or print either one.
+3. In the [Fetchrail repository's Actions secrets](https://github.com/Beelzebub2/fetchrail/settings/secrets/actions), create `AMO_JWT_ISSUER` and `AMO_JWT_SECRET` containing those values. The workflow passes them only to the submission step.
+4. Run **Actions → Firefox Add-ons → Run workflow**, selecting `main` and leaving **policy_only** unchecked. This submits the current application version without creating another desktop release. It builds, checks, and submits `browser-extension/dist/firefox` through `web-ext sign --channel listed` using `browser-extension/amo-metadata.json`.
+
+The metadata declares the **Download Management** category and selects *All Rights Reserved* because this repository does not contain a software license granting redistribution rights. Change the metadata only after selecting an actual license for the project. Each submission includes a ZIP of readable original source, build instructions, and npm lockfile. After submission, the workflow publishes the local `browser-extension/privacy-policy.txt` to Mozilla's privacy-policy API and verifies the result; it mirrors the live [privacy policy](https://fetchrail.rrmtools.uk/privacy). If the AMO policy update fails after a successful submission, rerun the workflow with **policy_only** checked to repair that field without creating a duplicate version. Review the listing in the [Developer Hub](https://addons.mozilla.org/en-US/developers/addons) and complete any requested reviewer details. Mozilla approval is separate from successfully uploading the version.
+
+## Automatic updates
+
+Every future `vMAJOR.MINOR.PATCH` tag goes through the existing Windows, Linux, distro, and release verification jobs. **After the verified release is published**, `firefox-add-ons` runs alongside `chrome-web-store` and submits the matching Firefox version to Mozilla. The CLI uses the AMO v5 submission API for both first-time listings and updates. It does not need a separate Firefox extension ID or a fresh manual upload for each release.
+
+`npm run browser:build`, `npm run browser:check`, `npm run amo:test`, and `npm run amo:lint` validate the extension locally. `web-ext sign` returns once the listing has been submitted (`--approval-timeout 0`); signing or submission errors cause the workflow to fail. The Mozilla store handles user updates after approval. If the same version is already submitted, AMO rejects the duplicate: inspect the developer dashboard and create a new release version for another update. The production Firefox build targets desktop Firefox 140+ for Mozilla's built-in data consent, and explicitly discloses download/page information and optional request authentication headers.
+
+For current-release bootstrap, do **not** replay the immutable desktop tag: run the manual Firefox Add-ons workflow on `main`. Future tagged releases submit automatically when the two AMO secrets are configured.
