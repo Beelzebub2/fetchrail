@@ -190,10 +190,8 @@ pub fn launch(arguments: &[&str]) -> Result<(), String> {
 }
 
 pub fn reveal(path: &Path) -> Result<(), String> {
-    if path.is_file() {
-        if tauri_plugin_opener::reveal_item_in_dir(path).is_ok() {
-            return Ok(());
-        }
+    if path.is_file() && tauri_plugin_opener::reveal_item_in_dir(path).is_ok() {
+        return Ok(());
     }
     let folder = if path.is_dir() {
         path

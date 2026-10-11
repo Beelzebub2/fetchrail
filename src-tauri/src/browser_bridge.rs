@@ -188,18 +188,9 @@ async fn process_request(
             }
         }
         NativeMethod::GetHandoff => {
-            let prefix = format!("{}:", request.params.handoff_id.as_deref().unwrap());
             let records = manager
-                .list()
-                .await
-                .into_iter()
-                .filter(|r| {
-                    r.extra
-                        .get("handoffId")
-                        .and_then(|v| v.as_str())
-                        .is_some_and(|id| id.starts_with(&prefix))
-                })
-                .collect::<Vec<_>>();
+                .get_handoff(request.params.handoff_id.as_deref().unwrap())
+                .await;
             NativeResponse::success(
                 request.id,
                 json!({"ids":records.iter().map(|r| r.id).collect::<Vec<_>>(), "statuses":records.iter().map(|r| &r.status).collect::<Vec<_>>(), "committed":!records.is_empty() && records.iter().all(|r| r.extra.get("handoffCommitted").and_then(|v| v.as_bool()) == Some(true))}),

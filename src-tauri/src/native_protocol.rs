@@ -352,6 +352,7 @@ mod tests {
             params: NativeParams {
                 source: Some(BrowserSource::ContextMenu),
                 items: vec![BrowserDownloadItem {
+                    request_headers: None,
                     expected_sha256: None,
                     url: url.to_string(),
                     suggested_file_name: None,

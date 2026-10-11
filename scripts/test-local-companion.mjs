@@ -3,8 +3,8 @@ import { spawn } from "node:child_process";
 import { createServer } from "node:http";
 import { createConnection } from "node:net";
 import { randomUUID, createHash } from "node:crypto";
-import { readFile, access } from "node:fs/promises";
-import { join, resolve } from "node:path";
+import { readFile, access, rename, mkdir, rm } from "node:fs/promises";
+import { join, resolve, sep } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { createFixture, executableName } from "./test-runtime.mjs";
 
@@ -59,6 +59,22 @@ try {
     assert.ok(!provenance.includes("session=fixture"));
   }
   const final = await call("getHandoff", { handoffId }); assert.equal(final.committed, true);
+  const cancelledId = randomUUID();
+  const batch = await call("addDownloads", { ...params, items: [params.items[0], { ...params.items[0], suggestedFileName: "cancelled-b.bin" }] }, cancelledId);
+  assert.equal(batch.accepted, 2);
+  await call("controlDownload", { downloadId: batch.ids[0], action: "cancel" });
+  await assert.rejects(call("commitHandoff", { handoffId: cancelledId, autoStart: true, source: "browserBatch" }), /rolled back/);
+  const cancelled = await call("getHandoff", { handoffId: cancelledId }); assert.equal(cancelled.committed, false); assert.ok(cancelled.statuses.includes("paused"));
+  const rollback = JSON.parse(await readFile(join(fixture.stateDir, "downloads.json"), "utf8"));
+  assert.ok(rollback.filter(r => batch.ids.includes(r.id)).every(r => r.handoffCommitted === false));
+  const failedId = randomUUID();
+  await call("addDownloads", params, failedId);
+  const history = join(fixture.stateDir, "downloads.json"), backup = join(fixture.stateDir, "downloads.saved.json");
+  await rename(history, backup); await mkdir(history);
+  try {
+    await assert.rejects(call("commitHandoff", { handoffId: failedId, autoStart: true, source: "browserBatch" }));
+    const failed = await call("getHandoff", { handoffId: failedId }); assert.equal(failed.committed, false); assert.deepEqual(failed.statuses, ["paused"]);
+  } finally { assert.ok(resolve(history).startsWith(resolve(fixture.root) + sep)); await rm(history, { recursive: true }); await rename(backup, history); }
   console.log("PASS: signed local Firefox GUID, authenticated handoff, duplicate protection, durable commit and exact downloaded bytes.");
 } finally {
   if (app.exitCode === null) { const closed = new Promise(done => app.on("exit", done)); app.kill(); await closed; }
