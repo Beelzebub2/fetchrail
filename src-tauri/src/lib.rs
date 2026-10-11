@@ -224,6 +224,11 @@ async fn get_settings(
 }
 
 #[tauri::command]
+fn open_browser_extension_store(app: AppHandle) -> Result<(), String> {
+    browser_extension::open_store(&app)
+}
+
+#[tauri::command]
 fn open_browser_extension_folder(
     app: AppHandle,
     browser: browser_extension::Browser,
@@ -606,7 +611,7 @@ pub fn run() {
                 let extension_item = MenuItem::with_id(
                     app,
                     "extension",
-                    "Open extension folder",
+                    "Get browser companion",
                     true,
                     None::<&str>,
                 )?;
@@ -622,10 +627,7 @@ pub fn run() {
                     .on_menu_event(|app, event| match event.id().as_ref() {
                         "show" => show_main_window(app),
                         "extension" => {
-                            if let Err(error) = browser_extension::open_folder(
-                                app,
-                                browser_extension::Browser::Chromium,
-                            ) {
+                            if let Err(error) = browser_extension::open_store(app) {
                                 eprintln!("Fetchrail browser extension: {error}");
                             }
                         }
@@ -779,6 +781,7 @@ pub fn run() {
             place_download,
             reveal_download,
             get_settings,
+            open_browser_extension_store,
             open_browser_extension_folder,
             update_settings,
             organize_existing_downloads,

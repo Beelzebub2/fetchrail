@@ -356,6 +356,12 @@ h1, h2, p { margin: 0; }
 .queue-create,.extension-actions { display: flex; flex-wrap: wrap; gap: 8px; }
 .queue-create input { flex: 1; }
 .extension-error { color: var(--danger); font-size: 12.5px; }
+.companion-store { display: grid; justify-items: start; gap: 12px; }
+.companion-store > strong { font-size: 14px; }
+.companion-store > p { margin: 0; }
+.companion-manual { margin: 20px 0; }
+.companion-manual > summary { margin-bottom: 12px; cursor: pointer; font-weight: 600; }
+.companion-manual > button { margin-top: 12px; }
 .rows { min-width: 0; }
 .form .rows > * { min-height: 58px; display: flex; align-items: center; gap: 12px; padding: 8px 0; border-top: 1px solid var(--line-soft); }
 .form .rows > .update-row { flex-wrap: wrap; }
