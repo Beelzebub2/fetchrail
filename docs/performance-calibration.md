@@ -41,7 +41,8 @@ The report explicitly states these limits instead of inventing a hardware score.
 - Quick: two opposite-order runs of 1/4/8 parallel requests, then the full
   receive/write/hash path. Default maximum requested payload is 1 GiB.
 - Deep: two opposite-order runs of 1/2/4/8 public or 1/2/4/8/16/32 provided-file requests over the normal pooled
-  client, followed by a repeated HTTP/1 1/4/8 matrix, sustained confirmation
+  client, followed by repeated HTTP/1 comparisons (1/4/8 public or 1/4/16/32
+  provided-file requests), sustained confirmation
   up to 30 seconds, and the full pipeline. The public baseline defaults to 1 GiB;
   choosing Deep with a provided direct file defaults to 16 GiB.
 - Requests are at most 64 MiB, streamed without accumulating the response in RAM.
