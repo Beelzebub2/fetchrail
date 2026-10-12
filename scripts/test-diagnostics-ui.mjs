@@ -125,6 +125,7 @@ try {
   await page.waitForFunction(()=>typeof window.finishDiagStart==="function");
   await page.waitForFunction(()=>[...document.querySelectorAll("button")].find(button=>button.textContent==="Optimize downloads")?.disabled===true);
   assert.equal(await page.getByRole("button",{name:"Optimize downloads",exact:true}).isDisabled(),true,"Starting diagnostics cannot be hidden while the native command is pending");
+  assert.equal(await page.getByRole("button",{name:"Go to download calibration",exact:true}).isDisabled(),true,"The cross-tool shortcut obeys the same pending-start guard");
   await page.evaluate(()=>{window.delayDiagStart=false;window.finishDiagStart();});
   await page.getByTestId("diagnostic-reading").filter({hasText:"123"}).waitFor();
   assert.equal(await moving(".diag-drawing.working .diag-cores rect"),"diag-core","The drawing keeps moving between native samples");
