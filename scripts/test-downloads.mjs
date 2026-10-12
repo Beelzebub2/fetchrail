@@ -241,9 +241,19 @@ try {
   app.kill(); await new Promise((done) => app.once("exit", done));
   await launch();
   await native("controlDownload", { downloadId: session.ids[0], action: "resume" });
-  await complete(session.ids[0], 4);
+  if (process.platform === "win32") {
+    await complete(session.ids[0], 4);
+  } else {
+    await waitFor(async () => (await record(session.ids[0]))?.status === "failed", "Linux restart requires fresh browser authorization");
+    assert.match((await record(session.ids[0])).error, /authentication/);
+    assert.equal(parseStateSnapshot(await read("downloads.json")).find(item => item.id === session.ids[0]).requestContext, undefined);
+    const authorized = await native("addDownloads", { source: "browserBatch", items: [{ url: base + "session.bin", expectedBytes: data.length, expectedMime: "application/octet-stream", requestContext: { cookie: "session=fetchrail-test", referer: base + "step/5", userAgent: "Fetchrail browser fixture" } }] });
+    assert.equal(authorized.accepted, 1);
+    ids.push(authorized.ids[0]);
+    await complete(authorized.ids[0], 4);
+  }
   await waitFor(async () => !parseStateSnapshot(await read("downloads.json")).find((item) => item.id === session.ids[0]).requestContext, "completed session headers are removed from disk");
-  console.log("PASS: cookie/referrer downloads verify, survive app restart and produce exact bytes without exposing session headers");
+  console.log("PASS: cookie/referrer downloads produce exact bytes without exposing headers; Windows encrypted restart and Linux fresh reauthorization follow storage policy");
   const landing = await add("landing.html");
   await waitFor(async () => (await record(landing))?.status === "failed", "HTML intermediate page rejection");
   assert.match((await record(landing)).error, /opens a web page/);
