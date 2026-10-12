@@ -345,14 +345,17 @@ if (shot) {
   ];
   const find = (name) => shot.querySelector(`[data-sim="${name}"]`);
   const totalSpeed = find("total-speed");
-  const totalConnections = find("total-connections");
+  const sectionSpeed = find("section-speed");
+  const seedSpeed = shot.querySelectorAll('[data-sim="seed-speed"]');
   const sparkLine = find("spark-line");
   const sparkArea = find("spark-area");
   const samples = [58, 63, 61, 70, 68, 76, 72, 80, 77, 82, 78, 84, 81, 85, 83];
 
-  const paintSidebar = (redrawGraph) => {
-    setText(totalSpeed, downloads.reduce((sum, download) => sum + download.speed, 0).toFixed(1));
-    setText(totalConnections, `${downloads.reduce((sum, download) => sum + download.active, 0)} connections`);
+  // The rail and the "Downloading" heading both show the speed of everything that is running.
+  const paintRail = (redrawGraph) => {
+    const speed = downloads.reduce((sum, download) => sum + download.speed, 0);
+    setText(totalSpeed, speed.toFixed(1));
+    setText(sectionSpeed, speed > 0 ? formatSpeed(speed) : "");
     if (!redrawGraph) return;
     const peak = Math.max(...samples, 1) * 1.08;
     const points = samples.map(
@@ -361,7 +364,7 @@ if (shot) {
     sparkLine.setAttribute("points", points.join(" "));
     sparkArea.setAttribute("d", `M0,44 L${points.join(" L")} L200,44 Z`);
   };
-  paintSidebar(true);
+  paintRail(true);
 
   if (motion) {
     let ticks = 0;
@@ -380,8 +383,11 @@ if (shot) {
       if (second) {
         samples.shift();
         samples.push(downloads.reduce((sum, download) => sum + download.speed, 0));
+        // The finished torrent keeps uploading at a pace that drifts with its peers.
+        const upload = `↑ ${Math.round(420 + 36 * Math.sin(ticks / 9))} KB/s`;
+        seedSpeed.forEach((node) => setText(node, upload));
       }
-      paintSidebar(second);
+      paintRail(second);
     });
   }
 }
