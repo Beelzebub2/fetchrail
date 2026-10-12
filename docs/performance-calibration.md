@@ -40,7 +40,7 @@ The report explicitly states these limits instead of inventing a hardware score.
 
 - Quick: two opposite-order runs of 1/4/8 parallel requests, then the full
   receive/write/hash path. Default maximum requested payload is 1 GiB.
-- Deep: two opposite-order runs of 1/2/4/8 requests over the normal pooled
+- Deep: two opposite-order runs of 1/2/4/8 public or 1/2/4/8/16/32 provided-file requests over the normal pooled
   client, followed by a repeated HTTP/1 1/4/8 matrix, sustained confirmation
   up to 30 seconds, and the full pipeline. The public baseline defaults to 1 GiB;
   choosing Deep with a provided direct file defaults to 16 GiB.
@@ -50,8 +50,10 @@ The report explicitly states these limits instead of inventing a hardware score.
   Two-second phase gaps and loaded probes reduce request churn. Public calibration
   stops on a failed trial, retains partial diagnostics and reports Retry-After
   on service refusals. It does not continue a failing matrix. The public baseline
-  tests at most eight parallel requests; higher counts are learned from ordinary
-  downloads against their actual hosts, within the existing manual ceiling.
+  tests at most eight parallel requests. Provided-file tests include 16 and 32.
+  A participant with no body before a test deadline marks that count unreliable,
+  while lower counts can still be confirmed. Refusals and invalid representations
+  stop further network work. Ordinary downloads also learn within the manual ceiling.
 - Public measurements use Cloudflare's documented `__down`/`__up` endpoints.
   Fast connections may need more sustained data than that service permits. Users
   can explicitly supply a permitted direct file URL instead. A one-byte probe must
@@ -95,7 +97,8 @@ A report is a weak starting prior for a new large-file host. Small/medium files
 retain their configured starting behavior unless that host has qualifying evidence.
 An initial count that is clearly underusing a measured link can expand promptly
 within the user's ceiling; sustained comparisons then stop expansion when more
-requests fail to deliver a material improvement or the measured capacity is met.
+requests fail to deliver a material improvement. A measured test route is not
+treated as a hard bandwidth ceiling for another download route.
 HTTP throttling reduces admission and retains shared Retry-After handling.
 Healthy ranges drain naturally instead of being cancelled to manufacture a smoother
 graph. Waiters are labelled Waiting separately from Connecting/Receiving.
