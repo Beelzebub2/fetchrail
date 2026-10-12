@@ -1005,7 +1005,7 @@ async fn run(
         if hardware.network_key!=after_hardware.network_key { return Err("The network changed during calibration. Results were discarded; repeat on a stable connection.".into()); }
         report.options.download_url=None;
         report.elapsed_ms=millis(started.elapsed());report.profile=recommendations(&report);
-        if report.profile.confidence=="insufficient" { report.notes.push("No concurrency level had two sufficiently long, successful measurements. Increase the data budget or let normal downloads provide evidence; existing settings remain unchanged.".into()); }
+        if report.profile.confidence=="insufficient" { report.notes.push("Online evidence was insufficient or incomplete. Repeated sustained measurements and a healthy receive/write/hash/finalization test are required before applying a network profile; existing settings remain unchanged.".into()); }
         Ok(report)
     }.await;
     sample_stop.cancel();
