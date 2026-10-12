@@ -120,6 +120,7 @@ try {
   await page.evaluate(() => {window.diagBlocked=false;window.delayDiagStart=true;});
   await page.getByRole("button",{name:"Run diagnostics",exact:true}).click();
   await page.waitForFunction(()=>typeof window.finishDiagStart==="function");
+  await page.waitForFunction(()=>[...document.querySelectorAll("button")].find(button=>button.textContent==="Optimize downloads")?.disabled===true);
   assert.equal(await page.getByRole("button",{name:"Optimize downloads",exact:true}).isDisabled(),true,"Starting diagnostics cannot be hidden while the native command is pending");
   await page.evaluate(()=>{window.delayDiagStart=false;window.finishDiagStart();});
   await page.getByTestId("diagnostic-reading").filter({hasText:"123"}).waitFor();
