@@ -20,6 +20,10 @@ Where information goes
 
 The companion passes chosen downloads and transfer controls to Fetchrail on your computer through Firefox native messaging. Fetchrail contacts the file server you selected to verify and download the file. If browser session support is enabled, the relevant session headers accompany the download request. The file server receives ordinary network request data, including your IP address, according to its privacy policy. The extension has no advertising, analytics or remotely hosted executable code.
 
+Optional desktop performance calibration
+
+The desktop app offers user-started hardware and connection tests with explicit network-data and temporary-disk budgets. Generated online test traffic goes to Cloudflare's speed-test endpoints. You may explicitly provide a direct file URL for bounded ranged reads instead; that link is held in memory during the test and excluded from saved/copied reports. The chosen server receives ordinary request information including your IP address. Downloaded files, browser credentials and measurement reports are not submitted. Hardware measurements and hashed network/volume/host tuning keys stay in the app's private local performance.json file, bounded to four reports, 128 observations and 2 MiB. Tuning expires after 14 days or relevant engine/network/volume changes. You can reset this data or disable automatic tuning in Settings > Performance. This optional desktop feature does not require additional browser permissions.
+
 Storage and retention
 
 Preferences and page-batch state are stored locally in browser extension storage. Temporary request observations use browser session storage, are bounded in size and ignored after two minutes. Turning off session support clears captured observations.

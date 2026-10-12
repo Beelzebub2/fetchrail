@@ -36,7 +36,7 @@ import {
   X,
 } from "lucide-react";
 import "./App.css";
-import { Diagnostics } from "./Diagnostics";
+import { PerformanceInvitation, PerformancePage, type PerformanceView } from "./Performance";
 import { AnalyticsPrompt, PrivacySettings } from "./Privacy";
 import type { AnalyticsConsent } from "./Privacy";
 import { usePlatformCapabilities } from "./platform";
@@ -62,6 +62,7 @@ type SegmentProgress = {
   downloadedBytes: number;
   speedBps: number;
   active: boolean;
+  waiting?: boolean;
 };
 
 export type DownloadRecord = {
@@ -145,6 +146,7 @@ export type DownloadSettings = Appearance & {
   defaultDownloadDir: string;
   maxConcurrentDownloads: number;
   connectionsPerDownload: number;
+  performanceAuto: boolean;
   minSegmentSizeMb: number;
   launchOnStart: boolean;
   minimizeToTray: boolean;
@@ -227,11 +229,11 @@ type ListEntry =
 const settingsSections = [
   ["general", "General", Settings2],
   ["downloads", "Downloads", Download],
+  ["performance", "Performance", Activity],
   ["queues", "Queues", CalendarClock],
   ["categories", "File categories", FolderOpen],
   ["torrents", "Torrents", Share2],
   ["browser", "Browser", Globe],
-  ["diagnostics", "Diagnostics", Activity],
   ["privacy", "Privacy", Monitor],
 ] as const;
 type SettingsSection = (typeof settingsSections)[number][0];
@@ -444,7 +446,7 @@ export function statusLabel(status: DownloadStatus) {
 export function partsOf(item: DownloadRecord): Part[] {
   const segments = item.segments.length
     ? item.segments
-    : [{ start: 0, length: item.totalBytes, downloadedBytes: item.downloadedBytes, speedBps: item.speedBps, active: false }];
+    : [{ start: 0, length: item.totalBytes, downloadedBytes: item.downloadedBytes, speedBps: item.speedBps, active: false, waiting: false }];
   return segments.map((segment) => {
     const complete = segment.length != null && segment.downloadedBytes >= segment.length;
     const state: PartState =
@@ -453,7 +455,7 @@ export function partsOf(item: DownloadRecord): Part[] {
         : item.status === "downloading"
           ? segment.active
             ? "receiving"
-            : "connecting"
+            : segment.waiting ? "waiting" : "connecting"
           : item.status === "paused"
             ? "paused"
             : item.status === "failed" || item.status === "cancelled"
@@ -537,6 +539,7 @@ function App() {
   const [showAdd, setShowAdd] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
   const [settingsSection, setSettingsSection] = useState<SettingsSection>("general");
+  const [performanceView, setPerformanceView] = useState<PerformanceView>("calibration");
   // Unsaved settings are kept as changes on top of what is saved, so they outlive a visit to the downloads.
   const [edits, setEdits] = useState<Partial<DownloadSettings>>({});
   const [saveState, setSaveState] = useState<"idle" | "saving" | "done">("idle");
@@ -731,7 +734,7 @@ function App() {
     () =>
       downloads
         .filter((item) => item.status === "downloading")
-        .reduce((count, item) => count + partsOf(item).filter((part) => part.state !== "done").length, 0),
+        .reduce((count, item) => count + partsOf(item).filter((part) => part.state === "receiving" || part.state === "connecting").length, 0),
     [downloads],
   );
 
@@ -917,7 +920,7 @@ function App() {
   // The bar keeps its last message while it slides away, so it never reads "0 unsaved changes".
   if (unsaved) savedBar.current = { done: false, text: `${unsaved} unsaved ${unsaved === 1 ? "change" : "changes"}` };
   else if (saveState === "done") savedBar.current = { done: true, text: "Settings saved" };
-  const barShown = inSettings && !["diagnostics", "privacy"].includes(settingsSection) && (unsaved > 0 || saveState !== "idle");
+  const barShown = inSettings && settingsSection !== "privacy" && !(settingsSection === "performance" && performanceView === "diagnostics") && (unsaved > 0 || saveState !== "idle");
 
   const shown = (id: string) => !inSettings && activeFilter === id;
   const tabClass = (id: string) => (shown(id) ? "rail-tab active" : "rail-tab");
@@ -1109,6 +1112,8 @@ function App() {
             update={update}
             samples={samples}
             section={settingsSection}
+            performanceView={performanceView}
+            onPerformanceView={setPerformanceView}
             organizing={organizing}
             onOrganizing={setOrganizing}
             onChange={editSettings}
@@ -1123,6 +1128,7 @@ function App() {
           />
         ) : (
           <>
+            <PerformanceInvitation onOpen={() => { setPerformanceView("calibration"); setShowSettings(true); setSettingsSection("performance"); }} />
             <div className="list-head">
               <h1 className="sr-only">{filterTitles[activeFilter] ?? activeFilter.slice(6)}</h1>
               <div className="group-by">
@@ -1925,6 +1931,8 @@ function SettingsPage({
   update,
   samples,
   section,
+  performanceView,
+  onPerformanceView,
   organizing,
   onOrganizing,
   onChange,
@@ -1946,6 +1954,8 @@ function SettingsPage({
   update: UpdateStatus;
   samples: number[];
   section: SettingsSection;
+  performanceView: PerformanceView;
+  onPerformanceView: (view: PerformanceView) => void;
   organizing: "sort" | "flatten" | null;
   onOrganizing: (mode: "sort" | "flatten" | null) => void;
   onChange: (change: Partial<DownloadSettings>) => void;
@@ -2024,7 +2034,7 @@ function SettingsPage({
     >
       {/* Keyed by section, so each one rises in when it is opened. */}
       <div className="settings-panel" id="settings-panel" role="tabpanel" aria-labelledby={"settings-tab-" + section} key={section}>
-        {section === "diagnostics" && <Diagnostics />}
+        {section === "performance" && <PerformancePage settings={settings} draft={draft} onChange={onChange} view={performanceView} onViewChange={onPerformanceView} />}
         {section === "privacy" && <PrivacySettings settings={settings} onChoice={onAnalytics} />}
         {section === "general" && (
           <section aria-labelledby="general-settings-title">

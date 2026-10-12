@@ -17,6 +17,8 @@ pub mod native_host;
 pub mod native_protocol;
 mod network;
 mod organize;
+mod performance;
+mod performance_platform;
 pub mod platform;
 #[cfg(target_os = "linux")]
 mod power_events;
@@ -329,6 +331,47 @@ async fn get_settings(
 }
 
 #[tauri::command]
+async fn performance_status(
+    manager: State<'_, Arc<DownloadManager>>,
+    include_report: Option<bool>,
+) -> Result<performance::Status, String> {
+    Ok(manager
+        .performance
+        .status_with_report(include_report.unwrap_or(true)))
+}
+#[tauri::command]
+async fn start_calibration(
+    manager: State<'_, Arc<DownloadManager>>,
+    options: performance::Options,
+) -> Result<performance::Status, String> {
+    manager.start_calibration(options).await
+}
+#[tauri::command]
+fn cancel_calibration(manager: State<'_, Arc<DownloadManager>>) {
+    manager.performance.cancel();
+}
+#[tauri::command]
+fn dismiss_calibration(manager: State<'_, Arc<DownloadManager>>) -> Result<(), String> {
+    manager.performance.dismiss()
+}
+#[tauri::command]
+async fn apply_calibration(
+    manager: State<'_, Arc<DownloadManager>>,
+    id: Uuid,
+) -> Result<DownloadSettings, String> {
+    manager.apply_calibration(id).await
+}
+#[tauri::command]
+async fn reset_calibration(
+    manager: State<'_, Arc<DownloadManager>>,
+) -> Result<DownloadSettings, String> {
+    manager.performance.reset()?;
+    let mut settings = manager.settings().await;
+    settings.performance_auto = false;
+    manager.update_settings(settings).await
+}
+
+#[tauri::command]
 fn open_browser_extension_store(app: AppHandle) -> Result<(), String> {
     browser_extension::open_store(&app)
 }
@@ -472,6 +515,15 @@ fn update_status(app: AppHandle) -> serde_json::Value {
 
 #[tauri::command]
 async fn check_for_update(app: AppHandle) -> serde_json::Value {
+    if app
+        .try_state::<Arc<DownloadManager>>()
+        .is_some_and(|manager| manager.performance.running() || manager.diagnostics().active())
+    {
+        use tauri::Emitter;
+        let status = serde_json::json!({"state":"failed","message":"Cancel the performance test or Diagnostics before checking for application updates."});
+        let _ = app.emit("fetchrail://update-status", &status);
+        return status;
+    }
     #[cfg(windows)]
     return serde_json::json!(install::check_for_update(&app).await);
     #[cfg(target_os = "linux")]
@@ -762,7 +814,10 @@ pub fn run() {
                 tauri::async_runtime::spawn(async move {
                     tokio::time::sleep(std::time::Duration::from_secs(20)).await;
                     loop {
-                        if manager.settings().await.auto_update {
+                        if manager.settings().await.auto_update
+                            && !manager.performance.running()
+                            && !manager.diagnostics().active()
+                        {
                             install::check_for_update(&app).await;
                         }
                         tokio::time::sleep(std::time::Duration::from_secs(30 * 60)).await;
@@ -775,7 +830,10 @@ pub fn run() {
                 tauri::async_runtime::spawn(async move {
                     tokio::time::sleep(std::time::Duration::from_secs(20)).await;
                     loop {
-                        if manager.settings().await.auto_update {
+                        if manager.settings().await.auto_update
+                            && !manager.performance.running()
+                            && !manager.diagnostics().active()
+                        {
                             linux_updates::check(&app).await;
                         }
                         tokio::time::sleep(std::time::Duration::from_secs(30 * 60)).await;
@@ -935,6 +993,12 @@ pub fn run() {
             frontend_ready,
             platform_capabilities,
             platform_diagnostics,
+            performance_status,
+            start_calibration,
+            cancel_calibration,
+            dismiss_calibration,
+            apply_calibration,
+            reset_calibration,
             repair_browser_integration,
             download_window::get_download,
             download_window::show_download_progress,
