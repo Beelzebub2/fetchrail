@@ -24,7 +24,13 @@
 
 <p align="center">
   <a href="https://chromewebstore.google.com/detail/fetchrail-browser-integra/ccmbmcgihlemlheldpkgnidgohlkaipb"><img src="https://developer.chrome.com/static/docs/webstore/branding/image/iNEddTyWiMfLSwFD6qGq.png" alt="Install Fetchrail from the Chrome Web Store" height="60"></a>
-  <a href="https://addons.mozilla.org/en-US/firefox/addon/fetchrail-browser-integration/"><img src="https://extensionworkshop.com/assets/img/documentation/publish/get-the-addon-178x60px.dad84b42.png" alt="Install Fetchrail from Firefox Add-ons" height="60"></a>
+  <a href="https://addons.mozilla.org/en-US/firefox/addon/fetchrail-browser-integration/"><img src="https://extensionworkshop.com/assets/img/documentation/publish/get-the-addon-178x60px.dad84b42.png" alt="Firefox Add-ons listing, awaiting approval" height="60"></a>
+</p>
+
+<p align="center">
+  <a href="https://chromewebstore.google.com/detail/ccmbmcgihlemlheldpkgnidgohlkaipb"><img src="https://img.shields.io/chrome-web-store/v/ccmbmcgihlemlheldpkgnidgohlkaipb?label=Chrome%20public&amp;style=flat-square&amp;color=238636" alt="Chrome Web Store: public version"></a>
+  <a href="https://github.com/Beelzebub2/fetchrail/actions/runs/38172309596"><img src="https://img.shields.io/badge/Firefox-v0.7.1%20in%20review-d29922?style=flat-square" alt="Firefox v0.7.1 awaiting approval"></a>
+  <a href="browser-extension/README.md"><img src="https://img.shields.io/badge/Opera%20GX-v0.7.1%20in%20review-d29922?style=flat-square" alt="Opera GX v0.7.1 awaiting Opera review"></a>
 </p>
 
 > Most downloads travel down a single connection. Fetchrail opens up to thirty-two, and lets you watch every one.
@@ -63,7 +69,7 @@ Add a magnet link or a `.torrent` file, choose the files you want, and manage it
 
 ## Your browser hands over the download
 
-The companion works in Chrome, Edge, Chromium, Vivaldi, Brave and Firefox. It sends downloads to Fetchrail, and gives them back to the browser if the handoff fails.
+The companion works in Chrome, Chromium, Vivaldi, Brave and Firefox. It sends downloads to Fetchrail, and gives them back to the browser if the handoff fails.
 
 1. **A download starts in your browser.** Click a file the way you always do. The companion notices it begin.
 2. **The companion pauses it and asks Fetchrail.** Fetchrail makes its own request and compares the size and content type with what the browser saw.
@@ -75,7 +81,7 @@ And it does more than catch:
 - **Works through download pages.** For sites with countdowns, it opens each page in turn, follows a single clear download button and captures the final file. Logins and CAPTCHAs stay with you.
 - **One right-click away.** Choose **Download with Fetchrail** on any link, or control running transfers from the toolbar.
 
-Install the companion from the [Chrome Web Store](https://chromewebstore.google.com/detail/fetchrail-browser-integra/ccmbmcgihlemlheldpkgnidgohlkaipb) or [Firefox Add-ons](https://addons.mozilla.org/en-US/firefox/addon/fetchrail-browser-integration/) for automatic browser updates. [Read the companion guide](browser-extension/README.md).
+Install from the [Chrome Web Store](https://chromewebstore.google.com/detail/ccmbmcgihlemlheldpkgnidgohlkaipb), or follow the [browser companion guide](browser-extension/README.md) for other browsers.
 
 ## Make it yours
 

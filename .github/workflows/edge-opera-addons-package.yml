@@ -1,0 +1,56 @@
+name: Edge and Opera Add-ons package
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    name: Prepare Chromium store ZIP
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '24'
+          cache: npm
+      - name: Build and check browser companion
+        run: |
+          npm ci
+          npm run browser:build
+          npm run browser:check
+          npm run cws:test
+      - name: Create Edge and Opera upload package
+        run: |
+          version="$(node -p 'require("./package.json").version')"
+          node scripts/prepare-chrome-web-store.mjs "v$version"
+          mkdir -p artifacts/edge-opera-addons
+          package="$GITHUB_WORKSPACE/artifacts/edge-opera-addons/fetchrail-browser-v$version-edge-opera.zip"
+          (cd "release-artifacts/chrome-web-store-$version" && zip -qr "$package" .)
+          unzip -p "$package" manifest.json | node -e '
+            let data = "";
+            process.stdin.on("data", (chunk) => { data += chunk; });
+            process.stdin.on("end", () => {
+              const manifest = JSON.parse(data);
+              if (manifest.manifest_version !== 3 || manifest.version !== process.argv[1] || manifest.key || manifest.update_url || !manifest.permissions.includes("nativeMessaging")) {
+                throw new Error("Invalid Edge/Opera production manifest");
+              }
+              console.log("Validated production MV3 package", manifest.version);
+            });
+          ' "$version"
+          if unzip -Z1 "$package" | grep -Eq '(^|/)(build-info.json|node_modules)(/|$)'; then
+            echo 'Unexpected development files in store archive' >&2
+            exit 1
+          fi
+          sha256sum "$package" | tee artifacts/edge-opera-addons/SHA256SUMS.txt
+      - name: Retain upload package
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: edge-opera-addons-upload
+          path: artifacts/edge-opera-addons/
+          if-no-files-found: error

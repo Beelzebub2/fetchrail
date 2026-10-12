@@ -59,8 +59,10 @@ export function compareExtensionChanges(base, head) {
   const paths = new Set(git("diff", "--name-only", "-z", base, head, "--").split("\0").filter(Boolean));
   const shared = [...paths].some((path) => path.startsWith("browser-extension/src/") || path === "browser-extension/build.mjs");
   const fontsChanged = paths.has("package-lock.json") && fontDependenciesChanged(base, head);
+  const chromiumChanged = shared || fontsChanged || paths.has("scripts/prepare-chrome-web-store.mjs") || manifestChanged(base, head, "chromium");
   return {
-    chromium: shared || fontsChanged || paths.has("scripts/prepare-chrome-web-store.mjs") || manifestChanged(base, head, "chromium"),
+    chromium: chromiumChanged,
+    opera: chromiumChanged,
     firefox: shared || fontsChanged || paths.has("browser-extension/amo-metadata.json") || manifestChanged(base, head, "firefox"),
     firefox_policy: paths.has("browser-extension/privacy-policy.txt"),
   };
@@ -69,6 +71,18 @@ export function compareExtensionChanges(base, head) {
 export function releaseExtensionChanges(tag, runs) {
   if (!releaseTag.test(tag)) throw new Error(`Invalid release tag: ${tag}`);
   const bases = successfulSubmissions(tag, runs ?? githubStoreHistory(tag));
+  // The first Opera listing was submitted manually at v0.7.1. Once Actions
+  // starts submitting updates, successful CI submissions take precedence.
+  const operaInitial = process.env.OPERA_INITIAL_SUBMISSION_REF;
+  if (!bases.opera && operaInitial) {
+    if (!releaseTag.test(operaInitial)) throw new Error(`Invalid Opera initial submission tag: ${operaInitial}`);
+    try {
+      execFileSync("git", ["merge-base", "--is-ancestor", operaInitial, tag], { stdio: "ignore" });
+    } catch {
+      throw new Error(`Opera submission baseline ${operaInitial} must be an ancestor of ${tag}.`);
+    }
+    bases.opera = operaInitial;
+  }
   // Each store is compared to its last successful submission, even when a
   // desktop release succeeded but the store submission failed afterward.
   const changes = Object.fromEntries(Object.entries(bases).map(([store, base]) =>
