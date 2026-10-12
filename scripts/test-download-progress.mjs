@@ -40,7 +40,7 @@ try {
     };
     window.testPerformance = { running: false, phase: "idle", progress: 0, error: null, prompt: false, latest: null, applied: null, learnedHosts: 0 };
     Object.defineProperty(navigator, "clipboard", { configurable: true, value: { writeText: async text => { window.testCopied = text; }, readText: async () => window.testCopied ?? "" } });
-    window.testSettings = { theme: "dark", accent: "ember", speedLimitBps: 0, autoUpdate: false, categories: [{ name: "Compressed", extensions: ["rar"], folder: "Compressed" }], sortIntoCategoryFolders: true, defaultDownloadDir: "C:\\Downloads", maxConcurrentDownloads: 3, connectionsPerDownload: 4, minSegmentSizeMb: 1, launchOnStart: false, minimizeToTray: true };
+    window.testSettings = { analyticsConsent: { enabled: false, decided: true, schema: 1, purpose: "product-improvement-v1" }, theme: "dark", accent: "ember", speedLimitBps: 0, autoUpdate: false, categories: [{ name: "Compressed", extensions: ["rar"], folder: "Compressed" }], sortIntoCategoryFolders: true, defaultDownloadDir: "C:\\Downloads", maxConcurrentDownloads: 3, connectionsPerDownload: 4, minSegmentSizeMb: 1, launchOnStart: false, minimizeToTray: true };
     window.testSettings.torrent = { uploadLimitBps: 0, maxSeeds: 3, ratioLimit: 1, seedTimeLimit: 86400, dht: true, lsd: true, upnp: true, connections: 200, listenInterfaces: "0.0.0.0:6881,[::]:6881", outgoingInterfaces: "", encryption: 1, proxyType: 0, proxyHost: "", proxyPort: 0, proxyUsername: "", proxyPassword: "" };
     window.testEmit = (event, payload) => {
       for (const [id, name] of listeners) if (name === event) callbacks.get(id)?.({ event, payload });
@@ -247,7 +247,7 @@ try {
   await gear.click();
   await page.getByRole("heading", { name: "General", exact: true }).waitFor();
   assert.equal(await gear.getAttribute("aria-pressed"), "true");
-  assert.equal(await rail.getByRole("tab").count(), 7, "The settings sections live in the rail.");
+  assert.equal(await rail.getByRole("tab").count(), 9, "The settings sections live in the rail.");
   assert.equal(await page.locator(".content").getByRole("tab").count(), 0, "Settings must not stack a tab bar of its own under the rail.");
   assert.equal(await page.getByRole("button", { name: /^All downloads/ }).count(), 0, "The view tabs give way to the settings sections.");
   assert.equal(await page.getByRole("heading", { name: "Settings", exact: true }).count(), 0, "There is no shared Settings page head.");
