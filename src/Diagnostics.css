@@ -1,52 +1,8 @@
-/* grade badges: size with font-size, colour with color */
-@property --ga{syntax:"<angle>";inherits:false;initial-value:0deg}
-.diag-badge{position:relative;display:inline-grid;place-items:center;width:1.56em;height:1.56em;flex:none;font-family:"Bricolage Grotesque","Segoe UI",sans-serif;font-weight:800;line-height:1}
-.diag-badge .fx,.diag-badge .plate,.diag-badge .fx::before,.diag-badge .fx::after{position:absolute;inset:0;border-radius:.4em}
-.diag-badge .fx{pointer-events:none}
-.diag-badge .plate{overflow:hidden;background:color-mix(in srgb,currentColor 14%,var(--bg));box-shadow:inset 0 0 0 .04em color-mix(in srgb,currentColor 62%,transparent)}
-.diag-badge .letter{position:relative;font-size:.9em;letter-spacing:-.06em}
-@keyframes g-spin{to{transform:rotate(360deg)}}
-@keyframes g-pop{0%{opacity:0;transform:scale(.4)}100%{opacity:1;transform:none}}
-@keyframes g-fade{0%{opacity:0;transform:scale(.9)}100%{opacity:1;transform:none}}
-@keyframes g-ripple{0%{opacity:.75;transform:scale(1)}70%,100%{opacity:0;transform:scale(1.34)}}
-@keyframes g-shine{0%{transform:translateX(-170%) skewX(-18deg)}42%,100%{transform:translateX(460%) skewX(-18deg)}}
-.diag-g-F{animation:gF-in .62s cubic-bezier(.3,1.5,.5,1) both,gF-idle 3.2s steps(1,end) .8s infinite}
-.diag-g-F .plate{background:color-mix(in srgb,currentColor 9%,var(--bg));box-shadow:none;border:.04em dashed color-mix(in srgb,currentColor 70%,transparent)}
-.diag-g-F .letter{animation:gF-flick 3.2s steps(1,end) .8s infinite}
-@keyframes gF-in{0%{opacity:0;transform:translateY(-.7em) rotate(-16deg)}55%{opacity:1;transform:translateY(.05em) rotate(-3deg)}100%{opacity:1;transform:rotate(-6deg)}}
-@keyframes gF-idle{0%,84%{transform:rotate(-6deg)}86%{transform:translate(-.06em,.01em) rotate(-7deg)}88%{transform:translate(.05em,-.02em) rotate(-5deg)}90%{transform:translate(-.03em,0) rotate(-6deg)}92%{transform:translate(.02em,.01em) rotate(-6deg)}94%,100%{transform:rotate(-6deg)}}
-@keyframes gF-flick{0%,85%,93%,100%{opacity:1}87%,91%{opacity:.35}}
-.diag-g-D{animation:gD-in .9s cubic-bezier(.3,0,.3,1) both,gD-idle 3.8s ease-in-out .9s infinite}
-.diag-g-D .plate{box-shadow:inset 0 0 0 .04em color-mix(in srgb,currentColor 40%,transparent)}
-@keyframes gD-in{0%{opacity:0;transform:translateY(-.3em)}100%{opacity:1;transform:translateY(.03em) rotate(3deg)}}
-@keyframes gD-idle{0%,100%{opacity:1;transform:translateY(.03em) rotate(3deg)}50%{opacity:.68;transform:translateY(.07em) rotate(4.5deg)}}
-.diag-g-C{animation:g-fade .55s cubic-bezier(.2,.7,.2,1) both}
-.diag-g-B,.diag-g-A{animation:g-pop .6s cubic-bezier(.34,1.45,.64,1) both}
-.diag-g-B .fx::before,.diag-g-A .fx::before,.diag-g-A .fx::after,.diag-g-S .fx::before,.diag-g-S .fx::after{content:"";box-shadow:0 0 0 .03em currentColor;opacity:0;animation:g-ripple 2.6s cubic-bezier(.2,.7,.2,1) .35s infinite}
-.diag-g-A .fx::before,.diag-g-A .fx::after{animation-duration:2.2s}
-.diag-g-S .fx::before,.diag-g-S .fx::after{animation-duration:1.9s}
-.diag-g-A .fx::after,.diag-g-S .fx::after{animation-delay:.9s}
-.diag-g-S{animation:gS-in .8s cubic-bezier(.2,.8,.2,1) both}
-.diag-g-S .plate{box-shadow:inset 0 0 0 .045em currentColor,0 0 .5em color-mix(in srgb,currentColor 30%,transparent)}
-@keyframes gS-in{0%{opacity:0;transform:perspective(5em) rotateY(-100deg) scale(.8)}55%{opacity:1;transform:perspective(5em) rotateY(16deg) scale(1.06)}100%{opacity:1;transform:perspective(5em) rotateY(0) scale(1)}}
-.diag-g-S .plate::after,.diag-g-SS .plate::after{content:"";position:absolute;top:-10%;bottom:-10%;left:0;width:36%;background:linear-gradient(90deg,transparent,rgba(255,255,255,.5),transparent);transform:translateX(-170%) skewX(-18deg);animation:g-shine 2.8s cubic-bezier(.4,0,.2,1) .6s infinite}
-.diag-g-SS{animation:gSS-in .6s cubic-bezier(.3,1.4,.5,1) both}
-.diag-g-SS .plate{border:.055em solid transparent;background:linear-gradient(var(--bg),var(--bg)) padding-box,conic-gradient(from var(--ga,0deg),#7db4ff,#c9a6ff,#ff9ad5,#ffd27a,#7df0c8,#7db4ff) border-box;box-shadow:0 0 .55em rgba(201,166,255,.28);animation:gSS-spin 3.2s linear infinite}
-.diag-g-SS .fx::before{content:"";inset:-.46em;border-radius:50%;background:repeating-conic-gradient(rgba(201,166,255,.34) 0 5deg,transparent 5deg 18deg);-webkit-mask:radial-gradient(circle,transparent 44%,#000 46%,transparent 70%);mask:radial-gradient(circle,transparent 44%,#000 46%,transparent 70%);animation:g-spin 16s linear infinite,gSS-rays .7s ease-out both}
-.diag-g-SS .fx::after{content:"";inset:-.42em;border-radius:0;background:radial-gradient(circle at 10% 24%,#fff 0 .03em,transparent .034em),radial-gradient(circle at 92% 12%,#ffd27a 0 .04em,transparent .044em),radial-gradient(circle at 84% 88%,#7df0c8 0 .03em,transparent .034em),radial-gradient(circle at 6% 80%,#ff9ad5 0 .035em,transparent .04em),radial-gradient(circle at 50% 0%,#c9a6ff 0 .025em,transparent .03em);animation:gSS-twinkle 1.5s ease-in-out infinite alternate}
-.diag-g-SS .letter{font-size:.8em;letter-spacing:0}
-.diag-g-SS .letter span{display:inline-block;padding:0 .03em;margin:0 -.055em;background:linear-gradient(110deg,#9cc4ff,#d9bfff 50%,#ffc2e4);-webkit-background-clip:text;background-clip:text;color:transparent;animation:gSS-slam .5s cubic-bezier(.3,1.5,.5,1) .12s both}
-.diag-g-SS .letter span+span{background:linear-gradient(110deg,#e3c8ff,#ffc2e4 45%,#ffe0a3);-webkit-background-clip:text;background-clip:text;animation-delay:.3s}
-@keyframes gSS-in{0%{opacity:0;transform:scale(1.9)}60%{opacity:1;transform:scale(.93)}100%{opacity:1;transform:scale(1)}}
-@keyframes gSS-spin{to{--ga:360deg}}
-@keyframes gSS-rays{0%{opacity:0}100%{opacity:1}}
-@keyframes gSS-twinkle{0%{opacity:.25;transform:scale(.92) rotate(-4deg)}100%{opacity:1;transform:scale(1.06) rotate(4deg)}}
-@keyframes gSS-slam{0%{opacity:0;transform:translateY(-.5em) scale(1.5)}100%{opacity:1;transform:none}}
-/* a badge that holds still, for legends */
-.diag-still,.diag-still *,.diag-still *::before,.diag-still *::after{animation:none!important}
-.diag-g-F.diag-still{transform:rotate(-6deg)}
-.diag-g-D.diag-still{transform:rotate(3deg)}
-.diag-g-SS.diag-still .fx::before,.diag-g-SS.diag-still .fx::after{display:none}
+/* Grades are resting labels: motion makes measured results harder to read. */
+.diag-badge { position:relative; display:inline-grid; place-items:center; width:1.56em; height:1.56em; flex:none; font-family:"Bricolage Grotesque","Segoe UI",sans-serif; font-weight:800; line-height:1; }
+.diag-badge .plate { position:absolute; inset:0; border-radius:.4em; background:color-mix(in srgb,currentColor 14%,var(--bg)); box-shadow:inset 0 0 0 .04em color-mix(in srgb,currentColor 62%,transparent); }
+.diag-badge .letter { position:relative; font-size:.9em; letter-spacing:-.06em; }
+.diag-g-SS .letter { font-size:.8em; letter-spacing:0; }
 
 .diagnostics { display:grid; gap:18px; padding-bottom:30px; }
 .diag-layout { display:flex; flex-wrap:wrap; gap:20px; }
@@ -59,15 +15,15 @@
 .diag-drawing.working { color:var(--accent); }
 .diag-drawing .t { fill:none; stroke:var(--line); stroke-width:2; }
 .diag-drawing .s { fill:none; stroke:currentColor; stroke-width:2; }
-.diag-drawing .f { fill:currentColor; transition:opacity 180ms; }
+.diag-drawing .f { fill:currentColor; }
 .diag-drawing .tf { fill:var(--track); }
 .diag-drawing .chassis { fill:var(--bg); }
 .diag-drawing text { fill:var(--text-3); font-size:10px; }
 .diag-needle { transform-origin:160px 156px; transition:transform 180ms linear; }
 .diag-reading { display:flex; justify-content:center; align-items:baseline; gap:8px; font-family:var(--mono); font-variant-numeric:tabular-nums; }
-.diag-reading strong { font-size:52px; font-weight:500; }
+.diag-reading strong { font-size:clamp(30px,4vw,42px); font-weight:500; }
 .diag-stage progress { width:100%; accent-color:var(--accent); }
-.diag-grade-stamp { position:absolute; inset:0; display:grid; place-content:center; gap:16px; background:color-mix(in srgb,var(--bg) 93%,transparent); }
+.diag-completed-stage { min-height:390px; display:grid; place-content:center; justify-items:center; gap:16px; }
 .diag-row { display:flex; align-items:center; gap:12px; padding:14px 10px; border:1px solid var(--line-soft); border-radius:12px; }
 .diag-row.active { border-color:var(--accent); background:var(--accent-soft); }
 .diag-row div { display:grid; gap:3px; flex:1; }
@@ -80,9 +36,12 @@
 .diag-report-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(min(100%,380px),1fr)); gap:18px; }
 .diag-card-head h2 { flex:1; }
 .diag-result { border-top:1px solid var(--line-soft); padding-top:12px; display:grid; gap:6px; }
-.diag-result > div { display:flex; justify-content:space-between; gap:12px; font-size:13px; }
+.diag-result > div { display:flex; flex-wrap:wrap; justify-content:space-between; gap:8px 12px; font-size:13px; }
 .diag-result span { white-space:nowrap; font-family:var(--mono); }
-.diag-result small,.diag-result p { font-size:12px; color:var(--text-3); }
+.diag-result small,.diag-result p,.diag-result summary { font-size:12px; color:var(--text-2); }
+.diag-result summary { cursor:pointer; }
+.diag-result p { overflow-wrap:anywhere; }
+.diag-result details p { margin-top:8px; }
 .diag-table-wrap { overflow-x:auto; }
 .diag-table { width:100%; border-collapse:collapse; font-size:13px; text-align:left; }
 .diag-table :is(th,td) { padding:12px; border-bottom:1px solid var(--line-soft); white-space:nowrap; }
@@ -91,8 +50,7 @@
 .diagnostics pre { background:var(--bg); border-radius:10px; padding:12px; overflow:auto; font-size:12px; }
 .diag-g-F { color:#ff5468; } .diag-g-D { color:#ff9166; } .diag-g-C { color:#f2c94c; } .diag-g-B { color:#a6e36a; } .diag-g-A { color:#4ddfc0; } .diag-g-S { color:#7db4ff; } .diag-g-SS { color:#c9a6ff; }
 [data-theme=light] .diag-g-F { color:#c7263c; } [data-theme=light] .diag-g-D { color:#b3501f; } [data-theme=light] .diag-g-C { color:#7d5d00; } [data-theme=light] .diag-g-B { color:#3b7412; } [data-theme=light] .diag-g-A { color:#0a6f4c; } [data-theme=light] .diag-g-S { color:#1c5fcc; } [data-theme=light] .diag-g-SS { color:#6b41cf; }
-[data-theme=light] .diag-g-SS .letter span { background:none; color:currentColor; }
-@media (prefers-reduced-motion:reduce) { .diagnostics *,.diagnostics *::before,.diagnostics *::after { animation:none!important; transition:none!important; } .diag-g-F { transform:rotate(-6deg); } .diag-g-D { transform:rotate(3deg); } .diag-g-SS .fx::before,.diag-g-SS .fx::after { display:none; } }
+@media (prefers-reduced-motion:reduce) { .diagnostics *,.diagnostics *::before,.diagnostics *::after { animation:none!important; transition:none!important; } }
 @media (max-width:600px) { .diag-reading strong { font-size:36px; } .diag-stage { min-height:300px; padding:16px; } .diag-idle-grid { gap:8px; } .diag-idle-grid p { font-size:11px; } }
 
 .diag-share-dialog { margin:auto; max-height:calc(100vh - 24px); width:min(640px,calc(100vw - 24px)); overflow:auto; color:var(--text); background:var(--surface); } .diag-share-dialog:not([open]) { display:none; } .diag-share-dialog::backdrop { background:rgba(0,0,0,.65); }
