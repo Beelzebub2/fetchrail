@@ -66,6 +66,10 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'Progress interface checks failed.' }
           npm run torrent:ui
           if ($LASTEXITCODE -ne 0) { throw 'Torrent interface checks failed.' }
+          npm run diagnostics:ui
+          if ($LASTEXITCODE -ne 0) { throw 'Diagnostics interface checks failed.' }
+          npm run analytics:ui
+          if ($LASTEXITCODE -ne 0) { throw 'Analytics interface checks failed.' }
       - name: Retain Windows interface evidence
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -240,6 +244,8 @@ jobs:
         run: |
           npm run ui:test
           npm run torrent:ui
+          npm run diagnostics:ui
+          npm run analytics:ui
       - name: Check Rust and native transfer correctness
         run: |
           set -euo pipefail
