@@ -17,6 +17,8 @@ If you already loaded the unpacked companion, disable or remove it before enabli
 
 For Linux browser packages, custom profiles and sandbox limits, see the [Linux companion guide](../docs/linux.md#browser-companion).
 
+Dedicated Microsoft Edge Add-ons and Opera Add-ons listings are being prepared. Until they are submitted and approved, neither store has an official Fetchrail listing. The production Chromium package can be used for either store, but the new listing's assigned extension ID must be approved by the installed Fetchrail native host before the companion can communicate with the app. See the [Edge and Opera submission guide](../docs/edge-opera-addons.md). Opera GX can also use Chrome Web Store extensions according to [Opera's guidance](https://help.opera.com/en/latest/customization/); test native messaging before relying on automatic routing.
+
 ### Manual installation: Chrome, Edge, Chromium, Vivaldi, and Brave
 
 1. In Fetchrail, open **Settings → Browser companion → Manual installation and Firefox → Open extension folder**. The tray's **Get browser companion** action opens the official store listing.
