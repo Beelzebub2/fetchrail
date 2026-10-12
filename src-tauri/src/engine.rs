@@ -4079,6 +4079,7 @@ impl DownloadManager {
                                 probe,
                                 peer_rate,
                                 segments,
+                                workers,
                                 shared,
                                 live_peer_rate,
                                 attempt == 0 && probe.accepts_ranges && probe.validator.is_some(),
@@ -4231,6 +4232,7 @@ impl DownloadManager {
         probe: &ProbeResult,
         peer_rate: &AtomicU64,
         peers: &[SegmentCounter],
+        worker_count: usize,
         shared: bool,
         live_peer_rate: &AtomicU64,
         recover_peer: bool,
@@ -4543,9 +4545,14 @@ impl DownloadManager {
                             progress_at.elapsed(),
                             &mut best_rate,
                             &mut previous_rate,
-                            // One completed transport's capacity is shared by the parallel ranges.
+                            // A completed range cannot inflate the target as active peers drain.
                             if recover_peer {
-                                peer_rate.load(Ordering::Relaxed) / peers.iter().filter(|p| p.active.load(Ordering::Relaxed)).count().max(1) as u64
+                                let share = peer_rate.load(Ordering::Relaxed) / worker_count.max(1) as u64;
+                                if peers.iter().filter(|p| p.active.load(Ordering::Relaxed)).count() >= 2 {
+                                    share.min(live_peer_rate.load(Ordering::Relaxed))
+                                } else {
+                                    share
+                                }
                             } else {
                                 0
                             },
