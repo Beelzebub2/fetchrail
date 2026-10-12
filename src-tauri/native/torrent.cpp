@@ -35,6 +35,11 @@
 #include <chrono>
 #include <deque>
 #include <thread>
+#include <random>
+#ifndef _WIN32
+#include <fcntl.h>
+#include <unistd.h>
+#endif
 
 namespace lt = libtorrent;
 namespace fs = std::filesystem;
@@ -65,18 +70,43 @@ static std::vector<char> read_file(std::string const& path) {
     return bytes;
 }
 
+static bool checkpoint_exists(std::string const& path) {
+    std::error_code error;
+    auto status = fs::symlink_status(fs::u8path(path), error);
+    return !error && fs::is_regular_file(status);
+}
+
 static void write_file(std::string const& path, std::vector<char> const& bytes) {
-    auto dest = fs::u8path(path), temp = fs::u8path(path + ".tmp");
+    auto dest = fs::u8path(path), temp = fs::u8path(path + "." + std::to_string(std::random_device{}()) + ".tmp");
     fs::create_directories(dest.parent_path());
-    std::ofstream f(temp, std::ios::binary | std::ios::trunc);
-    f.write(bytes.data(), bytes.size()); f.flush();
-    if (!f) throw std::runtime_error("Cannot save torrent state");
-    f.close();
 #ifdef _WIN32
-    if (!MoveFileExW(temp.c_str(), dest.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
+    auto file = CreateFileW(temp.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE) throw std::runtime_error("Cannot open torrent checkpoint for durable flush");
+    DWORD written = 0;
+    auto flushed = WriteFile(file, bytes.data(), DWORD(bytes.size()), &written, nullptr) && written == bytes.size() && FlushFileBuffers(file);
+    CloseHandle(file);
+    if (!flushed) { fs::remove(temp); throw std::runtime_error("Cannot flush torrent checkpoint"); }
+    if (!MoveFileExW(temp.c_str(), dest.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+        fs::remove(temp);
         throw std::runtime_error("Cannot replace torrent state");
+    }
 #else
-    fs::rename(temp, dest);
+    auto file = ::open(temp.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0600);
+    if (file < 0) throw std::runtime_error("Cannot open torrent checkpoint for durable flush");
+    size_t offset = 0;
+    while (offset < bytes.size()) {
+        auto count = ::write(file, bytes.data() + offset, bytes.size() - offset);
+        if (count < 0 && errno == EINTR) continue;
+        if (count <= 0) { ::close(file); fs::remove(temp); throw std::runtime_error("Cannot write torrent checkpoint"); }
+        offset += size_t(count);
+    }
+    auto flushed = ::fsync(file); ::close(file);
+    if (flushed != 0) { fs::remove(temp); throw std::runtime_error("Cannot flush torrent checkpoint"); }
+    try { fs::rename(temp, dest); } catch (...) { fs::remove(temp); throw; }
+    auto directory = ::open(dest.parent_path().c_str(), O_RDONLY | O_DIRECTORY);
+    if (directory < 0) throw std::runtime_error("Cannot flush torrent state directory");
+    flushed = ::fsync(directory); ::close(directory);
+    if (flushed != 0) throw std::runtime_error("Cannot flush torrent state directory");
 #endif
 }
 
@@ -150,6 +180,8 @@ struct Job {
     bool flushed = false;
     bool flushing = false;
     int pending_saves = 0;
+    bool saved_checkpoint = false;
+    std::string checkpoint_error;
     bool removing = false;
     bool removed = false;
     std::set<std::string> paths;
@@ -193,7 +225,7 @@ struct Engine {
         if (!session) {
             listen_request = config.value("listenInterfaces", "0.0.0.0:0,[::]:0");
             auto p = network_settings(config);
-            p.set_str(lt::settings_pack::user_agent, "Fetchrail/0.5.2 libtorrent/" LIBTORRENT_VERSION);
+            p.set_str(lt::settings_pack::user_agent, "Fetchrail/" FETCHRAIL_APP_VERSION " libtorrent/" LIBTORRENT_VERSION);
             p.set_int(lt::settings_pack::alert_mask, lt::alert_category::error | lt::alert_category::storage | lt::alert_category::status | lt::alert_category::connect | lt::alert_category::tracker);
             p.set_int(lt::settings_pack::alert_queue_size, 4096);
             p.set_int(lt::settings_pack::hashing_threads, std::clamp(int(std::thread::hardware_concurrency() / 4), 1, 4));
@@ -223,10 +255,13 @@ struct Engine {
         return i->second;
     }
     void save(Job& j, bool modified_only = false) {
+        if (j.pending_saves) return;
+        j.checkpoint_error.clear(); // A new explicit save is a new retry generation.
         ++j.pending_saves;
         auto flags = lt::torrent_handle::save_info_dict | lt::torrent_handle::flush_disk_cache;
-        if (modified_only) flags |= lt::torrent_handle::only_if_modified;
-        j.handle.save_resume_data(flags);
+        if (modified_only && j.saved_checkpoint && checkpoint_exists(j.resume_path)) flags |= lt::torrent_handle::only_if_modified;
+        try { j.handle.save_resume_data(flags); }
+        catch (std::exception const& e) { --j.pending_saves; j.checkpoint_error = e.what(); throw; }
     }
     template<class Predicate> void wait(Predicate done) {
         auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(15);
@@ -284,9 +319,20 @@ struct Engine {
                     j.flushed = true; j.flushing = false;
                 } else if (auto s = lt::alert_cast<lt::save_resume_data_alert>(a)) {
                     j.pending_saves = std::max(0, j.pending_saves - 1);
-                    write_file(j.resume_path, lt::write_resume_data_buf(s->params));
-                } else if (lt::alert_cast<lt::save_resume_data_failed_alert>(a)) {
+                    j.checkpoint_error = "Cannot write torrent checkpoint";
+                    try { write_file(j.resume_path, lt::write_resume_data_buf(s->params)); }
+                    catch (std::exception const& e) {
+                        j.checkpoint_error = e.what();
+                        events.push_back({{"id", it->first}, {"type", "checkpointError"}, {"message", j.checkpoint_error}});
+                        continue;
+                    }
+                    j.saved_checkpoint = true; j.checkpoint_error.clear();
+                } else if (auto s = lt::alert_cast<lt::save_resume_data_failed_alert>(a)) {
                     j.pending_saves = std::max(0, j.pending_saves - 1);
+                    if (s->error != lt::errors::resume_data_not_modified || !j.saved_checkpoint || !checkpoint_exists(j.resume_path)) {
+                        j.checkpoint_error = s->error.message();
+                        events.push_back({{"id", it->first}, {"type", "checkpointError"}, {"message", j.checkpoint_error}});
+                    }
                 } else if (lt::alert_cast<lt::torrent_removed_alert>(a)) {
                     j.removed = true;
                 } else if (lt::alert_cast<lt::metadata_received_alert>(a)) {
@@ -322,7 +368,13 @@ struct Engine {
     }
     json call(json const& c) {
         auto op = c.at("op").get<std::string>();
-        if (op == "init") { root = c.at("root"); return {{"version", LIBTORRENT_VERSION}}; }
+        if (op == "init") {
+            root = c.at("root");
+            bool unclean = fs::exists(fs::u8path(root + "/unclean"));
+            write_file(root + "/unclean", {'1'});
+            return {{"version", LIBTORRENT_VERSION}, {"unclean", unclean}};
+        }
+        if (op == "clean") { fs::remove(fs::u8path(root + "/unclean")); return json::object(); }
         if (op == "inspect") {
             auto bytes = read_file(c.at("path"));
             auto p = lt::load_torrent_buffer(lt::span<char const>(bytes.data(), bytes.size()));
@@ -417,6 +469,10 @@ struct Engine {
             }
             auto handle = get_session(c.value("config", json::object())).add_torrent(p);
             jobs.emplace(id, Job{handle, importing, resume, metapath});
+            if (c.value("restore", false) && fs::exists(fs::u8path(resume))) {
+                try { lt::read_resume_data(read_file(resume)); jobs.at(id).saved_checkpoint = true; }
+                catch (...) { jobs.at(id).checkpoint_error = "Previous resume checkpoint is invalid; full verification required"; }
+            }
             owners.emplace(handle, id);
             try { if (p.ti && !importing) jobs.at(id).paths = claim(id, p.save_path, metadata(*p.ti)); }
             catch (...) { session->remove_torrent(handle); owners.erase(handle); jobs.erase(id); throw; }
@@ -433,8 +489,20 @@ struct Engine {
             session->apply_settings(p); return json::object();
         }
         if (op == "checkpoint") {
-            for (auto& pair : jobs) if (!pair.second.importing && !pair.second.removing && !pair.second.pending_saves) save(pair.second, true);
-            if (session && c.value("wait", false)) wait([&] { for (auto const& pair : jobs) if (pair.second.pending_saves) return false; return true; });
+            auto done = [&] { for (auto const& pair : jobs) if (pair.second.pending_saves) return false; return true; };
+            auto blocking = c.value("wait", false);
+            bool pending = !done();
+            if (session && blocking && pending) {
+                wait(done);
+                for (auto const& pair : jobs) if (!pair.second.checkpoint_error.empty())
+                    throw std::runtime_error("Pending torrent checkpoint failed: " + pair.second.checkpoint_error);
+            }
+            for (auto& pair : jobs) if (!pair.second.importing && !pair.second.removing && !pair.second.pending_saves) save(pair.second, !blocking);
+            if (session && blocking) {
+                wait(done);
+                for (auto const& pair : jobs) if (!pair.second.checkpoint_error.empty())
+                    throw std::runtime_error("Torrent checkpoint failed for " + pair.first + ": " + pair.second.checkpoint_error);
+            }
             return json::object();
         }
         auto id = c.at("id").get<std::string>();
@@ -462,7 +530,7 @@ struct Engine {
             lt::announce_entry entry(c.at("url").get<std::string>());
             auto scheme = entry.url.substr(0, entry.url.find(':'));
             if (scheme != "http" && scheme != "https" && scheme != "udp") throw std::runtime_error("Tracker must use HTTP, HTTPS or UDP");
-            h.add_tracker(entry);
+            h.add_tracker(entry); save(j);
         } else if (op == "peer") {
             auto port = c.at("port").get<int>(); if (port < 1 || port > 65535) throw std::runtime_error("Peer port must be 1–65535");
             h.connect_peer({lt::make_address(c.at("address").get<std::string>()), static_cast<unsigned short>(port)});
