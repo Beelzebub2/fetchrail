@@ -92,6 +92,7 @@ async fn publication_crash_stages_reconcile_exactly_one_file_and_reject_foreign_
                 total,
                 manifest_sha256: format!("{:x}", Sha256::digest(b"manifest")),
                 sha256,
+                range_sha256: Vec::new(),
                 identity,
                 published: false,
             };
@@ -140,6 +141,124 @@ async fn publication_crash_stages_reconcile_exactly_one_file_and_reject_foreign_
             fs::remove_dir_all(root).await.unwrap();
         }
     }
+}
+
+#[tokio::test]
+async fn shared_range_commitments_recover_without_an_initial_full_file_digest() {
+    use std::io::{Seek, SeekFrom};
+
+    let root = std::env::temp_dir().join(format!("fetchrail-range-journal-{}", Uuid::new_v4()));
+    let destination = root.join("file.bin");
+    let mut saved = record(&destination);
+    let parts = root.join("parts").join(saved.id.to_string());
+    fs::create_dir_all(&parts).await.unwrap();
+    let data = (0..64 * 1024).map(|i| (i % 251) as u8).collect::<Vec<_>>();
+    let total = data.len() as u64;
+    let ranges = split_ranges(total, 4);
+    let manifest = PartManifest {
+        total_bytes: Some(total),
+        ranges: ranges.clone(),
+        validator: Some("\"checked-representation\"".into()),
+        version: 1,
+        final_url_sha256: Some("0".repeat(64)),
+        accepts_ranges: true,
+        shared_staging: true,
+    };
+    let manifest_bytes = serde_json::to_vec(&manifest).unwrap();
+    fs::write(parts.join("transfer.json"), &manifest_bytes)
+        .await
+        .unwrap();
+    let stage = parts.join("0.part");
+    fs::write(&stage, &data).await.unwrap();
+    for (index, range) in ranges.iter().enumerate() {
+        let slice = &data[range.start as usize..=range.end as usize];
+        write_json_atomic(
+            &parts.join(format!("{index}.progress.json")),
+            &PartCheckpoint {
+                bytes: range.len(),
+                sha256: format!("{:x}", Sha256::digest(slice)),
+            },
+        )
+        .await
+        .unwrap();
+    }
+    let hashes = completed_shared_hashes(&parts, total)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(hashes.len(), 4);
+    let temp = root.join(format!(".file.bin.{}.fixture.fetchrail-part", saved.id));
+    std::fs::hard_link(&stage, &temp).unwrap();
+    let (identity, bytes, _) = open_publication_file(&temp).unwrap();
+    assert_eq!(bytes, total);
+    assert_eq!(open_publication_file(&stage).unwrap().0, identity);
+    let journal = PublicationJournal {
+        version: 2,
+        id: saved.id,
+        destination: destination.clone(),
+        total,
+        manifest_sha256: format!("{:x}", Sha256::digest(&manifest_bytes)),
+        sha256: String::new(),
+        range_sha256: hashes,
+        identity,
+        published: false,
+    };
+    // A freshly synced cross-volume copy can carry the same commitments,
+    // even though its file identity differs from the private source.
+    let copied = root.join("separate-copy.fetchrail-part");
+    assert_eq!(fs::copy(&stage, &copied).await.unwrap(), total);
+    let (copy_identity, copy_len, _) = open_publication_file(&copied).unwrap();
+    assert_eq!(copy_len, total);
+    assert_ne!(copy_identity, journal.identity);
+    let copied_journal = PublicationJournal {
+        identity: copy_identity,
+        ..journal.clone()
+    };
+    assert!(journal_file_matches(&copied, &copied_journal, &manifest_bytes, None).unwrap());
+    let mut damaged_copy = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&copied)
+        .unwrap();
+    damaged_copy.seek(SeekFrom::Start(total / 3)).unwrap();
+    damaged_copy.write_all(b"damage").unwrap();
+    damaged_copy.sync_all().unwrap();
+    drop(damaged_copy);
+    assert!(!journal_file_matches(&copied, &copied_journal, &manifest_bytes, None).unwrap());
+    fs::remove_file(copied).await.unwrap();
+    assert!(journal_file_matches(&temp, &journal, &manifest_bytes, None).unwrap());
+    assert!(
+        !journal_file_matches(&temp, &journal, &manifest_bytes, Some(&"0".repeat(64))).unwrap()
+    );
+    write_json_atomic(
+        &parts.join("merge.json"),
+        &MergeCheckpoint {
+            file_name: temp.file_name().unwrap().to_str().unwrap().into(),
+            total,
+            fingerprint: journal.manifest_sha256.clone(),
+            expected_sha256: None,
+        },
+    )
+    .await
+    .unwrap();
+    write_json_atomic(&parts.join("publication.json"), &journal)
+        .await
+        .unwrap();
+    assert!(recover_publication(&parts, &mut saved).await.unwrap());
+    assert_eq!(saved.status, DownloadStatus::Completed);
+    assert_eq!(fs::read(&destination).await.unwrap(), data);
+
+    // An in-place modification keeps the same file identity and length. The
+    // persisted segment hashes must still reject it on the next recovery.
+    let mut changed = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&destination)
+        .unwrap();
+    changed.seek(SeekFrom::Start(total / 2)).unwrap();
+    changed.write_all(b"corrupted").unwrap();
+    changed.sync_all().unwrap();
+    drop(changed);
+    assert!(recover_publication(&parts, &mut saved).await.is_err());
+    fs::remove_dir_all(root).await.unwrap();
 }
 
 #[tokio::test]
@@ -250,6 +369,7 @@ fn publication_child_fault_fixture() {
                 total,
                 manifest_sha256: format!("{:x}", Sha256::digest(b"manifest")),
                 sha256,
+                range_sha256: Vec::new(),
                 identity,
                 published: false,
             };
