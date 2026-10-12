@@ -5,7 +5,7 @@ use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, VecDeque},
     hint::black_box,
     io::{Read, Write},
     path::{Path, PathBuf},
@@ -23,6 +23,25 @@ pub const NETWORK_BUDGET: u64 = 128 * 1024 * 1024;
 const NETWORK_SAMPLE: u64 = 20 * 1024 * 1024;
 const DISK_BYTES: usize = 64 * MIB;
 const ENDPOINT: &str = "https://speed.cloudflare.com/__down";
+// Live readings reach the interface about 15 times a second.
+const LIVE_INTERVAL: Duration = Duration::from_millis(66);
+// A live reading covers the last few emissions, roughly a quarter second of work.
+const RATE_WINDOW: usize = 4;
+// Steps that cost only time take more samples; disk writes and network payload keep three.
+const TIMED_SAMPLES: usize = 5;
+const BOUNDED_SAMPLES: usize = 3;
+/// Work time per timed sample, and presentation-only pauses outside measurement timing.
+#[derive(Clone, Copy)]
+struct Pacing {
+    sample: Duration,
+    step: Duration,
+    grade: Duration,
+}
+const PACING: Pacing = Pacing {
+    sample: Duration::from_millis(600),
+    step: Duration::from_millis(600),
+    grade: Duration::from_millis(2200),
+};
 pub const GRADE_VERSION: u32 = 1;
 pub const GRADES: [&str; 7] = ["F", "D", "C", "B", "A", "S", "SS"];
 // Provisional synthetic bands, not calibrated hardware rankings. Units are decimal.
@@ -303,6 +322,7 @@ impl Service {
                     sink,
                     &handle,
                     runner_cleanup,
+                    PACING,
                 )
             })
             .await;
@@ -389,12 +409,40 @@ impl Service {
 }
 
 type Sink = Arc<dyn Fn(Progress) + Send + Sync>;
+struct Live {
+    at: Instant,
+    key: (usize, usize),
+    span: (f64, f64),
+    fraction: f64,
+    window: VecDeque<(u64, Duration)>,
+}
+impl Live {
+    fn new() -> Self {
+        Self {
+            at: Instant::now() - Duration::from_secs(1),
+            key: (usize::MAX, usize::MAX),
+            span: (0., 0.),
+            fraction: 0.,
+            window: VecDeque::new(),
+        }
+    }
+    // A new step starts its track from zero.
+    fn enter(&mut self, group: usize, step: usize) {
+        if self.key != (group, step) {
+            self.key = (group, step);
+            self.span = (0., 0.);
+            self.fraction = 0.;
+            self.window.clear();
+        }
+    }
+}
 struct Context {
     reserved: AtomicU64,
     cancel: CancellationToken,
     sink: Sink,
-    last: Mutex<Instant>,
+    live: Mutex<Live>,
     started: Instant,
+    pacing: Pacing,
 }
 impl Context {
     fn check(&self) -> Result<(), String> {
@@ -404,6 +452,31 @@ impl Context {
             Ok(())
         }
     }
+    // Presentation-only pause after real work; no synthetic readings.
+    fn hold(&self, pause: Duration) -> Result<(), String> {
+        let began = Instant::now();
+        while began.elapsed() < pause {
+            self.check()?;
+            let left = pause.saturating_sub(began.elapsed());
+            std::thread::sleep(left.min(Duration::from_millis(50)));
+        }
+        self.check()
+    }
+    fn within(&self, elapsed: Duration) -> f64 {
+        if self.pacing.sample.is_zero() {
+            1.
+        } else {
+            elapsed.as_secs_f64() / self.pacing.sample.as_secs_f64()
+        }
+    }
+    // Places one sample on the step's track and restarts the live rate window.
+    fn sample(&self, group: usize, step: usize, index: usize, count: usize) {
+        let mut live = self.live.lock().unwrap();
+        live.enter(group, step);
+        live.span = (index as f64 / count as f64, 1. / count as f64);
+        live.window.clear();
+    }
+    // Throttled live reading: the rate of the most recent work, placed within the current sample.
     fn progress(
         &self,
         group: usize,
@@ -411,29 +484,75 @@ impl Context {
         label: &str,
         unit: &str,
         bytes: u64,
-        total: u64,
+        within: f64,
         elapsed: Duration,
-        force: bool,
     ) {
-        let mut last = self.last.lock().unwrap();
-        if force || last.elapsed() >= Duration::from_millis(200) {
-            *last = Instant::now();
-            (self.sink)(Progress {
-                group,
-                step,
-                label: label.into(),
-                unit: unit.into(),
-                value: if bytes > 0 {
-                    Some(rate(bytes, elapsed.as_secs_f64(), unit))
-                } else {
-                    None
-                },
-                fraction: (bytes as f64 / total.max(1) as f64).clamp(0., 1.),
-                bytes,
-                phase: "measuring".into(),
-                result: None,
-            });
+        let mut live = self.live.lock().unwrap();
+        live.enter(group, step);
+        if live.at.elapsed() < LIVE_INTERVAL {
+            return;
         }
+        let (from_bytes, from_elapsed) = live.window.front().copied().unwrap_or_default();
+        live.window.push_back((bytes, elapsed));
+        if live.window.len() > RATE_WINDOW {
+            live.window.pop_front();
+        }
+        let value = if bytes == 0 {
+            None
+        } else if unit == "ms" || bytes < from_bytes || elapsed <= from_elapsed {
+            Some(rate(bytes, elapsed.as_secs_f64(), unit))
+        } else {
+            Some(rate(
+                bytes - from_bytes,
+                (elapsed - from_elapsed).as_secs_f64(),
+                unit,
+            ))
+        };
+        let fraction = live.span.0 + within.clamp(0., 1.) * live.span.1;
+        self.send(&mut live, group, step, label, unit, value, bytes, fraction);
+    }
+    // Unthrottled reading with its own value: a step starting, a finished sample, a final median.
+    fn publish(
+        &self,
+        group: usize,
+        step: usize,
+        label: &str,
+        unit: &str,
+        value: Option<f64>,
+        bytes: u64,
+        fraction: f64,
+    ) {
+        let mut live = self.live.lock().unwrap();
+        live.enter(group, step);
+        self.send(&mut live, group, step, label, unit, value, bytes, fraction);
+    }
+    fn send(
+        &self,
+        live: &mut Live,
+        group: usize,
+        step: usize,
+        label: &str,
+        unit: &str,
+        value: Option<f64>,
+        bytes: u64,
+        fraction: f64,
+    ) {
+        // An empty start reading does not delay the step's first live one.
+        if value.is_some() {
+            live.at = Instant::now();
+        }
+        live.fraction = fraction.clamp(0., 1.).max(live.fraction);
+        (self.sink)(Progress {
+            group,
+            step,
+            label: label.into(),
+            unit: unit.into(),
+            value,
+            fraction: live.fraction,
+            bytes,
+            phase: "measuring".into(),
+            result: None,
+        });
     }
 }
 struct OwnedFolder(PathBuf, Arc<Mutex<Option<bool>>>);
@@ -544,40 +663,59 @@ fn cpu(ctx: &Context, data: &[u8], step: usize) -> Result<Step, String> {
         1 => ("compress", "Compress · zlib level 6"),
         _ => ("decompress", "Decompress · zlib"),
     };
-    let expected = Sha256::digest(data);
-    let mut encoder = ZlibEncoder::new(Vec::new(), Compression::new(6));
-    encoder
-        .write_all(data)
-        .map_err(|_| "Compression setup failed.")?;
-    let encoded = encoder.finish().map_err(|_| "Compression setup failed.")?;
+    // Only what this step verifies against or decodes, so its first reading is not kept waiting.
+    let expected = (step == 0).then(|| Sha256::digest(data));
+    let mut encoded = Vec::new();
+    if step == 2 {
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::new(6));
+        encoder
+            .write_all(data)
+            .map_err(|_| "Compression setup failed.")?;
+        encoded = encoder.finish().map_err(|_| "Compression setup failed.")?;
+    }
+    let live = |bytes: u64, elapsed: Duration| {
+        ctx.progress(0, step, label, "MB/s", bytes, ctx.within(elapsed), elapsed)
+    };
     let mut samples = Vec::new();
-    for sample in 0..3 {
+    for sample in 0..TIMED_SAMPLES {
+        ctx.sample(0, step, sample, TIMED_SAMPLES);
         let mut bytes = 0;
         let mut elapsed = Duration::ZERO;
-        for _ in 0..32 {
-            ctx.check()?;
-            let began = Instant::now();
+        // Chunks are timed one by one, so checks and live readings stay outside the measurement.
+        loop {
             match step {
                 0 => {
                     let mut hash = Sha256::new();
                     for chunk in data.chunks(MIB) {
                         ctx.check()?;
+                        let began = Instant::now();
                         hash.update(black_box(chunk));
+                        elapsed += began.elapsed();
+                        bytes += chunk.len() as u64;
+                        live(bytes, elapsed);
                     }
+                    let began = Instant::now();
                     let digest = hash.finalize();
                     elapsed += began.elapsed();
-                    if digest != expected {
+                    if Some(digest) != expected {
                         return Err("Checksum verification failed.".into());
                     }
                 }
                 1 => {
+                    let began = Instant::now();
                     let mut encoder = ZlibEncoder::new(Vec::new(), Compression::new(6));
+                    elapsed += began.elapsed();
                     for chunk in data.chunks(MIB) {
                         ctx.check()?;
+                        let began = Instant::now();
                         encoder
                             .write_all(chunk)
                             .map_err(|_| "Compression failed.")?;
+                        elapsed += began.elapsed();
+                        bytes += chunk.len() as u64;
+                        live(bytes, elapsed);
                     }
+                    let began = Instant::now();
                     let output = encoder.finish().map_err(|_| "Compression failed.")?;
                     elapsed += began.elapsed();
                     let mut decoded = Vec::new();
@@ -589,41 +727,44 @@ fn cpu(ctx: &Context, data: &[u8], step: usize) -> Result<Step, String> {
                     }
                 }
                 _ => {
+                    let began = Instant::now();
                     let mut decoded = buffer(data.len())?;
                     let mut decoder = ZlibDecoder::new(encoded.as_slice());
+                    elapsed += began.elapsed();
                     for chunk in decoded.chunks_mut(MIB) {
                         ctx.check()?;
+                        let began = Instant::now();
                         decoder
                             .read_exact(chunk)
                             .map_err(|_| "Decompression failed.")?;
+                        elapsed += began.elapsed();
+                        bytes += chunk.len() as u64;
+                        live(bytes, elapsed);
                     }
-                    elapsed += began.elapsed();
                     if decoded != data {
                         return Err("Decompression verification failed.".into());
                     }
                 }
             }
-            bytes += data.len() as u64;
-            ctx.progress(
-                0,
-                step,
-                label,
-                "MB/s",
-                bytes,
-                data.len() as u64 * 32,
-                elapsed,
-                false,
-            );
-            if elapsed >= Duration::from_millis(500) {
+            if elapsed >= ctx.pacing.sample {
                 break;
             }
         }
+        let value = rate(bytes, elapsed.as_secs_f64(), "MB/s");
         samples.push(Sample {
-            value: rate(bytes, elapsed.as_secs_f64(), "MB/s"),
+            value,
             bytes,
             seconds: elapsed.as_secs_f64(),
         });
-        ctx.progress(0, step, label, "MB/s", bytes, bytes, elapsed, sample == 2);
+        ctx.publish(
+            0,
+            step,
+            label,
+            "MB/s",
+            Some(value),
+            bytes,
+            (sample + 1) as f64 / TIMED_SAMPLES as f64,
+        );
     }
     Ok(Step::measured(key,label,"MB/s",samples,"Single worker, deterministic mixed synthetic corpus. Verification is outside timing; short samples are not a sustained capacity claim."))
 }
@@ -634,10 +775,17 @@ fn drive(ctx: &Context, folder: &Path, data: &[u8], step: usize) -> Result<Step,
         1 => ("read", "Sequential read · OS-cache influenced"),
         _ => ("join", "Copy finalization · 8 parts"),
     };
+    // Reading the fixture again costs only time; every write or join sample writes it anew.
+    let count = if step == 1 {
+        TIMED_SAMPLES
+    } else {
+        BOUNDED_SAMPLES
+    };
     let mut samples = Vec::new();
     let file = folder.join("sequential.bin");
-    for _ in 0..3 {
+    for sample in 0..count {
         ctx.check()?;
+        ctx.sample(1, step, sample, count);
         if step == 2 {
             for index in 0..8 {
                 let mut part = std::fs::File::create(folder.join(format!("{index}.part")))
@@ -652,7 +800,7 @@ fn drive(ctx: &Context, folder: &Path, data: &[u8], step: usize) -> Result<Step,
         }
         let began = Instant::now();
         let mut bytes = 0_u64;
-        let mut join_seconds = None;
+        let mut timed = None;
         if step == 2 {
             let merged = AtomicU64::new(0);
             let output = folder.join("joined.bin");
@@ -673,19 +821,19 @@ fn drive(ctx: &Context, folder: &Path, data: &[u8], step: usize) -> Result<Step,
                     result.map(|_| elapsed)
                 });
                 while !done.load(Ordering::Acquire) && !worker.is_finished() {
+                    let copied = merged.load(Ordering::Relaxed);
                     ctx.progress(
                         1,
                         step,
                         label,
                         "MB/s",
-                        merged.load(Ordering::Relaxed),
-                        DISK_BYTES as u64,
+                        copied,
+                        copied as f64 / DISK_BYTES as f64,
                         began.elapsed(),
-                        false,
                     );
-                    std::thread::sleep(Duration::from_millis(50));
+                    std::thread::sleep(LIVE_INTERVAL / 3);
                 }
-                join_seconds = Some(worker.join().map_err(|_| "Finalization worker failed.")??);
+                timed = Some(worker.join().map_err(|_| "Finalization worker failed.")??);
                 Ok(())
             })?;
             bytes = merged.load(Ordering::Relaxed);
@@ -705,9 +853,8 @@ fn drive(ctx: &Context, folder: &Path, data: &[u8], step: usize) -> Result<Step,
                     label,
                     "MB/s",
                     bytes,
-                    DISK_BYTES as u64,
+                    bytes as f64 / DISK_BYTES as f64,
                     began.elapsed(),
-                    false,
                 );
             }
             output
@@ -715,34 +862,41 @@ fn drive(ctx: &Context, folder: &Path, data: &[u8], step: usize) -> Result<Step,
                 .and_then(|_| output.sync_all())
                 .map_err(|_| "Drive sync failed.")?;
         } else {
-            let mut input =
-                std::fs::File::open(&file).map_err(|_| "Sequential write fixture unavailable.")?;
             let mut read = buffer(MIB)?;
             let mut check = 0;
+            let mut elapsed = Duration::ZERO;
+            // Whole passes over the fixture until the sample has run long enough.
             loop {
-                ctx.check()?;
-                let count = input.read(&mut read).map_err(|_| "Drive read failed.")?;
-                if count == 0 {
+                let pass = Instant::now();
+                let mut input = std::fs::File::open(&file)
+                    .map_err(|_| "Sequential write fixture unavailable.")?;
+                loop {
+                    ctx.check()?;
+                    let count = input.read(&mut read).map_err(|_| "Drive read failed.")?;
+                    if count == 0 {
+                        break;
+                    }
+                    black_box(&read[..count]);
+                    check ^= read[0];
+                    bytes += count as u64;
+                    let so_far = elapsed + pass.elapsed();
+                    ctx.progress(1, step, label, "MB/s", bytes, ctx.within(so_far), so_far);
+                }
+                elapsed += pass.elapsed();
+                if elapsed >= ctx.pacing.sample {
                     break;
                 }
-                black_box(&read[..count]);
-                check ^= read[0];
-                bytes += count as u64;
-                ctx.progress(
-                    1,
-                    step,
-                    label,
-                    "MB/s",
-                    bytes,
-                    DISK_BYTES as u64,
-                    began.elapsed(),
-                    false,
-                );
             }
             black_box(check);
+            timed = Some(elapsed.as_secs_f64());
         }
-        let seconds = join_seconds.unwrap_or_else(|| began.elapsed().as_secs_f64());
-        if bytes != DISK_BYTES as u64 {
+        let seconds = timed.unwrap_or_else(|| began.elapsed().as_secs_f64());
+        let whole = if step == 1 {
+            bytes > 0 && bytes % DISK_BYTES as u64 == 0
+        } else {
+            bytes == DISK_BYTES as u64
+        };
+        if !whole {
             return Err("Drive fixture size mismatch.".into());
         }
         // Validate all bytes in fixed corpus order outside the measured write/join duration.
@@ -768,20 +922,20 @@ fn drive(ctx: &Context, folder: &Path, data: &[u8], step: usize) -> Result<Step,
         if step == 2 {
             std::fs::remove_file(verify).map_err(|_| "Test output cleanup failed.")?;
         }
+        let value = rate(bytes, seconds, "MB/s");
         samples.push(Sample {
-            value: rate(bytes, seconds, "MB/s"),
+            value,
             bytes,
             seconds,
         });
-        ctx.progress(
+        ctx.publish(
             1,
             step,
             label,
             "MB/s",
+            Some(value),
             bytes,
-            bytes,
-            Duration::from_secs_f64(seconds),
-            true,
+            (sample + 1) as f64 / count as f64,
         );
     }
     Ok(Step::measured(
@@ -825,34 +979,36 @@ fn memory(
     if allocation < MIB {
         return Err("Not enough available memory for a safe allocation sample.".into());
     }
+    // Copying costs only time; every allocation sample reserves and touches the memory anew.
+    let count = if step == 0 {
+        TIMED_SAMPLES
+    } else {
+        BOUNDED_SAMPLES
+    };
+    let size = (allocation / 4).min(64 * MIB);
+    let (source, mut target) = if step == 0 {
+        (corpus(size)?, buffer(size)?)
+    } else {
+        (vec![], vec![])
+    };
     let mut samples = Vec::new();
-    for _ in 0..3 {
+    for sample in 0..count {
         ctx.check()?;
+        ctx.sample(2, step, sample, count);
         let mut copied = 0;
         let elapsed;
         if step == 0 {
-            let size = (allocation / 4).min(64 * MIB);
-            let source = corpus(size)?;
-            let mut target = buffer(size)?;
             let start = Instant::now();
-            for _ in 0..64 {
+            loop {
                 for (from, to) in source.chunks(MIB).zip(target.chunks_mut(MIB)) {
                     ctx.check()?;
                     to.copy_from_slice(black_box(from));
                     copied += from.len() as u64;
                 }
                 black_box(&target);
-                ctx.progress(
-                    2,
-                    step,
-                    label,
-                    unit,
-                    copied,
-                    size as u64 * 64,
-                    start.elapsed(),
-                    false,
-                );
-                if start.elapsed() >= Duration::from_millis(500) {
+                let so_far = start.elapsed();
+                ctx.progress(2, step, label, unit, copied, ctx.within(so_far), so_far);
+                if so_far >= ctx.pacing.sample {
                     break;
                 }
             }
@@ -876,9 +1032,8 @@ fn memory(
                     label,
                     "ms",
                     copied,
-                    allocation as u64,
+                    copied as f64 / allocation as f64,
                     start.elapsed(),
-                    false,
                 );
             }
             black_box(&target);
@@ -891,17 +1046,27 @@ fn memory(
                 }
             }
         }
+        let value = if step == 1 {
+            elapsed.as_secs_f64() * 1000.
+        } else {
+            rate(copied, elapsed.as_secs_f64(), unit)
+        };
         samples.push(Sample {
-            value: if step == 1 {
-                elapsed.as_secs_f64() * 1000.
-            } else {
-                rate(copied, elapsed.as_secs_f64(), unit)
-            },
+            value,
             bytes: copied,
             seconds: elapsed.as_secs_f64(),
         });
+        ctx.publish(
+            2,
+            step,
+            label,
+            unit,
+            Some(value),
+            copied,
+            (sample + 1) as f64 / count as f64,
+        );
     }
-    Ok(Step::measured(key,label,unit,samples,"Three real samples; allocation includes touching every byte/page. Adaptive allocation ≤ one eighth of available RAM, at most 1 GiB."))
+    Ok(Step::measured(key,label,unit,samples,"Verified copies run for a fixed time; allocation includes touching every byte/page. Adaptive allocation ≤ one eighth of available RAM, at most 1 GiB."))
 }
 
 #[derive(Clone)]
@@ -968,9 +1133,8 @@ async fn transfer(
                 },
                 "Mbps",
                 all - base,
-                sample_total,
+                (all - base) as f64 / sample_total as f64,
                 sample_start.elapsed(),
-                false,
             );
         }
     }
@@ -1045,8 +1209,9 @@ async fn network(
         observed = rate(warmup.bytes, warmup.elapsed_seconds.max(0.001), "Mbps");
     }
     let mut samples = Vec::new();
-    for _ in 0..3 {
+    for sample in 0..BOUNDED_SAMPLES {
         ctx.check()?;
+        ctx.sample(3, step, sample, BOUNDED_SAMPLES);
         let planned = if step == 0 {
             1024
         } else {
@@ -1091,17 +1256,15 @@ async fn network(
         if step != 0 {
             observed = rate(actual, seconds, "Mbps");
         }
-        (ctx.sink)(Progress {
-            group: 3,
+        ctx.publish(
+            3,
             step,
-            label: label.into(),
-            unit: unit.into(),
-            value: samples.last().map(|sample| sample.value),
-            fraction: 1.,
-            bytes: actual,
-            phase: "measuring".into(),
-            result: None,
-        });
+            label,
+            unit,
+            samples.last().map(|sample| sample.value),
+            actual,
+            (sample + 1) as f64 / BOUNDED_SAMPLES as f64,
+        );
     }
     Ok(Step::measured(key,label,unit,samples,"Cloudflare edge HTTP test, not ISP/ICMP capacity. Parallel requests may share HTTP/2 connections. Adaptive bounded samples include setup time and can underestimate fast links."))
 }
@@ -1114,14 +1277,16 @@ fn run(
     sink: Sink,
     handle: &tokio::runtime::Handle,
     cleanup: Arc<Mutex<Option<bool>>>,
+    pacing: Pacing,
 ) -> Result<Report, String> {
     let started = Instant::now();
     let ctx = Context {
         reserved: AtomicU64::new(0),
         cancel,
         sink,
-        last: Mutex::new(Instant::now() - Duration::from_secs(1)),
+        live: Mutex::new(Live::new()),
         started,
+        pacing,
     };
     let mut free = available_memory();
     let mut allocation = free
@@ -1213,26 +1378,18 @@ fn run(
                     "Configured parallel requests",
                 ],
             };
-            ctx.progress(
-                group,
-                step,
-                labels[step],
-                if group == 3 && step == 0 || group == 2 && step == 1 {
-                    "ms"
-                } else if group == 2 && step == 2 {
-                    "GB"
-                } else if group == 2 {
-                    "GB/s"
-                } else if group == 3 {
-                    "Mbps"
-                } else {
-                    "MB/s"
-                },
-                0,
-                1,
-                Duration::ZERO,
-                true,
-            );
+            let unit = if group == 3 && step == 0 || group == 2 && step == 1 {
+                "ms"
+            } else if group == 2 && step == 2 {
+                "GB"
+            } else if group == 2 {
+                "GB/s"
+            } else if group == 3 {
+                "Mbps"
+            } else {
+                "MB/s"
+            };
+            ctx.publish(group, step, labels[step], unit, None, 0, 0.);
             let result = match group {
                 0 => cpu(&ctx, &data, step),
                 1 => folder
@@ -1270,31 +1427,22 @@ fn run(
                 Step::unavailable(
                     &format!("unavailable-{group}-{step}"),
                     labels[step],
-                    if group == 3 && step == 0 || group == 2 && step == 1 {
-                        "ms"
-                    } else if group == 2 && step == 2 {
-                        "GB"
-                    } else if group == 2 {
-                        "GB/s"
-                    } else if group == 3 {
-                        "Mbps"
-                    } else {
-                        "MB/s"
-                    },
+                    unit,
                     &note,
                 )
             });
-            (ctx.sink)(Progress {
+            ctx.publish(
                 group,
                 step,
-                label: measured.label.clone(),
-                unit: measured.unit.clone(),
-                value: measured.value,
-                fraction: 1.,
-                bytes: measured.samples.last().map_or(0, |s| s.bytes),
-                phase: "measuring".into(),
-                result: None,
-            });
+                &measured.label,
+                &measured.unit,
+                measured.value,
+                measured.samples.last().map_or(0, |s| s.bytes),
+                1.,
+            );
+            if measured.value.is_some() {
+                ctx.hold(ctx.pacing.step)?;
+            }
             steps.push(measured);
         }
         let representative = if group == 3 {
@@ -1316,19 +1464,21 @@ fn run(
             steps,
             grade,
         };
+        // The stage keeps the last measured reading while the grade lands.
+        let last = &result.steps[2];
         (ctx.sink)(Progress {
             group,
             step: 2,
+            label: last.label.clone(),
+            unit: last.unit.clone(),
+            value: last.value,
+            fraction: 1.,
+            bytes: 0,
             phase: "graded".into(),
             result: Some(result.clone()),
-            ..Default::default()
         });
         report.groups.push(result);
-        // Presentation-only pause after a real completed group; no synthetic readings.
-        for _ in 0..14 {
-            ctx.check()?;
-            std::thread::sleep(Duration::from_millis(50));
-        }
+        ctx.hold(ctx.pacing.grade)?;
     }
     report.completed_at = chrono::Utc::now().to_rfc3339();
     report.elapsed_seconds = started.elapsed().as_secs_f64();
@@ -1339,14 +1489,47 @@ fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+    const QUICK: Pacing = Pacing {
+        sample: Duration::from_millis(30),
+        step: Duration::from_millis(60),
+        grade: Duration::from_millis(150),
+    };
     fn context() -> Context {
         Context {
             reserved: AtomicU64::new(0),
             cancel: CancellationToken::new(),
             sink: Arc::new(|_| {}),
-            last: Mutex::new(Instant::now() - Duration::from_secs(1)),
+            live: Mutex::new(Live::new()),
             started: Instant::now(),
+            pacing: QUICK,
         }
+    }
+    fn recorded() -> (Context, Arc<Mutex<Vec<(Instant, Progress)>>>) {
+        let readings = Arc::new(Mutex::new(Vec::new()));
+        let out = readings.clone();
+        let mut ctx = context();
+        ctx.sink = Arc::new(move |value| out.lock().unwrap().push((Instant::now(), value)));
+        (ctx, readings)
+    }
+    #[test]
+    fn a_timed_step_streams_dense_readings_and_its_track_never_rewinds() {
+        let (mut ctx, readings) = recorded();
+        ctx.pacing = PACING;
+        cpu(&ctx, &corpus(16 * MIB).unwrap(), 0).unwrap();
+        let readings = readings.lock().unwrap();
+        assert!(readings.len() >= 30, "{} live readings", readings.len());
+        assert!(readings
+            .windows(2)
+            .all(|pair| pair[0].1.fraction <= pair[1].1.fraction));
+        assert_eq!(readings.last().unwrap().1.fraction, 1.);
+    }
+    #[test]
+    fn live_reading_follows_recent_work_not_the_running_average() {
+        let (ctx, readings) = recorded();
+        ctx.progress(0, 0, "x", "MB/s", 100_000_000, 0.5, Duration::from_secs(1));
+        std::thread::sleep(Duration::from_millis(250));
+        ctx.progress(0, 0, "x", "MB/s", 110_000_000, 0.55, Duration::from_secs(2));
+        assert_eq!(readings.lock().unwrap().last().unwrap().1.value, Some(10.));
     }
     #[test]
     fn units_medians_and_coarse_summary_never_invent_failures_or_labels() {
@@ -1447,7 +1630,7 @@ mod tests {
         let data = corpus(64 * 1024).unwrap();
         for step in 0..3 {
             let measured = cpu(&ctx, &data, step).unwrap();
-            assert_eq!(measured.samples.len(), 3);
+            assert_eq!(measured.samples.len(), 5);
             assert!(measured.value.unwrap() > 0.);
             for sample in measured.samples {
                 assert!((sample.value - rate(sample.bytes, sample.seconds, "MB/s")).abs() < 1e-6);
@@ -1607,6 +1790,7 @@ mod tests {
                 Arc::new(|_| {}),
                 &handle,
                 cleanup,
+                QUICK,
             )
         })
         .await
@@ -1625,6 +1809,78 @@ mod tests {
         assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
         assert_eq!(report.debug_build, cfg!(debug_assertions));
         std::fs::remove_dir(root).unwrap();
+    }
+    #[tokio::test(flavor = "multi_thread")]
+    async fn runner_stream_never_rewinds_a_step_and_grades_keep_the_last_reading() {
+        let root = std::env::temp_dir().join(format!(
+            "fetchrail-diagnostics-stream-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let settings:DownloadSettings=serde_json::from_value(serde_json::json!({"defaultDownloadDir":root,"maxConcurrentDownloads":1,"connectionsPerDownload":8,"minSegmentSizeMb":4})).unwrap();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let out = events.clone();
+        let handle = tokio::runtime::Handle::current();
+        let report = tokio::task::spawn_blocking(move || {
+            run(
+                "stream-fixture".into(),
+                settings,
+                false,
+                CancellationToken::new(),
+                Arc::new(move |value: Progress| out.lock().unwrap().push((Instant::now(), value))),
+                &handle,
+                Arc::new(Mutex::new(None)),
+                QUICK,
+            )
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        std::fs::remove_dir(root).unwrap();
+        let events = events.lock().unwrap();
+        for group in 0..4 {
+            for step in 0..3 {
+                let track = events
+                    .iter()
+                    .filter(|(_, p)| p.phase == "measuring" && (p.group, p.step) == (group, step))
+                    .map(|(_, p)| p.fraction)
+                    .collect::<Vec<_>>();
+                assert!(
+                    track.windows(2).all(|pair| pair[0] <= pair[1]),
+                    "track rewound in test {group} step {step}"
+                );
+                assert_eq!(track.last(), Some(&1.));
+            }
+        }
+        for pair in events.windows(2) {
+            let ((at, shown), (next, following)) = (&pair[0], &pair[1]);
+            let pause = next.duration_since(*at);
+            if shown.phase == "graded" {
+                assert!(
+                    pause >= QUICK.grade,
+                    "grade {} left after {pause:?}",
+                    shown.group
+                );
+            } else if (following.group, following.step) != (shown.group, shown.step)
+                || following.phase == "graded"
+            {
+                assert_eq!(shown.fraction, 1.);
+                if shown.value.is_some() {
+                    assert!(pause >= QUICK.step, "step result left after {pause:?}");
+                }
+            }
+        }
+        let graded = events
+            .iter()
+            .filter(|(_, p)| p.phase == "graded")
+            .collect::<Vec<_>>();
+        assert_eq!(graded.len(), 4);
+        for (_, progress) in graded {
+            let last = &report.groups[progress.group].steps[2];
+            assert_eq!(progress.value, last.value);
+            assert_eq!(progress.unit, last.unit);
+            assert_eq!(progress.fraction, 1.);
+        }
     }
     #[tokio::test]
     async fn network_rejects_html_encoding_truncation_timeout_cancel_and_budget_exhaustion() {
