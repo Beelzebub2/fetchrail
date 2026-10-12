@@ -71,7 +71,7 @@ export function Diagnostics({ onActivityChange }: { onActivityChange: (active: b
   const shareDialog = useRef<HTMLDialogElement>(null);
   useEffect(() => { if (showShare) shareDialog.current?.showModal(); else shareDialog.current?.close(); }, [showShare]);
   const [completed, setCompleted] = useState<Record<number, Group>>({});
-  useEffect(() => { onActivityChange(state.active); }, [state.active, onActivityChange]);
+  useEffect(() => { onActivityChange(state.active || busy); }, [state.active, busy, onActivityChange]);
   useEffect(() => {
     let disposed = false, receivedEvent = false;
     const stop = listen<Snapshot>("fetchrail://diagnostics", event => {

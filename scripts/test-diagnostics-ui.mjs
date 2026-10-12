@@ -63,7 +63,7 @@ try {
         if (name === "get_download") return structuredClone(window.testRecord);
         if (name === "list_downloads") return [structuredClone(window.testRecord)];
         if (name === "diagnostics_state") { const snapshot=structuredClone(window.diagState); if(window.delayDiagState) await new Promise(resolve=>window.finishDiagState=resolve); return snapshot; }
-        if (name === "start_diagnostics") { if (window.diagBlocked) throw "Pause queued and active transfers before diagnostics."; window.diagState.active=true; window.diagState.completed=[]; window.diagState.message=null; window.diagState.progress={group:0,step:0,label:"Checksum · SHA-256",unit:"MB/s",value:123,fraction:0.2,bytes:1048576,phase:"measuring",result:null}; window.testEmit("fetchrail://diagnostics",structuredClone(window.diagState)); return "local-only-run"; }
+        if (name === "start_diagnostics") { if (window.diagBlocked) throw "Pause queued and active transfers before diagnostics."; if(window.delayDiagStart) await new Promise(resolve=>window.finishDiagStart=resolve); window.diagState.active=true; window.diagState.completed=[]; window.diagState.message=null; window.diagState.progress={group:0,step:0,label:"Checksum · SHA-256",unit:"MB/s",value:123,fraction:0.2,bytes:1048576,phase:"measuring",result:null}; window.testEmit("fetchrail://diagnostics",structuredClone(window.diagState)); return "local-only-run"; }
         if (name === "cancel_diagnostics") { window.diagState.active=false;window.diagState.message="Diagnostics cancelled; latest valid report kept.";window.testEmit("fetchrail://diagnostics",structuredClone(window.diagState));return; }
         if (name === "share_diagnostics") { if (args.permission!==true || args.runId!==window.diagReport.id) throw "Explicit current-run permission is required.";window.diagState.sharing="sending";window.testEmit("fetchrail://diagnostics",structuredClone(window.diagState));return; }
         if (name === "cancel_diagnostics_share") { window.diagState.sharing="not-shared";window.testEmit("fetchrail://diagnostics",structuredClone(window.diagState));return; }
@@ -117,8 +117,11 @@ try {
   await page.evaluate(() => {window.diagBlocked=true;});
   await page.getByRole("button",{name:"Run diagnostics",exact:true}).click();
   await page.getByRole("alert").filter({hasText:"Pause queued"}).waitFor();
-  await page.evaluate(() => {window.diagBlocked=false;});
+  await page.evaluate(() => {window.diagBlocked=false;window.delayDiagStart=true;});
   await page.getByRole("button",{name:"Run diagnostics",exact:true}).click();
+  await page.waitForFunction(()=>typeof window.finishDiagStart==="function");
+  assert.equal(await page.getByRole("button",{name:"Optimize downloads",exact:true}).isDisabled(),true,"Starting diagnostics cannot be hidden while the native command is pending");
+  await page.evaluate(()=>{window.delayDiagStart=false;window.finishDiagStart();});
   await page.getByTestId("diagnostic-reading").filter({hasText:"123"}).waitFor();
   assert.equal(await page.getByRole("button",{name:"Optimize downloads",exact:true}).isDisabled(),true,"Running diagnostics keep their cancellation controls visible");
   await page.evaluate(() => {window.diagState.progress={group:3,step:2,label:"Configured parallel requests",unit:"Mbps",value:250,fraction:0.25,bytes:1048576,phase:"measuring",result:null};window.testEmit("fetchrail://diagnostics",structuredClone(window.diagState));});
