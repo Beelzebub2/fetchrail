@@ -44,7 +44,7 @@ try {
       bands: [[100,250,500,1000,2000,4000],[50,100,250,500,1000,2000],[1,3,6,12,24,40],[10,25,50,100,500,1000]],
       completedAt: new Date().toISOString(), elapsedSeconds: 25, parallelRequests: 8, globalLimitBps: 20000000,
       networkBytes: 120 * 1024 ** 2, allocationBytes: 256 * 1024 ** 2, diskFootprintLimitBytes: 192 * 1024 ** 2, diskWritesLimitBytes: 576 * 1024 ** 2,
-      groups: [["cpu","Processor",[["checksum","Checksum · SHA-256","MB/s",1200],["compress","Compress · zlib level 6","MB/s",300],["decompress","Decompress · zlib","MB/s",900]]], ["drive","Drive",[["write","Sequential write · sync included","MB/s",500],["read","Sequential read · OS-cache influenced","MB/s",1800],["join","Copy finalization · 8 parts","MB/s",250]]], ["memory","Memory",[["copy","Buffer copy","GB/s",12],["allocate","Allocate and touch · adaptive size","ms",90],["available","Available for buffers · OS snapshot","GB",8]]], ["network","Connection",[["latency","HTTP response latency","ms",12],["single","Single request","Mbps",200],["parallel","Configured parallel requests","Mbps",500]]]].map(([key,name,steps]) => ({ key, name, grade:"A",steps: steps.map(([key,label,unit,value]) => ({ key,label,unit,value,status:"complete",variationPercent:5,shortSample:true,note:"Controlled fixture measurement",samples:[{value,bytes:1000000,seconds:1},{value,bytes:1000000,seconds:1},{value,bytes:1000000,seconds:1}] })) }))
+      groups: [["cpu","Processor",[["checksum","Checksum · SHA-256","MB/s",1200],["compress","Compress · zlib level 6","MB/s",300],["decompress","Decompress · zlib","MB/s",900]]], ["drive","Drive",[["write","Sequential write · sync included","MB/s",500],["read","Sequential read · OS-cache influenced","MB/s",1800],["join","Copy finalization · 8 parts","MB/s",250]]], ["memory","Memory",[["copy","Buffer copy","GB/s",12],["allocate","Allocate and touch · adaptive size","ms",90],["available","Available for buffers · OS snapshot","GB",8]]], ["network","Connection",[["latency","HTTP response latency","ms",12],["single","Single request","Mbps",200],["parallel","Configured parallel requests","Mbps",500]]]].map(([key,name,steps]) => ({ key, name, grade:"A",steps: steps.map(([key,label,unit,value]) => ({ key,label,unit,value,status:"complete",variationPercent:5,shortSample:true,note:"Controlled fixture measurement at C:\\private\\local-only-run via https://private.invalid/",samples:[{value,bytes:1000000,seconds:1},{value,bytes:1000000,seconds:1},{value,bytes:1000000,seconds:1}] })) }))
     };
     window.diagState = { bands:window.diagReport.bands,active:false,progress:null,latest:null,message:null,sharing:"local" };
     Object.defineProperty(navigator,"clipboard",{value:{writeText:async text => { window.copiedDiagnostics=text; }}});
@@ -62,8 +62,8 @@ try {
         if (name === "plugin:event|unlisten") { listeners.delete(args.eventId); return; }
         if (name === "get_download") return structuredClone(window.testRecord);
         if (name === "list_downloads") return [structuredClone(window.testRecord)];
-        if (name === "diagnostics_state") return structuredClone(window.diagState);
-        if (name === "start_diagnostics") { if (window.diagBlocked) throw "Pause queued and active transfers before diagnostics."; window.diagState.active=true; window.diagState.progress={group:0,step:0,label:"Checksum · SHA-256",unit:"MB/s",value:123,fraction:0.2,bytes:1048576,phase:"measuring",result:null}; window.testEmit("fetchrail://diagnostics",structuredClone(window.diagState)); return "local-only-run"; }
+        if (name === "diagnostics_state") { const snapshot=structuredClone(window.diagState); if(window.delayDiagState) await new Promise(resolve=>window.finishDiagState=resolve); return snapshot; }
+        if (name === "start_diagnostics") { if (window.diagBlocked) throw "Pause queued and active transfers before diagnostics."; window.diagState.active=true; window.diagState.completed=[]; window.diagState.message=null; window.diagState.progress={group:0,step:0,label:"Checksum · SHA-256",unit:"MB/s",value:123,fraction:0.2,bytes:1048576,phase:"measuring",result:null}; window.testEmit("fetchrail://diagnostics",structuredClone(window.diagState)); return "local-only-run"; }
         if (name === "cancel_diagnostics") { window.diagState.active=false;window.diagState.message="Diagnostics cancelled; latest valid report kept.";window.testEmit("fetchrail://diagnostics",structuredClone(window.diagState));return; }
         if (name === "share_diagnostics") { if (args.permission!==true || args.runId!==window.diagReport.id) throw "Explicit current-run permission is required.";window.diagState.sharing="sending";window.testEmit("fetchrail://diagnostics",structuredClone(window.diagState));return; }
         if (name === "cancel_diagnostics_share") { window.diagState.sharing="not-shared";window.testEmit("fetchrail://diagnostics",structuredClone(window.diagState));return; }
@@ -124,13 +124,38 @@ try {
   assert.equal(await page.locator(".diag-needle").getAttribute("data-angle"),"-45");
   await page.waitForTimeout(350);
   assert.equal(await page.locator(".diag-needle").getAttribute("data-angle"),"-45","Gauge cannot invent jitter between native samples");
+  assert.ok((await page.locator(".diag-stage").innerText()).includes("Values and sample progress reset"));
   await page.screenshot({path:join(output,"diagnostics-network-250.png"),fullPage:true});
+  // Native completion events deliberately have no live reading or unit.
+  await page.evaluate(() => {window.diagState.completed=window.diagReport.groups;window.diagState.progress={group:3,step:2,label:"",unit:"",value:null,fraction:0,bytes:0,phase:"graded",result:window.diagReport.groups[3]};window.testEmit("fetchrail://diagnostics",structuredClone(window.diagState));});
+  await page.getByRole("heading",{name:"Connection complete",exact:true}).waitFor();
+  assert.equal(await page.getByTestId("diagnostic-reading").count(),0);
+  assert.ok((await page.locator(".diag-row").last().innerText()).includes("Best download: 500 Mbps"));
+  assert.ok(!(await page.locator(".diag-row").last().innerText()).includes("12 ms"));
+  assert.equal(await page.locator(".diag-completed-stage .diag-badge").evaluate(el=>getComputedStyle(el).animationName),"none");
+  await page.screenshot({path:join(output,"diagnostics-group-complete.png"),fullPage:true});
   await page.getByRole("button",{name:"Cancel diagnostics",exact:true}).click();
   await page.getByRole("alert").filter({hasText:"Diagnostics cancelled"}).waitFor();
   await page.getByRole("button",{name:"Run diagnostics",exact:true}).click();
+  assert.equal(await page.locator(".diag-row .diag-badge").count(),0,"A new run clears old group results from the native snapshot");
   await page.evaluate(() => {window.diagState={...window.diagState,active:false,message:null,latest:window.diagReport};window.testEmit("fetchrail://diagnostics",structuredClone(window.diagState));});
   await page.getByRole("heading",{name:"Diagnostics report",exact:true}).waitFor();
-  await page.getByText("62.5 MB/s",{exact:true}).waitFor();
+  await page.locator(".diag-speed").filter({hasText:"20 MB/s"}).waitFor();
+  assert.ok((await page.locator(".diag-overall").innerText()).includes("Measured potential: 62.5 MB/s"));
+  await page.setViewportSize({width:375,height:800});
+  await page.locator(".content").evaluate(el=>el.scrollTop=el.scrollHeight);
+  assert.ok(await page.locator(".diagnostics").evaluate(el=>el.scrollWidth<=el.clientWidth),"Report content must fit a narrow window");
+  await page.screenshot({path:join(output,"diagnostics-report-narrow.png"),fullPage:true});
+  await page.setViewportSize({width:940,height:800});
+  await page.locator(".content").evaluate(el=>el.scrollTop=0);
+  await page.waitForTimeout(500);
+  assert.ok(await page.evaluate(()=>document.documentElement.scrollWidth<=window.innerWidth),"Report must fit the supported desktop minimum width");
+  assert.equal(await page.locator(".save-state i").evaluate(el=>el.getBoundingClientRect().width),7,"Save-state dot cannot shrink under the clipped narrow-layout label");
+  await page.screenshot({path:join(output,"diagnostics-report-desktop-minimum.png"),fullPage:true});
+  await page.setViewportSize({width:1280,height:1000});
+  await page.locator(".content").evaluate(el=>el.scrollTop=0);
+  assert.ok((await page.locator(".diag-result-guide").innerText()).includes("8 Mbps = 1 MB/s"));
+  assert.ok((await page.locator(".diag-report-grid").innerText()).includes("Lower allocation time is better"));
   assert.ok((await page.locator(".diag-table").innerText()).includes("50 s–54 s"));
   await page.getByRole("button",{name:"Copy report",exact:true}).click();
   const copied=await page.evaluate(()=>window.copiedDiagnostics);
@@ -148,12 +173,31 @@ try {
   assert.equal(await page.evaluate(()=>window.testCalls.filter(call=>call.name==="share_diagnostics")[0].args.permission),true);
   await page.locator(".content").evaluate(el=>el.scrollTop=0);
   await page.screenshot({path:join(output,"diagnostics-report.png"),fullPage:true});
+  // A late mount snapshot must not overwrite a newer event.
+  await page.getByRole("tab",{name:"General",exact:true}).click();
+  await page.evaluate(()=>{window.delayDiagState=true;});
+  await page.getByRole("tab",{name:"Diagnostics",exact:true}).click();
+  await page.waitForFunction(()=>typeof window.finishDiagState==="function");
+  await page.evaluate(()=>{window.diagState.active=true;window.diagState.progress={group:3,step:2,label:"Parallel requests",unit:"Mbps",value:321,fraction:.5,bytes:1,phase:"measuring",result:null};window.testEmit("fetchrail://diagnostics",structuredClone(window.diagState));window.finishDiagState();window.delayDiagState=false;});
+  await page.getByTestId("diagnostic-reading").filter({hasText:"321"}).waitFor();
+  await page.evaluate(()=>{window.diagState.active=false;window.testEmit("fetchrail://diagnostics",structuredClone(window.diagState));});
+  await page.getByRole("heading",{name:"Diagnostics report",exact:true}).waitFor();
   // Latest report survives section remount and failures remain unavailable/ungraded.
-  await page.evaluate(()=>{window.diagReport.groups[3].grade=null;window.diagReport.groups[3].steps.forEach(step=>{step.value=null;step.status="unavailable";});window.diagState.latest=window.diagReport;});
+  await page.evaluate(()=>{window.diagReport.groups[3].grade=null;window.diagReport.groups[3].steps.forEach(step=>{step.value=null;step.status="unavailable";step.samples=[];step.variationPercent=null;step.note="Network test disabled; local-only run.";});window.diagState.latest=window.diagReport;});
   await page.getByRole("tab",{name:"General",exact:true}).click();await page.getByRole("tab",{name:"Diagnostics",exact:true}).click();
   await page.getByRole("heading",{name:"Diagnostics report",exact:true}).waitFor();
+  assert.ok(await page.getByRole("heading",{name:"Local diagnostic results",exact:true}).isVisible());
+  assert.equal(await page.getByRole("heading",{name:"How long downloads might take",exact:true}).count(),0);
+  assert.ok(!(await page.locator(".diag-report-grid").innerText()).includes("Unavailable%"));
+  await page.getByRole("button",{name:"Copy report",exact:true}).click();
+  assert.ok((await page.evaluate(()=>window.copiedDiagnostics)).includes("No successful measurement"));
+  assert.ok(!(await page.evaluate(()=>window.copiedDiagnostics)).includes("Unavailable%"));
+  await page.screenshot({path:join(output,"diagnostics-local-report.png"),fullPage:true});
+  await page.evaluate(()=>{window.diagReport.groups[3].steps.forEach(step=>{step.note="Controlled connection failure.";});window.testEmit("fetchrail://diagnostics",structuredClone(window.diagState));});
   assert.ok(await page.getByText("Successful connection and drive-write measurements are needed for an estimate.",{exact:true}).isVisible());
+  assert.equal(await page.getByRole("heading",{name:"How long downloads might take",exact:true}).count(),0);
   await page.getByRole("button",{name:"Grade scale",exact:true}).click();
+  assert.ok(await page.locator(".diag-badge").evaluateAll(badges=>badges.every(badge=>[badge,...badge.querySelectorAll("*")].every(el=>getComputedStyle(el).animationName==="none"))),"All grades must rest without reduced motion enabled");
   for (const theme of ["dark","light"]) for (const accent of ["ember","azure","jade","iris"]) {await page.evaluate(({theme,accent})=>{document.documentElement.dataset.theme=theme;document.documentElement.dataset.accent=accent;},{theme,accent});await page.screenshot({path:join(output,`diagnostics-grades-${theme}-${accent}.png`),fullPage:true});}
   await page.emulateMedia({reducedMotion:"reduce"});await page.setViewportSize({width:375,height:800});
   await page.screenshot({path:join(output,"diagnostics-grades-narrow-reduced.png"),fullPage:true});
