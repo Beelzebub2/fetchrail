@@ -60,7 +60,7 @@ matched evidence before claiming a speed advantage.
 | Range completion | A worker completes its preassigned range and has no new work once all ranges have started | Queue immutable micro-ranges for new validated downloads, so an idle worker can take another piece |
 | Persistence | Private `data_dir/parts/<id>`, shared sparse `0.part` for new >=8 MiB validated multipart jobs; 5-second synced range SHA-256 checkpoints | Keep disjoint positioned writes, bounded checkpoints and exact restart verification |
 | Assembly | Hard link on the same volume, otherwise checked full-file copy | Avoid a cross-volume copy only after secure destination-local private staging exists |
-| Windows publication | Attachment policy, Zone.Identifier, durable journal, unique no-replace publication | Avoid an unnecessary post-download full-file hash without weakening crash recovery |
+| Windows publication | Attachment policy, Zone.Identifier, post-scan content verification, durable journal and no-replace publication | Measure scanning and verification separately; retain byte integrity |
 
 **Important limitation:** The current scheduler uses a fixed
 `split_ranges(total, connection_count)` layout and creates one future for
@@ -87,19 +87,19 @@ Existing controlled, read-only local artifact
 remeasurements of a completed local file*, not the original in-app finalization
 time or evidence of any third-party application's elapsed time.
 
-The new **version-2 publication journal** uses the already synced per-range
-SHA-256 commitments for a fully completed shared stage. After Windows
-attachment scanning, it verifies the temporary file's identity and exact size.
-The shortcut requires either the same file identity as the private stage
-(hard link), or a freshly completed and synced assembly whose identity was
-captured before the scan (copy on a different volume). If the user supplied no
-whole-file SHA-256, publication records the range hashes and skips the extra
-entire-file digest. After a crash, recovery re-reads and
-validates **every range** against its commitment, in addition to checking
-file identity, size, manifest fingerprint and no-clobber publication. Legacy
-version-1 journals, missing/incomplete checkpoints, *recovered* copied outputs
-whose assembly was not witnessed in the current process, and downloads with an
-expected whole-file checksum keep the full hash path.
+The **version-2 publication journal** records the synced per-range SHA-256
+commitments for a fully completed shared stage. Windows attachment services
+[may alter or delete the file](https://learn.microsoft.com/en-us/windows/win32/api/shobjidl_core/nf-shobjidl_core-iattachmentexecute-save).
+Matching file identity and size therefore cannot authorize a content-verification
+shortcut. After scanning, publication checks the pre-scan identity and length,
+then re-reads every range against its original commitment. This applies to
+both hard links and freshly synced copies. The verified Windows handle denies
+write sharing until the Completed catalog and its backup have been acknowledged;
+rename sharing remains enabled for no-replace publication. ADS-only provenance
+changes are preserved. Expected whole-file checksums still use full SHA-256.
+Crash recovery retains V1 full-hash and V2 per-range validation. The historical
+23.3-second hash measurement is a verification cost, not an established saving
+from this change.
 
 The metadata `Retry-After` loop now drops both the origin and global admission
 permits after recording shared cooldown and discarding the failed response,
@@ -116,9 +116,9 @@ and size; version-1 process-kill and foreign-file fixtures also passed.
 
 Private stages still ordinarily live in AppData on C:. If the user chooses D:
 for a large output, an NTFS hard link **cannot cross volumes**; the engine
-copies every byte to a destination-local temporary file. The version-2 journal
-avoids an additional post-copy 20 GB hash scan on the qualifying new transfer,
-but it cannot avoid the 20 GB copy itself or Windows attachment scanning. A
+copies every byte to a destination-local temporary file. Publication must
+verify content after Windows attachment scanning; it cannot avoid either the
+copy or the required verification merely by recording pre-scan hashes. A
 safe candidate for *new* downloads is destination-volume
 private staging: persist its owner/path/identity in the private transfer
 manifest; write ranges with restricted access and no-follow checks; resume only

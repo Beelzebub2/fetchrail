@@ -351,6 +351,7 @@ struct PublicationJournal {
     published: bool,
 }
 
+#[cfg(test)]
 fn file_fingerprint(
     path: &Path,
     cancel: &CancellationToken,
@@ -385,7 +386,10 @@ fn open_publication_file(path: &Path) -> std::io::Result<(FileIdentity, u64, std
     #[cfg(windows)]
     {
         use std::os::windows::fs::OpenOptionsExt;
-        options.custom_flags(0x00200000);
+        // Verification happens after scanning; keep writers out while allowing publication by rename.
+        options
+            .custom_flags(0x00200000)
+            .share_mode(0x00000001 | 0x00000004);
     }
     let file = options.open(path)?;
     let metadata = file.metadata()?;
@@ -422,15 +426,15 @@ fn open_publication_file(path: &Path) -> std::io::Result<(FileIdentity, u64, std
 }
 
 // A version-2 journal commits the hashes calculated while receiving each verified
-// range. Re-reading the bytes is necessary after a crash, but not on the normal
-// completion path. Version-1 publications retain their original full-file hash.
+// range. Both post-scan publication and crash recovery re-read their contents.
+// Version-1 publications retain their original full-file hash.
 fn journal_file_matches(
     path: &Path,
     journal: &PublicationJournal,
     manifest_bytes: &[u8],
     expected_sha256: Option<&str>,
 ) -> EngineResult<bool> {
-    let (identity, length, mut file) = open_publication_file(path)?;
+    let (identity, length, file) = open_publication_file(path)?;
     if identity != journal.identity || length != journal.total {
         return Ok(false);
     }
@@ -441,41 +445,96 @@ fn journal_file_matches(
             Ok(digest == journal.sha256
                 && expected_sha256.is_none_or(|expected| expected == digest))
         }
-        2 if journal.sha256.is_empty() && expected_sha256.is_none() => {
-            let manifest: PartManifest = serde_json::from_slice(manifest_bytes).map_err(|_| {
-                EngineError::Message(
-                    "Saved transfer layout is damaged; staging was preserved.".into(),
-                )
-            })?;
-            if !manifest.shared_staging
-                || !manifest.accepts_ranges
-                || manifest.validator.is_none()
-                || manifest.version != 1
-                || manifest.final_url_sha256.is_none()
-                || manifest.total_bytes != Some(journal.total)
-                || manifest.ranges.len() < 2
-                || manifest.ranges.len() > 32
-                || manifest.ranges != split_ranges(journal.total, manifest.ranges.len())
-                || journal.range_sha256.len() != manifest.ranges.len()
-                || journal.range_sha256.iter().any(|hash| {
-                    hash.len() != 64 || !hash.bytes().all(|byte| byte.is_ascii_hexdigit())
-                })
-            {
-                return Ok(false);
-            }
-            for (range, expected) in manifest.ranges.iter().zip(&journal.range_sha256) {
-                use std::io::{Seek, SeekFrom};
-                file.seek(SeekFrom::Start(range.start))?;
-                let mut bounded = (&mut file).take(range.len());
-                let actual = crate::integrity::sha256_reader(&mut bounded, &cancel)?;
-                if bounded.limit() != 0 || actual != *expected {
-                    return Ok(false);
-                }
-            }
-            Ok(true)
-        }
+        2 if journal.sha256.is_empty() && expected_sha256.is_none() => committed_ranges_match(
+            file,
+            journal.total,
+            manifest_bytes,
+            &journal.range_sha256,
+            &cancel,
+        ),
         _ => Ok(false),
     }
+}
+
+fn committed_ranges_match(
+    mut file: std::fs::File,
+    total: u64,
+    manifest_bytes: &[u8],
+    hashes: &[String],
+    cancel: &CancellationToken,
+) -> EngineResult<bool> {
+    let manifest: PartManifest = serde_json::from_slice(manifest_bytes).map_err(|_| {
+        EngineError::Message("Saved transfer layout is damaged; staging was preserved.".into())
+    })?;
+    if !manifest.shared_staging
+        || !manifest.accepts_ranges
+        || manifest.validator.is_none()
+        || manifest.version != 1
+        || manifest.final_url_sha256.is_none()
+        || manifest.total_bytes != Some(total)
+        || manifest.ranges.len() < 2
+        || manifest.ranges.len() > 32
+        || manifest.ranges != split_ranges(total, manifest.ranges.len())
+        || hashes.len() != manifest.ranges.len()
+        || hashes
+            .iter()
+            .any(|hash| hash.len() != 64 || !hash.bytes().all(|byte| byte.is_ascii_hexdigit()))
+    {
+        return Ok(false);
+    }
+    for (range, expected) in manifest.ranges.iter().zip(hashes) {
+        use std::io::{Seek, SeekFrom};
+        file.seek(SeekFrom::Start(range.start))?;
+        let mut bounded = (&mut file).take(range.len());
+        let actual = crate::integrity::sha256_reader(&mut bounded, cancel)?;
+        if bounded.limit() != 0 || actual != *expected {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+struct VerifiedPublication {
+    identity: FileIdentity,
+    file: std::fs::File,
+    sha256: String,
+    range_sha256: Vec<String>,
+}
+
+fn verify_scanned_publication(
+    path: &Path,
+    expected_identity: &FileIdentity,
+    total: u64,
+    manifest_bytes: &[u8],
+    complete_hashes: Option<Vec<String>>,
+    cancel: &CancellationToken,
+) -> EngineResult<VerifiedPublication> {
+    let (identity, bytes, file) = open_publication_file(path)?;
+    if identity != *expected_identity || bytes != total {
+        return Err(EngineError::Message(
+            "File changed during attachment processing; no file was published.".into(),
+        ));
+    }
+    let (sha256, range_sha256) = if let Some(hashes) = complete_hashes {
+        if !committed_ranges_match(file.try_clone()?, total, manifest_bytes, &hashes, cancel)? {
+            return Err(EngineError::Message(
+                "SHA-256 checksum mismatch after attachment processing. File was not published."
+                    .into(),
+            ));
+        }
+        (String::new(), hashes)
+    } else {
+        (
+            crate::integrity::sha256_reader(file.try_clone()?, cancel)?,
+            Vec::new(),
+        )
+    };
+    Ok(VerifiedPublication {
+        identity,
+        file,
+        sha256,
+        range_sha256,
+    })
 }
 
 async fn recover_publication(part_dir: &Path, record: &mut DownloadRecord) -> EngineResult<bool> {
@@ -3733,7 +3792,8 @@ impl DownloadManager {
 
         self.set_status(&task, &cancel, DownloadStatus::Merging, None)
             .await?;
-        let destination = self.merge_parts(&task, &cancel, &part_dir, &ranges).await?;
+        let (destination, verified_file) =
+            self.merge_parts(&task, &cancel, &part_dir, &ranges).await?;
         let final_bytes = total.unwrap_or(transferred);
         let snapshot = {
             let mut record = task.record.write().await;
@@ -3757,6 +3817,7 @@ impl DownloadManager {
         };
         self.persist_records().await?;
         self.acknowledge_catalog().await?;
+        drop(verified_file);
         if initial_downloaded == 0 {
             if let (Some(policy), Some(hardware)) = (policy, hardware) {
                 let (connections, bps) = policy.best();
@@ -4531,7 +4592,7 @@ impl DownloadManager {
         cancel: &CancellationToken,
         part_dir: &Path,
         ranges: &[ByteRange],
-    ) -> EngineResult<PathBuf> {
+    ) -> EngineResult<(PathBuf, std::fs::File)> {
         let record = task.record.read().await.clone();
         let requested = PathBuf::from(&record.destination);
         let parent = requested
@@ -4551,10 +4612,8 @@ impl DownloadManager {
         } else {
             ranges.to_vec()
         };
-        let fingerprint = format!(
-            "{:x}",
-            Sha256::digest(fs::read(part_dir.join("transfer.json")).await?)
-        );
+        let manifest_bytes = fs::read(part_dir.join("transfer.json")).await?;
+        let fingerprint = format!("{:x}", Sha256::digest(&manifest_bytes));
         let checkpoint_path = part_dir.join("merge.json");
         let prefix = format!(".{}.{}.", safe_file_name(desired_name), record.id);
         let checkpoint = fs::read(&checkpoint_path)
@@ -4656,6 +4715,15 @@ impl DownloadManager {
         } else {
             None
         };
+        let scan_identity = match assembled_identity {
+            Some(identity) => identity,
+            None => {
+                let path = temp_path.clone();
+                tokio::task::spawn_blocking(move || open_publication_file(&path).map(|v| v.0))
+                    .await
+                    .map_err(|e| EngineError::Message(e.to_string()))??
+            }
+        };
         // Assembly is done; Windows attachment policy can still spend time scanning the file.
         let snapshot = {
             let mut record = task.record.write().await;
@@ -4674,44 +4742,23 @@ impl DownloadManager {
             None
         };
         let path = temp_path.clone();
-        let stage_path = part_dir.join("0.part");
         let hash_cancel = cancel.clone();
-        let (identity, bytes, sha256, range_sha256) = tokio::task::spawn_blocking(
-            move || -> std::io::Result<(FileIdentity, u64, String, Vec<String>)> {
-                if let Some(hashes) = complete_hashes {
-                    let (identity, bytes, file) = open_publication_file(&path)?;
-                    // A hard link needs no copy. A freshly completed, synced copy
-                    // also carries these commitments, but a recovered copy must
-                    // be hashed again because this run did not witness its assembly.
-                    if let Ok((stage_identity, stage_bytes, _)) = open_publication_file(&stage_path)
-                    {
-                        let trusted_assembly = identity == stage_identity
-                            || assembled_identity.as_ref() == Some(&identity);
-                        if trusted_assembly && bytes == total && bytes == stage_bytes {
-                            if hash_cancel.is_cancelled() {
-                                return Err(std::io::ErrorKind::Interrupted.into());
-                            }
-                            return Ok((identity, bytes, String::new(), hashes));
-                        }
-                    }
-                    let sha256 = crate::integrity::sha256_reader(file, &hash_cancel)?;
-                    return Ok((identity, bytes, sha256, Vec::new()));
-                }
-                let (identity, bytes, sha256) = file_fingerprint(&path, &hash_cancel)?;
-                Ok((identity, bytes, sha256, Vec::new()))
-            },
-        )
+        let verified = tokio::task::spawn_blocking(move || {
+            verify_scanned_publication(
+                &path,
+                &scan_identity,
+                total,
+                &manifest_bytes,
+                complete_hashes,
+                &hash_cancel,
+            )
+        })
         .await
         .map_err(|e| EngineError::Message(e.to_string()))??;
-        if bytes != total {
-            return Err(EngineError::Message(
-                "Publication size changed; staging preserved.".into(),
-            ));
-        }
         if record
             .expected_sha256
             .as_ref()
-            .is_some_and(|expected| *expected != sha256)
+            .is_some_and(|expected| *expected != verified.sha256)
         {
             return Err(EngineError::Message(
                 "SHA-256 checksum mismatch. File was not published.".into(),
@@ -4726,14 +4773,18 @@ impl DownloadManager {
                 .await
                 .map_err(EngineError::Message)?;
             let mut journal = PublicationJournal {
-                version: if range_sha256.is_empty() { 1 } else { 2 },
+                version: if verified.range_sha256.is_empty() {
+                    1
+                } else {
+                    2
+                },
                 id: record.id,
                 destination: destination.clone(),
                 total,
                 manifest_sha256: fingerprint.clone(),
-                sha256: sha256.clone(),
-                range_sha256: range_sha256.clone(),
-                identity: identity.clone(),
+                sha256: verified.sha256.clone(),
+                range_sha256: verified.range_sha256.clone(),
+                identity: verified.identity.clone(),
                 published: false,
             };
             write_json_atomic(&part_dir.join("publication.json"), &journal).await?;
@@ -4748,7 +4799,7 @@ impl DownloadManager {
                 Ok(()) => {
                     journal.published = true;
                     write_json_atomic(&part_dir.join("publication.json"), &journal).await?;
-                    return Ok(destination);
+                    return Ok((destination, verified.file));
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
                 Err(error) => return Err(error.into()),
