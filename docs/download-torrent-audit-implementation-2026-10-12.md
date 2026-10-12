@@ -32,6 +32,10 @@ Implementation against `origin/main` at `5fbebcf`, on `fix/download-torrent-audi
 
 ## State migration and rollback
 
+Browser request headers survive restart only inside the Windows account-protected
+catalog. Linux keeps them in memory and requires fresh browser authorization after
+restart; its private checksummed catalog does not persist those headers.
+
 Catalog/settings/queues use `{fetchrail_state: 1, sha256, protected, payload}` envelopes. The checksum covers stored payload bytes and is checked before decryption; no plaintext hash is exposed for protected snapshots. Windows payload is DPAPI ciphertext bound to the Windows account; Linux payload is checksummed base64 in private state files and is **not encrypted**. Existing plain JSON is accepted and rewritten. Only typed valid old generations become `.json.backup`; terminal HTTP publication acknowledges the completed catalog into the backup before removing its journal. Version 1 is introduced by this unreleased change; interim developer fixtures with plaintext-hash envelopes must be recreated, not silently accepted.
 
 Transfer manifests are version 1, contain a typed ETag and `final_url_sha256`, and retain existing range/shared-file layouts for a matching new manifest. Legacy manifests have no trustworthy URL/strength evidence and are not reused. Incompatible attempts are renamed under the private parts directory as `<id>.incompatible-<uuid>`; link replacements use `<id>.previous-source-<uuid>`. They are intentionally retained for recovery, consume disk space, and can be exported/reviewed and explicitly removed after the user no longer needs them. They are never silently merged into the active attempt. Unmarked legacy import directories are preserved rather than guessed to be safe to erase.
