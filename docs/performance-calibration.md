@@ -7,6 +7,12 @@ network payload budget and temporary disk space. Applying a usable report enable
 automatic tuning; the switch also permits learning without running an online test.
 Existing installations and explicit per-download connection choices stay manual.
 
+The teammate's **Diagnostics** page remains the broader CPU compression/decompression,
+memory-copy/allocation and local diagnostic report. **Performance** measures a sustained
+download workload and applies tuning. These runs cannot overlap, queued transfers wait,
+and update checks defer during either test. Diagnostics' separate, explicit per-run
+coarse sharing does not include this calibration report or its measurements.
+
 ## Measurement inventory
 
 | Measurement | Method and limits |

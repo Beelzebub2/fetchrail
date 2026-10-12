@@ -13,9 +13,19 @@ const fixtures = new Map();
 for (const tag of ["v1.2.3", "v1.2.4", "v1.2.5"]) fixtures.set(tag, releaseFixture(tag));
 const options = {
   name: "fetchrail-update-test",
-  modules: ["worker.mjs", "policy.mjs", "bootstrap.mjs"].map(name => ({ type: "ESModule", path: fileURLToPath(new URL(name, import.meta.url)) })),
+  modules: [{ type: "ESModule", path: fileURLToPath(new URL("test-runtime.mjs", import.meta.url)), contents: `
+    export { default, ReleaseFeed } from "./worker.mjs";
+    import { AnalyticsStore as Store } from "./analytics.mjs";
+    export class AnalyticsStore extends Store {
+      testSeed(day) { this.ctx.storage.sql.exec("INSERT INTO analytics_daily VALUES (?, '0.0.1', 'other', 'other', '{\\"launch\\":1}', 1)", day); }
+      testBudget() { this.ctx.storage.sql.exec("INSERT INTO analytics_budget VALUES (1, ?, 20000) ON CONFLICT(id) DO UPDATE SET hour = excluded.hour, reports = excluded.reports", Math.floor(Date.now()/3600000)); }
+      testAlarm() { return this.ctx.storage.getAlarm(); }
+      testRunAlarm() { return this.alarm(); }
+    }
+  ` }, ...["worker.mjs", "policy.mjs", "bootstrap.mjs", "analytics.mjs"].map(name => ({ type: "ESModule", path: fileURLToPath(new URL(name, import.meta.url)) }))],
   compatibilityDate: "2026-10-09",
-  durableObjects: { RELEASE_FEED: { className: "ReleaseFeed", useSQLite: true } },
+  durableObjects: { RELEASE_FEED: { className: "ReleaseFeed", useSQLite: true }, ANALYTICS: { className: "AnalyticsStore", useSQLite: true } },
+  bindings: { ANALYTICS_READ_TOKEN: "test-read-secret-with-at-least-32-characters" },
   serviceBindings: { ASSETS: "assets-test" },
   outboundService: async request => {
     if (request.url === "https://token.actions.githubusercontent.com/.well-known/jwks") return Response.json({ keys: [jwt.jwk] });
@@ -38,6 +48,51 @@ async function publish(tag, changes = {}) {
     body: JSON.stringify({ tag, manifestSha256: await sha256(fixtures.get(tag).bytes), ...changes }) });
 }
 try {
+  const reportFixture = { schema: 1, version: "0.6.1", os: "windows", arch: "x64", counters: { launch: 1, http_added: 3, http_completed: 2, size_under_10mb: 2 } };
+  const collect = (data, headers = {}, path = "/api/analytics") => worker.dispatchFetch(`https://fetchrail.rrmtools.uk${path}`, { method: "POST", headers: { "Content-Type": "application/json", ...headers }, body: typeof data === "string" ? data : JSON.stringify(data) });
+  const readAnalytics = () => worker.dispatchFetch("https://fetchrail.rrmtools.uk/api/analytics/report", { headers: { Authorization: `Bearer ${options.bindings.ANALYTICS_READ_TOKEN}` } });
+  assert.equal((await get("/api/analytics/report")).status, 401);
+  assert.equal((await worker.dispatchFetch("https://fetchrail.rrmtools.uk/api/analytics/report", { headers: { Authorization: "Bearer incorrect" } })).status, 401);
+  assert.equal((await get("/api/analytics")).status, 405);
+  for (const data of [
+    { ...reportFixture, url: "https://private.example" }, { ...reportFixture, id: "device" },
+    { ...reportFixture, counters: { filename: 1 } }, { ...reportFixture, counters: { launch: 1001 } },
+    { ...reportFixture, counters: { launch: -1 } }, { ...reportFixture, counters: { launch: 0.5 } },
+    { ...reportFixture, counters: {} }, { ...reportFixture, os: "Linux-secret-distro" },
+    { ...reportFixture, arch: "machine fingerprint" }, { ...reportFixture, version: "0.6.1-user-name" },
+    { ...reportFixture, schema: 2 }, null, [], "not json",
+  ]) assert.equal((await collect(data)).status, 400);
+  assert.equal((await collect(" ".repeat(2049))).status, 413);
+  assert.equal((await collect(reportFixture, { Cookie: "secret=value" })).status, 400);
+  assert.equal((await collect(reportFixture, { Authorization: "Bearer credential" })).status, 400);
+  assert.equal((await collect(reportFixture, {}, "/api/analytics?url=secret")).status, 400);
+  assert.equal((await collect(reportFixture)).status, 204);
+  assert.equal((await collect(reportFixture)).status, 204);
+  let analytics = await (await readAnalytics()).json();
+  assert.equal(analytics.rows.length, 1);
+  assert.equal(analytics.rows[0].reports, 2);
+  assert.deepEqual(analytics.rows[0].counters, { launch: 2, http_added: 6, http_completed: 4, size_under_10mb: 4 });
+  assert.deepEqual(Object.keys(analytics.rows[0]).sort(), ["arch", "counters", "day", "os", "reports", "version"]);
+  const summary = { ...reportFixture, purpose: "diagnostics-summary-v1", counters: { diagnostics_cpu_b: 1, diagnostics_drive_a: 1 } };
+  for (const data of [
+    { ...summary, runId: "local-only-id" }, { ...summary, cpuMbps: 1234 },
+    { ...summary, counters: { diagnostics_cpu_b: 2 } }, { ...summary, counters: { diagnostics_cpu_b: 1, diagnostics_cpu_a: 1 } },
+    { ...summary, counters: { launch: 1 } }, { ...reportFixture, counters: { diagnostics_cpu_b: 1 } },
+  ]) assert.equal((await collect(data)).status, 400, "Separate diagnostic purpose cannot carry raw metrics, IDs, usage counters or duplicate bands");
+  assert.equal((await collect(summary)).status, 204);
+  assert.equal((await (await readAnalytics()).json()).rows[0].counters.diagnostics_cpu_b, 1);
+  const namespace = await worker.getDurableObjectNamespace("ANALYTICS");
+  const store = namespace.get(namespace.idFromName("daily-v1"));
+  assert.ok(await store.testAlarm(), "Cleanup is scheduled without requiring further intake");
+  const oldDay = new Date(Date.now() - 31 * 86400000).toISOString().slice(0, 10);
+  await store.testSeed(oldDay);
+  await store.testRunAlarm();
+  analytics = await (await readAnalytics()).json();
+  assert.equal(analytics.rows.length, 1, "Alarm removes expired aggregates even with no new reports");
+  for (let patch = 0; patch < 63; patch++) assert.equal((await collect({ ...reportFixture, version: `2.0.${patch}` })).status, 204);
+  assert.equal((await collect({ ...reportFixture, version: "3.0.0" })).status, 429, "Daily dimension cap bounds forged version cardinality");
+  await store.testBudget();
+  assert.equal((await collect(reportFixture)).status, 429, "Shared hourly ceiling needs no IP address or identifier");
   const initial = await get("/api/updates/latest");
   assert.equal(initial.status, 200); assert.equal((await initial.json()).version, "0.5.3");
   assert.equal(initial.headers.get("cache-control"), "public, max-age=30, must-revalidate");
@@ -101,8 +156,16 @@ try {
   worker = new Miniflare(runtimeOptions);
   await (await worker.getCaches()).default.delete("https://fetchrail.rrmtools.uk/api/updates/latest");
   assert.equal((await (await get("/api/updates/latest")).json()).version, "1.2.5", "SQLite feed survives restart and concurrent notifications retain the newest release");
+  analytics = await (await readAnalytics()).json();
+  assert.equal(analytics.rows.length, 64, "Aggregate totals survive SQLite restart");
   const release = await (await get("/api/releases/latest")).json();
   assert.equal(release.tag_name, "v1.2.5");
   assert.ok(release.assets.some(asset => asset.name === "Fetchrail-v1.2.5-linux-arm64.AppImage"));
-  console.log("PASS: real Workers runtime verifies OIDC publication, immutable replay, checksum mismatch, concurrent rollback protection, restart persistence, public caching/ETag and static routing.");
+  await worker.dispose();
+  worker = new Miniflare(convertV4MiniflareOptions({ https: true, resourcePersistencePath: directory, workers: [
+    { ...options, bindings: {} },
+    { name: "assets-test", modules: [{ type: "ESModule", path: fileURLToPath(new URL("test-assets.mjs", import.meta.url)) }] },
+  ] }));
+  assert.equal((await readAnalytics()).status, 401, "Missing read secret fails closed even with a supplied token");
+  console.log("PASS: real Workers runtime verifies strict private analytics schema, auth, aggregation, retention alarm, cardinality/volume caps and persistence; OIDC publication, immutable replay, checksum mismatch, concurrent rollback protection, caching/ETag and static routing.");
 } finally { await worker.dispose(); await rm(directory, { recursive: true, force: true }); }

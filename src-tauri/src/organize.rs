@@ -322,6 +322,7 @@ mod tests {
             std::env::temp_dir().join(format!("fetchrail-organizer-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&root).unwrap();
         let settings = DownloadSettings {
+            analytics_consent: Default::default(),
             extra: Default::default(),
             torrent: Default::default(),
             speed_limit_bps: 0,

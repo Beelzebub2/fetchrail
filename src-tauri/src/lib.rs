@@ -1,8 +1,10 @@
 #[cfg(all(not(debug_assertions), dev))]
 compile_error!("Release builds must embed the frontend: enable --features tauri/custom-protocol.");
 
+mod analytics;
 mod browser_bridge;
 mod browser_extension;
+mod diagnostics;
 mod download_window;
 mod engine;
 #[cfg(windows)]
@@ -280,6 +282,42 @@ fn open_browser_extension_folder(
 }
 
 #[tauri::command]
+async fn start_diagnostics(
+    manager: State<'_, Arc<DownloadManager>>,
+    network: bool,
+) -> Result<String, String> {
+    manager.start_diagnostics(network).await
+}
+#[tauri::command]
+fn diagnostics_state(manager: State<'_, Arc<DownloadManager>>) -> diagnostics::Snapshot {
+    manager.diagnostics().snapshot()
+}
+#[tauri::command]
+fn cancel_diagnostics(manager: State<'_, Arc<DownloadManager>>) {
+    manager.diagnostics().cancel();
+}
+#[tauri::command]
+async fn share_diagnostics(
+    manager: State<'_, Arc<DownloadManager>>,
+    run_id: String,
+    permission: bool,
+) -> Result<(), String> {
+    manager.diagnostics().share(&run_id, permission).await
+}
+#[tauri::command]
+fn cancel_diagnostics_share(manager: State<'_, Arc<DownloadManager>>) {
+    manager.diagnostics().cancel_share();
+}
+
+#[tauri::command]
+async fn set_analytics_consent(
+    manager: State<'_, Arc<DownloadManager>>,
+    enabled: bool,
+) -> Result<DownloadSettings, String> {
+    manager.set_analytics_consent(enabled).await
+}
+
+#[tauri::command]
 async fn update_settings(
     manager: State<'_, Arc<DownloadManager>>,
     settings: DownloadSettings,
@@ -367,10 +405,10 @@ fn update_status(app: AppHandle) -> serde_json::Value {
 async fn check_for_update(app: AppHandle) -> serde_json::Value {
     if app
         .try_state::<Arc<DownloadManager>>()
-        .is_some_and(|manager| manager.performance.running())
+        .is_some_and(|manager| manager.performance.running() || manager.diagnostics().active())
     {
         use tauri::Emitter;
-        let status = serde_json::json!({"state":"failed","message":"Cancel the performance test before checking for application updates."});
+        let status = serde_json::json!({"state":"failed","message":"Cancel the performance test or Diagnostics before checking for application updates."});
         let _ = app.emit("fetchrail://update-status", &status);
         return status;
     }
@@ -658,7 +696,10 @@ pub fn run() {
                 tauri::async_runtime::spawn(async move {
                     tokio::time::sleep(std::time::Duration::from_secs(20)).await;
                     loop {
-                        if manager.settings().await.auto_update && !manager.performance.running() {
+                        if manager.settings().await.auto_update
+                            && !manager.performance.running()
+                            && !manager.diagnostics().active()
+                        {
                             install::check_for_update(&app).await;
                         }
                         tokio::time::sleep(std::time::Duration::from_secs(30 * 60)).await;
@@ -671,7 +712,10 @@ pub fn run() {
                 tauri::async_runtime::spawn(async move {
                     tokio::time::sleep(std::time::Duration::from_secs(20)).await;
                     loop {
-                        if manager.settings().await.auto_update && !manager.performance.running() {
+                        if manager.settings().await.auto_update
+                            && !manager.performance.running()
+                            && !manager.diagnostics().active()
+                        {
                             linux_updates::check(&app).await;
                         }
                         tokio::time::sleep(std::time::Duration::from_secs(30 * 60)).await;
@@ -868,6 +912,12 @@ pub fn run() {
             open_browser_extension_store,
             open_browser_extension_folder,
             update_settings,
+            set_analytics_consent,
+            start_diagnostics,
+            diagnostics_state,
+            cancel_diagnostics,
+            share_diagnostics,
+            cancel_diagnostics_share,
             organize_existing_downloads,
             list_queues,
             create_queue,
