@@ -1,3 +1,4 @@
+import { parseStateSnapshot } from "./state-snapshot.mjs";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { createServer } from "node:http";
@@ -49,7 +50,7 @@ try {
   let complete;
   for (let i = 0; i < 300; i++) { const record = (await call("getDownloads")).downloads.find(r => r.id === accepted.ids[0]); assert.notEqual(record.status, "failed", record.error); if (record.status === "completed") { complete = record; break; } await delay(100); }
   assert(complete); assert(authorized);
-  const saved = JSON.parse(await readFile(join(fixture.stateDir, "downloads.json"), "utf8")); assert.equal(saved.length, 1);
+  const saved = parseStateSnapshot(await readFile(join(fixture.stateDir, "downloads.json"), "utf8")); assert.equal(saved.length, 1);
   assert.equal(saved[0].handoffCommitted, true);
   const expected = createHash("sha256").update(body).digest("hex");
   assert.equal(createHash("sha256").update(await readFile(saved[0].destination)).digest("hex"), expected);
@@ -65,7 +66,7 @@ try {
   await call("controlDownload", { downloadId: batch.ids[0], action: "cancel" });
   await assert.rejects(call("commitHandoff", { handoffId: cancelledId, autoStart: true, source: "browserBatch" }), /rolled back/);
   const cancelled = await call("getHandoff", { handoffId: cancelledId }); assert.equal(cancelled.committed, false); assert.ok(cancelled.statuses.includes("paused"));
-  const rollback = JSON.parse(await readFile(join(fixture.stateDir, "downloads.json"), "utf8"));
+  const rollback = parseStateSnapshot(await readFile(join(fixture.stateDir, "downloads.json"), "utf8"));
   assert.ok(rollback.filter(r => batch.ids.includes(r.id)).every(r => r.handoffCommitted === false));
   const failedId = randomUUID();
   await call("addDownloads", params, failedId);

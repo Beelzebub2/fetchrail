@@ -54,7 +54,11 @@ fn main() {
     let mut config = cmake::Config::new(&native);
     config
         .profile("Release")
-        .define("CMAKE_PREFIX_PATH", &installed);
+        .define("CMAKE_PREFIX_PATH", &installed)
+        .define(
+            "FETCHRAIL_APP_VERSION",
+            std::env::var("CARGO_PKG_VERSION").unwrap(),
+        );
     if windows {
         config.define("CMAKE_MSVC_RUNTIME_LIBRARY", "MultiThreaded");
     } else {

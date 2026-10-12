@@ -24,6 +24,7 @@ pub mod platform;
 mod power_events;
 mod rate_limit;
 mod staging;
+mod state_store;
 pub mod torrent;
 
 use std::sync::{
@@ -49,6 +50,56 @@ struct FrontendReady(AtomicBool, std::sync::Mutex<Option<String>>);
 struct ShuttingDown(AtomicBool);
 struct TrayReady(AtomicBool);
 struct BrowserIntegration(std::sync::Mutex<platform::Feature>);
+struct StartupRecovery(String);
+
+fn valid_backup(path: &std::path::Path, name: &str) -> bool {
+    match name {
+        "downloads.json" => state_store::read::<Vec<engine::StoredDownload>>(path).is_ok(),
+        "settings.json" => state_store::read::<DownloadSettings>(path).is_ok(),
+        "queues.json" => state_store::read::<Vec<QueueRecord>>(path).is_ok(),
+        _ => false,
+    }
+}
+
+#[tauri::command]
+fn recovery_status(app: AppHandle) -> Result<serde_json::Value, String> {
+    let Some(recovery) = app.try_state::<StartupRecovery>() else {
+        return Ok(serde_json::Value::Null);
+    };
+    let root = platform::app_data_dir()?;
+    let files = ["downloads.json", "settings.json", "queues.json"].into_iter().map(|name| serde_json::json!({"name":name, "backupAvailable":valid_backup(&root.join(name).with_extension("json.backup"), name)})).collect::<Vec<_>>();
+    Ok(serde_json::json!({"error":recovery.0, "files":files}))
+}
+
+#[tauri::command]
+fn open_recovery_files() -> Result<(), String> {
+    platform::reveal(&platform::app_data_dir()?)
+}
+
+#[tauri::command]
+fn restore_state_backup(app: AppHandle, name: String) -> Result<(), String> {
+    if app.try_state::<StartupRecovery>().is_none() {
+        return Err("Recovery is only available before transfers start.".into());
+    }
+    if !["downloads.json", "settings.json", "queues.json"].contains(&name.as_str()) {
+        return Err("Unknown state file.".into());
+    }
+    let path = platform::app_data_dir()?.join(&name);
+    let backup = path.with_extension("json.backup");
+    if !valid_backup(&backup, &name) {
+        return Err("No validated backup is available. The original files were preserved.".into());
+    }
+    let bytes = std::fs::read(&backup).map_err(|e| e.to_string())?;
+    if let Ok(original) = std::fs::read(&path) {
+        platform::write_private_atomic(
+            &path.with_extension(format!("json.broken-{}", Uuid::new_v4())),
+            &original,
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    platform::write_private_atomic(&path, &bytes).map_err(|e| e.to_string())?;
+    restart_app(app)
+}
 
 #[tauri::command]
 fn repair_browser_integration(app: AppHandle) -> Result<platform::Feature, String> {
@@ -103,7 +154,11 @@ async fn add_download(
     manager: State<'_, Arc<DownloadManager>>,
     request: AddDownloadRequest,
 ) -> Result<DownloadRecord, String> {
-    manager.inner().add(request).await
+    manager
+        .inner()
+        .add(request)
+        .await
+        .map(DownloadRecord::public_view)
 }
 
 #[tauri::command]
@@ -111,7 +166,14 @@ async fn add_downloads(
     manager: State<'_, Arc<DownloadManager>>,
     requests: Vec<AddDownloadRequest>,
 ) -> Result<BatchDownloadResult, String> {
-    manager.inner().add_batch(requests).await
+    manager.inner().add_batch(requests).await.map(|mut batch| {
+        batch.accepted = batch
+            .accepted
+            .into_iter()
+            .map(DownloadRecord::public_view)
+            .collect();
+        batch
+    })
 }
 
 #[tauri::command]
@@ -140,7 +202,10 @@ async fn commit_torrent(
     manager: State<'_, Arc<DownloadManager>>,
     request: torrent::TorrentCommitRequest,
 ) -> Result<DownloadRecord, String> {
-    manager.commit_torrent(request).await
+    manager
+        .commit_torrent(request)
+        .await
+        .map(DownloadRecord::public_view)
 }
 #[tauri::command]
 async fn torrent_command(
@@ -157,7 +222,33 @@ async fn set_download_speed_limit(
     id: Uuid,
     speed_limit_bps: u64,
 ) -> Result<DownloadRecord, String> {
-    manager.set_speed_limit(id, speed_limit_bps).await
+    manager
+        .set_speed_limit(id, speed_limit_bps)
+        .await
+        .map(DownloadRecord::public_view)
+}
+
+#[tauri::command]
+async fn replace_download_source(
+    manager: State<'_, Arc<DownloadManager>>,
+    id: Uuid,
+    source: String,
+) -> Result<DownloadRecord, String> {
+    manager
+        .replace_source(id, source)
+        .await
+        .map(DownloadRecord::public_view)
+}
+#[tauri::command]
+async fn set_download_retry(
+    manager: State<'_, Arc<DownloadManager>>,
+    id: Uuid,
+    enabled: bool,
+) -> Result<DownloadRecord, String> {
+    manager
+        .set_retry(id, enabled)
+        .await
+        .map(DownloadRecord::public_view)
 }
 
 #[tauri::command]
@@ -174,7 +265,12 @@ async fn schedule_queue(
 async fn list_downloads(
     manager: State<'_, Arc<DownloadManager>>,
 ) -> Result<Vec<DownloadRecord>, String> {
-    Ok(manager.list().await)
+    Ok(manager
+        .list()
+        .await
+        .into_iter()
+        .map(DownloadRecord::public_view)
+        .collect())
 }
 
 #[tauri::command]
@@ -187,7 +283,7 @@ async fn pause_download(
     manager: State<'_, Arc<DownloadManager>>,
     id: Uuid,
 ) -> Result<DownloadRecord, String> {
-    manager.pause(id).await
+    manager.pause(id).await.map(DownloadRecord::public_view)
 }
 
 #[tauri::command]
@@ -195,7 +291,11 @@ async fn resume_download(
     manager: State<'_, Arc<DownloadManager>>,
     id: Uuid,
 ) -> Result<DownloadRecord, String> {
-    manager.inner().resume(id).await
+    manager
+        .inner()
+        .resume(id)
+        .await
+        .map(DownloadRecord::public_view)
 }
 
 #[tauri::command]
@@ -203,7 +303,7 @@ async fn cancel_download(
     manager: State<'_, Arc<DownloadManager>>,
     id: Uuid,
 ) -> Result<DownloadRecord, String> {
-    manager.cancel(id).await
+    manager.cancel(id).await.map(DownloadRecord::public_view)
 }
 
 #[tauri::command]
@@ -369,7 +469,10 @@ async fn assign_queue(
     id: Uuid,
     queue: String,
 ) -> Result<DownloadRecord, String> {
-    manager.assign_queue(id, queue).await
+    manager
+        .assign_queue(id, queue)
+        .await
+        .map(DownloadRecord::public_view)
 }
 
 #[tauri::command]
@@ -378,7 +481,10 @@ async fn schedule_download(
     id: Uuid,
     scheduled_for: Option<DateTime<Utc>>,
 ) -> Result<DownloadRecord, String> {
-    manager.schedule(id, scheduled_for).await
+    manager
+        .schedule(id, scheduled_for)
+        .await
+        .map(DownloadRecord::public_view)
 }
 
 #[tauri::command]
@@ -388,7 +494,10 @@ async fn place_download(
     directory: String,
     file_name: String,
 ) -> Result<DownloadRecord, String> {
-    manager.place(id, directory, file_name).await
+    manager
+        .place(id, directory, file_name)
+        .await
+        .map(DownloadRecord::public_view)
 }
 
 #[tauri::command]
@@ -673,8 +782,14 @@ pub fn run() {
                 eprintln!("Fetchrail browser extension: {error}");
             }
             let manager =
-                tauri::async_runtime::block_on(DownloadManager::load(app.handle().clone()))
-                    .map_err(std::io::Error::other)?;
+                match tauri::async_runtime::block_on(DownloadManager::load(app.handle().clone())) {
+                    Ok(manager) => manager,
+                    Err(error) => {
+                        app.manage(StartupRecovery(error));
+                        show_main_window(app.handle());
+                        return Ok(());
+                    }
+                };
             app.manage(manager.clone());
             offer_torrent_arguments(
                 app.handle(),
@@ -826,7 +941,9 @@ pub fn run() {
         })
         .on_window_event(|window, event| {
             if let WindowEvent::CloseRequested { api, .. } = event {
-                let manager = window.app_handle().state::<Arc<DownloadManager>>();
+                let Some(manager) = window.app_handle().try_state::<Arc<DownloadManager>>() else {
+                    return;
+                };
                 // Closing a download prompt is its Cancel button; an answered prompt is destroyed instead.
                 if let Some(id) = window.label().strip_prefix(PROMPT_WINDOW) {
                     if let Ok(id) = Uuid::parse_str(id) {
@@ -899,6 +1016,8 @@ pub fn run() {
             torrent_command,
             torrent_licenses,
             set_download_speed_limit,
+            replace_download_source,
+            set_download_retry,
             schedule_queue,
             list_downloads,
             get_overview,
@@ -928,15 +1047,21 @@ pub fn run() {
             update_status,
             check_for_update,
             restart_app,
+            recovery_status,
+            open_recovery_files,
+            restore_state_backup,
         ])
         .build(context())
         .expect("error while building Fetchrail")
         .run(|app, event| {
             if let tauri::RunEvent::ExitRequested { api, code, .. } = event {
+                let Some(manager) = app.try_state::<Arc<DownloadManager>>() else {
+                    return;
+                };
                 if !app.state::<ShuttingDown>().0.swap(true, Ordering::AcqRel) {
                     api.prevent_exit();
                     let app = app.clone();
-                    let manager = app.state::<Arc<DownloadManager>>().inner().clone();
+                    let manager = manager.inner().clone();
                     tauri::async_runtime::spawn(async move {
                         manager.shutdown().await;
                         app.exit(code.unwrap_or(0));

@@ -1273,7 +1273,7 @@ fn finalize_pipeline(
 #[derive(Clone)]
 struct Source {
     url: String,
-    representation: Option<(u64, String)>,
+    representation: Option<(u64, crate::engine::StrongEtag)>,
 }
 impl Source {
     fn public(url: &str) -> Self {
@@ -1295,7 +1295,7 @@ impl Source {
                     reqwest::header::RANGE,
                     format!("bytes={offset}-{}", offset + bytes - 1),
                 )
-                .header(reqwest::header::IF_RANGE, validator)
+                .header(reqwest::header::IF_RANGE, validator.as_str())
         } else {
             client.get(format!(
                 "{}?bytes={bytes}&nonce={}",

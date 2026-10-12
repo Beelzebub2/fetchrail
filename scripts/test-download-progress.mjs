@@ -91,6 +91,11 @@ try {
   assert.equal(await page.getByRole("tab").count(), 3);
   assert.equal(await page.locator("tbody tr").count(), 4);
   assert.equal(await page.getByRole("progressbar").getAttribute("aria-valuenow"), "12");
+  await page.evaluate(() => {
+    window.testRecord.downloadedBytes = 8 * 1024 ** 3;
+    window.testEmit("fetchrail://downloads-progress", [structuredClone(window.testRecord)]);
+  });
+  await page.waitForFunction(() => document.querySelector('[role="progressbar"]')?.getAttribute("aria-valuenow") === "25");
   await page.screenshot({ path: join(output, "download-status.png"), fullPage: true });
   await page.getByRole("button", { name: "Hide details" }).click();
   assert.equal(await page.locator("tbody").count(), 0);

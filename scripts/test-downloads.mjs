@@ -1,3 +1,4 @@
+import { parseStateSnapshot } from "./state-snapshot.mjs";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { randomUUID, createHash } from "node:crypto";
@@ -19,7 +20,7 @@ const fixture = await createFixture("download-check");
 const { stateDir } = fixture;
 const read = (name) => readFile(join(stateDir, name));
 const original = Object.fromEntries(await Promise.all(["downloads.json", "settings.json", "queues.json"].map(async (name) => [name, await read(name).catch((error) => { if (error.code === "ENOENT") return null; throw error; })])));
-const records = JSON.parse(original["downloads.json"] ?? "[]");
+const records = parseStateSnapshot(original["downloads.json"] ?? "[]");
 assert.ok(!records.some((item) => ["connecting", "downloading", "merging", "queued", "scheduled"].includes(item.status)), "Finish or pause existing downloads before this check.");
 let running = false;
 try {
@@ -153,14 +154,14 @@ async function complete(id, connections) {
     return item?.status === "completed" && item;
   }, "download completion");
   assert.equal(item.connections, connections);
-  const full = JSON.parse(await read("downloads.json")).find((item) => item.id === id);
+  const full = parseStateSnapshot(await read("downloads.json")).find((item) => item.id === id);
   assert.equal(digest(await readFile(full.destination)), expectedHash, "Downloaded bytes must match the original.");
   assert.equal(item.downloadedBytes, data.length);
   return item;
 }
 try {
   await mkdir(stateDir, { recursive: true });
-  const settings = { ...JSON.parse(original["settings.json"] ?? "{}"), autoUpdate: false, speedLimitBps: 4 * 1024 * 1024, defaultDownloadDir: out, maxConcurrentDownloads: 2, connectionsPerDownload: 4, minSegmentSizeMb: 1, launchOnStart: false,
+  const settings = { ...parseStateSnapshot(original["settings.json"] ?? "{}"), autoUpdate: false, speedLimitBps: 4 * 1024 * 1024, defaultDownloadDir: out, maxConcurrentDownloads: 2, connectionsPerDownload: 4, minSegmentSizeMb: 1, launchOnStart: false,
     categories: [{ name: "Archives", extensions: ["zip"], folder: "Sorted" }] };
   await writeFile(join(stateDir, "settings.json"), JSON.stringify(settings));
   const windowStart = Date.now() + 30000;
@@ -204,14 +205,14 @@ try {
     if (item?.status === "failed") throw new Error(item.error);
     return item?.status === "completed" && item;
   }, "verified empty download");
-  const emptySaved = JSON.parse(await read("downloads.json")).find(item => item.id === empty);
+  const emptySaved = parseStateSnapshot(await read("downloads.json")).find(item => item.id === empty);
   assert.equal((await readFile(emptySaved.destination)).length, 0);
   assert.equal(emptyRecord.downloadedBytes, 0);
   assert.ok(observed.get("empty.bin").gets >= 2, "The full GET must run even after an empty metadata GET.");
   const noContent = await add("no-content.bin");
   const rejected = await waitFor(async () => { const item = await record(noContent); return item?.status === "failed" && item; }, "HTTP 204 rejection");
   assert.match(rejected.error, /204/);
-  const noContentSaved = JSON.parse(await read("downloads.json")).find(item => item.id === noContent);
+  const noContentSaved = parseStateSnapshot(await read("downloads.json")).find(item => item.id === noContent);
   await assert.rejects(access(noContentSaved.destination), { code: "ENOENT" });
   console.log("PASS: zero-length HEAD/probes download real known/unknown-length bytes; valid HEAD size and genuine empty GET remain supported");
   await assert.rejects(native("addDownloads", { source: "popup", items: [{ url: "file:///C:/secret" }] }));
@@ -241,7 +242,7 @@ try {
   await launch();
   await native("controlDownload", { downloadId: session.ids[0], action: "resume" });
   await complete(session.ids[0], 4);
-  await waitFor(async () => !JSON.parse(await read("downloads.json")).find((item) => item.id === session.ids[0]).requestContext, "completed session headers are removed from disk");
+  await waitFor(async () => !parseStateSnapshot(await read("downloads.json")).find((item) => item.id === session.ids[0]).requestContext, "completed session headers are removed from disk");
   console.log("PASS: cookie/referrer downloads verify, survive app restart and produce exact bytes without exposing session headers");
   const landing = await add("landing.html");
   await waitFor(async () => (await record(landing))?.status === "failed", "HTML intermediate page rejection");
@@ -315,14 +316,14 @@ try {
   console.log("PASS: server filenames replace URL IDs before capture prompts and for manually added downloads");
   const sorted = await add("sorted.zip");
   await complete(sorted, 4);
-  await waitFor(async () => JSON.parse(await read("downloads.json")).find((item) => item.id === sorted).destination === join(out, "Sorted", "sorted.zip"), "category folder", 5000);
+  await waitFor(async () => parseStateSnapshot(await read("downloads.json")).find((item) => item.id === sorted).destination === join(out, "Sorted", "sorted.zip"), "category folder", 5000);
   console.log("PASS: a file ending sorts the download into its category's folder");
   const collisionA = await add("collision-a.bin");
   const collisionB = await add("collision-b.bin");
   await complete(collisionA, 4); await complete(collisionB, 4);
   // A download reports completed a moment before its final path reaches downloads.json.
   await waitFor(async () => {
-    const saved = JSON.parse(await read("downloads.json"));
+    const saved = parseStateSnapshot(await read("downloads.json"));
     return saved.find((item) => item.id === collisionA).destination !== saved.find((item) => item.id === collisionB).destination;
   }, "distinct destinations for colliding names", 5000);
   console.log("PASS: simultaneous server-suggested filename collisions keep both files");
@@ -376,10 +377,10 @@ try {
   const diagnosis = { recordedAt: new Date().toISOString(), error: error.message,
     app: { exitCode: app?.exitCode, signalCode: app?.signalCode },
     sourceArchiveSha256: process.env.FETCHRAIL_SOURCE_ARCHIVE_SHA256 ?? null };
-  try { diagnosis.downloads = JSON.parse(await read("downloads.json")).map(item => ({ id: item.id, status: item.status,
+  try { diagnosis.downloads = parseStateSnapshot(await read("downloads.json")).map(item => ({ id: item.id, status: item.status,
     queue: item.queue, downloadedBytes: item.downloadedBytes, totalBytes: item.totalBytes, mergedBytes: item.mergedBytes,
     scheduledFor: item.scheduledFor, error: item.error })); } catch {}
-  try { diagnosis.queues = JSON.parse(await read("queues.json")); } catch {}
+  try { diagnosis.queues = parseStateSnapshot(await read("queues.json")); } catch {}
   diagnosis.server = [...observed].map(([name, entry]) => ({ name, active: entry.active, peak: entry.peak, rangeRequests: entry.ranges.length }));
   const evidence = join(root, "artifacts/linux-qualification");
   await mkdir(evidence, { recursive: true });
