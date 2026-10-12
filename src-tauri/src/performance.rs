@@ -525,15 +525,6 @@ fn rate(bytes: u64, elapsed: Duration) -> u64 {
 fn millis(duration: Duration) -> u64 {
     duration.as_millis().min(u64::MAX as u128) as u64
 }
-pub fn percentile(values: &[u64], p: f64) -> u64 {
-    if values.is_empty() {
-        return 0;
-    }
-    let mut values = values.to_vec();
-    values.sort_unstable();
-    values[((values.len() - 1) as f64 * p.clamp(0.0, 1.0)).round() as usize]
-}
-
 pub struct LivePolicy {
     pub eligible: std::sync::atomic::AtomicBool,
     pub contaminated: std::sync::atomic::AtomicBool,
@@ -1701,7 +1692,6 @@ mod tests {
         drop(more);drop(permits);
         policy.throttled();
         assert_eq!(policy.target.load(Ordering::Relaxed), 1);
-        assert_eq!(percentile(&[4, 1, 9, 3], 0.5), 4);
         let quick = LivePolicy::new(2, 16, 1024 * 1024);
         let _quick_lanes = lanes(&quick,2).await;
         quick.capacity_hint_bps.store(100 * MIB, Ordering::Relaxed);
