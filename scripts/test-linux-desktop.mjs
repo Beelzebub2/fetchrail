@@ -74,9 +74,13 @@ try {
   session = opened.sessionId;
   assert.ok(session);
   await until(() => evaluate('return Boolean(document.querySelector("button[aria-label=Settings]"))'), "embedded main interface");
-  await until(() => evaluate(`return Boolean(document.querySelector('button[aria-label="Close analytics choice"]'))`), "initial analytics choice");
-  await click('button[aria-label="Close analytics choice"]');
-  await until(() => evaluate("return !document.querySelector('dialog[open]')"), "initial analytics choice kept off");
+  // A first-run native WebKitGTK window presents an accessible modal consent
+  // choice. Explicitly decline optional analytics before clicking controls
+  // underneath it; do not bypass the dialog or silently grant consent.
+  await until(() => evaluate('return Boolean(document.querySelector("dialog.analytics-prompt[open]"))'), "first-run analytics choice");
+  await click('dialog.analytics-prompt .analytics-actions button:first-child');
+  await until(() => evaluate('return !document.querySelector("dialog.analytics-prompt[open]")'), "analytics refusal saved");
+  assert.equal((await invoke("get_settings")).analyticsConsent?.enabled, false, "Native UI declines analytics by default");
   evidence.frontendReadySeconds = (performance.now() - started) / 1000;
   const main = await wd("/window");
   assert.match(await wd("/url"), /^(tauri:\/\/localhost|https?:\/\/tauri\.localhost)(?:\/|$)/);

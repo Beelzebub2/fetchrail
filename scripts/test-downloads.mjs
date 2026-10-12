@@ -242,18 +242,30 @@ try {
   await launch();
   await native("controlDownload", { downloadId: session.ids[0], action: "resume" });
   if (process.platform === "win32") {
+    // Only Windows encrypts the saved credential envelope using the user's DPAPI identity.
     await complete(session.ids[0], 4);
+    await waitFor(async () => !parseStateSnapshot(await read("downloads.json")).find((item) => item.id === session.ids[0]).requestContext, "completed session headers are removed from disk");
+    console.log("PASS: Windows DPAPI retains browser credentials across a restart, then removes them on completion");
   } else {
-    await waitFor(async () => (await record(session.ids[0]))?.status === "failed", "Linux restart requires fresh browser authorization");
-    assert.match((await record(session.ids[0])).error, /authentication/);
-    assert.equal(parseStateSnapshot(await read("downloads.json")).find(item => item.id === session.ids[0]).requestContext, undefined);
-    const authorized = await native("addDownloads", { source: "browserBatch", items: [{ url: base + "session.bin", expectedBytes: data.length, expectedMime: "application/octet-stream", requestContext: { cookie: "session=fetchrail-test", referer: base + "step/5", userAgent: "Fetchrail browser fixture" } }] });
-    assert.equal(authorized.accepted, 1);
-    ids.push(authorized.ids[0]);
-    await complete(authorized.ids[0], 4);
+    // Linux has no Secret Service integration yet. Browser headers are intentionally
+    // session-only; a restarted transfer must fail closed, never send unauthenticated
+    // bytes as if the saved cookie were available or persist secrets in plaintext.
+    const expired = await waitFor(async () => {
+      const item = await record(session.ids[0]);
+      return item?.status === "failed" && item;
+    }, "Linux session credentials expire at restart");
+    assert.match(expired.error, /Link expired or authentication is required/);
+    const saved = parseStateSnapshot(await read("downloads.json")).find(item => item.id === session.ids[0]);
+    assert.equal(saved.requestContext, undefined, "Linux must not persist browser headers in unencrypted state");
+    const renewed = await native("addDownloads", { source: "browserBatch", items: [{
+      url: base + "session.bin", expectedBytes: data.length, expectedMime: "application/octet-stream",
+      requestContext: { cookie: "session=fetchrail-test", referer: base + "step/5", userAgent: "Fetchrail browser fixture" },
+    }] });
+    assert.equal(renewed.accepted, 1, "A fresh browser handoff can reauthorize a failed Linux session");
+    ids.push(renewed.ids[0]);
+    await complete(renewed.ids[0], 4);
+    console.log("PASS: Linux drops browser credentials on restart, fails closed and accepts a fresh authenticated browser handoff");
   }
-  await waitFor(async () => !parseStateSnapshot(await read("downloads.json")).find((item) => item.id === session.ids[0]).requestContext, "completed session headers are removed from disk");
-  console.log("PASS: cookie/referrer downloads produce exact bytes without exposing headers; Windows encrypted restart and Linux fresh reauthorization follow storage policy");
   const landing = await add("landing.html");
   await waitFor(async () => (await record(landing))?.status === "failed", "HTML intermediate page rejection");
   assert.match((await record(landing)).error, /opens a web page/);
