@@ -1,6 +1,8 @@
 # Chrome Web Store release automation
 
-Tagged releases run the `chrome-web-store` job after the Windows release succeeds. The job rebuilds the Chromium companion, removes the unpacked development key and update URL, creates a production ZIP, obtains a short lived Google access token through GitHub OIDC, and uses Chrome Web Store API v2 to upload and submit it with `DEFAULT_PUBLISH`.
+Tagged releases compare the extension payload against the most recent earlier **published** reachable release tag. Failed or unpublished tags cannot suppress store updates that users never received. **The `chrome-web-store` job runs only when Chromium extension code, assets, production packaging, relevant fonts, or manifest settings have changed.** App-only releases skip the store job entirely, including Google authentication and submission. The first published release is always eligible. Application version bumps also update the extension manifests, but a version-number-only change does not count as an extension update.
+
+When a Chromium update is needed, the job runs after the complete desktop release succeeds. It rebuilds the extension, removes the unpacked development key and update URL, creates a production ZIP, obtains a short-lived Google access token through GitHub OIDC, and uses Chrome Web Store API v2 to upload and submit it with `DEFAULT_PUBLISH`. Publishing still refuses an active store review or a version that is not newer than the published extension.
 
 Configure these repository variables before enabling a tagged release:
 
