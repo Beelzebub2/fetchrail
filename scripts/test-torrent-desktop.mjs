@@ -82,6 +82,13 @@ try {
     throw error;
   }
   await launch();
+  // A fresh install asks for optional analytics consent in a native modal.
+  // Explicitly decline before driving the underlying download form, rather
+  // than racing the modal and leaving the download input disabled in CI.
+  const consent = page.getByRole("dialog", { name: "Help improve Fetchrail?" });
+  await consent.waitFor({ state: "visible", timeout: 15000 });
+  await consent.getByRole("button", { name: "No thanks", exact: true }).click();
+  await consent.waitFor({ state: "hidden" });
   let settings = await invoke("get_settings");
   settings.autoUpdate = false; settings.maxConcurrentDownloads = 2; settings.speedLimitBps = 2 * 1024 * 1024;
   Object.assign(settings.torrent, localTorrentConfig, { ratioLimit: 0, seedTimeLimit: 0, maxSeeds: 1 });
@@ -95,8 +102,12 @@ try {
   await assert.rejects(invoke("torrent_import_status", { id: dripping.id }), /cancelled|expired/);
   await invoke("cancel_torrent_import", { id: localPreview.id });
   const magnet = `magnet:?xt=urn:btih:${metadata.hashes.find(h => h.length === 40)}&x.pe=127.0.0.1:${peerPort}`;
-  await page.getByRole("textbox", { name: "Link to download", exact: true }).fill(magnet);
-  await page.getByRole("button", { name: "Download", exact: true }).click();
+  const linkInput = page.getByRole("textbox", { name: "Link to download", exact: true });
+  await linkInput.fill(magnet);
+  assert.equal(await linkInput.inputValue(), magnet, "The visible input must retain the magnet before submission.");
+  const downloadButton = page.getByRole("button", { name: "Download", exact: true });
+  await until(() => downloadButton.isEnabled(), "magnet enables Download", 10000);
+  await downloadButton.click();
   await page.getByRole("checkbox", { name: /Download Payload[\\/]skip.bin/ }).waitFor({ timeout: 60000 });
   const imports = join(fixture.stateDir, "torrent-imports");
   for (const dir of await readdir(imports).catch(e => { if (e.code === "ENOENT") return []; throw e; })) assert.deepEqual((await readdir(join(imports, dir))).filter(name => name !== "owner.json"), [], "Only the ownership marker may exist before confirmation");
