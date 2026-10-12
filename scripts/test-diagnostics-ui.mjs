@@ -150,6 +150,7 @@ try {
   await page.locator(".content").evaluate(el=>el.scrollTop=0);
   await page.waitForTimeout(500);
   assert.ok(await page.evaluate(()=>document.documentElement.scrollWidth<=window.innerWidth),"Report must fit the supported desktop minimum width");
+  assert.equal(await page.locator(".save-state i").evaluate(el=>el.getBoundingClientRect().width),7,"Save-state dot cannot shrink under the clipped narrow-layout label");
   await page.screenshot({path:join(output,"diagnostics-report-desktop-minimum.png"),fullPage:true});
   await page.setViewportSize({width:1280,height:1000});
   await page.locator(".content").evaluate(el=>el.scrollTop=0);
