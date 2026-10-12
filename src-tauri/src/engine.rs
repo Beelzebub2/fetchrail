@@ -3830,15 +3830,18 @@ impl DownloadManager {
                 .collect::<Vec<_>>();
             let mut previous_rate = 0;
             let mut sampled_at = Instant::now();
+            let mut generation = task.performance.lock().expect("task performance poisoned")
+                .as_ref().map(|p| p.generation.load(Ordering::Acquire));
             loop {
                 tokio::time::sleep(Duration::from_secs(4)).await;
                 let elapsed = sampled_at.elapsed().as_secs_f64();
-                let (mut bytes, mut receiving) = (0u64, 0usize);
+                let (mut bytes, mut peer_bytes, mut receiving) = (0u64, 0u64, 0usize);
                 for (segment, prior) in segments.iter().zip(&mut previous) {
                     let current = segment.downloaded.load(Ordering::Relaxed);
                     let delta = current.saturating_sub(*prior);
+                    bytes += delta;
                     if segment.active.load(Ordering::Relaxed) && delta > 0 {
-                        bytes += delta;
+                        peer_bytes += delta;
                         receiving += 1;
                     }
                     *prior = current;
@@ -3847,7 +3850,7 @@ impl DownloadManager {
                     && limiter.quantum() == usize::MAX
                     && task.limiter.quantum() == usize::MAX
                 {
-                    (bytes as f64 / elapsed / receiving as f64) as u64
+                    (peer_bytes as f64 / elapsed / receiving as f64) as u64
                 } else {
                     0
                 };
@@ -3863,7 +3866,9 @@ impl DownloadManager {
                         Duration::from_secs_f64(elapsed),
                         receiving,
                         limiter.quantum() == usize::MAX && task.limiter.quantum() == usize::MAX,
+                        generation.unwrap_or(u64::MAX),
                     );
+                    generation = Some(policy.generation.load(Ordering::Acquire));
                 }
                 previous_rate = rate;
                 sampled_at = Instant::now();
