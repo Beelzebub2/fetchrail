@@ -28,10 +28,10 @@
 </p>
 
 <p align="center">
-  <a href="#browser-store-status"><img src="https://img.shields.io/badge/Chrome-approved%20%26%20public-238636?style=flat-square" alt="Chrome extension approved and public"></a>
-  <a href="#browser-store-status"><img src="https://img.shields.io/badge/Firefox-awaiting%20approval-d29922?style=flat-square" alt="Firefox extension awaiting approval"></a>
-  <a href="#browser-store-status"><img src="https://img.shields.io/badge/Edge-package%20ready-64748b?style=flat-square" alt="Edge Add-ons upload package ready; not submitted"></a>
-  <a href="#browser-store-status"><img src="https://img.shields.io/badge/Opera%20GX-package%20ready-64748b?style=flat-square" alt="Opera GX Add-ons upload package ready; not submitted"></a>
+  <a href="https://chromewebstore.google.com/detail/ccmbmcgihlemlheldpkgnidgohlkaipb"><img src="https://img.shields.io/chrome-web-store/v/ccmbmcgihlemlheldpkgnidgohlkaipb?label=Chrome%20public&amp;style=flat-square&amp;color=238636" alt="Chrome Web Store: public version"></a>
+  <a href="https://github.com/Beelzebub2/fetchrail/actions/runs/38172309596"><img src="https://img.shields.io/badge/Firefox-v0.7.1%20in%20review-d29922?style=flat-square" alt="Firefox v0.7.1 awaiting approval"></a>
+  <a href="docs/edge-opera-addons.md"><img src="https://img.shields.io/badge/Edge-v0.7.1%20not%20submitted-64748b?style=flat-square" alt="Edge v0.7.1 not submitted"></a>
+  <a href="docs/edge-opera-addons.md"><img src="https://img.shields.io/badge/Opera%20GX-v0.7.1%20not%20submitted-64748b?style=flat-square" alt="Opera GX v0.7.1 not submitted"></a>
 </p>
 
 > Most downloads travel down a single connection. Fetchrail opens up to thirty-two, and lets you watch every one.
@@ -82,22 +82,7 @@ And it does more than catch:
 - **Works through download pages.** For sites with countdowns, it opens each page in turn, follows a single clear download button and captures the final file. Logins and CAPTCHAs stay with you.
 - **One right-click away.** Choose **Download with Fetchrail** on any link, or control running transfers from the toolbar.
 
-Install the companion from the [Chrome Web Store](https://chromewebstore.google.com/detail/fetchrail-browser-integra/ccmbmcgihlemlheldpkgnidgohlkaipb) for automatic updates. Firefox will also support store updates once its [Add-ons listing](https://addons.mozilla.org/en-US/firefox/addon/fetchrail-browser-integration/) is approved; until then, use the [manual installation guide](browser-extension/README.md#firefox).
-
-### Browser store status
-
-The current source tree contains companion **[v0.7.1](browser-extension/manifests/chromium.json)** for Chromium and Firefox. Published desktop and browser store releases can be older because they ship and undergo review separately.
-
-| Store | Extension version | Approval status |
-| :-- | :-- | :-- |
-| [Chrome Web Store](https://chromewebstore.google.com/detail/ccmbmcgihlemlheldpkgnidgohlkaipb) | [![Chrome Web Store published version](https://img.shields.io/chrome-web-store/v/ccmbmcgihlemlheldpkgnidgohlkaipb?label=public%20version&style=flat-square&color=ff8a3d)](https://chromewebstore.google.com/detail/ccmbmcgihlemlheldpkgnidgohlkaipb) | **Approved and public** |
-| [Firefox Add-ons](https://addons.mozilla.org/en-US/firefox/addon/fetchrail-browser-integration/) | **v0.7.1 submitted** | **Awaiting Mozilla approval**; not publicly available yet |
-| [Microsoft Edge Add-ons](https://microsoftedge.microsoft.com/addons) | **v0.7.1 package prepared** | **Not submitted**; publisher registration and first listing required |
-| [Opera Add-ons (Opera GX)](https://addons.opera.com/) | **v0.7.1 package prepared** | **Not submitted**; publisher sign-in and first listing required |
-
-**Status checked 12 October 2026:** Google's [store status check](https://github.com/Beelzebub2/fetchrail/actions/runs/38296087862) confirmed Chrome **v0.6.0** is published. Firefox **v0.7.1** was [submitted successfully](https://github.com/Beelzebub2/fetchrail/actions/runs/38172309596), but its public store listing is not yet available. The Chrome version badge updates with the public store release; review statuses are dated snapshots and should be refreshed after store decisions.
-
-Microsoft Edge and Opera GX now have a tested upload package. The [Edge/Opera submission guide](docs/edge-opera-addons.md) covers the [package workflow](.github/workflows/edge-opera-addons-package.yml), developer accounts and native-host ID that must be registered after each store creates the listing. The grey badges above mean the package is ready, not that store submission or approval has occurred.
+Install from the [Chrome Web Store](https://chromewebstore.google.com/detail/ccmbmcgihlemlheldpkgnidgohlkaipb), or follow the [browser companion guide](browser-extension/README.md) for other browsers.
 
 ## Make it yours
 
