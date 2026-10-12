@@ -1,5 +1,5 @@
 Fetchrail Browser Integration Privacy Policy
-Last updated: 11 October 2026.
+Last updated: 12 October 2026.
 Canonical policy: https://fetchrail.rrmtools.uk/privacy
 
 Fetchrail Browser Integration connects Firefox to the Fetchrail download manager installed on your Windows or Linux computer. It handles information needed to select, route and control downloads. This information is not sent to the developer, an analytics service or an advertising service.
@@ -19,6 +19,10 @@ Local preferences: Browser download routing, session setting, queues, connection
 Where information goes
 
 The companion passes chosen downloads and transfer controls to Fetchrail on your computer through Firefox native messaging. Fetchrail contacts the file server you selected to verify and download the file. If browser session support is enabled, the relevant session headers accompany the download request. The file server receives ordinary network request data, including your IP address, according to its privacy policy. The extension has no advertising, analytics or remotely hosted executable code.
+
+Optional desktop performance calibration
+
+The desktop app offers user-started hardware and connection tests with explicit network-data and temporary-disk budgets. Generated online test traffic goes to Cloudflare's speed-test endpoints, which receive ordinary request information including your IP address. Downloaded files, browser credentials and measurement reports are not submitted. Hardware measurements and hashed network/volume/host tuning keys stay in the app's private local performance.json file, bounded to four reports, 128 observations and 2 MiB. Tuning expires after 14 days or relevant engine/network/volume changes. You can reset this data or disable automatic tuning in Settings > Performance. This optional desktop feature does not require additional browser permissions.
 
 Storage and retention
 

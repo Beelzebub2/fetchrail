@@ -62,6 +62,8 @@ pub struct DownloadRecord {
     pub connections: usize,
     #[serde(default)]
     pub requested_connections: Option<usize>,
+    #[serde(default = "default_true")]
+    pub connections_manual: bool,
     pub error: Option<String>,
     pub created_at: DateTime<Utc>,
     pub finished_at: Option<DateTime<Utc>>,
@@ -132,6 +134,8 @@ pub struct SegmentProgress {
     pub speed_bps: u64,
     /// The connection is open and receiving.
     pub active: bool,
+    #[serde(default)]
+    pub waiting: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -165,6 +169,9 @@ pub struct DownloadSettings {
     pub default_download_dir: String,
     pub max_concurrent_downloads: usize,
     pub connections_per_download: usize,
+    /// Calibration and lightweight measured adaptation; old profiles retain manual behavior.
+    #[serde(default)]
+    pub performance_auto: bool,
     pub min_segment_size_mb: u64,
     #[serde(default)]
     pub launch_on_start: bool,
@@ -493,6 +500,7 @@ mod tests {
             default_download_dir: download_root.into(),
             max_concurrent_downloads: 3,
             connections_per_download: 8,
+            performance_auto: false,
             min_segment_size_mb: 4,
             launch_on_start: false,
             minimize_to_tray: true,

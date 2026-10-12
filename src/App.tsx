@@ -36,6 +36,7 @@ import {
   X,
 } from "lucide-react";
 import "./App.css";
+import { PerformanceInvitation, PerformancePage } from "./Performance";
 import { usePlatformCapabilities } from "./platform";
 import { TorrentImportDialog, TorrentInspector, TorrentRow, TorrentSettingsFields } from "./Torrents";
 import type { TorrentImport, TorrentSummary, TorrentSettings } from "./Torrents";
@@ -59,6 +60,7 @@ type SegmentProgress = {
   downloadedBytes: number;
   speedBps: number;
   active: boolean;
+  waiting?: boolean;
 };
 
 export type DownloadRecord = {
@@ -138,6 +140,7 @@ export type DownloadSettings = Appearance & {
   defaultDownloadDir: string;
   maxConcurrentDownloads: number;
   connectionsPerDownload: number;
+  performanceAuto: boolean;
   minSegmentSizeMb: number;
   launchOnStart: boolean;
   minimizeToTray: boolean;
@@ -220,6 +223,7 @@ type ListEntry =
 const settingsSections = [
   ["general", "General", Settings2],
   ["downloads", "Downloads", Download],
+  ["performance", "Performance", Activity],
   ["queues", "Queues", CalendarClock],
   ["categories", "File categories", FolderOpen],
   ["torrents", "Torrents", Share2],
@@ -435,7 +439,7 @@ export function statusLabel(status: DownloadStatus) {
 export function partsOf(item: DownloadRecord): Part[] {
   const segments = item.segments.length
     ? item.segments
-    : [{ start: 0, length: item.totalBytes, downloadedBytes: item.downloadedBytes, speedBps: item.speedBps, active: false }];
+    : [{ start: 0, length: item.totalBytes, downloadedBytes: item.downloadedBytes, speedBps: item.speedBps, active: false, waiting: false }];
   return segments.map((segment) => {
     const complete = segment.length != null && segment.downloadedBytes >= segment.length;
     const state: PartState =
@@ -444,7 +448,7 @@ export function partsOf(item: DownloadRecord): Part[] {
         : item.status === "downloading"
           ? segment.active
             ? "receiving"
-            : "connecting"
+            : segment.waiting ? "waiting" : "connecting"
           : item.status === "paused"
             ? "paused"
             : item.status === "failed" || item.status === "cancelled"
@@ -713,7 +717,7 @@ function App() {
     () =>
       downloads
         .filter((item) => item.status === "downloading")
-        .reduce((count, item) => count + partsOf(item).filter((part) => part.state !== "done").length, 0),
+        .reduce((count, item) => count + partsOf(item).filter((part) => part.state === "receiving" || part.state === "connecting").length, 0),
     [downloads],
   );
 
@@ -1097,6 +1101,7 @@ function App() {
           />
         ) : (
           <>
+            <PerformanceInvitation onOpen={() => { setShowSettings(true); setSettingsSection("performance"); }} />
             <div className="list-head">
               <h1 className="sr-only">{filterTitles[activeFilter] ?? activeFilter.slice(6)}</h1>
               <div className="group-by">
@@ -1990,6 +1995,7 @@ function SettingsPage({
     >
       {/* Keyed by section, so each one rises in when it is opened. */}
       <div className="settings-panel" id="settings-panel" role="tabpanel" aria-labelledby={"settings-tab-" + section} key={section}>
+        {section === "performance" && <PerformancePage settings={settings} draft={draft} onChange={onChange} />}
         {section === "general" && (
           <section aria-labelledby="general-settings-title">
             <div className="page-head rise">
