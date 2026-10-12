@@ -12,7 +12,15 @@ import { createServer } from 'node:http';
 const total = Number(process.argv[1]), mode = process.argv[2];
 const body = Buffer.alloc(mode === 'uneven-rates' ? 64 * 1024 : 16 * 1024, 0x5a);
 let failed = false;
-const server = createServer((request, response) => {
+const handler = (request, response) => {
+  if (mode === 'redirect-secret' && request.url !== '/destination') {
+    response.writeHead(302, {Location: `http://127.0.0.1:${target.address().port}/destination`}).end(); return;
+  }
+  if (mode === 'redirect-loop') { response.writeHead(302, {Location: request.url}).end(); return; }
+  if (mode === 'redirect-secret' && ['cookie', 'authorization', 'origin', 'referer'].some(name => request.headers[name])) {
+    response.writeHead(400).end(); return;
+  }
+  if (mode === 'forbid-unranged-if-range' && request.headers['if-range'] && !request.headers.range) { response.writeHead(400).end(); return; }
   const range = /^bytes=(\d+)-(\d*)$/.exec(request.headers.range ?? '');
   let start = range ? Number(range[1]) : 0;
   let end = range?.[2] ? Number(range[2]) : total - 1;
@@ -61,8 +69,10 @@ const server = createServer((request, response) => {
   }
   if (mode === 'uneven-rates' && start === 0) setTimeout(pump, 1000);
   else pump();
-});
-server.listen(0, '127.0.0.1', () => console.log(JSON.stringify({port: server.address().port})));
+};
+const server = createServer(handler), target = createServer(handler);
+const start = () => server.listen(0, '127.0.0.1', () => console.log(JSON.stringify({port: server.address().port})));
+if (mode === 'redirect-secret') target.listen(0, '127.0.0.1', start); else start();
 "#;
 
 struct TestServer {
@@ -147,6 +157,7 @@ async fn parts(total: u64, connections: usize) -> (PathBuf, Segments, ProbeResul
         accepts_ranges: true,
         suggested_file_name: None,
         validator: Some("\"fixture\"".into()),
+        final_url: None,
     };
     (dir, segments, probe)
 }
@@ -289,6 +300,59 @@ async fn changed_or_encoded_representations_are_rejected_before_writing() {
         assert_eq!(segments[0].downloaded.load(Ordering::Relaxed), 0);
         fs::remove_dir_all(dir).await.unwrap();
     }
+}
+
+#[tokio::test]
+async fn redirect_credentials_are_origin_scoped_and_loops_fail_boundedly() {
+    let server = TestServer::new(1024, "redirect-secret");
+    let client = download_client_builder().no_proxy().build().unwrap();
+    let request = client
+        .get(server.url.clone())
+        .header(header::COOKIE, "secret=private")
+        .header(header::AUTHORIZATION, "Bearer private")
+        .header(header::ORIGIN, "https://initial.test")
+        .header(header::REFERER, "https://initial.test/private");
+    let (response, _origin, _global) = send_admitted(&client, request, &CancellationToken::new())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_ne!(response.url().origin(), server.url.origin());
+    assert_eq!(response.bytes().await.unwrap().len(), 1024);
+    let looping = TestServer::new(1024, "redirect-loop");
+    let result = send_admitted(
+        &client,
+        client.get(looping.url.clone()),
+        &CancellationToken::new(),
+    )
+    .await;
+    assert!(matches!(result, Err(EngineError::Message(_))));
+}
+
+#[tokio::test]
+async fn unknown_total_never_sends_if_range_without_range() {
+    let server = TestServer::new(1024, "forbid-unranged-if-range");
+    let (dir, _, mut probe) = parts(1024, 1).await;
+    probe.total_bytes = None;
+    probe.accepts_ranges = true;
+    let ranges = [ByteRange {
+        start: 0,
+        end: u64::MAX,
+    }];
+    let segments = segment_counters(&dir, &ranges).await.unwrap();
+    DownloadManager::download_ranges(
+        &download_client_builder().no_proxy().build().unwrap(),
+        &RateLimiter::new(0),
+        &task(),
+        &CancellationToken::new(),
+        &server.url,
+        &dir,
+        &segments,
+        &probe,
+    )
+    .await
+    .unwrap();
+    assert_eq!(fs::read(dir.join("0.part")).await.unwrap().len(), 1024);
+    fs::remove_dir_all(dir).await.unwrap();
 }
 
 #[tokio::test]
@@ -604,16 +668,12 @@ async fn old_large_part_files_keep_their_layout_and_resume_offsets() {
         .await
         .unwrap();
     prepare_parts(&dir, &probe, &ranges).await.unwrap();
-    assert_eq!(
+    assert_ne!(
         fs::read(dir.join("transfer.json")).await.unwrap(),
         legacy_bytes,
-        "Keep the fingerprint used by a finished legacy merge checkpoint"
+        "Legacy checkpoints have no URL identity, so they must not be reused"
     );
-    assert!(!shared_staging(&dir).await.unwrap());
-    assert_eq!(
-        fs::metadata(dir.join("0.part")).await.unwrap().len(),
-        123_456
-    );
+    assert!(shared_staging(&dir).await.unwrap());
     let segments = segment_counters(&dir, &ranges).await.unwrap();
     DownloadManager::download_ranges(
         &download_client_builder().no_proxy().build().unwrap(),
@@ -627,8 +687,8 @@ async fn old_large_part_files_keep_their_layout_and_resume_offsets() {
     )
     .await
     .unwrap();
-    verify_parts(&dir, &segments).await;
-    assert!(server
+    assert_eq!(fs::metadata(dir.join("0.part")).await.unwrap().len(), total);
+    assert!(!server
         .requests
         .lock()
         .unwrap()
