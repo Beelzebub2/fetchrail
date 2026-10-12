@@ -63,7 +63,12 @@ try {
     await receive.call({ op: "limit", id, downloadLimit: 1024 * 1024 });
     await receive.call({ op: "resume", id });
     await receive.call({ op: "peer", id, address: "127.0.0.1", port });
-    const sample = await until(async () => (await receive.call({ op: "poll" })).states.find(s => s.id === id && s.downloaded > 1024 * 1024), format + " real peer transfer");
+    let sample;
+    try { sample = await until(async () => (await receive.call({ op: "poll" })).states.find(s => s.id === id && s.downloaded > 1024 * 1024), format + " real peer transfer"); }
+    catch (error) {
+      console.error(JSON.stringify({ format, protocol: config.protocol, receive: await receive.call({ op: "details", id }), seed: await seed.call({ op: "details", id }), states: await receive.call({ op: "poll" }) }));
+      throw error;
+    }
     assert.equal(sample.wanted, 20 * 1024 * 1024);
     await receive.call({ op: "pause", id });
     const stopped = await until(async () => (await receive.call({ op: "poll" })).states.find(s => s.id === id && s.state === "paused"), "pause acknowledgement");
