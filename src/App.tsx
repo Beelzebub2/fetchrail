@@ -65,6 +65,9 @@ type SegmentProgress = {
 };
 
 export type DownloadRecord = {
+  autoRetry?: boolean;
+  nextRetryAt?: string | null;
+  failureCategory?: string;
   expectedSha256?: string | null;
   torrent?: TorrentSummary;
   speedLimitBps: number;
@@ -552,6 +555,7 @@ function App() {
   const [scheduledLocal, setScheduledLocal] = useState("");
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
+  const [recovery, setRecovery] = useState<{ error: string; files: { name: string; backupAvailable: boolean }[] } | null>(null);
   const [update, setUpdate] = useState<UpdateStatus>({ state: "idle" });
   const [version, setVersion] = useState("");
   const [torrentSources, setTorrentSources] = useState<string[]>([]);
@@ -607,7 +611,7 @@ function App() {
             : currentQueues[0]?.name ?? "Default",
         );
       })
-      .catch((error) => setMessage(String(error)));
+      .catch((error) => { setMessage(String(error)); void invoke<typeof recovery>("recovery_status").then(setRecovery).catch(e => setMessage(String(e))); });
 
     const unlisten = listen<DownloadRecord>("fetchrail://download-updated", (event) => {
       setDownloads((current) => {
@@ -627,7 +631,10 @@ function App() {
     );
     const unlistenTorrents = listen<DownloadRecord[]>("fetchrail://torrent-updated", event => {
       const changed = new Map(event.payload.map(item => [item.id, item]));
-      setDownloads(current => current.map(item => changed.get(item.id) ?? item));
+      setDownloads(current => {
+        const known = new Set(current.map(item => item.id));
+        return [...event.payload.filter(item => !known.has(item.id)), ...current.map(item => changed.get(item.id) ?? item)];
+      });
     });
     const unlistenQueues = listen<QueueRecord[]>("fetchrail://queues-updated", (event) => {
       setQueues(event.payload);
@@ -636,6 +643,10 @@ function App() {
           ? current
           : event.payload[0]?.name ?? "Default",
       );
+    });
+    const unlistenProgress = listen<DownloadRecord[]>("fetchrail://downloads-progress", event => {
+      const changed = new Map(event.payload.map(item => [item.id, item]));
+      setDownloads(current => current.map(item => changed.get(item.id) ?? item));
     });
     const unlistenSettings = listen<DownloadSettings>("fetchrail://settings-updated", (event) => setSettings(event.payload));
     const unlistenUpdate = listen<UpdateStatus>("fetchrail://update-status", (event) => setUpdate(event.payload));
@@ -648,6 +659,7 @@ function App() {
       void unlisten.then((stop) => stop());
       void unlistenRemoved.then((stop) => stop());
       void unlistenTorrents.then(stop => stop());
+      void unlistenProgress.then(stop => stop());
       void unlistenQueues.then((stop) => stop());
       void unlistenSettings.then((stop) => stop());
       void unlistenUpdate.then((stop) => stop());
@@ -921,6 +933,8 @@ function App() {
   async function chooseAnalytics(enabled: boolean) {
     setSettings(await invoke<DownloadSettings>("set_analytics_consent", { enabled }));
   }
+
+  if (recovery) return <main className="app-shell" style={{ padding: 32 }}><h1>Recover saved downloads</h1><p role="alert">{recovery.error}</p><p>Your files and broken state were preserved. Restore a validated previous snapshot, or open the private state folder to export the broken files for repair.</p>{recovery.files.map(file => <p key={file.name}>{file.name} <button disabled={!file.backupAvailable} onClick={() => void invoke("restore_state_backup", { name: file.name }).catch(e => setMessage(String(e)))}>Restore last valid state</button></p>)}<button onClick={() => void invoke("open_recovery_files").catch(e => setMessage(String(e)))}>Open preserved files</button><button onClick={() => void invoke("restart_app").catch(e => setMessage(String(e)))}>Retry startup</button>{message && <p role="alert">{message}</p>}</main>;
 
   return (
     <div className="app-shell">
@@ -1518,6 +1532,8 @@ function DownloadRow({
   const [scheduleDraft, setScheduleDraft] = useState("");
   const [editingLimit, setEditingLimit] = useState(false);
   const [limitDraft, setLimitDraft] = useState(0);
+  const [editingSource, setEditingSource] = useState(false);
+  const [sourceDraft, setSourceDraft] = useState("");
   const running = runningStatuses.has(item.status);
   const canPause = ["queued", "scheduled", "connecting", "downloading"].includes(item.status);
   const canResume = ["paused", "failed", "cancelled"].includes(item.status);
@@ -1697,6 +1713,9 @@ function DownloadRow({
             <Ellipsis size={16} />
           </button>
           <div className="menu" popover="auto" id={menuId} style={{ positionAnchor: anchor }}>
+            {["paused", "failed"].includes(item.status) && <button popoverTarget={menuId} popoverTargetAction="hide" onClick={() => { setSourceDraft(""); setEditingSource(true); }}>Update download link…</button>}
+            <button popoverTarget={menuId} popoverTargetAction="hide" onClick={() => void command("set_download_retry", item.id, { enabled: item.autoRetry === false })}>Automatic retry: {item.autoRetry === false ? "off" : "on"}</button>
+            {item.nextRetryAt && <button popoverTarget={menuId} popoverTargetAction="hide" onClick={() => void command("resume_download", item.id)}>Retry now · planned {formatDateTime(item.nextRetryAt)}</button>}
             <button popoverTarget={menuId} popoverTargetAction="hide" onClick={() => { setLimitDraft(item.speedLimitBps / 1024); setEditingLimit(true); }}>
               Speed limit…
             </button>
@@ -1802,6 +1821,7 @@ function DownloadRow({
           <button type="button" className="ghost-button" onClick={() => setEditingLimit(false)}>Cancel</button>
         </div>
       )}
+      {editingSource && <div className="row-schedule" role="group" aria-label={`Update download link for ${item.fileName}`}><label>New HTTP or HTTPS link <input type="url" value={sourceDraft} onChange={e => setSourceDraft(e.target.value)} /></label><span>Your previous partial file stays in recovery storage. Resume after saving to download from the new link from the beginning.</span><button className="secondary-button" disabled={!/^https?:\/\//i.test(sourceDraft)} onClick={async () => { if (await command("replace_download_source", item.id, { source: sourceDraft })) setEditingSource(false); }}>Save link</button><button className="ghost-button" onClick={() => setEditingSource(false)}>Cancel</button></div>}
       <div className="connections" id={panelId} inert={!expanded}>
         <div>
           <div className="connections-body">

@@ -87,6 +87,26 @@ pub struct DownloadRecord {
     pub progress_requested: bool,
 }
 
+impl DownloadRecord {
+    /// UI and ordinary IPC use a display URL. The private engine retains the real source.
+    pub fn public_view(mut self) -> Self {
+        let private_url = self.url.clone();
+        if let Ok(mut url) = url::Url::parse(&self.url) {
+            let _ = url.set_username("");
+            let _ = url.set_password(None);
+            if url.query().is_some() {
+                url.set_query(Some("redacted"));
+            }
+            url.set_fragment(None);
+            self.url = url.into();
+        }
+        self.error = self
+            .error
+            .map(|error| error.replace(&private_url, &self.url));
+        self
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default, rename_all = "camelCase")]
 pub struct CompletionOptions {
