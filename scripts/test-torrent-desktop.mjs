@@ -19,7 +19,7 @@ const root = fixture.root, failures = []; let app, browser, page, seed;
 async function digest(path) { const sha = createHash("sha256"); for await (const chunk of createReadStream(path)) sha.update(chunk); return sha.digest("hex"); }
 async function freePort() { const socket = tcpServer(); await new Promise(done => socket.listen(0, "127.0.0.1", done)); const port = socket.address().port; await new Promise(done => socket.close(done)); return port; }
 let appClosed;
-async function launch() {
+async function launch(recovery = false) {
   const port = await freePort();
   app = spawn(exe, ["--background"], { windowsHide: true, env: { ...fixture.env, WEBVIEW2_USER_DATA_FOLDER: join(root, "webview"), WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS: `--remote-debugging-port=${port}` }, stdio: ["ignore", "ignore", "pipe"] });
   appClosed = new Promise(done => app.once("exit", done));
@@ -29,7 +29,8 @@ async function launch() {
   page = await until(() => browser.contexts()[0]?.pages().find(p => !p.url().includes("download-prompt")), "main WebView");
   page.on("pageerror", e => failures.push(e.message));
   await page.waitForFunction(() => !!window.__TAURI_INTERNALS__);
-  await page.getByRole("textbox", { name: "Link to download", exact: true }).waitFor();
+  if (recovery) await page.getByRole("heading", { name: "Recover saved downloads", exact: true }).waitFor();
+  else await page.getByRole("textbox", { name: "Link to download", exact: true }).waitFor();
 }
 async function invoke(command, args = {}) { return page.evaluate(({ command, args }) => window.__TAURI_INTERNALS__.invoke(command, args), { command, args }); }
 async function quit() {
@@ -42,6 +43,11 @@ async function quit() {
 }
 const block = randomBytes(64 * 1024), httpBytes = 256 * 1024 * 1024;
 const server = createServer(async (request, response) => {
+  if (request.url === "/slow.torrent") {
+    response.writeHead(200); response.flushHeaders();
+    const drip = setInterval(() => response.write("."), 25);
+    response.once("close", () => clearInterval(drip)); return;
+  }
   if (request.url === "/payload.torrent") { const data = await readFile(join(root, "payload.torrent")); response.writeHead(200, { "Content-Length": data.length }); response.end(data); return; }
   let start = 0, end = httpBytes - 1;
   const range = /bytes=(\d+)-(\d*)/.exec(request.headers.range ?? "");
@@ -82,12 +88,20 @@ try {
   settings.autoUpdate = false; settings.maxConcurrentDownloads = 2; settings.speedLimitBps = 2 * 1024 * 1024;
   Object.assign(settings.torrent, localTorrentConfig, { ratioLimit: 0, seedTimeLimit: 0, maxSeeds: 1 });
   settings = await invoke("update_settings", { settings });
+  const importStarted = Date.now();
+  const dripping = await invoke("import_torrent", { request: { source: http + "/slow.torrent" } });
+  assert.ok(Date.now() - importStarted < 2000, "Import ID must exist before a slow body completes");
+  const localPreview = await invoke("import_torrent", { request: { source: torrent } });
+  await until(async () => (await invoke("torrent_import_status", { id: localPreview.id })).metadata, "independent local preview", 10000);
+  await invoke("cancel_torrent_import", { id: dripping.id });
+  await assert.rejects(invoke("torrent_import_status", { id: dripping.id }), /cancelled|expired/);
+  await invoke("cancel_torrent_import", { id: localPreview.id });
   const magnet = `magnet:?xt=urn:btih:${metadata.hashes.find(h => h.length === 40)}&x.pe=127.0.0.1:${peerPort}`;
   await page.getByRole("textbox", { name: "Link to download", exact: true }).fill(magnet);
   await page.getByRole("button", { name: "Download", exact: true }).click();
   await page.getByRole("checkbox", { name: /Download Payload[\\/]skip.bin/ }).waitFor({ timeout: 60000 });
   const imports = join(fixture.stateDir, "torrent-imports");
-  for (const dir of await readdir(imports).catch(e => { if (e.code === "ENOENT") return []; throw e; })) assert.deepEqual(await readdir(join(imports, dir)), [], "No payload before confirmation");
+  for (const dir of await readdir(imports).catch(e => { if (e.code === "ENOENT") return []; throw e; })) assert.deepEqual((await readdir(join(imports, dir))).filter(name => name !== "owner.json"), [], "Only the ownership marker may exist before confirmation");
   await page.getByRole("checkbox", { name: /Download Payload[\\/]skip.bin/ }).uncheck();
   await page.getByRole("checkbox", { name: "Add paused", exact: true }).check();
   const destination = join(root, "receiver");
@@ -95,7 +109,13 @@ try {
   await page.getByRole("button", { name: "Add torrent", exact: true }).click();
   const job = await until(async () => (await invoke("list_downloads")).find(r => r.torrent), "committed torrent");
   assert.equal(job.status, "paused"); assert.equal(job.totalBytes, 128 * 1024 * 1024);
-  await assert.rejects(invoke("import_torrent", { request: { source: torrent } }), /already/);
+  // Metadata work returns its cancellable ID before validation completes.
+  const duplicate = await invoke("import_torrent", { request: { source: torrent } });
+  await until(async () => { try { await invoke("torrent_import_status", { id: duplicate.id }); return false; } catch (error) { assert.match(String(error), /already/); return true; } }, "duplicate validation");
+  await invoke("cancel_torrent_import", { id: duplicate.id });
+  // A stale dialog cancellation after commit must leave committed metadata intact.
+  await invoke("cancel_torrent_import", { id: job.id });
+  await access(join(fixture.stateDir, "torrents", job.id + ".torrent"));
   await assert.rejects(invoke("add_download", { request: { url: http + "/collision.bin", fileName: "wanted.bin", directory: join(destination, "Payload"), startPaused: true } }), /torrent owns/);
   await assert.rejects(invoke("add_download", { request: { url: http + "/collision.bin", directory: join(destination, "Payload", "wanted.bin"), startPaused: true } }), /torrent owns/);
   await assert.rejects(access(join(destination, "Payload", "wanted.bin")), "Rejected HTTP directory cannot occupy a torrent's future file");
@@ -156,15 +176,37 @@ try {
   }
   await invoke("remove_download", { id: job.id, deleteFile: true });
   await assert.rejects(access(join(moved, "Payload", "wanted.bin"))); assert.equal(await readFile(join(moved, "unrelated.txt"), "utf8"), "preserve me");
-  const remote = await invoke("import_torrent", { request: { source: http + "/payload.torrent" } }); assert.equal(remote.metadata.name, metadata.name);
+  const replacement = await invoke("replace_download_source", { id: transfer.id, source: http + "/replacement.bin?signature=synthetic-secret-token" });
+  assert.equal(replacement.status, "paused"); assert.equal(replacement.downloadedBytes, 0);
+  assert.ok(!replacement.url.includes("synthetic-secret-token"));
+  assert.ok((await readdir(join(fixture.stateDir, "parts"))).some(name => name.startsWith(transfer.id + ".previous-source-")), "Changing source preserves the old attempt instead of trusting the reused ETag");
+  const remote = await invoke("import_torrent", { request: { source: http + "/payload.torrent" } });
+  const remoteReady = await until(async () => (await invoke("torrent_import_status", { id: remote.id })).metadata, "remote metadata preview");
+  assert.equal(remoteReady.name, metadata.name);
   const conflict = join(root, "http-ancestor");
   const owner = await invoke("add_download", { request: { url: http + "/collision.bin", fileName: "Payload", directory: conflict, startPaused: true } });
-  await assert.rejects(invoke("commit_torrent", { request: { id: remote.id, directory: conflict, priorities: Array(remote.metadata.fileCount).fill(4), queue: "Default", startPaused: true } }), /HTTP transfer owns/);
+  await assert.rejects(invoke("commit_torrent", { request: { id: remote.id, directory: conflict, priorities: Array(remoteReady.fileCount).fill(4), queue: "Default", startPaused: true } }), /HTTP transfer owns/);
   await assert.rejects(access(join(conflict, "Payload")), "Rejected torrent cannot create a directory over an HTTP file claim");
   await invoke("remove_download", { id: owner.id, deleteFile: false });
-  await invoke("cancel_torrent_import", { id: remote.id });
+  const broken = await invoke("commit_torrent", { request: { id: remote.id, directory: join(root, "broken-restore"), priorities: Array(remoteReady.fileCount).fill(4), queue: "Default", startPaused: true } });
+  const foreignPayload = join(broken.destination, "unrelated.txt"); await writeFile(foreignPayload, "preserve failed-restore payload");
+  await quit();
+  await writeFile(join(fixture.stateDir, "torrents", broken.id + ".resume"), "invalid resume");
+  await writeFile(join(fixture.stateDir, "torrents", broken.id + ".torrent"), "invalid metadata");
+  await launch();
+  assert.equal((await invoke("list_downloads")).find(item => item.id === broken.id).status, "failed");
+  await assert.rejects(invoke("remove_download", { id: broken.id, deleteFile: true }), /not loaded|metadata|paths/);
+  await invoke("remove_download", { id: broken.id, deleteFile: false });
+  assert.equal(await readFile(foreignPayload, "utf8"), "preserve failed-restore payload");
+  assert.ok(!(await invoke("list_downloads")).some(item => item.id === broken.id));
+  await quit();
+  await writeFile(join(fixture.stateDir, "settings.json"), "{");
+  await launch(true);
+  const recovery = await invoke("recovery_status");
+  assert.ok(recovery.files.find(file => file.name === "settings.json").backupAvailable);
+  assert.equal(await readFile(join(fixture.stateDir, "settings.json"), "utf8"), "{");
   await quit(); assert.deepEqual(failures, []);
-  report.tests.push("real WebView2 magnet confirmation", "metadata-only import", "file selection", "duplicate rejection", "HTTP path ownership", "mixed 60-second bandwidth cap", "pause", "graceful shutdown + fast resume", "sequential recovery", "SHA-256 integrity", "seeding goal", "storage move", "safe payload deletion", "remote .torrent + cancel");
+  report.tests.push("real WebView2 magnet confirmation", "cancellable slow-drip metadata with independent local preview", "cancel-after-commit preserves metadata", "metadata-only import", "file selection", "duplicate rejection", "HTTP path ownership", "mixed 60-second bandwidth cap", "pause", "graceful shutdown + fast resume", "sequential recovery", "SHA-256 integrity", "seeding goal", "storage move", "safe payload deletion", "source replacement preserves old bytes and redacts signed query", "remote .torrent preview", "failed restore removable without deleting unrelated payload", "corrupt state starts recovery UI with validated backup");
   await mkdir("artifacts", { recursive: true }); await writeFile("artifacts/torrent-desktop.json", JSON.stringify(report, null, 2));
   console.log("PASS packaged torrent integration: " + report.tests.join(", ")); console.log(JSON.stringify(report.mixedLimit));
 } catch (error) {

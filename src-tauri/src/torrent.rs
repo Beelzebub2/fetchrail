@@ -6,6 +6,7 @@ use std::{
     ffi::{c_char, c_void, CStr, CString},
     path::Path,
     sync::mpsc,
+    time::{Duration, Instant},
 };
 use tokio::sync::oneshot;
 
@@ -40,9 +41,10 @@ impl Drop for Native {
     }
 }
 
-type Request = (Value, oneshot::Sender<Result<Value, String>>);
+type Request = (Value, Instant, oneshot::Sender<Result<Value, String>>);
 pub struct TorrentEngine {
     sender: mpsc::SyncSender<Request>,
+    pub recovered_unclean: bool,
 }
 impl TorrentEngine {
     pub fn new(root: &Path) -> Result<Self, String> {
@@ -52,28 +54,55 @@ impl TorrentEngine {
             .ok_or("Torrent state requires a UTF-8 path; choose a UTF-8 home/data directory.")?
             .to_owned();
         let (sender, receiver) = mpsc::sync_channel::<Request>(128);
+        let (ready, initialized) = mpsc::sync_channel(1);
         std::thread::Builder::new()
             .name("torrent-control".into())
             .spawn(move || {
                 let native = Native(unsafe { fr_torrent_new() });
                 if native.0.is_null() {
+                    let _ =
+                        ready.send(Err("Could not initialize native torrent engine".to_string()));
                     return;
                 }
-                let _ = native.call(json!({"op":"init", "root":root}));
-                while let Ok((request, reply)) = receiver.recv() {
+                let result = native
+                    .call(json!({"op":"init", "root":root}))
+                    .map(|value| value["unclean"].as_bool().unwrap_or(true));
+                let failed = result.is_err();
+                let _ = ready.send(result);
+                if failed {
+                    return;
+                }
+                while let Ok((request, deadline, reply)) = receiver.recv() {
+                    // Dropped/expired queued mutations must never run after the caller timed out.
+                    if reply.is_closed() || Instant::now() >= deadline {
+                        continue;
+                    }
                     let _ = reply.send(native.call(request));
                 }
             })
             .map_err(|e| e.to_string())?;
-        Ok(Self { sender })
+        let recovered_unclean = initialized
+            .recv_timeout(Duration::from_secs(10))
+            .map_err(|_| "Torrent initialization timed out".to_string())??;
+        Ok(Self {
+            sender,
+            recovered_unclean,
+        })
     }
     pub async fn call(&self, request: Value) -> Result<Value, String> {
         let (reply, result) = oneshot::channel();
+        let timeout = if request["op"] == "poll" || request["op"] == "details" {
+            Duration::from_secs(3)
+        } else if request["op"] == "checkpoint" {
+            Duration::from_secs(35)
+        } else {
+            Duration::from_secs(20)
+        };
         self.sender
-            .try_send((request, reply))
+            .try_send((request, Instant::now() + timeout, reply))
             .map_err(|e| format!("Torrent control queue unavailable: {e}"))?;
-        result
-            .await
+        tokio::time::timeout(timeout, result)
+            .await.map_err(|_| "Torrent command timed out; its in-flight outcome is uncertain. Refresh before retrying a storage mutation.".to_string())?
             .map_err(|_| "Torrent worker stopped".to_string())?
     }
 }
@@ -179,4 +208,105 @@ pub struct TorrentCommitRequest {
     #[serde(default)]
     pub verify_existing: bool,
     pub scheduled_for: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+#[cfg(test)]
+mod audit_tests {
+    use super::*;
+    #[tokio::test]
+    async fn startup_handshake_surfaces_native_init_failure_and_absent_removal_is_safe() {
+        let root =
+            std::env::temp_dir().join(format!("fetchrail-native-init-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(root.join("unclean")).unwrap();
+        assert!(TorrentEngine::new(&root).is_err());
+        std::fs::remove_dir(root.join("unclean")).unwrap();
+        let engine = TorrentEngine::new(&root).unwrap();
+        engine
+            .call(json!({"op":"remove", "id":uuid::Uuid::new_v4()}))
+            .await
+            .unwrap();
+        engine
+            .call(json!({"op":"checkpoint", "wait":true}))
+            .await
+            .unwrap();
+        engine.call(json!({"op":"clean"})).await.unwrap();
+        drop(engine);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn native_checkpoint_failure_preserves_old_resume_then_explicit_retry_succeeds() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let root = std::env::temp_dir().join(format!(
+            "fetchrail-native-checkpoint-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let payload = root.join("payload.bin");
+        std::fs::write(&payload, vec![0x5a; 32768]).unwrap();
+        let metadata = root.join("fixture.torrent");
+        let engine = TorrentEngine::new(&root.join("state")).unwrap();
+        engine.call(json!({"op":"create", "path":payload, "output":metadata, "format":"v1", "pieceLength":16384})).await.unwrap();
+        let id = uuid::Uuid::new_v4();
+        engine
+            .call(
+                json!({"op":"add", "id":id, "source":metadata, "destination":root,
+            "config":{"dht":false,"lsd":false,"upnp":false,"listenInterfaces":"127.0.0.1:0"}}),
+            )
+            .await
+            .unwrap();
+        engine
+            .call(json!({"op":"checkpoint", "wait":true}))
+            .await
+            .unwrap();
+        let resume = root.join("state").join(format!("{id}.resume"));
+        let previous = std::fs::read(&resume).unwrap();
+        // Deny replacement of the known-good resume while the real native save runs.
+        let locked = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&resume)
+            .unwrap();
+        let error = engine
+            .call(json!({"op":"checkpoint", "wait":true}))
+            .await
+            .unwrap_err();
+        assert!(error.contains("checkpoint"), "{error}");
+        drop(locked);
+        assert_eq!(std::fs::read(&resume).unwrap(), previous);
+        engine
+            .call(json!({"op":"checkpoint", "wait":true}))
+            .await
+            .unwrap();
+        engine
+            .call(json!({"op":"tracker", "id":id, "url":"http://127.0.0.1:1/announce"}))
+            .await
+            .unwrap();
+        engine
+            .call(json!({"op":"checkpoint", "wait":true}))
+            .await
+            .unwrap();
+        let tracker = b"http://127.0.0.1:1/announce";
+        assert!(std::fs::read(&resume)
+            .unwrap()
+            .windows(tracker.len())
+            .any(|w| w == tracker));
+        std::fs::remove_file(&resume).unwrap();
+        engine.call(json!({"op":"checkpoint"})).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while !resume.exists() {
+                engine.call(json!({"op":"poll"})).await.unwrap();
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect(
+            "A missing known-good checkpoint must be recreated, never accepted as not-modified",
+        );
+        engine.call(json!({"op":"remove", "id":id})).await.unwrap();
+        engine.call(json!({"op":"clean"})).await.unwrap();
+        drop(engine);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }

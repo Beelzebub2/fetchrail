@@ -55,7 +55,7 @@ The report explicitly states these limits instead of inventing a hardware score.
 - Public measurements use Cloudflare's documented `__down`/`__up` endpoints.
   Fast connections may need more sustained data than that service permits. Users
   can explicitly supply a permitted direct file URL instead. A one-byte probe must
-  return 206, a known total and a strong ETag/Last-Modified validator, using the
+  return 206, a known total and a strong ETag validator, using the
   engine's existing parsers. Every range must match its offsets, total, validator
   and body length; changed content, ignored ranges, encoding and HTML are rejected.
   Signed queries remain intact; redirects and browser credentials are not used.

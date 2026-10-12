@@ -40,6 +40,7 @@ export function DownloadProgress({ id }: { id: string }) {
         if (record.id === id) setItem(record);
       });
       await subscribe<DownloadRecord[]>("fetchrail://torrent-updated", records => { const record = records.find(record => record.id === id); if (record) setItem(record); });
+      await subscribe<DownloadRecord[]>("fetchrail://downloads-progress", records => { const record = records.find(record => record.id === id); if (record) setItem(record); });
       await subscribe<string>("fetchrail://download-removed", (removed) => {
         if (removed === id) void getCurrentWindow().destroy();
       });
