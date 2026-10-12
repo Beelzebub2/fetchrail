@@ -29,6 +29,7 @@ jobs:
       actions: read
     outputs:
       chromium: ${{ steps.check.outputs.chromium }}
+      opera: ${{ steps.check.outputs.opera }}
       firefox: ${{ steps.check.outputs.firefox }}
       firefox_policy: ${{ steps.check.outputs.firefox_policy }}
     steps:
@@ -43,6 +44,7 @@ jobs:
         id: check
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          OPERA_INITIAL_SUBMISSION_REF: ${{ vars.OPERA_INITIAL_SUBMISSION_REF }}
         run: node scripts/extension-release-changes.mjs "$GITHUB_REF_NAME"
 
   windows:
@@ -566,3 +568,62 @@ jobs:
     with:
       policy_only: ${{ needs.extension-changes.outputs.firefox != 'true' }}
     secrets: inherit
+
+  opera-add-ons:
+    name: Opera Add-ons
+    needs: [publish, extension-changes]
+    if: github.ref_type == 'tag' && needs.extension-changes.outputs.opera == 'true'
+    concurrency:
+      group: opera-add-ons-publish
+      cancel-in-progress: false
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '24'
+          cache: npm
+      - name: Check release and build extension
+        run: |
+          node scripts/check-release.mjs "$GITHUB_REF_NAME"
+          npm ci
+          npm run browser:build
+          npm run browser:check
+          npm run cws:test
+      - name: Prepare Opera production extension package
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          node scripts/prepare-chrome-web-store.mjs "$GITHUB_REF_NAME"
+          mkdir -p release-artifacts
+          (cd "release-artifacts/chrome-web-store-$version" && zip -qr "../opera-addons-$version.zip" .)
+          unzip -p "release-artifacts/opera-addons-$version.zip" manifest.json | node -e '
+            let data = "";
+            process.stdin.on("data", chunk => data += chunk);
+            process.stdin.on("end", () => {
+              const manifest = JSON.parse(data);
+              if (manifest.version !== process.argv[1] || manifest.manifest_version !== 3 || manifest.key || manifest.update_url) {
+                throw new Error("Invalid Opera production manifest");
+              }
+            });
+          ' "$version"
+      - name: Verify Opera publisher configuration
+        env:
+          OPERA_SESSION_ID: ${{ secrets.OPERA_SESSION_ID }}
+          OPERA_PACKAGE_ID: ${{ vars.OPERA_PACKAGE_ID }}
+        run: |
+          if [ -z "$OPERA_SESSION_ID" ] || [ -z "$OPERA_PACKAGE_ID" ]; then
+            echo "Opera publisher configuration is missing. Set repository variable OPERA_PACKAGE_ID and secret OPERA_SESSION_ID." >&2
+            exit 1
+          fi
+      - name: Submit Opera Add-ons update
+        env:
+          OPERA_SESSION_ID: ${{ secrets.OPERA_SESSION_ID }}
+          OPERA_PACKAGE_ID: ${{ vars.OPERA_PACKAGE_ID }}
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          ./node_modules/.bin/publish-extension --opera-zip "release-artifacts/opera-addons-$version.zip"

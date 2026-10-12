@@ -2,6 +2,7 @@ import { execFileSync, spawnSync } from "node:child_process";
 
 const submissionSteps = {
   chromium: "Submit extension update",
+  opera: "Submit Opera Add-ons update",
   firefox: "Submit listed Firefox release to Mozilla",
   firefox_policy: "Publish and verify Firefox privacy policy",
 };
@@ -16,7 +17,7 @@ function isAncestor(revision, head) {
 }
 
 export function successfulSubmissions(head, runs) {
-  const bases = { chromium: null, firefox: null, firefox_policy: null };
+  const bases = { chromium: null, opera: null, firefox: null, firefox_policy: null };
   const ordered = [...runs].sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt)));
   for (const run of ordered) {
     if (run.status !== "completed" || !run.headSha || !isAncestor(run.headSha, head)) continue;
