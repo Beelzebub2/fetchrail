@@ -435,6 +435,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
+          fetch-depth: 0
           persist-credentials: false
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
         with:
@@ -470,12 +471,12 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           $tag = $env:GITHUB_REF_NAME
-          gh release view $tag --repo "$env:GITHUB_REPOSITORY" *> $null
-          if ($LASTEXITCODE -eq 0) { throw 'Refusing to overwrite an existing immutable release. Use a new version tag.' }
+          node scripts/release-notes.mjs $tag release-artifacts/release-notes.md
+          if ($LASTEXITCODE -ne 0) { throw 'Release note generation failed; no draft was created.' }
           $inventory = Get-Content -LiteralPath release-artifacts/release-inventory.json -Raw | ConvertFrom-Json
           $assetNames = @($inventory.files.name) + @('release-metadata.tar.gz', 'SHA256SUMS')
           $assets = $assetNames | ForEach-Object { (Get-Item -LiteralPath (Join-Path release-artifacts $_)).FullName }
-          gh release create $tag @assets --draft --verify-tag --title "Fetchrail $tag" --generate-notes --repo "$env:GITHUB_REPOSITORY"
+          gh release create $tag @assets --draft --verify-tag --title "Fetchrail $tag" --notes-file release-artifacts/release-notes.md --repo "$env:GITHUB_REPOSITORY"
           if ($LASTEXITCODE -ne 0) { throw 'Draft release creation failed.' }
           gh release upload $tag release-artifacts/latest.json --repo "$env:GITHUB_REPOSITORY"
           if ($LASTEXITCODE -ne 0) { throw 'Latest manifest publication failed; release remains a draft.' }
