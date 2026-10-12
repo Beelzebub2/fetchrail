@@ -17,7 +17,7 @@ If you already loaded the unpacked companion, disable or remove it before enabli
 
 For Linux browser packages, custom profiles and sandbox limits, see the [Linux companion guide](../docs/linux.md#browser-companion).
 
-Dedicated Microsoft Edge Add-ons and Opera Add-ons listings are being prepared. Until they are submitted and approved, neither store has an official Fetchrail listing. The production Chromium package can be used for either store, but the new listing's assigned extension ID must be approved by the installed Fetchrail native host before the companion can communicate with the app. See the [Edge and Opera submission guide](../docs/edge-opera-addons.md). Opera GX can also use Chrome Web Store extensions according to [Opera's guidance](https://help.opera.com/en/latest/customization/); test native messaging before relying on automatic routing.
+The Opera Add-ons v0.7.1 listing was submitted on 12 October 2026 and is awaiting review. Until it is published, Opera GX users can install the Chrome Web Store build according to [Opera's guidance](https://help.opera.com/en/latest/customization/). The [Opera submission guide](../docs/edge-opera-addons.md) covers store updates and native-host setup after approval.
 
 ### Manual installation: Chrome, Edge, Chromium, Vivaldi, and Brave
 

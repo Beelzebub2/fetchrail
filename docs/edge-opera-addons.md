@@ -1,6 +1,6 @@
 # Publishing Fetchrail for Edge and Opera GX
 
-The Chromium Manifest V3 companion is shared by Chrome, Microsoft Edge and Opera (including Opera GX). Edge and Opera each require their own developer account and first-time listing. **As of 12 October 2026 neither standalone Edge nor Opera listing has been submitted.** Don't mark a store as approved until its listing is accessible to the public.
+The Chromium Manifest V3 companion is shared by Chrome, Microsoft Edge and Opera (including Opera GX). Opera Add-ons **v0.7.1 was submitted for moderation on 12 October 2026**, and is not public yet. The Edge store listing has not been submitted. Only mark a store as approved after its public listing is accessible.
 
 ## Build the production ZIP
 
@@ -67,7 +67,20 @@ The [Microsoft Edge Add-ons badge](https://learn.microsoft.com/en-us/microsoft-e
 1. Sign in with an Opera account at [Upload Extensions](https://addons.opera.com/developer/upload/) and upload the production ZIP.
 2. Complete the package/version form, **Productivity** category, summary, description, relevant current screenshots and license information. Review the [publishing guidelines](https://help.opera.com/en/extensions/publishing-guidelines/) and [acceptance criteria](https://help.opera.com/en/extensions/acceptance-criteria/). Opera's terms may apply a default CC BY-NC-ND 4.0 license if no separate EULA is provided; the publisher must choose the intended distribution terms before submitting.
 3. Submit the extension from the developer dashboard, then check the **Submitted extensions** page for moderation and feedback. The upload and moderation are separate steps; there is no documented official API for first-time Opera publication.
-4. After a public listing exists, copy its published extension ID and public URL. Replace the preparation badge with a link to the verified listing.
+4. Fetchrail v0.7.1 completed these steps on 12 October 2026. The [Opera developer listing](https://addons.opera.com/developer/package/30745/) is awaiting moderation. Once approved, confirm the extension ID and public URL and replace the review badge.
+
+## Automatic Opera update submissions
+
+The tagged [Release workflow](../.github/workflows/release.yml) builds a production Opera ZIP and submits it to moderation automatically **when the extension contents have changed** since the last successful Opera submission. Opera tracks its own successful submissions, so a Chrome Web Store success cannot suppress a failed Opera update. Release version checks and desktop release publication must pass first.
+
+The workflow uses the maintained [publish-browser-extension](https://github.com/aklinker1/publish-browser-extension) CLI, which accesses Opera's authenticated developer API. Opera does not publish an officially supported developer publishing API, so the automation may need maintenance as their site changes.
+
+- GitHub variable `OPERA_PACKAGE_ID`: **30745** (already configured).
+- GitHub variable `OPERA_INITIAL_SUBMISSION_REF`: **v0.7.1** records the initial manual Opera submission and prevents an unnecessary update when only the app version changes.
+- GitHub Actions secret `OPERA_SESSION_ID`: the private `sessionid` cookie of the signed-in account on `addons.opera.com`. Add it directly in [GitHub Actions secrets](https://github.com/Beelzebub2/fetchrail/settings/secrets/actions), never to repository files or logs.
+- If the cookie expires, sign in again and replace the secret. A failing authentication check must fail the job visibly; no unauthenticated publication is attempted.
+
+The workflow accepts a successful *submission to Opera for review*. Opera moderators decide when a submitted version becomes public. Until the first review is complete, avoid publishing another version unnecessarily.
 
 Opera GX can also use [Chrome Web Store extensions](https://help.opera.com/en/latest/customization/) without a separate Opera listing. However, verify that native messaging actually connects in Opera GX; browser-side installation by itself does not guarantee integration.
 

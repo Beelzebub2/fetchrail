@@ -30,7 +30,7 @@
 <p align="center">
   <a href="https://chromewebstore.google.com/detail/ccmbmcgihlemlheldpkgnidgohlkaipb"><img src="https://img.shields.io/chrome-web-store/v/ccmbmcgihlemlheldpkgnidgohlkaipb?label=Chrome%20public&amp;style=flat-square&amp;color=238636" alt="Chrome Web Store: public version"></a>
   <a href="https://github.com/Beelzebub2/fetchrail/actions/runs/38172309596"><img src="https://img.shields.io/badge/Firefox-v0.7.1%20in%20review-d29922?style=flat-square" alt="Firefox v0.7.1 awaiting approval"></a>
-  <a href="browser-extension/README.md"><img src="https://img.shields.io/badge/Opera%20GX-v0.7.1%20not%20submitted-64748b?style=flat-square" alt="Opera GX v0.7.1 not submitted"></a>
+  <a href="browser-extension/README.md"><img src="https://img.shields.io/badge/Opera%20GX-v0.7.1%20in%20review-d29922?style=flat-square" alt="Opera GX v0.7.1 awaiting Opera review"></a>
 </p>
 
 > Most downloads travel down a single connection. Fetchrail opens up to thirty-two, and lets you watch every one.
