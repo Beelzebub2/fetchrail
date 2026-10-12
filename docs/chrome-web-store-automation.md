@@ -1,6 +1,8 @@
 # Chrome Web Store release automation
 
-Tagged releases compare the extension payload against the most recent earlier **published** reachable release tag. Failed or unpublished tags cannot suppress store updates that users never received. **The `chrome-web-store` job runs only when Chromium extension code, assets, production packaging, relevant fonts, or manifest settings have changed.** App-only releases skip the store job entirely, including Google authentication and submission. The first published release is always eligible. Application version bumps also update the extension manifests, but a version-number-only change does not count as an extension update.
+Tagged releases compare the extension against the **last successful Chrome Web Store submission recorded in GitHub Actions**, including submissions from a release whose other jobs later failed. **The `chrome-web-store` job runs only when Chromium extension code, assets, production packaging, relevant fonts, or manifest settings have changed since that submission.** App-only releases skip Google authentication and submission. Version-number-only manifest bumps do not count as extension changes. When no successful submission is on record, the job attempts the first publication.
+
+The change detector checks completed GitHub Actions jobs, so an unsuccessful extension submission never counts as published. The desktop release also waits for this check to complete successfully before publication.
 
 When a Chromium update is needed, the job runs after the complete desktop release succeeds. It rebuilds the extension, removes the unpacked development key and update URL, creates a production ZIP, obtains a short-lived Google access token through GitHub OIDC, and uses Chrome Web Store API v2 to upload and submit it with `DEFAULT_PUBLISH`. Publishing still refuses an active store review or a version that is not newer than the published extension.
 

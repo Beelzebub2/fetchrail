@@ -4,7 +4,8 @@ import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "nod
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { compareExtensionChanges, previousReleaseTag, releaseExtensionChanges } from "./extension-release-changes.mjs";
+import { compareExtensionChanges, releaseExtensionChanges } from "./extension-release-changes.mjs";
+import { successfulSubmissions } from "./store-submission-history.mjs";
 
 const directory = mkdtempSync(join(tmpdir(), "fetchrail-extension-release-test-"));
 const initialDirectory = process.cwd();
@@ -62,9 +63,8 @@ try {
   git("commit", "-qm", "Initial release");
   git("tag", "v1.0.0");
 
-  assert.equal(previousReleaseTag("v1.0.0"), null);
-  assert.deepEqual(releaseExtensionChanges("v1.0.0").changes, { chromium: true, firefox: true, firefox_policy: true });
-  assert.throws(() => previousReleaseTag("invalid"), /Invalid release tag/);
+  assert.deepEqual(releaseExtensionChanges("v1.0.0", []).changes, { chromium: true, firefox: true, firefox_policy: true });
+  assert.throws(() => releaseExtensionChanges("invalid", []), /Invalid release tag/);
 
   scenario("App version only", () => {
     for (const browser of ["chromium", "firefox"]) updateJson(`browser-extension/manifests/${browser}.json`, (data) => { data.version = "1.0.1"; });
@@ -83,17 +83,42 @@ try {
 
   scenario("Tagged release", () => write("browser-extension/src/background.js", "console.log('new release');\n"), { ...none, chromium: true, firefox: true });
   git("tag", "v1.0.1");
-  assert.equal(previousReleaseTag("v1.0.1"), "v1.0.0");
-  // A failed, unpublished tag must not become the baseline for the next
-  // release and suppress browser updates that users never received.
+  const oldSha = git("rev-parse", "v1.0.0").trim();
+  const currentSha = git("rev-parse", "v1.0.1").trim();
+  const step = (name, conclusion) => ({ name, conclusion });
+  const run = (headSha, createdAt, steps) => ({ headSha, createdAt, status: "completed", jobs: [{ name: "release", steps }] });
+  const chromeStep = "Submit extension update";
+  const firefoxStep = "Submit listed Firefox release to Mozilla";
+  const policyStep = "Publish and verify Firefox privacy policy";
+  const oldSuccess = run(oldSha, "2026-10-01T00:00:00Z", [step(chromeStep, "success"), step(firefoxStep, "success"), step(policyStep, "success")]);
+  const failedRelease = run(currentSha, "2026-10-02T00:00:00Z", [step(chromeStep, "failure"), step(firefoxStep, "failure")]);
+  const manualPolicy = run(currentSha, "2026-10-03T00:00:00Z", [step(firefoxStep, "skipped"), step(policyStep, "success")]);
+
+  assert.deepEqual(successfulSubmissions("v1.0.1", [oldSuccess, failedRelease, manualPolicy]), {
+    chromium: oldSha, firefox: oldSha, firefox_policy: currentSha,
+  });
+  assert.deepEqual(releaseExtensionChanges("v1.0.1", [oldSuccess, failedRelease, manualPolicy]).changes, {
+    chromium: true, firefox: true, firefox_policy: false,
+  }, "failed submissions cannot suppress future extension updates");
+
+  const acceptedChrome = run(currentSha, "2026-10-04T00:00:00Z", [step(chromeStep, "success")]);
+  assert.deepEqual(releaseExtensionChanges("v1.0.1", [oldSuccess, failedRelease, acceptedChrome]).changes, {
+    chromium: false, firefox: true, firefox_policy: false,
+  }, "Chrome and Firefox must track their last submissions independently");
+  assert.deepEqual(releaseExtensionChanges("v1.0.1", [acceptedChrome]).changes, {
+    chromium: false, firefox: true, firefox_policy: true,
+  }, "first-time Firefox submission must still run");
+
+  // A later app-only version must compare with the successful submission,
+  // even if the intervening desktop release failed its store job.
   git("tag", "v1.0.2");
-  assert.equal(previousReleaseTag("v1.0.2"), "v1.0.1");
-  assert.equal(previousReleaseTag("v1.0.2", new Set(["v1.0.0"])), "v1.0.0");
-  assert.equal(previousReleaseTag("v1.0.2", new Set()), null);
+  assert.equal(releaseExtensionChanges("v1.0.2", [oldSuccess, failedRelease]).changes.chromium, true);
   const output = join(directory, "github-output.txt");
-  execFileSync(process.execPath, [script, "v1.0.1"], { cwd: directory, env: { ...process.env, GITHUB_OUTPUT: output } });
+  const history = join(directory, "history.json");
+  writeFileSync(history, JSON.stringify([oldSuccess, failedRelease, manualPolicy]));
+  execFileSync(process.execPath, [script, "v1.0.1", history], { cwd: directory, env: { ...process.env, GITHUB_OUTPUT: output } });
   assert.equal(readFileSync(output, "utf8"), "chromium=true\nfirefox=true\nfirefox_policy=false\n");
-  console.log("PASS: unchanged app releases skip store submission; browser-specific, shared, font, policy and first-release changes are detected.");
+  console.log("PASS: store submissions are gated on real extension changes, failed releases, browser-specific history and policy-only updates.");
 } finally {
   process.chdir(initialDirectory);
   rmSync(directory, { recursive: true, force: true });
