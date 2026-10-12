@@ -7,11 +7,23 @@ network payload budget and temporary disk space. Applying a usable report enable
 automatic tuning; the switch also permits learning without running an online test.
 Existing installations and explicit per-download connection choices stay manual.
 
-The teammate's **Diagnostics** page remains the broader CPU compression/decompression,
-memory-copy/allocation and local diagnostic report. **Performance** measures a sustained
-download workload and applies tuning. These runs cannot overlap, queued transfers wait,
+The **Performance** page combines **Optimize downloads** and **Hardware diagnostics**.
+Hardware diagnostics retains the broader CPU compression/decompression,
+memory-copy/allocation tests, provisional grades and diagnostic report. Optimize
+downloads measures a sustained download workload and applies tuning. Diagnostic
+grades and brief capacity samples do not train download tuning. These runs cannot overlap, queued transfers wait,
 and update checks defer during either test. Diagnostics' separate, explicit per-run
 coarse sharing does not include this calibration report or its measurements.
+
+| View | Keep it for | How it affects downloads |
+| --- | --- | --- |
+| Hardware diagnostics | Compression/decompression, memory copy/allocation, small local drive tests, optional bounded connection samples and provisional grades. | Informational. It never applies download settings or trains tuning. |
+| Optimize downloads | Repeated sustained request counts, both relevant volumes, buffer comparisons, loaded latency and the complete receive/write/hash/finalization path. | A usable report can enable tuning within the user's ceilings; qualifying completed downloads refine it. |
+
+Both measure hashing, drives and connections for different workloads. Their
+measurements remain separately labelled: short diagnostic bursts and grade bands
+cannot substitute for repeated sustained evidence. The selected view survives
+navigation away and back; a running test keeps its cancellation controls visible.
 
 ## Measurement inventory
 

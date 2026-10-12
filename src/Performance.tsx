@@ -2,7 +2,10 @@ import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { Activity, Check, Copy, Play, RotateCw, X } from "lucide-react";
 import type { DownloadSettings } from "./App";
+import { Diagnostics } from "./Diagnostics";
 import "./Performance.css";
+
+export type PerformanceView = "calibration" | "diagnostics";
 
 type Options = { downloadUrl?: string; deep: boolean; online: boolean; upload: boolean; networkBudgetMib: number; diskBudgetMib: number };
 type Adapter = { kind: string; receiveLinkBps: number; transmitLinkBps: number; mtu: number };
@@ -61,12 +64,14 @@ function Trace({ values, label, unit }: { values: number[]; label: string; unit:
   return <figure className="performance-trace"><figcaption>{label}<span className="mono">min {Math.min(...valid).toFixed(1)} · median {quantile(valid)?.toFixed(1)} · max {Math.max(...valid).toFixed(1)} {unit}</span></figcaption><svg viewBox="0 0 600 100" role="img" aria-label={`${label}, ${valid.length} samples; see minimum, median and maximum above`} preserveAspectRatio="none"><path d="M0 90H600" className="trace-base" /><polyline points={points} /></svg></figure>;
 }
 
-export function PerformancePage({ settings, draft, onChange }: { settings: DownloadSettings; draft: DownloadSettings; onChange: (change: Partial<DownloadSettings>) => void }) {
+export function PerformancePage({ settings, draft, onChange, view, onViewChange }: { settings: DownloadSettings; draft: DownloadSettings; onChange: (change: Partial<DownloadSettings>) => void; view: PerformanceView; onViewChange: (view: PerformanceView) => void }) {
   const { status, setStatus, error, setError } = useStatus();
   const [options, setOptions] = useState<Options>({ deep: false, online: true, upload: false, networkBudgetMib: 1024, diskBudgetMib: 256 });
   const [busy, setBusy] = useState(false);
   const [note, setNote] = useState<string | null>(null);
   const [confirmReset, setConfirmReset] = useState(false);
+  const [diagnosticsActive, setDiagnosticsActive] = useState(false);
+  useEffect(() => { if (status?.running) onViewChange("calibration"); }, [status?.running, onViewChange]);
   const running = status?.running || busy;
   const report = status?.latest;
   const folderChanged = settings.defaultDownloadDir !== draft.defaultDownloadDir;
@@ -82,6 +87,14 @@ export function PerformancePage({ settings, draft, onChange }: { settings: Downl
   const peakMemory = quantile(report?.resources.flatMap(s => s.processMemoryBytes == null ? [] : [s.processMemoryBytes]) ?? [], 1);
   return <section aria-labelledby="performance-title">
     <div className="page-head rise"><div><h1 id="performance-title">Performance</h1><p>Measure this computer, then let Fetchrail learn from real downloads.</p></div></div>
+    <div className="performance-view-switch">
+      <div className="segmented" role="group" aria-label="Performance tools">
+        <button type="button" aria-pressed={view === "calibration"} disabled={diagnosticsActive} onClick={() => onViewChange("calibration")}>Optimize downloads</button>
+        <button type="button" aria-pressed={view === "diagnostics"} disabled={running} onClick={() => onViewChange("diagnostics")}>Hardware diagnostics</button>
+      </div>
+      <p className="hint">{view === "calibration" ? "Repeated connection and drive tests can tune future downloads within your limits. Reports stay local." : "Inspect CPU, memory, drive and connection measurements. Diagnostic grades are informational and do not change download settings."}</p>
+    </div>
+    {view === "diagnostics" ? <Diagnostics onActivityChange={setDiagnosticsActive} /> : <>
     <div className="performance-layout">
       <section className="card rise d1" aria-labelledby="performance-test-title">
         <div className="card-head"><h2 id="performance-test-title">Calibrate your connection and drive</h2><p>Pause downloads and torrent seeding first. New queued downloads wait while testing.</p></div>
@@ -144,5 +157,6 @@ export function PerformancePage({ settings, draft, onChange }: { settings: Downl
       <details><summary>Every measurement: throughput, dips, waits and flushes</summary><div className="performance-table" tabIndex={0} aria-label="Scrollable measurement table"><table><thead><tr><th scope="col">Measurement</th><th scope="col">Requests / buffer</th><th scope="col">Data / time</th><th scope="col">Overall MB/s</th><th scope="col">Min / median / max MB/s</th><th scope="col">Headers / loaded latency</th><th scope="col">Flush / failures</th><th scope="col">Evidence</th></tr></thead><tbody>{report.trials.map((t,i) => <tr key={i}><th scope="row">{names[t.kind] ?? t.kind}</th><td>{t.parallelRequests || "—"} / {t.bufferBytes ? bytes(t.bufferBytes) : "—"}</td><td>{bytes(t.bytes)} / {(t.elapsedMs / 1000).toFixed(2)} s</td><td>{(t.throughputBps / 1e6).toFixed(1)}</td><td>{[0,.5,1].map(q => { const v = quantile(t.samplesBps,q); return v == null ? "—" : (v / 1e6).toFixed(1); }).join(" / ")}</td><td>{ms(quantile(t.responseHeaderMs ?? t.firstByteMs))} / {ms(quantile(t.loadedLatencyMs))}</td><td>{t.flushMs} ms / {t.failures}{t.httpStatuses?.some(v => v !== 200) && <small>HTTP {t.httpStatuses.filter(v => v !== 200).join(", ")}</small>}{t.errors?.map(e => <small key={e}>{e}</small>)}</td><td>{t.validForTuning ? "Usable" : "Diagnostic only"}{t.protocols.length > 0 && <small>{t.protocols.join(", ")}</small>}</td></tr>)}</tbody></table></div><p className="hint">Parallel requests can share a single HTTP/2 transport. MB/s is decimal megabytes per second. Overall throughput includes startup and final flush. Core-process CPU/memory exclude the WebView child process. Min/median/max use observed full sampling intervals; short transfers can have no interval samples.</p></details>
       <details><summary>What these results can and cannot establish</summary><ul>{report.notes.map(note => <li key={note}>{note}</li>)}</ul></details>
     </section>}
+    </>}
   </section>;
 }

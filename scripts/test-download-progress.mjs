@@ -65,6 +65,7 @@ try {
         if (window.testOpenError === name) throw new Error(name === "open_browser_extension_store" ? "Could not open the Chrome Web Store" : "Could not open destination");
         if (name === "platform_capabilities") return window.testCapabilities ?? (location.search.includes("platform=linux") ? { os: "linux", startup: { available: true, reason: "XDG startup" }, tray: { available: false, reason: "No watcher" }, shutdown: { available: false, reason: "Shutdown denied by policy" }, forceShutdown: { available: false, reason: "Old logind" }, disconnect: { available: true, reason: "Allowed" }, connections: [{ id: "connection-uuid", name: "Test connection" }], updateOwner: "package-manager", browserIntegration: { available: true, reason: "Native browser" } } : { os: "windows", startup: { available: true, reason: "Startup enabled" }, tray: { available: true, reason: "Tray available" }, shutdown: { available: true, reason: "Allowed" }, forceShutdown: { available: true, reason: "Allowed" }, disconnect: { available: true, reason: "Allowed" }, connections: [], updateOwner: "setup", browserIntegration: { available: true, reason: "Native browser" } });
         if (name === "performance_status") return structuredClone(window.testPerformance);
+        if (name === "diagnostics_state") return { bands: [], active: false, progress: null, latest: null, message: null, sharing: "local" };
         if (name === "start_calibration") { window.testCalibrationOptions = args.options; window.testPerformance.running = true; window.testPerformance.phase = "drive writes, flushes, reads and finalization"; window.testPerformance.progress = 5; return structuredClone(window.testPerformance); }
         if (name === "cancel_calibration") { window.testPerformance.running = false; window.testPerformance.phase = "cancelled"; return; }
         if (name === "dismiss_calibration") { window.testPerformance.prompt = false; return; }
@@ -252,7 +253,7 @@ try {
   await gear.click();
   await page.getByRole("heading", { name: "General", exact: true }).waitFor();
   assert.equal(await gear.getAttribute("aria-pressed"), "true");
-  assert.equal(await rail.getByRole("tab").count(), 9, "The settings sections live in the rail.");
+  assert.equal(await rail.getByRole("tab").count(), 8, "Calibration and diagnostics share the Performance section.");
   assert.equal(await page.locator(".content").getByRole("tab").count(), 0, "Settings must not stack a tab bar of its own under the rail.");
   assert.equal(await page.getByRole("button", { name: /^All downloads/ }).count(), 0, "The view tabs give way to the settings sections.");
   assert.equal(await page.getByRole("heading", { name: "Settings", exact: true }).count(), 0, "There is no shared Settings page head.");
@@ -390,12 +391,18 @@ try {
   await page.getByRole("button", {name:"Settings",exact:true}).click();
   await page.getByRole("tab", {name:"Performance",exact:true}).click();
   await page.getByRole("heading", {name:"Performance",exact:true}).waitFor();
+  assert.equal(await page.getByRole("tab", {name:"Diagnostics",exact:true}).count(),0);
+  await page.getByRole("button", {name:"Hardware diagnostics",exact:true}).click();
+  await page.getByRole("heading", {name:"Diagnostics",exact:true}).waitFor();
+  assert.equal(await page.getByRole("button", {name:"Start quick test",exact:true}).count(),0);
+  await page.getByRole("button", {name:"Optimize downloads",exact:true}).click();
   assert.equal(await page.evaluate(() => window.testCalls.filter(c=>c.name==="start_calibration").length),0);
   await page.getByRole("button", {name:"Deep",exact:true}).click();
   await page.getByLabel("Network payload budget").selectOption("64");
   await page.getByLabel("Temporary disk space").selectOption("64");
   await page.getByRole("button", {name:"Start deep test",exact:true}).click();
   await page.getByRole("button", {name:"Cancel test",exact:true}).waitFor();
+  assert.equal(await page.getByRole("button", {name:"Hardware diagnostics",exact:true}).isDisabled(),true,"Running calibration keeps its cancellation controls visible");
   assert.deepEqual(await page.evaluate(()=>window.testCalibrationOptions), {deep:true,online:true,upload:false,networkBudgetMib:64,diskBudgetMib:64});
   await page.getByRole("button", {name:"Cancel test",exact:true}).click();
   await page.getByRole("button", {name:"Start deep test",exact:true}).waitFor();

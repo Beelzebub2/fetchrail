@@ -36,8 +36,7 @@ import {
   X,
 } from "lucide-react";
 import "./App.css";
-import { PerformanceInvitation, PerformancePage } from "./Performance";
-import { Diagnostics } from "./Diagnostics";
+import { PerformanceInvitation, PerformancePage, type PerformanceView } from "./Performance";
 import { AnalyticsPrompt, PrivacySettings } from "./Privacy";
 import type { AnalyticsConsent } from "./Privacy";
 import { usePlatformCapabilities } from "./platform";
@@ -235,7 +234,6 @@ const settingsSections = [
   ["categories", "File categories", FolderOpen],
   ["torrents", "Torrents", Share2],
   ["browser", "Browser", Globe],
-  ["diagnostics", "Diagnostics", Activity],
   ["privacy", "Privacy", Monitor],
 ] as const;
 type SettingsSection = (typeof settingsSections)[number][0];
@@ -541,6 +539,7 @@ function App() {
   const [showAdd, setShowAdd] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
   const [settingsSection, setSettingsSection] = useState<SettingsSection>("general");
+  const [performanceView, setPerformanceView] = useState<PerformanceView>("calibration");
   // Unsaved settings are kept as changes on top of what is saved, so they outlive a visit to the downloads.
   const [edits, setEdits] = useState<Partial<DownloadSettings>>({});
   const [saveState, setSaveState] = useState<"idle" | "saving" | "done">("idle");
@@ -921,7 +920,7 @@ function App() {
   // The bar keeps its last message while it slides away, so it never reads "0 unsaved changes".
   if (unsaved) savedBar.current = { done: false, text: `${unsaved} unsaved ${unsaved === 1 ? "change" : "changes"}` };
   else if (saveState === "done") savedBar.current = { done: true, text: "Settings saved" };
-  const barShown = inSettings && !["diagnostics", "privacy"].includes(settingsSection) && (unsaved > 0 || saveState !== "idle");
+  const barShown = inSettings && settingsSection !== "privacy" && !(settingsSection === "performance" && performanceView === "diagnostics") && (unsaved > 0 || saveState !== "idle");
 
   const shown = (id: string) => !inSettings && activeFilter === id;
   const tabClass = (id: string) => (shown(id) ? "rail-tab active" : "rail-tab");
@@ -1113,6 +1112,8 @@ function App() {
             update={update}
             samples={samples}
             section={settingsSection}
+            performanceView={performanceView}
+            onPerformanceView={setPerformanceView}
             organizing={organizing}
             onOrganizing={setOrganizing}
             onChange={editSettings}
@@ -1127,7 +1128,7 @@ function App() {
           />
         ) : (
           <>
-            <PerformanceInvitation onOpen={() => { setShowSettings(true); setSettingsSection("performance"); }} />
+            <PerformanceInvitation onOpen={() => { setPerformanceView("calibration"); setShowSettings(true); setSettingsSection("performance"); }} />
             <div className="list-head">
               <h1 className="sr-only">{filterTitles[activeFilter] ?? activeFilter.slice(6)}</h1>
               <div className="group-by">
@@ -1930,6 +1931,8 @@ function SettingsPage({
   update,
   samples,
   section,
+  performanceView,
+  onPerformanceView,
   organizing,
   onOrganizing,
   onChange,
@@ -1951,6 +1954,8 @@ function SettingsPage({
   update: UpdateStatus;
   samples: number[];
   section: SettingsSection;
+  performanceView: PerformanceView;
+  onPerformanceView: (view: PerformanceView) => void;
   organizing: "sort" | "flatten" | null;
   onOrganizing: (mode: "sort" | "flatten" | null) => void;
   onChange: (change: Partial<DownloadSettings>) => void;
@@ -2029,8 +2034,7 @@ function SettingsPage({
     >
       {/* Keyed by section, so each one rises in when it is opened. */}
       <div className="settings-panel" id="settings-panel" role="tabpanel" aria-labelledby={"settings-tab-" + section} key={section}>
-        {section === "performance" && <PerformancePage settings={settings} draft={draft} onChange={onChange} />}
-        {section === "diagnostics" && <Diagnostics />}
+        {section === "performance" && <PerformancePage settings={settings} draft={draft} onChange={onChange} view={performanceView} onViewChange={onPerformanceView} />}
         {section === "privacy" && <PrivacySettings settings={settings} onChoice={onAnalytics} />}
         {section === "general" && (
           <section aria-labelledby="general-settings-title">
