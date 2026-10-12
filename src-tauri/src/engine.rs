@@ -55,7 +55,7 @@ const TRANSFER_BUFFER_SIZE: usize = 1024 * 1024;
 fn download_client_builder() -> reqwest::ClientBuilder {
     Client::builder()
         .user_agent(concat!("Fetchrail/", env!("CARGO_PKG_VERSION")))
-        .redirect(reqwest::redirect::Policy::limited(10))
+        .redirect(reqwest::redirect::Policy::none())
         .pool_max_idle_per_host(32)
         .tcp_nodelay(true)
         .http2_adaptive_window(true)
@@ -85,6 +85,78 @@ fn origin_budget(url: &Url) -> Arc<crate::network::OriginGate> {
     let budget = Arc::new(crate::network::OriginGate::new());
     origins.insert(key, budget.clone());
     budget
+}
+
+// Keep the final origin's admission permit until its response body has been consumed.
+async fn send_admitted(
+    client: &Client,
+    request: reqwest::RequestBuilder,
+    cancel: &CancellationToken,
+) -> EngineResult<(
+    reqwest::Response,
+    crate::network::OriginPermit,
+    tokio::sync::SemaphorePermit<'static>,
+)> {
+    let mut request = request.build()?;
+    let mut seen = HashSet::new();
+    for _ in 0..=10 {
+        let url = request.url().clone();
+        if !matches!(url.scheme(), "http" | "https") || !seen.insert(url.clone()) {
+            return Err(EngineError::Message(
+                "Invalid or looping HTTP redirect.".into(),
+            ));
+        }
+        let origin = origin_budget(&url);
+        let permit = origin
+            .acquire(32, cancel)
+            .await
+            .ok_or(EngineError::Cancelled)?;
+        let global = tokio::select! {
+            permit = global_budget().acquire() => permit.map_err(|e| EngineError::Message(e.to_string()))?,
+            _ = cancel.cancelled() => return Err(EngineError::Cancelled),
+        };
+        let replay = request
+            .try_clone()
+            .ok_or_else(|| EngineError::Message("HTTP request cannot be replayed.".into()))?;
+        let response = tokio::select! {
+            response = client.execute(request) => response?,
+            _ = cancel.cancelled() => return Err(EngineError::Cancelled),
+        };
+        if !matches!(
+            response.status(),
+            StatusCode::MOVED_PERMANENTLY
+                | StatusCode::FOUND
+                | StatusCode::SEE_OTHER
+                | StatusCode::TEMPORARY_REDIRECT
+                | StatusCode::PERMANENT_REDIRECT
+        ) {
+            return Ok((response, permit, global));
+        }
+        let next = response
+            .headers()
+            .get(header::LOCATION)
+            .and_then(|v| v.to_str().ok())
+            .ok_or_else(|| EngineError::Message("HTTP redirect has no valid Location.".into()))?;
+        let next = url.join(next)?;
+        request = replay;
+        if url.origin() != next.origin() || (url.scheme() == "https" && next.scheme() == "http") {
+            for name in [
+                header::COOKIE,
+                header::AUTHORIZATION,
+                header::PROXY_AUTHORIZATION,
+                header::ORIGIN,
+                header::REFERER,
+            ] {
+                request.headers_mut().remove(name);
+            }
+        }
+        *request.url_mut() = next;
+        // No permit from a previous hop is held while admitting the next origin.
+        drop(response);
+        drop(permit);
+        drop(global);
+    }
+    Err(EngineError::Message("Too many HTTP redirects.".into()))
 }
 
 fn retry_after(headers: &HeaderMap, now: DateTime<Utc>) -> Option<Duration> {
@@ -130,7 +202,7 @@ fn normalize_sha256(value: Option<&str>) -> Result<Option<String>, String> {
 #[derive(Debug, thiserror::Error)]
 enum EngineError {
     #[error("request failed: {0}")]
-    Request(#[from] reqwest::Error),
+    Request(reqwest::Error),
     #[error("file operation failed: {0}")]
     Io(#[from] std::io::Error),
     #[error("invalid URL: {0}")]
@@ -152,13 +224,72 @@ enum EngineError {
 }
 
 type EngineResult<T> = Result<T, EngineError>;
+impl From<reqwest::Error> for EngineError {
+    fn from(error: reqwest::Error) -> Self {
+        Self::Request(error.without_url())
+    }
+}
+
+fn failure_category(error: &EngineError) -> (&'static str, bool) {
+    match error {
+        EngineError::Request(e) => (
+            "transient_network",
+            e.is_timeout() || e.is_connect() || e.is_body(),
+        ),
+        EngineError::RetryAfter { .. } => ("rate_limited", true),
+        EngineError::Http(s) if matches!(*s, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN) => {
+            ("auth_required", false)
+        }
+        EngineError::Http(s) => (
+            "http_error",
+            s.is_server_error()
+                || matches!(
+                    *s,
+                    StatusCode::TOO_MANY_REQUESTS | StatusCode::REQUEST_TIMEOUT
+                ),
+        ),
+        EngineError::Io(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+            ("permission_denied", false)
+        }
+        EngineError::Io(e) if matches!(e.raw_os_error(), Some(28 | 112)) => ("disk_full", false),
+        EngineError::Slow | EngineError::Incomplete => ("transient_network", true),
+        EngineError::RangeUnsupported => ("range_unsupported", false),
+        EngineError::Message(e) if e.contains("checksum") || e.contains("SHA-256") => {
+            ("checksum_failed", false)
+        }
+        EngineError::Message(e)
+            if e.contains("changed")
+                || e.contains("Content-Range")
+                || e.contains("representation") =>
+        {
+            ("resource_changed", false)
+        }
+        EngineError::Message(e)
+            if e.contains("path") || e.contains("reparse") || e.contains("symlink") =>
+        {
+            ("unsafe_path", false)
+        }
+        _ => ("transfer_failed", false),
+    }
+}
 
 #[derive(Debug, Clone)]
 struct ProbeResult {
     total_bytes: Option<u64>,
     accepts_ranges: bool,
     suggested_file_name: Option<String>,
-    validator: Option<String>,
+    validator: Option<StrongEtag>,
+    final_url: Option<Url>,
+}
+
+/// Dates are deliberately excluded: second-resolution timestamps cannot prove byte identity.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(transparent)]
+struct StrongEtag(String);
+impl From<&str> for StrongEtag {
+    fn from(value: &str) -> Self {
+        Self(value.into())
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -171,7 +302,11 @@ struct ByteRange {
 struct PartManifest {
     total_bytes: Option<u64>,
     ranges: Vec<ByteRange>,
-    validator: Option<String>,
+    validator: Option<StrongEtag>,
+    #[serde(default)]
+    version: u8,
+    #[serde(default)]
+    final_url_sha256: Option<String>,
     accepts_ranges: bool,
     #[serde(default)]
     shared_staging: bool,
@@ -189,6 +324,200 @@ struct MergeCheckpoint {
     total: u64,
     fingerprint: String,
     expected_sha256: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct FileIdentity {
+    volume: u64,
+    file: u64,
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct PublicationJournal {
+    version: u8,
+    id: Uuid,
+    destination: PathBuf,
+    total: u64,
+    manifest_sha256: String,
+    sha256: String,
+    identity: FileIdentity,
+    published: bool,
+}
+
+fn file_fingerprint(
+    path: &Path,
+    cancel: &CancellationToken,
+) -> std::io::Result<(FileIdentity, u64, String)> {
+    for ancestor in path.ancestors() {
+        let metadata = std::fs::symlink_metadata(ancestor)?;
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::MetadataExt;
+            if metadata.file_attributes() & 0x400 != 0 {
+                return Err(std::io::Error::other("Publication path is a reparse point"));
+            }
+        }
+        if metadata.file_type().is_symlink() {
+            return Err(std::io::Error::other("Publication path is a symlink"));
+        }
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        options.custom_flags(0x00200000);
+    }
+    let file = options.open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(std::io::Error::other("Publication is not a regular file"));
+    }
+    #[cfg(unix)]
+    let identity = {
+        use std::os::unix::fs::MetadataExt;
+        FileIdentity {
+            volume: metadata.dev(),
+            file: metadata.ino(),
+        }
+    };
+    #[cfg(windows)]
+    let identity = {
+        use std::os::windows::io::AsRawHandle;
+        use windows::Win32::{
+            Foundation::HANDLE,
+            Storage::FileSystem::{GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION},
+        };
+        let mut info = BY_HANDLE_FILE_INFORMATION::default();
+        unsafe { GetFileInformationByHandle(HANDLE(file.as_raw_handle()), &mut info) }
+            .map_err(std::io::Error::other)?;
+        if info.dwFileAttributes & 0x400 != 0 {
+            return Err(std::io::Error::other("Publication is a reparse point"));
+        }
+        FileIdentity {
+            volume: info.dwVolumeSerialNumber as u64,
+            file: ((info.nFileIndexHigh as u64) << 32) | info.nFileIndexLow as u64,
+        }
+    };
+    let digest = crate::integrity::sha256_reader(file, cancel)?;
+    Ok((identity, metadata.len(), digest))
+}
+
+async fn recover_publication(part_dir: &Path, record: &mut DownloadRecord) -> EngineResult<bool> {
+    let bytes = match fs::read(part_dir.join("publication.json")).await {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(e.into()),
+    };
+    let mut journal: PublicationJournal = serde_json::from_slice(&bytes).map_err(|_| {
+        EngineError::Message("Publication journal is damaged; staging was preserved.".into())
+    })?;
+    let manifest = fs::read(part_dir.join("transfer.json")).await?;
+    if journal.version != 1
+        || journal.id != record.id
+        || journal.manifest_sha256 != format!("{:x}", Sha256::digest(manifest))
+        || !journal.destination.is_absolute()
+        || journal.destination.parent() != Path::new(&record.destination).parent()
+    {
+        return Err(EngineError::Message(
+            "Publication journal does not match this download; files were preserved.".into(),
+        ));
+    }
+    if !fs::try_exists(&journal.destination).await? {
+        if journal.published {
+            return Err(EngineError::Message(
+                "Published output is missing; staging was preserved for recovery.".into(),
+            ));
+        }
+        let checkpoint: MergeCheckpoint = serde_json::from_slice(
+            &fs::read(part_dir.join("merge.json")).await?,
+        )
+        .map_err(|_| {
+            EngineError::Message(
+                "Unpublished assembly checkpoint is damaged; staging was preserved.".into(),
+            )
+        })?;
+        let prefix = format!(".{}.{}.", safe_file_name(&record.file_name), record.id);
+        if !checkpoint.file_name.starts_with(&prefix)
+            || !checkpoint.file_name.ends_with(".fetchrail-part")
+            || Path::new(&checkpoint.file_name).components().count() != 1
+            || checkpoint.total != journal.total
+            || checkpoint.fingerprint != journal.manifest_sha256
+            || checkpoint.expected_sha256 != record.expected_sha256
+        {
+            return Err(EngineError::Message(
+                "Unpublished assembly does not match its journal; files were preserved.".into(),
+            ));
+        }
+        let temporary = journal
+            .destination
+            .parent()
+            .unwrap()
+            .join(checkpoint.file_name);
+        let path = temporary.clone();
+        let (identity, total, digest) =
+            tokio::task::spawn_blocking(move || file_fingerprint(&path, &CancellationToken::new()))
+                .await
+                .map_err(|e| EngineError::Message(e.to_string()))??;
+        if identity != journal.identity
+            || total != journal.total
+            || digest != journal.sha256
+            || record
+                .expected_sha256
+                .as_ref()
+                .is_some_and(|expected| *expected != digest)
+        {
+            return Err(EngineError::Message(
+                "Unpublished assembly changed; no file was published.".into(),
+            ));
+        }
+        let destination = journal.destination.clone();
+        tokio::task::spawn_blocking(move || {
+            crate::platform::publish_noreplace(&temporary, &destination)
+        })
+        .await
+        .map_err(|e| EngineError::Message(e.to_string()))??;
+        journal.published = true;
+        write_json_atomic(&part_dir.join("publication.json"), &journal).await?;
+        // Recover the already-verified assembly without contacting an expired source URL.
+    }
+    let path = journal.destination.clone();
+    let (identity, total, digest) =
+        tokio::task::spawn_blocking(move || file_fingerprint(&path, &CancellationToken::new()))
+            .await
+            .map_err(|e| EngineError::Message(e.to_string()))??;
+    if identity != journal.identity
+        || total != journal.total
+        || digest != journal.sha256
+        || record
+            .expected_sha256
+            .as_ref()
+            .is_some_and(|expected| *expected != digest)
+    {
+        return Err(EngineError::Message("Published file changed or belongs to another owner; no file was replaced. Inspect the preserved staging before retrying.".into()));
+    }
+    record.destination = journal.destination.to_string_lossy().into_owned();
+    record.file_name = journal
+        .destination
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .into_owned();
+    record.total_bytes = Some(total);
+    record.downloaded_bytes = total;
+    record.merged_bytes = total;
+    record.status = DownloadStatus::Completed;
+    record.finished_at = Some(Utc::now());
+    record.error = None;
+    record.speed_bps = 0;
+    record.eta_seconds = Some(0);
+    record.segments.clear();
+    Ok(true)
 }
 
 impl ByteRange {
@@ -236,7 +565,7 @@ struct DownloadTask {
 
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct StoredDownload {
+pub(crate) struct StoredDownload {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     torrent_priorities: Option<Arc<Vec<u8>>>,
     #[serde(flatten)]
@@ -288,11 +617,9 @@ impl DownloadTask {
 
 pub struct DownloadManager {
     torrent_engine: TorrentEngine,
-    #[allow(clippy::type_complexity)] // Keep the existing bounded import state together.
-    torrent_imports: RwLock<HashMap<Uuid, (String, Option<TorrentMetadata>, Instant)>>,
+    torrent_imports: RwLock<HashMap<Uuid, PendingTorrentImport>>,
     torrent_checkpoint: Mutex<Instant>,
     torrent_configuration: tokio::sync::Mutex<serde_json::Value>,
-    torrent_import_lock: tokio::sync::Mutex<()>,
     #[allow(clippy::type_complexity)] // This shared budget is updated under one lock.
     bandwidth_broker: Mutex<(Instant, u64, (bool, bool), (u64, u64))>,
     pending_torrent_sources: Mutex<Vec<String>>,
@@ -305,13 +632,182 @@ pub struct DownloadManager {
     parts_dir: PathBuf,
     // ponytail: serialize state writes and final renames; split locks if disk contention matters.
     persist_lock: tokio::sync::Mutex<()>,
+    dirty_progress: Mutex<ProgressEvents>,
     minimize_to_tray: AtomicBool,
     limiter: RateLimiter,
     dispatch_lock: tokio::sync::Mutex<()>,
     dispatch_suspended: AtomicBool,
 }
 
+#[derive(Default)]
+struct ProgressEvents {
+    dirty: HashMap<Uuid, DownloadRecord>,
+    status: HashMap<Uuid, DownloadStatus>,
+}
+impl ProgressEvents {
+    fn structural(&mut self, record: &DownloadRecord) {
+        self.dirty.remove(&record.id);
+        self.status.insert(record.id, record.status.clone());
+    }
+    fn progress(&mut self, record: &DownloadRecord) {
+        if self.status.get(&record.id) == Some(&record.status) {
+            self.dirty.insert(record.id, record.clone().public_view());
+        }
+    }
+}
+
+#[derive(Clone)]
+struct PendingTorrentImport {
+    source: String,
+    metadata: Option<TorrentMetadata>,
+    started: Instant,
+    cancel: CancellationToken,
+    error: Option<String>,
+    native_loaded: bool,
+}
+
+fn plain_directory(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok_and(|metadata| {
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::MetadataExt;
+            if metadata.file_attributes() & 0x400 != 0 {
+                return false;
+            }
+        }
+        metadata.is_dir() && !metadata.file_type().is_symlink()
+    })
+}
+
+async fn clean_import_stage(data_dir: &Path, id: Uuid) -> std::io::Result<()> {
+    let root = data_dir.join("torrent-imports");
+    let stage = root.join(id.to_string());
+    if !plain_directory(&root) || !plain_directory(&stage) {
+        return Ok(());
+    }
+    let marker = fs::read(stage.join("owner.json")).await?;
+    if serde_json::from_slice::<Uuid>(&marker).ok() == Some(id) {
+        fs::remove_dir_all(stage).await?;
+    }
+    Ok(())
+}
+
+async fn gc_torrent_orphans(data_dir: &Path, committed: &HashSet<Uuid>) -> std::io::Result<()> {
+    let cache = data_dir.join("torrents");
+    if plain_directory(&cache) {
+        let mut entries = fs::read_dir(&cache).await?;
+        while let Some(entry) = entries.next_entry().await? {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let Some((id, suffix)) = name.split_once('.') else {
+                continue;
+            };
+            let Ok(id) = Uuid::parse_str(id) else {
+                continue;
+            };
+            let owned = matches!(suffix, "torrent" | "resume")
+                || ((suffix.starts_with("torrent.") || suffix.starts_with("resume."))
+                    && suffix.ends_with(".tmp"));
+            if owned && !committed.contains(&id) && entry.file_type().await?.is_file() {
+                fs::remove_file(entry.path()).await?;
+            }
+        }
+    }
+    let imports = data_dir.join("torrent-imports");
+    if plain_directory(&imports) {
+        let mut entries = fs::read_dir(&imports).await?;
+        while let Some(entry) = entries.next_entry().await? {
+            if let Ok(id) = Uuid::parse_str(&entry.file_name().to_string_lossy()) {
+                let _ = clean_import_stage(data_dir, id).await;
+            }
+        }
+    }
+    Ok(())
+}
+
 impl DownloadManager {
+    pub async fn replace_source(&self, id: Uuid, source: String) -> Result<DownloadRecord, String> {
+        let url =
+            Url::parse(source.trim()).map_err(|_| "Enter a valid HTTP or HTTPS download link.")?;
+        if !matches!(url.scheme(), "http" | "https")
+            || !url.username().is_empty()
+            || url.password().is_some()
+        {
+            return Err("Use an HTTP or HTTPS link without embedded credentials.".into());
+        }
+        let _dispatch = self.dispatch_lock.lock().await;
+        let task = self.task(id).await?;
+        let mut record = task.record.read().await.clone();
+        if record.torrent.is_some()
+            || !matches!(
+                record.status,
+                DownloadStatus::Paused | DownloadStatus::Failed
+            )
+            || task.running.load(Ordering::Acquire)
+        {
+            return Err(
+                "Pause this HTTP download and wait for it to stop before updating its link.".into(),
+            );
+        }
+        let part_dir = self.part_dir(id);
+        if fs::try_exists(part_dir.join("publication.json"))
+            .await
+            .map_err(|e| e.to_string())?
+        {
+            return Err("This download has a pending publication. Resume it to reconcile the file before changing sources.".into());
+        }
+        // A same ETag on a new URL proves nothing. Always preserve the old attempt and restart.
+        let preserved = part_dir.with_file_name(format!("{id}.previous-source-{}", Uuid::new_v4()));
+        let moved = match fs::rename(&part_dir, &preserved).await {
+            Ok(()) => true,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+            Err(e) => return Err(e.to_string()),
+        };
+        record.url = url.into();
+        record.status = DownloadStatus::Paused;
+        record.error = None;
+        record.downloaded_bytes = 0;
+        record.merged_bytes = 0;
+        record.total_bytes = None;
+        record.segments.clear();
+        record.finished_at = None;
+        record.resume_supported = None;
+        record.extra.remove("retryAttempts");
+        record.extra.remove("nextRetryAt");
+        self.tasks
+            .write()
+            .await
+            .insert(id, Arc::new(DownloadTask::new(record.clone(), None)));
+        if let Err(error) = self.persist_records().await {
+            self.tasks.write().await.insert(id, task);
+            if moved {
+                let _ = fs::rename(&preserved, &part_dir).await;
+            }
+            return Err(error.to_string());
+        }
+        self.emit_record(&record);
+        Ok(record)
+    }
+
+    pub async fn set_retry(&self, id: Uuid, enabled: bool) -> Result<DownloadRecord, String> {
+        let _dispatch = self.dispatch_lock.lock().await;
+        let task = self.task(id).await?;
+        let snapshot = {
+            let mut record = task.record.write().await;
+            record.extra.insert("autoRetry".into(), json!(enabled));
+            if !enabled
+                && record.extra.remove("nextRetryAt").is_some()
+                && record.status == DownloadStatus::Scheduled
+            {
+                record.status = DownloadStatus::Failed;
+                record.scheduled_for = None;
+            }
+            record.clone()
+        };
+        self.persist_records().await.map_err(|e| e.to_string())?;
+        self.emit_record(&snapshot);
+        Ok(snapshot)
+    }
+
     pub async fn load(app: AppHandle) -> Result<Arc<Self>, String> {
         let data_dir = crate::platform::app_data_dir()?;
         crate::platform::private_dir(&data_dir)
@@ -367,6 +863,7 @@ impl DownloadManager {
             .map_err(|error| format!("Could not initialize HTTP client: {error}"))?;
 
         let mut task_map = HashMap::new();
+        let mut recovered_publications = Vec::new();
         let state_path = data_dir.join(STATE_FILE);
         if let Some(records) = read_saved_json::<Vec<StoredDownload>>(&state_path)
             .await
@@ -384,6 +881,18 @@ impl DownloadManager {
                     record.speed_bps = 0;
                     record.eta_seconds = None;
                     record.merged_bytes = 0;
+                }
+                if record.torrent.is_none() {
+                    match recover_publication(&parts_dir.join(record.id.to_string()), &mut record)
+                        .await
+                    {
+                        Ok(true) => recovered_publications.push(record.id),
+                        Ok(false) => (),
+                        Err(error) => {
+                            record.status = DownloadStatus::Failed;
+                            record.error = Some(error.to_string());
+                        }
+                    }
                 }
                 for segment in &mut record.segments {
                     segment.speed_bps = 0;
@@ -408,7 +917,6 @@ impl DownloadManager {
             minimize_to_tray: AtomicBool::new(settings.minimize_to_tray),
             limiter: RateLimiter::new(settings.speed_limit_bps),
             dispatch_lock: tokio::sync::Mutex::new(()),
-            torrent_import_lock: tokio::sync::Mutex::new(()),
             bandwidth_broker: Mutex::new((Instant::now(), 0, (false, false), (0, 0))),
             dispatch_suspended: AtomicBool::new(false),
             settings: RwLock::new(settings),
@@ -416,6 +924,7 @@ impl DownloadManager {
             data_dir,
             parts_dir,
             persist_lock: tokio::sync::Mutex::new(()),
+            dirty_progress: Mutex::new(ProgressEvents::default()),
         });
         manager
             .persist_settings()
@@ -425,10 +934,29 @@ impl DownloadManager {
             .persist_records()
             .await
             .map_err(|error| error.to_string())?;
+        if !recovered_publications.is_empty() {
+            manager
+                .acknowledge_catalog()
+                .await
+                .map_err(|e| e.to_string())?;
+            for id in recovered_publications {
+                let _ = fs::remove_dir_all(manager.part_dir(id)).await;
+            }
+        }
         manager
             .persist_queues()
             .await
             .map_err(|error| error.to_string())?;
+        let committed = manager
+            .list()
+            .await
+            .into_iter()
+            .filter(|r| r.torrent.is_some())
+            .map(|r| r.id)
+            .collect::<HashSet<_>>();
+        gc_torrent_orphans(&manager.data_dir, &committed)
+            .await
+            .map_err(|e| format!("Cannot clean owned import cache: {e}"))?;
         for record in manager.list().await {
             if let Some(torrent) = &record.torrent {
                 let result = manager.torrent_engine.call(json!({"op":"add", "id":record.id,
@@ -437,6 +965,13 @@ impl DownloadManager {
                 if result.is_ok() {
                     manager.torrent_engine.call(json!({"op":"limit", "id":record.id, "downloadLimit":record.speed_limit_bps.min(i32::MAX as u64)})).await?;
                     manager.torrent_engine.call(json!({"op":"sequential", "id":record.id, "enabled":torrent.sequential})).await?;
+                    if manager.torrent_engine.recovered_unclean {
+                        manager
+                            .torrent_engine
+                            .call(json!({"op":"recheck", "id":record.id}))
+                            .await?;
+                        manager.task(record.id).await?.record.write().await.error = Some("Recovered after an unclean shutdown; verifying payload before transfer.".into());
+                    }
                 }
                 if let Err(error) = result {
                     let task = manager.task(record.id).await?;
@@ -538,31 +1073,115 @@ impl DownloadManager {
     }
 
     pub async fn import_torrent(
-        &self,
+        self: &Arc<Self>,
         request: TorrentImportRequest,
     ) -> Result<serde_json::Value, String> {
-        let _import = self.torrent_import_lock.lock().await;
-        if self.torrent_imports.read().await.len() >= 4 {
+        let mut imports = self.torrent_imports.write().await;
+        if self.dispatch_suspended.load(Ordering::Acquire) {
+            return Err("App is shutting down.".into());
+        }
+        if imports.len() >= 4 {
             return Err("Finish or cancel an open torrent import first.".into());
         }
         let id = Uuid::new_v4();
-        let source = request.source.trim();
+        let source = request.source.trim().to_owned();
+        let cancel = CancellationToken::new();
+        imports.insert(
+            id,
+            PendingTorrentImport {
+                source: source.clone(),
+                metadata: None,
+                started: Instant::now(),
+                cancel: cancel.clone(),
+                error: None,
+                native_loaded: false,
+            },
+        );
+        drop(imports);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
+        let manager = self.clone();
+        tauri::async_runtime::spawn(async move {
+            let result = tokio::select! {
+                result = tokio::time::timeout_at(deadline, manager.resolve_torrent_import(id, &source)) => result.unwrap_or_else(|_| Err("Torrent metadata timed out after two minutes. Cancel and retry.".into())),
+                _ = cancel.cancelled() => Err("Torrent import cancelled.".into()),
+            };
+            let failed = result.is_err();
+            if let Some(import) = manager.torrent_imports.write().await.get_mut(&id) {
+                match result {
+                    Ok(metadata) => {
+                        if metadata.is_some() {
+                            import.metadata = metadata;
+                        }
+                        import.native_loaded = source.starts_with("magnet:");
+                    }
+                    Err(error) => import.error = Some(error),
+                }
+            }
+            if failed || cancel.is_cancelled() {
+                let _ = manager
+                    .torrent_engine
+                    .call(json!({"op":"remove", "id":id}))
+                    .await;
+                let _ = fs::remove_file(
+                    manager
+                        .data_dir
+                        .join("torrents")
+                        .join(format!("{id}.torrent")),
+                )
+                .await;
+            }
+        });
+        // Return the reserved ID before networking, so cancellation exists from the first byte.
+        Ok(json!({"id":id, "metadata":null}))
+    }
+
+    async fn resolve_torrent_import(
+        &self,
+        id: Uuid,
+        source: &str,
+    ) -> Result<Option<TorrentMetadata>, String> {
         let path = self.data_dir.join("torrents").join(format!("{id}.torrent"));
         let metadata = if source.starts_with("magnet:") {
             let staging = self.data_dir.join("torrent-imports").join(id.to_string());
+            crate::platform::private_dir(&self.data_dir.join("torrent-imports"))
+                .map_err(|e| e.to_string())?;
+            crate::platform::private_dir(&staging).map_err(|e| e.to_string())?;
+            write_json_atomic(&staging.join("owner.json"), &id)
+                .await
+                .map_err(|e| e.to_string())?;
             self.torrent_engine.call(json!({"op":"add", "id":id, "source":source,
                 "destination":staging, "importing":true, "config":self.settings.read().await.torrent})).await?;
-            None
+            if let Some(import) = self.torrent_imports.write().await.get_mut(&id) {
+                import.native_loaded = true;
+            }
+            loop {
+                let import = self
+                    .torrent_imports
+                    .read()
+                    .await
+                    .get(&id)
+                    .cloned()
+                    .ok_or("Torrent import was cancelled.")?;
+                if let Some(metadata) = import.metadata {
+                    break Some(metadata);
+                }
+                if let Some(error) = import.error {
+                    return Err(error);
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
         } else {
             let bytes = if source.starts_with("http://") || source.starts_with("https://") {
-                let response = self
-                    .client
-                    .get(source)
-                    .send()
-                    .await
-                    .map_err(|e| e.to_string())?
+                let (response, _origin, _global) = send_admitted(
+                    &self.client,
+                    self.client.get(source),
+                    &CancellationToken::new(),
+                )
+                .await
+                .map_err(|e| e.to_string())?;
+                let response = response
                     .error_for_status()
-                    .map_err(|e| e.to_string())?;
+                    .map_err(|e| e.without_url().to_string())?;
                 if response
                     .content_length()
                     .is_some_and(|size| size > 32 * 1024 * 1024)
@@ -572,7 +1191,7 @@ impl DownloadManager {
                 let mut bytes = Vec::new();
                 let mut stream = response.bytes_stream();
                 while let Some(chunk) = stream.next().await {
-                    let chunk = chunk.map_err(|e| e.to_string())?;
+                    let chunk = chunk.map_err(|e| e.without_url().to_string())?;
                     if bytes.len() + chunk.len() > 32 * 1024 * 1024 {
                         return Err("Torrent metadata exceeds 32 MiB.".into());
                     }
@@ -606,11 +1225,7 @@ impl DownloadManager {
             }
             Some(metadata)
         };
-        self.torrent_imports
-            .write()
-            .await
-            .insert(id, (source.to_owned(), metadata.clone(), Instant::now()));
-        Ok(json!({"id":id, "metadata":metadata}))
+        Ok(metadata)
     }
 
     pub fn offer_torrent_sources(
@@ -649,31 +1264,39 @@ impl DownloadManager {
     }
 
     pub async fn torrent_import_status(&self, id: Uuid) -> Result<serde_json::Value, String> {
-        let imports = self.torrent_imports.read().await;
-        let (_, metadata, _) = imports
+        let import = self
+            .torrent_imports
+            .read()
+            .await
             .get(&id)
+            .cloned()
             .ok_or("Torrent import expired or was cancelled.")?;
-        if metadata.is_none() {
+        if let Some(error) = import.error {
+            return Err(error);
+        }
+        if import.metadata.is_none() && import.native_loaded {
             self.torrent_engine
                 .call(json!({"op":"details", "id":id}))
                 .await?;
         }
-        Ok(json!({"id":id, "metadata":metadata}))
+        Ok(json!({"id":id, "metadata":import.metadata}))
     }
 
     pub async fn cancel_torrent_import(&self, id: Uuid) -> Result<(), String> {
+        // Commit and cancellation share the ownership transition, never the network read.
         let _dispatch = self.dispatch_lock.lock().await;
-        let entry = self.torrent_imports.read().await.get(&id).cloned();
-        if entry
-            .as_ref()
-            .is_some_and(|(source, _, _)| source.starts_with("magnet:"))
-        {
+        let Some(entry) = self.torrent_imports.write().await.remove(&id) else {
+            return Ok(());
+        };
+        entry.cancel.cancel();
+        if entry.source.starts_with("magnet:") {
             self.torrent_engine
                 .call(json!({"op":"remove", "id":id}))
                 .await?;
         }
-        self.torrent_imports.write().await.remove(&id);
         let _ = fs::remove_file(self.data_dir.join("torrents").join(format!("{id}.torrent"))).await;
+        let _ = fs::remove_file(self.data_dir.join("torrents").join(format!("{id}.resume"))).await;
+        let _ = clean_import_stage(&self.data_dir, id).await;
         // The engine never downloads payload in the private staging directory.
         Ok(())
     }
@@ -683,14 +1306,20 @@ impl DownloadManager {
         request: TorrentCommitRequest,
     ) -> Result<DownloadRecord, String> {
         let _dispatch = self.dispatch_lock.lock().await;
-        let (source, metadata, _) = self
+        let import = self
             .torrent_imports
             .read()
             .await
             .get(&request.id)
             .cloned()
             .ok_or("Torrent import is not available.")?;
-        let metadata = metadata.ok_or("Wait for torrent metadata before starting.")?;
+        let source = import.source;
+        if let Some(error) = import.error {
+            return Err(error);
+        }
+        let metadata = import
+            .metadata
+            .ok_or("Wait for torrent metadata before starting.")?;
         self.check_torrent_duplicate(&metadata.hashes).await?;
         if request.priorities.len() != metadata.file_count
             || request.priorities.iter().any(|p| ![0, 1, 4, 7].contains(p))
@@ -730,15 +1359,10 @@ impl DownloadManager {
             self.torrent_engine
                 .call(json!({"op":"remove", "id":id}))
                 .await?;
+            let _ = clean_import_stage(&self.data_dir, id).await;
         }
         let settings = self.settings.read().await.clone();
-        self.torrent_engine
-            .call(
-                json!({"op":"add", "id":id, "source":path, "destination":directory,
-            "priorities":request.priorities, "config":settings.torrent}),
-            )
-            .await?;
-        let record = DownloadRecord {
+        let mut record = DownloadRecord {
             id,
             extra: Default::default(),
             expected_sha256: None,
@@ -785,14 +1409,28 @@ impl DownloadManager {
             .insert(id, Arc::new(DownloadTask::new(record.clone(), None)));
         if let Err(error) = self.persist_records().await {
             self.tasks.write().await.remove(&id);
-            let _ = self
-                .torrent_engine
-                .call(json!({"op":"remove", "id":id}))
-                .await;
             return Err(error.to_string());
         }
+        // Commit the visible row before a native mutation, so a timeout cannot create a ghost.
+        if let Err(error) = self.torrent_engine.call(json!({"op":"add", "id":id, "source":path,
+            "destination":directory, "priorities":record.torrent.as_ref().unwrap().priorities, "config":settings.torrent})).await {
+            record.status = DownloadStatus::Failed;
+            record.error = Some(format!("Torrent was saved but startup needs recovery: {error}"));
+            *self.task(id).await?.record.write().await = record.clone();
+            let _ = self.persist_records().await;
+        }
         self.torrent_imports.write().await.remove(&id);
-        self.apply_torrent_budget().await?;
+        // The durable row is committed. Configuration failure must not turn success into a ghost job.
+        if let Err(error) = self.apply_torrent_budget().await {
+            let task = self.task(id).await?;
+            let mut saved = task.record.write().await;
+            saved.error = Some(format!(
+                "Added successfully; network configuration needs retry: {error}"
+            ));
+            record = saved.clone();
+            drop(saved);
+            let _ = self.persist_records().await;
+        }
         self.emit_record(&record);
         Ok(record)
     }
@@ -944,9 +1582,22 @@ impl DownloadManager {
         let _dispatch = self.dispatch_lock.lock().await;
         let task = self.task(id).await?;
         let record = task.record.read().await.clone();
-        self.torrent_engine
-            .call(json!({"op":"pause", "id":id}))
-            .await?;
+        // Removing history needs no live handle or metadata. Payload deletion does.
+        let metadata = if delete_file {
+            self.torrent_engine
+                .call(json!({"op":"pause", "id":id}))
+                .await?;
+            let details = self
+                .torrent_engine
+                .call(json!({"op":"details", "id":id}))
+                .await?;
+            let metadata: TorrentMetadata = serde_json::from_value(details["metadata"].clone())
+                .map_err(|_| "Cannot verify torrent payload paths. Remove the history entry without deleting files.".to_string())?;
+            validate_torrent_destination(Path::new(&record.destination), &metadata, true).await?;
+            Some(metadata)
+        } else {
+            None
+        };
         task.running.store(false, Ordering::Release);
         task.paused.store(true, Ordering::Release);
         {
@@ -956,20 +1607,11 @@ impl DownloadManager {
             paused.torrent.as_mut().unwrap().upload_speed_bps = 0;
             self.emit_record(&paused);
         }
-        let details = self
-            .torrent_engine
-            .call(json!({"op":"details", "id":id}))
-            .await?;
-        let metadata: TorrentMetadata =
-            serde_json::from_value(details["metadata"].clone()).map_err(|e| e.to_string())?;
         let root = PathBuf::from(&record.destination);
-        if delete_file {
-            validate_torrent_destination(&root, &metadata, true).await?;
-        }
         self.torrent_engine
             .call(json!({"op":"remove", "id":id}))
             .await?;
-        if delete_file {
+        if let Some(metadata) = metadata {
             for file in &metadata.files {
                 let path = root.join(&file.path);
                 match fs::remove_file(&path).await {
@@ -1005,9 +1647,9 @@ impl DownloadManager {
         }
         self.tasks.write().await.remove(&id);
         self.persist_records().await.map_err(|e| e.to_string())?;
-        let _ = fs::remove_file(&record.torrent.as_ref().unwrap().metadata_path).await;
+        let _ = fs::remove_file(self.data_dir.join("torrents").join(format!("{id}.torrent"))).await;
         let _ = fs::remove_file(self.data_dir.join("torrents").join(format!("{id}.resume"))).await;
-        let _ = self.app.emit(REMOVED_EVENT, id);
+        self.emit_removed(id);
         Ok(())
     }
 
@@ -1090,7 +1732,7 @@ impl DownloadManager {
                 let metadata: TorrentMetadata =
                     serde_json::from_value(event["metadata"].clone()).map_err(|e| e.to_string())?;
                 if let Some(import) = self.torrent_imports.write().await.get_mut(&id) {
-                    import.1 = Some(metadata);
+                    import.metadata = Some(metadata);
                 }
             } else if let Ok(task) = self.task(id).await {
                 let mut record = task.record.write().await;
@@ -1102,6 +1744,8 @@ impl DownloadManager {
                         .torrent_engine
                         .call(json!({"op":"pause", "id":id}))
                         .await;
+                } else if event["type"] == "checkpointError" {
+                    record.error = Some(format!("Resume checkpoint was not saved: {}. Previous checkpoint was preserved; retry checkpoint or verify after restart.", event["message"].as_str().unwrap_or("native save failed")));
                 } else if event["type"] == "moved" {
                     record.destination = event["path"]
                         .as_str()
@@ -1198,7 +1842,13 @@ impl DownloadManager {
             }
         }
         if !updates.is_empty() {
-            let _ = self.app.emit("fetchrail://torrent-updated", &updates);
+            let _ = self.app.emit(
+                "fetchrail://torrent-updated",
+                updates
+                    .into_iter()
+                    .map(DownloadRecord::public_view)
+                    .collect::<Vec<_>>(),
+            );
         }
         let checkpoint = {
             let mut last = self.torrent_checkpoint.lock().unwrap();
@@ -1220,7 +1870,10 @@ impl DownloadManager {
             .read()
             .await
             .iter()
-            .filter(|(_, (_, _, when))| when.elapsed() > Duration::from_secs(600))
+            .filter(|(_, import)| {
+                import.started.elapsed()
+                    > Duration::from_secs(if import.metadata.is_none() { 120 } else { 600 })
+            })
             .map(|(id, _)| *id)
             .collect::<Vec<_>>();
         for id in expired {
@@ -1230,7 +1883,26 @@ impl DownloadManager {
     }
 
     pub async fn shutdown(&self) {
+        if tokio::time::timeout(Duration::from_secs(45), self.shutdown_inner())
+            .await
+            .is_err()
+        {
+            eprintln!("Shutdown deadline reached; native recovery remains marked unclean.");
+        }
+    }
+
+    async fn shutdown_inner(&self) {
         self.dispatch_suspended.store(true, Ordering::Release);
+        let imports = self
+            .torrent_imports
+            .read()
+            .await
+            .keys()
+            .copied()
+            .collect::<Vec<_>>();
+        for id in imports {
+            let _ = self.cancel_torrent_import(id).await;
+        }
         let _dispatch = self.dispatch_lock.lock().await;
         let tasks = self
             .tasks
@@ -1277,15 +1949,17 @@ impl DownloadManager {
                 .call(json!({"op":"pause", "id":record.id}))
                 .await;
         }
-        if let Err(error) = self
+        let checkpoint = self
             .torrent_engine
             .call(json!({"op":"checkpoint", "wait":true}))
-            .await
-        {
+            .await;
+        if let Err(error) = &checkpoint {
             eprintln!("Torrent shutdown checkpoint: {error}");
         }
         let _ = self.torrent_engine.call(json!({"op":"poll"})).await;
-        let _ = self.persist_records().await;
+        if self.persist_records().await.is_ok() && checkpoint.is_ok() {
+            let _ = self.torrent_engine.call(json!({"op":"clean"})).await;
+        }
     }
 
     async fn add_inner(
@@ -1659,6 +2333,8 @@ impl DownloadManager {
                 record.status,
                 DownloadStatus::Paused | DownloadStatus::Failed | DownloadStatus::Cancelled
             ) || record.torrent.is_some() && record.status == DownloadStatus::Completed)
+                && !(record.status == DownloadStatus::Scheduled
+                    && record.extra.contains_key("nextRetryAt"))
             {
                 return Err("Only paused, failed or cancelled downloads can be resumed.".into());
             }
@@ -1668,6 +2344,9 @@ impl DownloadManager {
             record.status = DownloadStatus::Queued;
             record.error = None;
             record.finished_at = None;
+            record.extra.remove("retryAttempts");
+            record.extra.remove("nextRetryAt");
+            record.extra.remove("failureCategory");
             record.clone()
         };
         self.persist_records()
@@ -1783,7 +2462,7 @@ impl DownloadManager {
         self.persist_records()
             .await
             .map_err(|error| error.to_string())?;
-        let _ = self.app.emit(REMOVED_EVENT, id);
+        self.emit_removed(id);
         Ok(())
     }
 
@@ -2191,14 +2870,37 @@ impl DownloadManager {
     }
 
     fn start_scheduler(self: &Arc<Self>) {
+        let progress = self.clone();
+        tauri::async_runtime::spawn(async move {
+            let mut ticker = interval(Duration::from_millis(200));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                ticker.tick().await;
+                let mut events = progress.dirty_progress.lock().unwrap();
+                let updates = std::mem::take(&mut events.dirty)
+                    .into_values()
+                    .collect::<Vec<_>>();
+                if !updates.is_empty() {
+                    let _ = progress.app.emit("fetchrail://downloads-progress", updates);
+                }
+            }
+        });
+        let telemetry = self.clone();
+        tauri::async_runtime::spawn(async move {
+            let mut ticker = interval(Duration::from_millis(400));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                ticker.tick().await;
+                if let Err(error) = telemetry.poll_torrents().await {
+                    eprintln!("Torrent telemetry: {error}");
+                }
+            }
+        });
         let manager = self.clone();
         tauri::async_runtime::spawn(async move {
             let mut ticker = interval(Duration::from_millis(400));
             loop {
                 ticker.tick().await;
-                if let Err(error) = manager.poll_torrents().await {
-                    eprintln!("Torrent telemetry: {error}");
-                }
                 manager.dispatch_ready_downloads().await;
             }
         });
@@ -2379,6 +3081,19 @@ impl DownloadManager {
         cancel: CancellationToken,
     ) -> EngineResult<()> {
         task.check_stopped(&cancel)?;
+        {
+            let mut record = task.record.read().await.clone();
+            let part_dir = self.part_dir(record.id);
+            if recover_publication(&part_dir, &mut record).await? {
+                let completed = record.clone();
+                *task.record.write().await = record;
+                self.persist_records().await?;
+                self.acknowledge_catalog().await?;
+                let _ = fs::remove_dir_all(&part_dir).await;
+                self.emit_record(&completed);
+                return Ok(());
+            }
+        }
         self.set_status(&task, &cancel, DownloadStatus::Connecting, None)
             .await?;
 
@@ -2463,6 +3178,7 @@ impl DownloadManager {
         task.check_stopped(&cancel)?;
 
         let total = probe.total_bytes;
+        self.emit_record(&*task.record.read().await);
         let part_dir = self.part_dir(task.record.read().await.id);
 
         let mut ranges = match total {
@@ -2572,11 +3288,15 @@ impl DownloadManager {
             record.eta_seconds = Some(0);
             record.status = DownloadStatus::Completed;
             record.error = None;
+            record.extra.remove("retryAttempts");
+            record.extra.remove("nextRetryAt");
+            record.extra.remove("failureCategory");
             record.finished_at = Some(Utc::now());
             record.clone()
         };
-        let _ = fs::remove_dir_all(&part_dir).await;
         self.persist_records().await?;
+        self.acknowledge_catalog().await?;
+        let _ = fs::remove_dir_all(&part_dir).await;
         self.emit_record(&snapshot);
         crate::download_window::on_completion(&self.app, &snapshot).await;
         Ok(())
@@ -2812,10 +3532,8 @@ impl DownloadManager {
         }
 
         task.check_stopped(cancel)?;
-        let origin = origin_budget(url);
-        let _origin_permit = tokio::select! { permit = origin.acquire(32, cancel) => permit.ok_or(EngineError::Cancelled)?, _ = cancel.cancelled() => return Err(EngineError::Cancelled) };
-        let _global_permit = tokio::select! { permit = global_budget().acquire() => permit.map_err(|e| EngineError::Message(e.to_string()))?, _ = cancel.cancelled() => return Err(EngineError::Cancelled) };
         let absolute_start = range.start.saturating_add(existing);
+        let requested_range = probe.accepts_ranges && (range.end != u64::MAX || existing > 0);
         let mut request = client
             .get(url.clone())
             .headers(context_headers(task.request_context.as_ref())?)
@@ -2825,16 +3543,15 @@ impl DownloadManager {
         } else if probe.accepts_ranges && existing > 0 {
             request = request.header(RANGE, format!("bytes={absolute_start}-"));
         }
-        if probe.accepts_ranges {
+        if requested_range {
             if let Some(validator) = &probe.validator {
-                request = request.header(IF_RANGE, validator);
+                request = request.header(IF_RANGE, &validator.0);
             }
         }
 
-        let response = tokio::select! {
-            result = request.send() => result?,
-            _ = cancel.cancelled() => return Err(EngineError::Cancelled),
-        };
+        let (response, _origin_permit, _global_permit) =
+            send_admitted(client, request, cancel).await?;
+        let origin = origin_budget(response.url());
 
         if !response.status().is_success() || response.status() == StatusCode::NO_CONTENT {
             if response.status() == StatusCode::TOO_MANY_REQUESTS
@@ -2851,6 +3568,15 @@ impl DownloadManager {
             return Err(EngineError::Http(response.status()));
         }
         reject_html_page(response.headers())?;
+        if probe
+            .final_url
+            .as_ref()
+            .is_some_and(|expected| expected != response.url())
+        {
+            return Err(EngineError::Message(
+                "Download redirect changed. Restart using the new source.".into(),
+            ));
+        }
         if let Some(expected) = &probe.validator {
             if representation_validator(response.headers()).as_ref() != Some(expected) {
                 return Err(EngineError::Message(
@@ -2858,10 +3584,15 @@ impl DownloadManager {
                 ));
             }
         }
-        if probe.accepts_ranges && response.status() != StatusCode::PARTIAL_CONTENT {
+        if requested_range && response.status() != StatusCode::PARTIAL_CONTENT {
             return Err(EngineError::RangeUnsupported);
         }
         if response.status() == StatusCode::PARTIAL_CONTENT {
+            if !requested_range {
+                return Err(EngineError::Message(
+                    "Server sent an unsolicited partial representation.".into(),
+                ));
+            }
             let (actual_start, actual_end, actual_total) = parse_content_range(response.headers())
                 .ok_or_else(|| {
                     EngineError::Message("Server returned an invalid Content-Range.".into())
@@ -3128,7 +3859,7 @@ impl DownloadManager {
             };
             record.clone()
         };
-        self.emit_record(&snapshot);
+        self.emit_progress(&snapshot);
     }
 
     async fn probe(
@@ -3140,6 +3871,7 @@ impl DownloadManager {
         let mut accepts_ranges = false;
         let mut suggested_file_name = None;
         let mut validator = None;
+        let mut final_url = None;
 
         let head = self
             .metadata_request(
@@ -3160,6 +3892,7 @@ impl DownloadManager {
                 accepts_ranges = header_has_bytes(response.headers());
                 suggested_file_name = file_name_from_headers(response.headers());
                 validator = representation_validator(response.headers());
+                final_url = Some(response.url().clone());
             }
         }
 
@@ -3196,7 +3929,9 @@ impl DownloadManager {
                 return Err(EngineError::Http(response.status()));
             }
             reject_html_page(response.headers())?;
-            validator = representation_validator(response.headers()).or(validator);
+            // Never inherit HEAD identity into a different GET representation.
+            validator = representation_validator(response.headers());
+            final_url = Some(response.url().clone());
             suggested_file_name =
                 file_name_from_headers(response.headers()).or(suggested_file_name);
         } else if suggested_file_name.is_none() {
@@ -3221,36 +3956,28 @@ impl DownloadManager {
         Ok(ProbeResult {
             // Even a zero-length GET probe must not bypass the actual full-body transfer.
             total_bytes: total_bytes.filter(|bytes| *bytes > 0),
-            accepts_ranges: accepts_ranges && total_bytes != Some(0),
+            accepts_ranges: accepts_ranges && total_bytes != Some(0) && validator.is_some(),
             suggested_file_name,
             validator,
+            final_url,
         })
     }
 
     async fn metadata_request(
         &self,
         request: reqwest::RequestBuilder,
-        url: &Url,
+        _url: &Url,
     ) -> EngineResult<reqwest::Response> {
-        let origin = origin_budget(url);
         for attempt in 0..3 {
-            let response = {
-                let _origin = origin
-                    .acquire(32, &CancellationToken::new())
-                    .await
-                    .ok_or(EngineError::Cancelled)?;
-                let _global = global_budget()
-                    .acquire()
-                    .await
-                    .map_err(|e| EngineError::Message(e.to_string()))?;
-                request
-                    .try_clone()
-                    .ok_or_else(|| {
-                        EngineError::Message("Metadata request cannot be replayed.".into())
-                    })?
-                    .send()
-                    .await?
-            };
+            let (response, _origin, _global) = send_admitted(
+                &self.client,
+                request.try_clone().ok_or_else(|| {
+                    EngineError::Message("Metadata request cannot be replayed.".into())
+                })?,
+                &CancellationToken::new(),
+            )
+            .await?;
+            let origin = origin_budget(response.url());
             let status = response.status();
             if !matches!(
                 status,
@@ -3371,7 +4098,7 @@ impl DownloadManager {
                                 .then(|| (total - joined).div_ceil(speed));
                             record.clone()
                         };
-                        self.emit_record(&snapshot);
+                        self.emit_progress(&snapshot);
                     }
                 }
             };
@@ -3384,7 +4111,7 @@ impl DownloadManager {
                 &MergeCheckpoint {
                     file_name: temp_path.file_name().unwrap().to_str().unwrap().into(),
                     total,
-                    fingerprint,
+                    fingerprint: fingerprint.clone(),
                     expected_sha256: record.expected_sha256.clone(),
                 },
             )
@@ -3401,17 +4128,26 @@ impl DownloadManager {
         self.emit_record(&snapshot);
         #[cfg(windows)]
         crate::platform::mark_download(&temp_path, &record.url, desired_name).await?;
-        if let Some(expected) = record
-            .expected_sha256
-            .as_ref()
-            .filter(|_| cfg!(windows) || recovered)
-        {
-            let path = temp_path.clone();
-            let expected = expected.clone();
-            let cancel = cancel.clone();
-            tokio::task::spawn_blocking(move || verify_file_hash(&path, &expected, &cancel))
+        task.check_stopped(cancel)?;
+        let path = temp_path.clone();
+        let hash_cancel = cancel.clone();
+        let (identity, bytes, sha256) =
+            tokio::task::spawn_blocking(move || file_fingerprint(&path, &hash_cancel))
                 .await
                 .map_err(|e| EngineError::Message(e.to_string()))??;
+        if bytes != total {
+            return Err(EngineError::Message(
+                "Publication size changed; staging preserved.".into(),
+            ));
+        }
+        if record
+            .expected_sha256
+            .as_ref()
+            .is_some_and(|expected| *expected != sha256)
+        {
+            return Err(EngineError::Message(
+                "SHA-256 checksum mismatch. File was not published.".into(),
+            ));
         }
         let _dispatch = self.dispatch_lock.lock().await;
         let _lock = self.persist_lock.lock().await;
@@ -3421,6 +4157,17 @@ impl DownloadManager {
             self.check_torrent_path(&destination)
                 .await
                 .map_err(EngineError::Message)?;
+            let mut journal = PublicationJournal {
+                version: 1,
+                id: record.id,
+                destination: destination.clone(),
+                total,
+                manifest_sha256: fingerprint.clone(),
+                sha256: sha256.clone(),
+                identity: identity.clone(),
+                published: false,
+            };
+            write_json_atomic(&part_dir.join("publication.json"), &journal).await?;
             let from = temp_path.clone();
             let to = destination.clone();
             match tokio::task::spawn_blocking(move || {
@@ -3429,7 +4176,11 @@ impl DownloadManager {
             .await
             .map_err(|e| EngineError::Message(e.to_string()))?
             {
-                Ok(()) => return Ok(destination),
+                Ok(()) => {
+                    journal.published = true;
+                    write_json_atomic(&part_dir.join("publication.json"), &journal).await?;
+                    return Ok(destination);
+                }
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
                 Err(error) => return Err(error.into()),
             }
@@ -3454,8 +4205,41 @@ impl DownloadManager {
                 record.error = None;
             } else {
                 record.status = DownloadStatus::Failed;
-                record.error = Some(error.to_string());
+                let (category, transient) = failure_category(&error);
+                record
+                    .extra
+                    .insert("failureCategory".into(), json!(category));
+                record.error = Some(match category {
+                    "auth_required" => "Link expired or authentication is required. Update the download link, then resume.".into(),
+                    "disk_full" => "Download storage is full. Free space, then retry.".into(),
+                    "permission_denied" => "Cannot write download storage. Choose a writable folder or unlock the file, then retry.".into(),
+                    _ => error.to_string(),
+                });
                 record.finished_at = Some(Utc::now());
+                let attempts = record
+                    .extra
+                    .get("retryAttempts")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
+                let enabled = record
+                    .extra
+                    .get("autoRetry")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(true);
+                let delay = match error {
+                    EngineError::RetryAfter { delay, .. } => delay.max(Duration::from_secs(10)),
+                    _ => Duration::from_secs(10u64 << attempts.min(5)),
+                };
+                if transient && enabled && attempts < 6 && delay <= Duration::from_secs(600) {
+                    let next = Utc::now() + chrono::Duration::from_std(delay).unwrap_or_default();
+                    record.status = DownloadStatus::Scheduled;
+                    record.scheduled_for = Some(next);
+                    record.extra.insert("nextRetryAt".into(), json!(next));
+                    record
+                        .extra
+                        .insert("retryAttempts".into(), json!(attempts + 1));
+                    record.finished_at = None;
+                }
             }
             record.speed_bps = 0;
             record.eta_seconds = None;
@@ -3509,6 +4293,17 @@ impl DownloadManager {
         self.persist_records_locked().await
     }
 
+    async fn acknowledge_catalog(&self) -> EngineResult<()> {
+        let _lock = self.persist_lock.lock().await;
+        let path = self.data_dir.join(STATE_FILE);
+        tokio::task::spawn_blocking(move || {
+            crate::state_store::acknowledge::<Vec<StoredDownload>>(&path)
+        })
+        .await
+        .map_err(|e| EngineError::Message(e.to_string()))?
+        .map_err(EngineError::Message)
+    }
+
     async fn persist_records_locked(&self) -> EngineResult<()> {
         let tasks = self
             .tasks
@@ -3520,7 +4315,7 @@ impl DownloadManager {
         let mut records = Vec::with_capacity(tasks.len());
         for task in tasks {
             let record = task.record.read().await.clone();
-            let request_context = if record.status == DownloadStatus::Completed {
+            let request_context = if record.status == DownloadStatus::Completed || !cfg!(windows) {
                 None
             } else {
                 task.request_context.clone()
@@ -3532,23 +4327,39 @@ impl DownloadManager {
             });
         }
         records.sort_by_key(|task| task.record.created_at);
-        write_json_atomic(&self.data_dir.join(STATE_FILE), &records).await
+        write_catalog_atomic(&self.data_dir.join(STATE_FILE), records).await
     }
 
     async fn persist_settings(&self) -> EngineResult<()> {
         let _lock = self.persist_lock.lock().await;
-        let settings = self.settings.read().await.clone();
-        write_json_atomic(&self.data_dir.join(SETTINGS_FILE), &settings).await
+        let mut settings = self.settings.read().await.clone();
+        if !cfg!(windows) {
+            settings.torrent.proxy_password.clear();
+        }
+        write_catalog_atomic(&self.data_dir.join(SETTINGS_FILE), settings).await
     }
 
     async fn persist_queues(&self) -> EngineResult<()> {
         let _lock = self.persist_lock.lock().await;
         let queues = self.queues.read().await.clone();
-        write_json_atomic(&self.data_dir.join(QUEUES_FILE), &queues).await
+        write_catalog_atomic(&self.data_dir.join(QUEUES_FILE), queues).await
     }
 
     fn emit_record(&self, record: &DownloadRecord) {
-        let _ = self.app.emit(DOWNLOAD_EVENT, record);
+        let mut events = self.dirty_progress.lock().unwrap();
+        events.structural(record);
+        let _ = self.app.emit(DOWNLOAD_EVENT, record.clone().public_view());
+    }
+
+    fn emit_progress(&self, record: &DownloadRecord) {
+        self.dirty_progress.lock().unwrap().progress(record);
+    }
+
+    fn emit_removed(&self, id: Uuid) {
+        let mut progress = self.dirty_progress.lock().unwrap();
+        progress.dirty.remove(&id);
+        progress.status.remove(&id);
+        let _ = self.app.emit(REMOVED_EVENT, id);
     }
 
     fn part_dir(&self, id: Uuid) -> PathBuf {
@@ -3723,6 +4534,13 @@ fn validate_torrent_destination_blocking(
         }
         let mut current = root.to_path_buf();
         for part in path.components() {
+            #[cfg(windows)]
+            if let std::path::Component::Normal(name) = part {
+                let name = name.to_string_lossy();
+                if sanitize_filename::sanitize(name.as_ref()) != name {
+                    return Err("Torrent contains a reserved or aliased Windows filename.".into());
+                }
+            }
             current.push(part.as_os_str());
             if reparse(&current)? {
                 return Err(format!(
@@ -3893,13 +4711,24 @@ fn sync_startup_registration(enabled: bool) -> Result<(), String> {
 
 async fn read_saved_json<T: serde::de::DeserializeOwned>(path: &Path) -> EngineResult<Option<T>> {
     match fs::read(path).await {
-        Ok(bytes) => serde_json::from_slice(&bytes).map(Some).map_err(|error| EngineError::Message(format!(
-            "Saved {} is invalid at line {}, column {}. Data was preserved; restore a valid backup.",
-            path.file_name().unwrap_or_default().to_string_lossy(), error.line(), error.column()
-        ))),
+        Ok(bytes) => crate::state_store::decode(&bytes).and_then(|bytes| serde_json::from_slice(&bytes).map_err(|e| e.to_string())).map(Some)
+            .map_err(|error| EngineError::Message(format!("Saved {} is invalid: {error}. Data was preserved; restore a validated backup from recovery.", path.file_name().unwrap_or_default().to_string_lossy()))),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(error.into()),
     }
+}
+
+async fn write_catalog_atomic<
+    T: serde::Serialize + serde::de::DeserializeOwned + Send + 'static,
+>(
+    path: &Path,
+    value: T,
+) -> EngineResult<()> {
+    let path = path.to_owned();
+    tokio::task::spawn_blocking(move || crate::state_store::write(&path, &value))
+        .await
+        .map_err(|e| EngineError::Message(e.to_string()))?
+        .map_err(EngineError::Message)
 }
 
 async fn write_json_atomic<T: serde::Serialize>(path: &Path, value: &T) -> EngineResult<()> {
@@ -3993,17 +4822,19 @@ fn content_length_from_headers(headers: &HeaderMap) -> Option<u64> {
         .ok()
 }
 
-fn representation_validator(headers: &HeaderMap) -> Option<String> {
+fn representation_validator(headers: &HeaderMap) -> Option<StrongEtag> {
     headers
         .get(header::ETAG)
         .and_then(|value| value.to_str().ok())
-        .filter(|value| value.starts_with('"') && value.ends_with('"'))
-        .or_else(|| {
-            headers
-                .get(header::LAST_MODIFIED)
-                .and_then(|value| value.to_str().ok())
+        .filter(|value| {
+            value.len() >= 2
+                && value.starts_with('"')
+                && value.ends_with('"')
+                && value.as_bytes()[1..value.len() - 1]
+                    .iter()
+                    .all(|b| *b == 0x21 || (0x23..=0x7e).contains(b) || *b >= 0x80)
         })
-        .map(str::to_owned)
+        .map(StrongEtag::from)
 }
 
 async fn shared_staging(part_dir: &Path) -> EngineResult<bool> {
@@ -4058,6 +4889,11 @@ async fn prepare_parts(
         total_bytes: probe.total_bytes,
         ranges: ranges.to_vec(),
         validator: probe.validator.clone(),
+        version: 1,
+        final_url_sha256: probe
+            .final_url
+            .as_ref()
+            .map(|url| format!("{:x}", Sha256::digest(url.as_str().as_bytes()))),
         accepts_ranges: probe.accepts_ranges,
         shared_staging: stored.as_ref().is_some_and(|saved| saved.shared_staging),
     };
@@ -4066,7 +4902,13 @@ async fn prepare_parts(
         && probe.total_bytes.is_some()
         && stored.as_ref() == Some(&manifest);
     if !reusable {
-        match fs::remove_dir_all(part_dir).await {
+        // Preserve incompatible bytes for manual recovery; never stitch different identities.
+        let quarantine = part_dir.with_file_name(format!(
+            "{}.incompatible-{}",
+            part_dir.file_name().unwrap_or_default().to_string_lossy(),
+            Uuid::new_v4()
+        ));
+        match fs::rename(part_dir, quarantine).await {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(error.into()),
@@ -4378,6 +5220,8 @@ fn verify_file_hash(path: &Path, expected: &str, cancel: &CancellationToken) -> 
     Ok(())
 }
 
+#[cfg(test)]
+mod audit_tests;
 #[cfg(test)]
 mod transfer_tests;
 
@@ -4950,6 +5794,7 @@ mod tests {
             accepts_ranges: true,
             suggested_file_name: None,
             validator: Some("\"v1\"".into()),
+            final_url: None,
         };
         let ranges = split_ranges(total, 1);
         let error = super::prepare_parts(&dir, &probe, &ranges)
@@ -4978,6 +5823,7 @@ mod tests {
             accepts_ranges: true,
             suggested_file_name: None,
             validator: Some("\"v1\"".into()),
+            final_url: None,
         };
         let ranges = split_ranges(100, 2);
         super::prepare_parts(&dir, &probe, &ranges).await.unwrap();

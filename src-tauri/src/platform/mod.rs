@@ -84,6 +84,15 @@ fn resolve_xdg(value: Option<PathBuf>, home: &Path, fallback: &str) -> PathBuf {
 
 pub fn private_dir(path: &Path) -> std::io::Result<()> {
     fs::create_dir_all(path)?;
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        if fs::symlink_metadata(path)?.file_attributes() & 0x400 != 0 {
+            return Err(std::io::Error::other(
+                "Private state directory cannot be a reparse point.",
+            ));
+        }
+    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -210,7 +219,7 @@ pub fn publish_noreplace(source: &Path, destination: &Path) -> std::io::Result<(
         use std::os::windows::ffi::OsStrExt;
         use windows::{
             core::PCWSTR,
-            Win32::Storage::FileSystem::{MoveFileExW, MOVE_FILE_FLAGS},
+            Win32::Storage::FileSystem::{MoveFileExW, MOVEFILE_WRITE_THROUGH},
         };
         let source = source
             .as_os_str()
@@ -227,7 +236,7 @@ pub fn publish_noreplace(source: &Path, destination: &Path) -> std::io::Result<(
             MoveFileExW(
                 PCWSTR(source.as_ptr()),
                 PCWSTR(destination.as_ptr()),
-                MOVE_FILE_FLAGS(0),
+                MOVEFILE_WRITE_THROUGH,
             )
         }
         .is_err()

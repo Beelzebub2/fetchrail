@@ -16,7 +16,10 @@ pub async fn get_download(
     manager: State<'_, Arc<DownloadManager>>,
     id: Uuid,
 ) -> Result<DownloadRecord, String> {
-    manager.get_download(id).await
+    manager
+        .get_download(id)
+        .await
+        .map(DownloadRecord::public_view)
 }
 
 #[tauri::command]
@@ -57,7 +60,10 @@ pub async fn set_download_completion_options(
     id: Uuid,
     options: CompletionOptions,
 ) -> Result<DownloadRecord, String> {
-    manager.set_completion_options(id, options).await
+    manager
+        .set_completion_options(id, options)
+        .await
+        .map(DownloadRecord::public_view)
 }
 
 #[tauri::command]
