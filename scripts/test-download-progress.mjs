@@ -38,6 +38,8 @@ try {
       resumeSupported: true, completionOptions: { showCompleteDialog: true, hangUp: false, exitApp: false, turnOffComputer: false, forceShutdown: false },
       segments: [0, 1, 2, 3].map((part) => ({ start: part * 8 * 1024 ** 3, length: 8 * 1024 ** 3, downloadedBytes: 1024 ** 3, speedBps: 75 * 1024 ** 2 / 4, active: true })),
     };
+    window.testPerformance = { running: false, phase: "idle", progress: 0, error: null, prompt: false, latest: null, applied: null, learnedHosts: 0 };
+    Object.defineProperty(navigator, "clipboard", { configurable: true, value: { writeText: async text => { window.testCopied = text; }, readText: async () => window.testCopied ?? "" } });
     window.testSettings = { analyticsConsent: { enabled: false, decided: true, schema: 1, purpose: "product-improvement-v1" }, theme: "dark", accent: "ember", speedLimitBps: 0, autoUpdate: false, categories: [{ name: "Compressed", extensions: ["rar"], folder: "Compressed" }], sortIntoCategoryFolders: true, defaultDownloadDir: "C:\\Downloads", maxConcurrentDownloads: 3, connectionsPerDownload: 4, minSegmentSizeMb: 1, launchOnStart: false, minimizeToTray: true };
     window.testSettings.torrent = { uploadLimitBps: 0, maxSeeds: 3, ratioLimit: 1, seedTimeLimit: 86400, dht: true, lsd: true, upnp: true, connections: 200, listenInterfaces: "0.0.0.0:6881,[::]:6881", outgoingInterfaces: "", encryption: 1, proxyType: 0, proxyHost: "", proxyPort: 0, proxyUsername: "", proxyPassword: "" };
     window.testEmit = (event, payload) => {
@@ -62,6 +64,13 @@ try {
         if (name === "setup_info") return { mode: new URLSearchParams(location.search).get("setup"), version: "0.6.1", dir: "C:\\Programs\\Fetchrail", installed: location.search.includes("installed"), desktopShortcut: true, theme: "dark", accent: "ember", downloadDir: "C:\\Downloads", sortsIntoFolders: true, launchOnStart: location.search.includes("installed") };
         if (window.testOpenError === name) throw new Error(name === "open_browser_extension_store" ? "Could not open the Chrome Web Store" : "Could not open destination");
         if (name === "platform_capabilities") return window.testCapabilities ?? (location.search.includes("platform=linux") ? { os: "linux", startup: { available: true, reason: "XDG startup" }, tray: { available: false, reason: "No watcher" }, shutdown: { available: false, reason: "Shutdown denied by policy" }, forceShutdown: { available: false, reason: "Old logind" }, disconnect: { available: true, reason: "Allowed" }, connections: [{ id: "connection-uuid", name: "Test connection" }], updateOwner: "package-manager", browserIntegration: { available: true, reason: "Native browser" } } : { os: "windows", startup: { available: true, reason: "Startup enabled" }, tray: { available: true, reason: "Tray available" }, shutdown: { available: true, reason: "Allowed" }, forceShutdown: { available: true, reason: "Allowed" }, disconnect: { available: true, reason: "Allowed" }, connections: [], updateOwner: "setup", browserIntegration: { available: true, reason: "Native browser" } });
+        if (name === "performance_status") return structuredClone(window.testPerformance);
+        if (name === "diagnostics_state") return { bands: [], active: false, progress: null, latest: null, message: null, sharing: "local" };
+        if (name === "start_calibration") { window.testCalibrationOptions = args.options; window.testPerformance.running = true; window.testPerformance.phase = "drive writes, flushes, reads and finalization"; window.testPerformance.progress = 5; return structuredClone(window.testPerformance); }
+        if (name === "cancel_calibration") { window.testPerformance.running = false; window.testPerformance.phase = "cancelled"; return; }
+        if (name === "dismiss_calibration") { window.testPerformance.prompt = false; return; }
+        if (name === "apply_calibration") { window.testPerformance.applied = args.id; window.testSettings.performanceAuto = true; window.testEmit("fetchrail://settings-updated", structuredClone(window.testSettings)); return structuredClone(window.testSettings); }
+        if (name === "reset_calibration") { window.testPerformance.latest = null; window.testPerformance.applied = null; window.testSettings.performanceAuto = false; window.testEmit("fetchrail://settings-updated", structuredClone(window.testSettings)); return structuredClone(window.testSettings); }
         if (name === "get_overview") return { active: 0, queued: 0, completed: 1, failed: 0, currentSpeedBps: 0 };
         if (name === "list_queues") return [{ name: "Default", paused: false, startsAt: null, stopsAt: null }];
         if (name === "plugin:app|version") return "0.5.2";
@@ -244,7 +253,7 @@ try {
   await gear.click();
   await page.getByRole("heading", { name: "General", exact: true }).waitFor();
   assert.equal(await gear.getAttribute("aria-pressed"), "true");
-  assert.equal(await rail.getByRole("tab").count(), 8, "The settings sections live in the rail.");
+  assert.equal(await rail.getByRole("tab").count(), 8, "Calibration and diagnostics share the Performance section.");
   assert.equal(await page.locator(".content").getByRole("tab").count(), 0, "Settings must not stack a tab bar of its own under the rail.");
   assert.equal(await page.getByRole("button", { name: /^All downloads/ }).count(), 0, "The view tabs give way to the settings sections.");
   assert.equal(await page.getByRole("heading", { name: "Settings", exact: true }).count(), 0, "There is no shared Settings page head.");
@@ -375,6 +384,61 @@ try {
   await page.waitForFunction(() => window.testRecord.completionOptions.turnOffComputer === false);
   assert.equal(await page.getByLabel("Turn off computer when done").isDisabled(), true);
   assert.equal(await page.getByLabel("Ignore shutdown inhibitors").isDisabled(), true);
+
+  // Calibration is opt-in, stays within selected budgets, exposes uncertainty, and preserves other drafts.
+  await page.setViewportSize({width:1280,height:900});
+  await page.goto(base);
+  await page.getByRole("button", {name:"Settings",exact:true}).click();
+  await page.getByRole("tab", {name:"Performance",exact:true}).click();
+  await page.getByRole("heading", {name:"Performance",exact:true}).waitFor();
+  assert.equal(await page.getByRole("tab", {name:"Diagnostics",exact:true}).count(),0);
+  await page.getByRole("button", {name:"Hardware diagnostics",exact:true}).click();
+  await page.getByRole("heading", {name:"Diagnostics",exact:true}).waitFor();
+  assert.equal(await page.getByRole("button", {name:"Start quick test",exact:true}).count(),0);
+  await page.getByRole("button", {name:"Optimize downloads",exact:true}).click();
+  assert.equal(await page.evaluate(() => window.testCalls.filter(c=>c.name==="start_calibration").length),0);
+  await page.getByRole("button", {name:"Deep",exact:true}).click();
+  await page.getByLabel("Network payload budget").selectOption("64");
+  await page.getByLabel("Temporary disk space").selectOption("64");
+  await page.getByRole("button", {name:"Start deep test",exact:true}).click();
+  await page.getByRole("button", {name:"Cancel test",exact:true}).waitFor();
+  assert.equal(await page.getByRole("button", {name:"Hardware diagnostics",exact:true}).isDisabled(),true,"Running calibration keeps its cancellation controls visible");
+  assert.deepEqual(await page.evaluate(()=>window.testCalibrationOptions), {deep:true,online:true,upload:false,networkBudgetMib:64,diskBudgetMib:64});
+  await page.getByRole("button", {name:"Cancel test",exact:true}).click();
+  await page.getByRole("button", {name:"Start deep test",exact:true}).waitFor();
+  await page.getByText("Use your own direct test file", {exact:true}).click();
+  await page.getByLabel("Direct file URL", {exact:true}).fill("https://fixture.invalid/file?credential=PRIVATE_SOURCE");
+  assert.equal(await page.getByLabel("Include upload test (generated bytes only)", {exact:true}).isDisabled(),true);
+  await page.getByRole("button", {name:"Start deep test",exact:true}).click();
+  assert.equal(await page.evaluate(()=>window.testCalibrationOptions.downloadUrl),"https://fixture.invalid/file?credential=PRIVATE_SOURCE");
+  await page.getByRole("button", {name:"Cancel test",exact:true}).click();
+  await page.getByLabel("Direct file URL", {exact:true}).fill("");
+  await page.evaluate(() => {
+    window.testPerformance.latest = { id:"report-fixture",createdAt:new Date().toISOString(),applicationVersion:"0.6.1",options:{deep:true,online:true},elapsedMs:9000,requestedNetworkBytes:64*1024**2,receivedNetworkBytes:60*1024**2,diskWrittenBytes:256*1024**2,
+      hardware:{networkKey:"PRIVATE_NETWORK_FINGERPRINT",driveKey:"PRIVATE_DRIVE_FINGERPRINT",os:"windows",architecture:"x86_64",logicalProcessors:8,memoryBytes:16*1024**3,availableMemoryBytes:8*1024**3,processMemoryBytes:128*1024**2,onBattery:false,metered:false,adapters:[{kind:"ethernet",receiveLinkBps:1e9,transmitLinkBps:1e9,mtu:1500}],freeDiskBytes:80*1024**3,diskBytes:128*1024**3,filesystem:"NTFS"},
+      profile:{connections:4,bufferBytes:1024**2,simultaneousDownloads:12,measuredNetworkBps:90e6,measuredDiskBps:200e6,confidence:"measured"},idleLatencyMs:[10,12,14],failedLatencyRequests:0,systemTcpRetransmissions:0,adapterReceiveErrors:0,adapterReceiveDiscards:0,
+      trials:[{kind:"download",parallelRequests:4,bufferBytes:0,bytes:32*1024**2,elapsedMs:4000,throughputBps:90e6,samplesBps:[60e6,90e6,95e6],firstByteMs:[20],loadedLatencyMs:[20,25],protocols:["HTTP/2 IPv4"],failures:0,validForTuning:true,flushMs:0}],resources:[{elapsedMs:1000,phase:"download",cpuPercent:20,processCpuPercent:5,availableMemoryBytes:8*1024**3,processMemoryBytes:128*1024**2}],notes:["Results are local; server capacity can vary."] };
+  });
+  await page.getByRole("tab", {name:"General",exact:true}).click();
+  await page.getByRole("tab", {name:"Performance",exact:true}).click();
+  await page.getByRole("heading", {name:"Latest results",exact:true}).waitFor();
+  await page.getByRole("button", {name:"Apply calibration",exact:true}).click();
+  await page.waitForFunction(()=>window.testSettings.performanceAuto===true);
+  await page.getByRole("button", {name:"Copy detailed report",exact:true}).click();
+  await page.waitForFunction(()=>window.testCopied?.includes('"report-fixture"'));
+  assert.equal(await page.evaluate(()=>window.testCopied.includes("PRIVATE_")),false);
+  await page.screenshot({path:join(output,"calibration-results.png"),fullPage:true});
+  await page.setViewportSize({width:640,height:800});
+  await page.screenshot({path:join(output,"calibration-results-small.png"),fullPage:true});
+  assert.ok(await page.evaluate(()=>document.documentElement.scrollWidth<=document.documentElement.clientWidth+1),"Calibration must not overflow the app width");
+  await page.getByRole("button", {name:"Reset calibration and learning",exact:true}).click();
+  await page.getByRole("button", {name:"Confirm reset",exact:true}).click();
+  await page.waitForFunction(()=>window.testSettings.performanceAuto===false);
+  await page.evaluate(()=>{window.testPerformance.latest={id:"short-test",createdAt:new Date().toISOString(),applicationVersion:"0.6.1",options:{deep:false,online:true},elapsedMs:1000,hardware:{adapters:[],logicalProcessors:8},profile:{connections:8,bufferBytes:1024**2,simultaneousDownloads:12,measuredNetworkBps:0,measuredDiskBps:0,confidence:"insufficient"},idleLatencyMs:[],trials:[],resources:[],notes:["Insufficient evidence"],requestedNetworkBytes:0,receivedNetworkBytes:0,diskWrittenBytes:0,failedLatencyRequests:0,adapterReceiveErrors:0,adapterReceiveDiscards:0};});
+  await page.getByRole("tab", {name:"General",exact:true}).click();await page.getByRole("tab", {name:"Performance",exact:true}).click();
+  await page.getByRole("heading", {name:"Latest results",exact:true}).waitFor();
+  assert.equal(await page.getByRole("button", {name:"Apply calibration",exact:true}).isDisabled(),true,"Short or failed tests must not be applied");
+  console.log("PASS: opt-in calibration, selected budgets, cancellation, application, redacted report, reset, uncertainty and responsive results");
 
   // The setup program is the same page with `setup` in its address: three steps to install, one screen to remove.
   await page.setViewportSize({ width: 920, height: 600 });

@@ -1,5 +1,32 @@
 fn main() {
     let root = std::path::PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
+    // Invalidate tuning when engine code or dependencies change, including local builds.
+    {
+        use std::hash::{Hash, Hasher};
+        let mut build = std::collections::hash_map::DefaultHasher::new();
+        for name in [
+            "src/engine.rs",
+            "src/network.rs",
+            "src/performance.rs",
+            "src/performance_platform.rs",
+            "src/staging.rs",
+            "src/model.rs",
+            "Cargo.toml",
+            "Cargo.lock",
+        ] {
+            println!("cargo:rerun-if-changed={name}");
+            let text = std::fs::read_to_string(root.join(name))
+                .expect("Missing engine fingerprint source");
+            text.replace("\r\n", "\n").hash(&mut build);
+        }
+        std::env::var("PROFILE")
+            .unwrap_or_default()
+            .hash(&mut build);
+        println!(
+            "cargo:rustc-env=FETCHRAIL_ENGINE_BUILD={:016x}",
+            build.finish()
+        );
+    }
     let native = root.join("native");
     let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap();
     let target_arch = std::env::var("CARGO_CFG_TARGET_ARCH").unwrap();

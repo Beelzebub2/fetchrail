@@ -329,6 +329,7 @@ mod tests {
             default_download_dir: root.to_string_lossy().to_string(),
             max_concurrent_downloads: 3,
             connections_per_download: 8,
+            performance_auto: false,
             min_segment_size_mb: 4,
             launch_on_start: false,
             minimize_to_tray: true,

@@ -228,6 +228,81 @@ async fn cancellation_flushes_partial_bytes_and_resume_appends_exactly() {
 }
 
 #[tokio::test]
+async fn automatic_admission_waits_cancels_and_resumes_exact_parts() {
+    let total = 8 * 1024 * 1024;
+    let server = TestServer::new(total, "slow");
+    let (dir, segments, probe) = parts(total, 4).await;
+    let task = task();
+    let policy = crate::performance::LivePolicy::new(1, 4, 64 * 1024);
+    *task.performance.lock().unwrap() = Some(policy.clone());
+    let client = Client::builder().no_proxy().build().unwrap();
+    let limiter = RateLimiter::new(0);
+    let token = CancellationToken::new();
+    let (result, _) = tokio::join!(
+        DownloadManager::download_ranges(
+            &client,
+            &limiter,
+            &task,
+            &token,
+            &server.url,
+            &dir,
+            &segments,
+            &probe
+        ),
+        async {
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while segments
+                    .iter()
+                    .map(|s| s.downloaded.load(Ordering::Relaxed))
+                    .sum::<u64>()
+                    < 64 * 1024
+                {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .unwrap();
+            assert!(
+                segments
+                    .iter()
+                    .filter(|s| s.active.load(Ordering::Relaxed))
+                    .count()
+                    <= 1
+            );
+            assert!(segments.iter().any(|s| s.waiting.load(Ordering::Relaxed)));
+            token.cancel();
+        }
+    );
+    assert!(matches!(result, Err(EngineError::Cancelled)));
+    let counters = segment_counters(&dir, &split_ranges(total, 4))
+        .await
+        .unwrap();
+    assert!(
+        counters
+            .iter()
+            .map(|s| s.downloaded.load(Ordering::Relaxed))
+            .sum::<u64>()
+            > 0
+    );
+    policy.disable();
+    *task.performance.lock().unwrap() = None;
+    DownloadManager::download_ranges(
+        &client,
+        &limiter,
+        &task,
+        &CancellationToken::new(),
+        &server.url,
+        &dir,
+        &counters,
+        &probe,
+    )
+    .await
+    .unwrap();
+    verify_parts(&dir, &counters).await;
+    fs::remove_dir_all(dir).await.unwrap();
+}
+
+#[tokio::test]
 async fn transient_failures_retry_only_the_failed_range() {
     let total = 8 * 1024 * 1024;
     let client = Client::builder().no_proxy().build().unwrap();

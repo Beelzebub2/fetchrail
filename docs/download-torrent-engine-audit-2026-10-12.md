@@ -1,8 +1,8 @@
 # Fetchrail: HTTP Download & BitTorrent Engine Audit
 
-**Audit date:** 12 October 2026  
-**Reviewed checkout:** `/mdi` (Fetchrail), Git `051df46`, Rust package `0.6.1`  
-**Scope:** HTTP(S) downloads, resume/finalization, queues/bandwidth, native libtorrent, import/recovery, privacy, telemetry, and features expected of a mature desktop download client.  
+**Audit date:** 12 October 2026\
+**Reviewed checkout:** `/mdi` (Fetchrail), Git `051df46`, Rust package `0.6.1`\
+**Scope:** HTTP(S) downloads, resume/finalization, queues/bandwidth, native libtorrent, import/recovery, privacy, telemetry, and features expected of a mature desktop download client.\
 **Deliverable type:** analysis and implementation guidance. The application itself was not modified.
 
 > **Reading guide:** **Confirmed** means the stated behavior is directly visible in the current source; it need not mean it has been exploited in production. **Risk / needs reproduction** means the code permits an edge case, but a focused failing test is still needed to establish user impact. **Opportunity** is a proposed enhancement whose value must be measured. Priorities: **P0** release-blocking verified data loss/security compromise; **P1** high-value correctness/recovery/security work; **P2** measurable reliability or capability work; **P3** optional polish. No P0 compromise or corruption was demonstrated by this review.

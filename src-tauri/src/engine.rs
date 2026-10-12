@@ -52,7 +52,7 @@ const REMOVED_EVENT: &str = "fetchrail://download-removed";
 const MERGE_BUFFER_SIZE: usize = 4 * 1024 * 1024;
 const TRANSFER_BUFFER_SIZE: usize = 1024 * 1024;
 
-fn download_client_builder() -> reqwest::ClientBuilder {
+pub(crate) fn download_client_builder() -> reqwest::ClientBuilder {
     Client::builder()
         .user_agent(concat!("Fetchrail/", env!("CARGO_PKG_VERSION")))
         .redirect(reqwest::redirect::Policy::none())
@@ -159,7 +159,7 @@ async fn send_admitted(
     Err(EngineError::Message("Too many HTTP redirects.".into()))
 }
 
-fn retry_after(headers: &HeaderMap, now: DateTime<Utc>) -> Option<Duration> {
+pub(crate) fn retry_after(headers: &HeaderMap, now: DateTime<Utc>) -> Option<Duration> {
     let value = headers.get(header::RETRY_AFTER)?.to_str().ok()?.trim();
     let duration = if let Ok(seconds) = value.parse::<u64>() {
         Duration::from_secs(seconds)
@@ -285,7 +285,12 @@ struct ProbeResult {
 /// Dates are deliberately excluded: second-resolution timestamps cannot prove byte identity.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(transparent)]
-struct StrongEtag(String);
+pub(crate) struct StrongEtag(String);
+impl StrongEtag {
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
+    }
+}
 impl From<&str> for StrongEtag {
     fn from(value: &str) -> Self {
         Self(value.into())
@@ -531,6 +536,7 @@ struct SegmentCounter {
     range: ByteRange,
     downloaded: AtomicU64,
     active: AtomicBool,
+    waiting: AtomicBool,
 }
 
 type Segments = Arc<Vec<SegmentCounter>>;
@@ -549,6 +555,7 @@ fn segment_progress(segments: &[SegmentCounter], speeds: &[f64]) -> Vec<SegmentP
             downloaded_bytes: segment.downloaded.load(Ordering::Relaxed),
             speed_bps: speeds.get(index).copied().unwrap_or(0.0).max(0.0) as u64,
             active: segment.active.load(Ordering::Relaxed),
+            waiting: segment.waiting.load(Ordering::Relaxed),
         })
         .collect()
 }
@@ -562,6 +569,7 @@ struct DownloadTask {
     running: AtomicBool,
     request_context: Option<BrowserRequestContext>,
     limiter: RateLimiter,
+    performance: Mutex<Option<Arc<crate::performance::LivePolicy>>>,
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -584,6 +592,7 @@ impl DownloadTask {
         Self {
             analytics_sample: Mutex::new(analytics_sample),
             limiter: RateLimiter::new(record.speed_limit_bps),
+            performance: Mutex::new(None),
             request_context,
             paused: AtomicBool::new(record.status == DownloadStatus::Paused),
             record: RwLock::new(record),
@@ -622,6 +631,7 @@ impl DownloadTask {
 }
 
 pub struct DownloadManager {
+    pub(crate) performance: Arc<crate::performance::Performance>,
     closing: AtomicBool,
     diagnostics: Arc<crate::diagnostics::Service>,
     analytics: Arc<crate::analytics::Analytics>,
@@ -921,6 +931,7 @@ impl DownloadManager {
         }
 
         let manager = Arc::new(Self {
+            performance: crate::performance::Performance::load(&data_dir),
             closing: AtomicBool::new(false),
             diagnostics: Arc::new(crate::diagnostics::Service::new(
                 app.clone(),
@@ -1023,9 +1034,51 @@ impl DownloadManager {
     pub fn diagnostics(&self) -> &Arc<crate::diagnostics::Service> {
         &self.diagnostics
     }
+    fn reject_active_update(&self) -> Result<(), String> {
+        #[cfg(windows)]
+        if self
+            .app
+            .try_state::<crate::install::Updates>()
+            .is_some_and(|u| {
+                matches!(
+                    u.status(),
+                    crate::install::UpdateStatus::Checking
+                        | crate::install::UpdateStatus::Downloading { .. }
+                )
+            })
+        {
+            return Err(
+                "Wait for the application update to finish before running performance tests."
+                    .into(),
+            );
+        }
+        #[cfg(target_os = "linux")]
+        if self
+            .app
+            .try_state::<crate::linux_updates::Updates>()
+            .is_some_and(|u| {
+                matches!(
+                    u.status(),
+                    crate::linux_updates::Status::Checking
+                        | crate::linux_updates::Status::Downloading { .. }
+                )
+            })
+        {
+            return Err(
+                "Wait for the application update to finish before running performance tests."
+                    .into(),
+            );
+        }
+        Ok(())
+    }
+
     pub async fn start_diagnostics(&self, network: bool) -> Result<String, String> {
         let _dispatch = self.dispatch_lock.lock().await;
+        if self.performance.running() {
+            return Err("Cancel the performance calibration before running Diagnostics.".into());
+        }
         self.reject_diagnostics()?;
+        self.reject_active_update()?;
         if !self.torrent_imports.read().await.is_empty() {
             return Err("Finish or cancel the open torrent import before diagnostics.".into());
         }
@@ -1453,6 +1506,7 @@ impl DownloadManager {
             eta_seconds: None,
             connections: 0,
             requested_connections: None,
+            connections_manual: true,
             error: None,
             created_at: Utc::now(),
             finished_at: None,
@@ -1973,6 +2027,7 @@ impl DownloadManager {
 
     async fn shutdown_inner(&self) {
         self.dispatch_suspended.store(true, Ordering::Release);
+        self.performance.stop().await;
         {
             let _dispatch = self.dispatch_lock.lock().await;
             self.diagnostics.cancel();
@@ -2159,6 +2214,7 @@ impl DownloadManager {
                     .connections
                     .unwrap_or(settings.connections_per_download),
             ),
+            connections_manual: request.connections.is_some(),
             error: None,
             created_at: Utc::now(),
             finished_at: None,
@@ -2246,6 +2302,16 @@ impl DownloadManager {
             let mut record = task.record.write().await;
             record.speed_limit_bps = limit;
             task.limiter.set_limit(limit);
+            if limit > 0 {
+                if let Some(policy) = task
+                    .performance
+                    .lock()
+                    .expect("task performance poisoned")
+                    .as_ref()
+                {
+                    policy.set_eligible(false);
+                }
+            }
             record.clone()
         };
         self.persist_records()
@@ -2577,6 +2643,38 @@ impl DownloadManager {
         self.settings.read().await.clone()
     }
 
+    pub async fn start_calibration(
+        &self,
+        options: crate::performance::Options,
+    ) -> Result<crate::performance::Status, String> {
+        let _dispatch = self.dispatch_lock.lock().await;
+        if self.diagnostics.active() || self.diagnostics.snapshot().sharing == "sending" {
+            return Err("Finish or cancel Diagnostics and sharing before calibrating.".into());
+        }
+        self.reject_active_update()?;
+        if self.dispatch_suspended.load(Ordering::Acquire) {
+            return Err("The app is shutting down.".into());
+        }
+        for task in self.tasks.read().await.values() {
+            if task.running.load(Ordering::Acquire) || task.record.read().await.status.is_active() {
+                return Err("Pause active downloads and torrent seeding before testing. Queued downloads will wait until the test finishes.".into());
+            }
+        }
+        self.performance.start(
+            PathBuf::from(self.settings.read().await.default_download_dir.clone()),
+            options,
+        )
+    }
+
+    pub async fn apply_calibration(&self, id: Uuid) -> Result<DownloadSettings, String> {
+        let mut settings = self.settings().await;
+        let hardware =
+            crate::performance_platform::snapshot(Path::new(&settings.default_download_dir)).0;
+        let _ = self.performance.apply(id, &hardware)?;
+        settings.performance_auto = true;
+        self.update_settings(settings).await
+    }
+
     /// Move files already in the default Downloads folder according to the saved
     /// category rules, or move them back out of configured category folders.
     pub async fn organize_existing_downloads(
@@ -2874,6 +2972,30 @@ impl DownloadManager {
         }
         let prior_limit = self.settings.read().await.speed_limit_bps;
         *self.settings.write().await = settings.clone();
+        if settings.speed_limit_bps > 0 {
+            for task in self.tasks.read().await.values() {
+                if let Some(policy) = task
+                    .performance
+                    .lock()
+                    .expect("task performance poisoned")
+                    .as_ref()
+                {
+                    policy.set_eligible(false);
+                }
+            }
+        }
+        if !settings.performance_auto {
+            for task in self.tasks.read().await.values() {
+                if let Some(policy) = task
+                    .performance
+                    .lock()
+                    .expect("task performance poisoned")
+                    .take()
+                {
+                    policy.disable();
+                }
+            }
+        }
         self.apply_torrent_budget().await?;
         self.minimize_to_tray
             .store(settings.minimize_to_tray, Ordering::Release);
@@ -3042,14 +3164,32 @@ impl DownloadManager {
     }
 
     async fn dispatch_ready_downloads(self: &Arc<Self>) {
-        if self.dispatch_suspended.load(Ordering::Acquire) || self.diagnostics.active() {
+        if self.dispatch_suspended.load(Ordering::Acquire)
+            || self.performance.running()
+            || self.diagnostics.active()
+        {
             return;
         }
         let _dispatch = self.dispatch_lock.lock().await;
-        if self.dispatch_suspended.load(Ordering::Acquire) || self.diagnostics.active() {
+        if self.dispatch_suspended.load(Ordering::Acquire)
+            || self.performance.running()
+            || self.diagnostics.active()
+        {
             return;
         }
-        let max_concurrent = self.settings.read().await.max_concurrent_downloads;
+        let settings = self.settings.read().await.clone();
+        let max_concurrent = settings.max_concurrent_downloads;
+        let calibrated_volume = if settings.performance_auto {
+            let hardware = self
+                .performance
+                .hardware(Path::new(&settings.default_download_dir));
+            self.performance
+                .profile(&hardware)
+                .filter(|p| p.simultaneous_downloads < max_concurrent)
+                .map(|p| (hardware.drive_key, p.simultaneous_downloads.max(1)))
+        } else {
+            None
+        };
         let tasks = self
             .tasks
             .read()
@@ -3059,6 +3199,7 @@ impl DownloadManager {
             .collect::<Vec<_>>();
         let mut running = 0;
         let mut seeds = 0;
+        let mut calibrated_running = 0;
         let max_seeds = self.settings.read().await.torrent.max_seeds;
         for task in &tasks {
             if task.running.load(Ordering::Acquire) {
@@ -3090,6 +3231,32 @@ impl DownloadManager {
                 } else {
                     running += 1;
                 }
+            }
+        }
+        for task in &tasks {
+            if task.running.load(Ordering::Acquire) {
+                if let Some((drive, _)) = &calibrated_volume {
+                    let record = task.record.read().await;
+                    if !record.torrent.as_ref().is_some_and(|t| t.selected_ready)
+                        && crate::performance_platform::volume_key(
+                            Path::new(&record.destination)
+                                .parent()
+                                .unwrap_or(Path::new(&settings.default_download_dir)),
+                        )
+                        .as_ref()
+                            == Some(drive)
+                    {
+                        calibrated_running += 1;
+                    }
+                }
+            }
+            if let Some(policy) = task
+                .performance
+                .lock()
+                .expect("task performance poisoned")
+                .as_ref()
+            {
+                policy.set_eligible(running <= 1 && seeds == 0);
             }
         }
         let now = Utc::now();
@@ -3156,6 +3323,27 @@ impl DownloadManager {
             if !is_seed && running >= max_concurrent {
                 continue;
             }
+            let uses_calibrated_drive = if is_seed {
+                false
+            } else if let Some((drive, _)) = &calibrated_volume {
+                let record = task.record.read().await;
+                crate::performance_platform::volume_key(
+                    Path::new(&record.destination)
+                        .parent()
+                        .unwrap_or(Path::new(&settings.default_download_dir)),
+                )
+                .as_ref()
+                    == Some(drive)
+            } else {
+                false
+            };
+            if uses_calibrated_drive
+                && calibrated_volume
+                    .as_ref()
+                    .is_some_and(|(_, limit)| calibrated_running >= *limit)
+            {
+                continue;
+            }
             {
                 let mut record = task.record.write().await;
                 if record.status == DownloadStatus::Scheduled {
@@ -3205,6 +3393,9 @@ impl DownloadManager {
                 seeds += 1;
             } else {
                 running += 1;
+                if uses_calibrated_drive {
+                    calibrated_running += 1;
+                }
             }
         }
         let _ = self.apply_torrent_budget().await;
@@ -3215,6 +3406,7 @@ impl DownloadManager {
         task: Arc<DownloadTask>,
         cancel: CancellationToken,
     ) -> EngineResult<()> {
+        let run_started = Instant::now();
         task.check_stopped(&cancel)?;
         {
             let mut record = task.record.read().await.clone();
@@ -3243,6 +3435,7 @@ impl DownloadManager {
 
         let settings = self.settings.read().await.clone();
         let snapshot = task.record.read().await.clone();
+        let initial_downloaded = snapshot.downloaded_bytes;
         let requested_connections = snapshot
             .requested_connections
             .unwrap_or(snapshot.connections)
@@ -3323,6 +3516,76 @@ impl DownloadManager {
                 end: u64::MAX,
             }],
         };
+
+        // A tuning change must never repartition or erase an existing resumable transfer.
+        if settings.performance_auto && snapshot.downloaded_bytes > 0 && probe.validator.is_some() {
+            if let Ok(bytes) = fs::read(part_dir.join("transfer.json")).await {
+                if let Ok(saved) = serde_json::from_slice::<PartManifest>(&bytes) {
+                    if saved.total_bytes == probe.total_bytes
+                        && saved.validator == probe.validator
+                        && saved.accepts_ranges == probe.accepts_ranges
+                        && !saved.ranges.is_empty()
+                        && saved.ranges.len() <= 32
+                        && saved.ranges
+                            == split_ranges(probe.total_bytes.unwrap_or(0), saved.ranges.len())
+                    {
+                        ranges = saved.ranges;
+                    }
+                }
+            }
+        }
+        let destination = PathBuf::from(task.record.read().await.destination.clone());
+        let hardware = if settings.performance_auto && !snapshot.connections_manual {
+            Some(
+                self.performance.hardware(
+                    destination
+                        .parent()
+                        .unwrap_or(Path::new(&settings.default_download_dir)),
+                ),
+            )
+        } else {
+            None
+        };
+        let policy = hardware
+            .as_ref()
+            .filter(|_| probe.accepts_ranges && probe.validator.is_some() && ranges.len() > 1)
+            .map(|h| {
+                let ceiling = ranges.len().min(requested_connections).max(1).min(
+                    if h.available_memory_bytes
+                        .is_some_and(|v| v < 256 * 1024 * 1024)
+                    {
+                        2
+                    } else {
+                        32
+                    },
+                );
+                let start = self.performance.connections(
+                    &url.origin().ascii_serialization(),
+                    h,
+                    total.unwrap_or(0),
+                    ceiling,
+                );
+                let profile = self.performance.profile(h);
+                let buffer = profile
+                    .as_ref()
+                    .map_or(TRANSFER_BUFFER_SIZE, |p| p.buffer_bytes);
+                let buffer = if h
+                    .available_memory_bytes
+                    .is_some_and(|v| v < 256 * 1024 * 1024)
+                {
+                    64 * 1024
+                } else {
+                    buffer
+                };
+                let policy = crate::performance::LivePolicy::new(start, ceiling, buffer);
+                if let Some(profile) = profile {
+                    policy
+                        .capacity_hint_bps
+                        .store(profile.measured_network_bps, Ordering::Relaxed);
+                }
+                policy
+            });
+        *task.performance.lock().expect("task performance poisoned") = policy.clone();
 
         prepare_parts(&part_dir, &probe, &ranges).await?;
 
@@ -3431,6 +3694,24 @@ impl DownloadManager {
         };
         self.persist_records().await?;
         self.acknowledge_catalog().await?;
+        if initial_downloaded == 0 {
+            if let (Some(policy), Some(hardware)) = (policy, hardware) {
+                let (connections, bps) = policy.best();
+                if !policy.contaminated.load(Ordering::Relaxed)
+                    && self.limiter.quantum() == usize::MAX
+                    && task.limiter.quantum() == usize::MAX
+                {
+                    self.performance.learn(
+                        &url.origin().ascii_serialization(),
+                        &hardware,
+                        final_bytes,
+                        connections,
+                        bps,
+                        run_started.elapsed(),
+                    );
+                }
+            }
+        }
         let _ = fs::remove_dir_all(&part_dir).await;
         self.emit_record(&snapshot);
         crate::download_window::on_completion(&self.app, &snapshot).await;
@@ -3571,6 +3852,19 @@ impl DownloadManager {
                     0
                 };
                 live_peer_rate.store(rate.min(previous_rate), Ordering::Relaxed);
+                if let Some(policy) = task
+                    .performance
+                    .lock()
+                    .expect("task performance poisoned")
+                    .as_ref()
+                {
+                    policy.observe(
+                        bytes,
+                        Duration::from_secs_f64(elapsed),
+                        receiving,
+                        limiter.quantum() == usize::MAX && task.limiter.quantum() == usize::MAX,
+                    );
+                }
                 previous_rate = rate;
                 sampled_at = Instant::now();
             }
@@ -3667,6 +3961,18 @@ impl DownloadManager {
         }
 
         task.check_stopped(cancel)?;
+        let policy = task
+            .performance
+            .lock()
+            .expect("task performance poisoned")
+            .clone();
+        segment.waiting.store(policy.is_some(), Ordering::Relaxed);
+        let _range_permit = if let Some(policy) = &policy {
+            Some(policy.acquire(cancel).await.ok_or(EngineError::Cancelled)?)
+        } else {
+            None
+        };
+        segment.waiting.store(false, Ordering::Relaxed);
         let absolute_start = range.start.saturating_add(existing);
         let requested_range = probe.accepts_ranges && (range.end != u64::MAX || existing > 0);
         let mut request = client
@@ -3692,6 +3998,9 @@ impl DownloadManager {
             if response.status() == StatusCode::TOO_MANY_REQUESTS
                 || response.status() == StatusCode::SERVICE_UNAVAILABLE
             {
+                if let Some(policy) = &policy {
+                    policy.throttled();
+                }
                 let delay =
                     retry_after(response.headers(), Utc::now()).unwrap_or(Duration::from_secs(2));
                 origin.cool_down(delay).await;
@@ -3760,7 +4069,12 @@ impl DownloadManager {
                 .await?;
         }
         // Batch small network chunks into disk writes; flush even on cancellation or failure.
-        let mut output = BufWriter::with_capacity(TRANSFER_BUFFER_SIZE, output);
+        let mut output = BufWriter::with_capacity(
+            policy
+                .as_ref()
+                .map_or(TRANSFER_BUFFER_SIZE, |p| p.buffer_bytes),
+            output,
+        );
         let mut stream = response.bytes_stream();
         segment.active.store(true, Ordering::Relaxed);
         let started = Instant::now();
@@ -3812,7 +4126,9 @@ impl DownloadManager {
                         .await
                         .map_err(|_| EngineError::Cancelled)?;
                     task.check_stopped(cancel)?;
+                    let writing_at=policy.as_ref().map(|_|Instant::now());
                     output.write_all(&chunk[offset..offset + size]).await?;
+                    if let (Some(policy),Some(writing_at))=(&policy,writing_at) {policy.write_wait_ns.fetch_add(writing_at.elapsed().as_nanos().min(u64::MAX as u128) as u64,Ordering::Relaxed);}
                     if let Some(hash) = &mut part_hash {
                         hash.update(&chunk[offset..offset + size]);
                     }
@@ -4637,6 +4953,7 @@ fn default_settings(download_dir: &Path) -> DownloadSettings {
         default_download_dir: download_dir.to_string_lossy().to_string(),
         max_concurrent_downloads: 3,
         connections_per_download: 8,
+        performance_auto: false,
         min_segment_size_mb: 4,
         launch_on_start: false,
         minimize_to_tray: true,
@@ -5019,7 +5336,7 @@ fn content_length_from_headers(headers: &HeaderMap) -> Option<u64> {
         .ok()
 }
 
-fn representation_validator(headers: &HeaderMap) -> Option<StrongEtag> {
+pub(crate) fn representation_validator(headers: &HeaderMap) -> Option<StrongEtag> {
     headers
         .get(header::ETAG)
         .and_then(|value| value.to_str().ok())
@@ -5164,7 +5481,7 @@ async fn prepare_parts(
     Ok(())
 }
 
-fn parse_content_range(headers: &HeaderMap) -> Option<(u64, u64, Option<u64>)> {
+pub(crate) fn parse_content_range(headers: &HeaderMap) -> Option<(u64, u64, Option<u64>)> {
     let value = headers.get(CONTENT_RANGE)?.to_str().ok()?.trim();
     let value = value.strip_prefix("bytes ")?;
     let (range, total) = value.split_once('/')?;
@@ -5227,6 +5544,7 @@ async fn segment_counters(part_dir: &Path, ranges: &[ByteRange]) -> EngineResult
             }
         }
         segments.push(SegmentCounter {
+            waiting: AtomicBool::new(false),
             range: *range,
             downloaded: AtomicU64::new(downloaded),
             active: AtomicBool::new(false),
@@ -5783,6 +6101,7 @@ mod tests {
             eta_seconds: None,
             connections: 8,
             requested_connections: Some(8),
+            connections_manual: true,
             error: None,
             created_at: Utc::now(),
             finished_at: None,

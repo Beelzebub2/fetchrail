@@ -63,7 +63,7 @@ try {
         if (name === "get_download") return structuredClone(window.testRecord);
         if (name === "list_downloads") return [structuredClone(window.testRecord)];
         if (name === "diagnostics_state") { const snapshot=structuredClone(window.diagState); if(window.delayDiagState) await new Promise(resolve=>window.finishDiagState=resolve); return snapshot; }
-        if (name === "start_diagnostics") { if (window.diagBlocked) throw "Pause queued and active transfers before diagnostics."; window.diagState.active=true; window.diagState.completed=[]; window.diagState.message=null; window.diagState.progress={group:0,step:0,label:"Checksum · SHA-256",unit:"MB/s",value:123,fraction:0.2,bytes:1048576,phase:"measuring",result:null}; window.testEmit("fetchrail://diagnostics",structuredClone(window.diagState)); return "local-only-run"; }
+        if (name === "start_diagnostics") { if (window.diagBlocked) throw "Pause queued and active transfers before diagnostics."; if(window.delayDiagStart) await new Promise(resolve=>window.finishDiagStart=resolve); window.diagState.active=true; window.diagState.completed=[]; window.diagState.message=null; window.diagState.progress={group:0,step:0,label:"Checksum · SHA-256",unit:"MB/s",value:123,fraction:0.2,bytes:1048576,phase:"measuring",result:null}; window.testEmit("fetchrail://diagnostics",structuredClone(window.diagState)); return "local-only-run"; }
         if (name === "cancel_diagnostics") { window.diagState.active=false;window.diagState.message="Diagnostics cancelled; latest valid report kept.";window.testEmit("fetchrail://diagnostics",structuredClone(window.diagState));return; }
         if (name === "share_diagnostics") { if (args.permission!==true || args.runId!==window.diagReport.id) throw "Explicit current-run permission is required.";window.diagState.sharing="sending";window.testEmit("fetchrail://diagnostics",structuredClone(window.diagState));return; }
         if (name === "cancel_diagnostics_share") { window.diagState.sharing="not-shared";window.testEmit("fetchrail://diagnostics",structuredClone(window.diagState));return; }
@@ -107,7 +107,8 @@ try {
   await page.getByRole("button",{name:"Settings",exact:true}).click();
   await page.getByLabel("Minimize to tray").uncheck();
   await page.waitForFunction(() => document.querySelector(".save-dock").classList.contains("shown"));
-  await page.getByRole("tab",{name:"Diagnostics",exact:true}).click();
+  await page.getByRole("tab",{name:"Performance",exact:true}).click();
+  await page.getByRole("button",{name:"Hardware diagnostics",exact:true}).click();
   await page.getByRole("heading",{name:"Diagnostics",exact:true}).waitFor();
   assert.equal(await page.locator(".save-dock").evaluate(el => el.classList.contains("shown")),false);
   assert.equal(await page.evaluate(() => window.testCalls.filter(call=>call.name==="update_settings").length),0);
@@ -116,9 +117,14 @@ try {
   await page.evaluate(() => {window.diagBlocked=true;});
   await page.getByRole("button",{name:"Run diagnostics",exact:true}).click();
   await page.getByRole("alert").filter({hasText:"Pause queued"}).waitFor();
-  await page.evaluate(() => {window.diagBlocked=false;});
+  await page.evaluate(() => {window.diagBlocked=false;window.delayDiagStart=true;});
   await page.getByRole("button",{name:"Run diagnostics",exact:true}).click();
+  await page.waitForFunction(()=>typeof window.finishDiagStart==="function");
+  await page.waitForFunction(()=>[...document.querySelectorAll("button")].find(button=>button.textContent==="Optimize downloads")?.disabled===true);
+  assert.equal(await page.getByRole("button",{name:"Optimize downloads",exact:true}).isDisabled(),true,"Starting diagnostics cannot be hidden while the native command is pending");
+  await page.evaluate(()=>{window.delayDiagStart=false;window.finishDiagStart();});
   await page.getByTestId("diagnostic-reading").filter({hasText:"123"}).waitFor();
+  assert.equal(await page.getByRole("button",{name:"Optimize downloads",exact:true}).isDisabled(),true,"Running diagnostics keep their cancellation controls visible");
   await page.evaluate(() => {window.diagState.progress={group:3,step:2,label:"Configured parallel requests",unit:"Mbps",value:250,fraction:0.25,bytes:1048576,phase:"measuring",result:null};window.testEmit("fetchrail://diagnostics",structuredClone(window.diagState));});
   await page.getByTestId("diagnostic-reading").filter({hasText:"250"}).waitFor();
   assert.equal(await page.locator(".diag-needle").getAttribute("data-angle"),"-45");
@@ -176,7 +182,7 @@ try {
   // A late mount snapshot must not overwrite a newer event.
   await page.getByRole("tab",{name:"General",exact:true}).click();
   await page.evaluate(()=>{window.delayDiagState=true;});
-  await page.getByRole("tab",{name:"Diagnostics",exact:true}).click();
+  await page.getByRole("tab",{name:"Performance",exact:true}).click();
   await page.waitForFunction(()=>typeof window.finishDiagState==="function");
   await page.evaluate(()=>{window.diagState.active=true;window.diagState.progress={group:3,step:2,label:"Parallel requests",unit:"Mbps",value:321,fraction:.5,bytes:1,phase:"measuring",result:null};window.testEmit("fetchrail://diagnostics",structuredClone(window.diagState));window.finishDiagState();window.delayDiagState=false;});
   await page.getByTestId("diagnostic-reading").filter({hasText:"321"}).waitFor();
@@ -184,7 +190,7 @@ try {
   await page.getByRole("heading",{name:"Diagnostics report",exact:true}).waitFor();
   // Latest report survives section remount and failures remain unavailable/ungraded.
   await page.evaluate(()=>{window.diagReport.groups[3].grade=null;window.diagReport.groups[3].steps.forEach(step=>{step.value=null;step.status="unavailable";step.samples=[];step.variationPercent=null;step.note="Network test disabled; local-only run.";});window.diagState.latest=window.diagReport;});
-  await page.getByRole("tab",{name:"General",exact:true}).click();await page.getByRole("tab",{name:"Diagnostics",exact:true}).click();
+  await page.getByRole("tab",{name:"General",exact:true}).click();await page.getByRole("tab",{name:"Performance",exact:true}).click();
   await page.getByRole("heading",{name:"Diagnostics report",exact:true}).waitFor();
   assert.ok(await page.getByRole("heading",{name:"Local diagnostic results",exact:true}).isVisible());
   assert.equal(await page.getByRole("heading",{name:"How long downloads might take",exact:true}).count(),0);
@@ -204,5 +210,6 @@ try {
   assert.ok(await page.locator(".diagnostics").evaluate(el=>el.getBoundingClientRect().width<=window.innerWidth));
   assert.equal(await page.locator(".diag-g-F").evaluate(el=>getComputedStyle(el).animationName),"none");
   assert.deepEqual(errors,[]);
+  assert.equal(await page.evaluate(() => window.testCalls.filter(call=>call.name==="update_settings").length),0,"Diagnostic actions cannot submit unrelated pending settings");
   console.log("PASS: real sample gauge250Mbps=-45deg/no jitter, cancel/failure/latest, no settings save, exact estimates, copy exclusions, per-run permission preview/keep-local/cancel, theme+accent+reduced-motion screenshots: "+output);
 } finally {await browser.close();await new Promise(done=>server.close(done));}
