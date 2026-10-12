@@ -1,7 +1,7 @@
 {
   "name": "fetchrail",
   "private": true,
-  "version": "0.6.1",
+  "version": "0.7.1",
   "type": "module",
   "scripts": {
     "dev": "vite",
@@ -38,7 +38,7 @@
     "linux:desktop": "node scripts/test-linux-desktop.mjs",
     "linux:wayland": "bash scripts/test-linux-wayland.sh",
     "desktop:test": "node scripts/smoke-desktop.mjs",
-    "release:test": "node scripts/test-release-aggregation.mjs && node scripts/test-release-downloads.mjs",
+    "release:test": "node scripts/test-release-aggregation.mjs && node scripts/test-release-downloads.mjs && node scripts/test-extension-release-changes.mjs",
     "release:signatures": "node scripts/test-signatures.mjs",
     "website:sync-downloads": "node scripts/sync-website-downloads.mjs",
     "updates:test": "npm test --prefix update-service",
