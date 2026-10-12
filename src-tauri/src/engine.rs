@@ -3349,10 +3349,29 @@ impl DownloadManager {
             let result = manager.run(task.clone(), cancel).await;
             if let Err(error) = result {
                 manager.handle_run_error(&task, error).await;
+                #[cfg(feature = "test-tools")]
+                manager.save_test_trace(&task).await;
             }
             task.running.store(false, Ordering::Release);
             let _ = manager.persist_records().await;
         });
+    }
+
+    #[cfg(feature = "test-tools")]
+    async fn save_test_trace(&self, task: &Arc<DownloadTask>) {
+        if let Some(trace) = &task.trace {
+            let trace = trace.clone();
+            let root = self.data_dir.clone();
+            let record = task.record.read().await;
+            let (id, status) = (record.id, record.status.clone());
+            drop(record);
+            if !matches!(
+                tokio::task::spawn_blocking(move || trace.save(&root, id, status)).await,
+                Ok(Ok(()))
+            ) {
+                eprintln!("Isolated developer trace could not be saved");
+            }
+        }
     }
 
     fn start_scheduler(self: &Arc<Self>) {
@@ -3995,6 +4014,8 @@ impl DownloadManager {
             }
         }
         let _ = fs::remove_dir_all(&part_dir).await;
+        #[cfg(feature = "test-tools")]
+        self.save_test_trace(&task).await;
         self.emit_record(&snapshot);
         crate::download_window::on_completion(&self.app, &snapshot).await;
         Ok(())
@@ -4722,6 +4743,10 @@ impl DownloadManager {
             })
             .count();
         let planned = segments.len();
+        #[cfg(feature = "test-tools")]
+        if let Some(trace) = &task.trace {
+            trace.sample(downloaded, receiving, connecting, planned);
+        }
         let snapshot = {
             let mut record = task.record.write().await;
             record.downloaded_bytes = downloaded;

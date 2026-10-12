@@ -182,6 +182,10 @@ never changes the installed app's settings or downloads. HTTP fixtures use
 localhost; an empty isolated torrent history does not start a torrent session.
 The default payload is 2 GiB; `FETCHRAIL_APP_BENCH_BYTES` accepts 64 MiB–4 GiB.
 `FETCHRAIL_APP_BENCH_CASES` selects uniform, skew or faults. Results are private
+`fixed` compares ordinary partitions; `resume` requires a payload larger than
+2 GiB and checks a retained version-2 partition through Pause/Resume and a real
+application process kill/restart. Server-side cancellation must close before
+resumption; it is distinct from the app's bounded live worker count.
 ignored artifacts, with an independently calculated payload SHA-256 and both
 durable catalogs checked after the terminal app event. Failed runs are retained.
 
@@ -194,6 +198,16 @@ The trace has no source URLs or paths and is never ordinary product analytics.
 It does not attribute attachment time to a particular antivirus, distinguish
 TLS setup from header latency, or establish power-loss durability from a process
 kill. Local cache and loopback results cannot predict WAN speed.
+
+The isolated preview also saves `dev-transfer-traces.json` in its own data root
+on completion, pause/cancellation or failure. It retains at most ten captures,
+each with up to 3,600 numeric samples at approximately one-second intervals;
+metrics remain fixed-size, and completed sample buffers are released from RAM.
+The catalog is capped by an 8 MiB input guard and never overwrites an unrecognized
+file/schema. URL/path/name/credential strings are absent. Timing is per process
+epoch; a kill before a terminal save can lose that epoch's trace. This feature
+requires `test-tools`, explicit tracing and an isolated root; ordinary analytics
+and consent are unchanged.
 
 Benchmark experimental range plans are ignored by ordinary builds. A separately
 named `Fetchrail-Preview.exe` refuses to start without its isolated launcher.
