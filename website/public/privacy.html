@@ -3,8 +3,8 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Fetchrail Browser Integration — Privacy Policy</title>
-  <meta name="description" content="How Fetchrail Browser Integration processes download and browser data locally on your device.">
+  <title>Fetchrail — Privacy Policy</title>
+  <meta name="description" content="How Fetchrail handles local download data and optional improvement analytics.">
   <link rel="canonical" href="https://fetchrail.rrmtools.uk/privacy">
   <link rel="icon" href="/favicon.svg" type="image/svg+xml">
   <link rel="stylesheet" href="/styles.css">
@@ -12,8 +12,8 @@
 <body>
   <main class="wrap legal">
     <a href="/">Fetchrail home</a>
-    <h1>Fetchrail Browser Integration privacy policy</h1>
-    <p>Last updated: 11 October 2026.</p>
+    <h1>Fetchrail privacy policy</h1>
+    <p>Last updated: 12 October 2026.</p>
     <p>Fetchrail Browser Integration connects your browser to the Fetchrail download manager installed on your Windows or Linux computer. It processes the information needed to select, route and control downloads. The extension does not send this information to the developer, an analytics service or an advertising service.</p>
     <h2>Information processed</h2>
     <ul>
@@ -33,8 +33,18 @@
     <p>You can disable automatic download routing, leave browser session support off, revoke optional website access in your browser, stop a page batch, remove downloads from Fetchrail or uninstall the extension. Session support is off by default. Page scanning uses temporary access to the active tab after your action; broader HTTP(S) website access is optional and requested for page batches or session support. The extension does not capture private/incognito downloads.</p>
     <h2>Limited use</h2>
     <p>Fetchrail Browser Integration's use of information received from browser APIs complies with the Chrome Web Store User Data Policy, including the Limited Use requirements. Information is used only to provide the extension's download-management features. It is not sold, used for advertising, used to determine creditworthiness or provided to data brokers.</p>
+    <h2>Optional desktop improvement analytics</h2>
+    <p>RRMTools, the Fetchrail maintainer, offers optional first-party analytics to improve download reliability and prioritize useful features. It is off by default, including for existing installations, until you choose Allow in the desktop app. No thanks or closing the prompt keeps it off, with every feature still available. Settings → Privacy lets you allow or withdraw at any time. A changed collection scope requires a new choice.</p>
+    <p>Reports contain only the app release version, broad operating system (Windows, Linux or other), CPU architecture (x64, arm64 or other), and combined counts: app launches; HTTP/torrent downloads added, completed, failed or cancelled; pause/resume, speed limits, queues, schedules, browser handoffs and batch use. Completed transfers contribute a size bucket (below 10 MiB, 10 MiB to below 1 GiB, or 1 GiB and above). Only newly added transfers while consent is enabled are eligible; their first terminal outcome is counted once. There is no history import.</p>
+    <p>Analytics excludes URLs/domains, magnets, filenames/paths, browser history, cookies, credentials, request headers, raw errors, tracker/peer information, exact event times, user/device/session/transfer identifiers and detailed machine specifications. The extension itself has no analytics instrumentation. The desktop app may count a download handed off by the extension only under the desktop consent choice; none of the download or browser information listed earlier is included.</p>
+    <p>Counters stay in memory and are sent at most every 30 minutes to https://fetchrail.rrmtools.uk/api/analytics, operated by RRMTools on Cloudflare. Unsent counts are discarded on withdrawal, exit or failed delivery. Our service aggregates immediately into protected daily totals and does not store raw reports or IP addresses. Live aggregates cover the latest 30 UTC calendar days; Cloudflare's recovery copies may retain deleted aggregate data for another 30 days. Automatic invocation logging and tracing are disabled for this service; explicit release-service logs contain only operational release data.</p>
+    <p>Cloudflare necessarily sees your IP address in transit and may process network/security metadata under its own policies. These analytics minimize data and do not promise absolute anonymity. No analytics SDK, advertising, cross-service linking or unique-user tracking is used. Once combined into totals, individual contributions cannot be identified for deletion. App update checks and visits to the website are separate from desktop analytics.</p>
+    <h2>Diagnostics and separate per-run sharing</h2>
+    <p>Settings → Diagnostics runs only after your action. Processor, drive and memory results stay on your computer in the latest local diagnostic report. The optional connection checkbox sends bounded HTTPS download requests to speed.cloudflare.com, with at most 128 MiB of requested payload plus protocol overhead. Cloudflare receives ordinary request/IP metadata under its own policies. Fetchrail sends no uploads or diagnostic result reports to that speed-test endpoint; turn the checkbox off for a local-only run.</p>
+    <p>The existing usage-analytics choice does not authorize diagnostic performance fields. A completed release-build report offers a separate optional preview and Share choice covering that run only. The preview contains app release version, broad OS/CPU architecture and independent coarse processor, drive, memory and connection band counters. Exact measurements, available RAM, allocation size, model names, paths, endpoints, identifiers, error strings, timestamps and the full report are excluded. Grades are provisional synthetic bands, not universal hardware rankings.</p>
+    <p>Only an explicit per-run Share sends that summary to the RRMTools Fetchrail endpoint on Cloudflare. Keep local sends nothing and changes no functionality. Sharing can be cancelled while pending; there is no automatic retry or queue. A local attempt marker prevents duplicate shares, including after restart. The same protected daily aggregation, thirty-calendar-day live retention and additional up-to-thirty-day Cloudflare recovery window described above apply. No raw per-run summary, identifiers or IPs are stored by our analytics code; Cloudflare sees the IP in transit. Once combined, a contribution cannot be identified for deletion.</p>
     <h2>Website and support</h2>
-    <p>This policy describes the browser extension and its local desktop integration. The Fetchrail website is hosted by Cloudflare, which may process ordinary website request logs and aggregate website analytics. Those website visits do not transmit your extension download history or session headers. GitHub handles visits, software downloads and support issues under its own policies.</p>
+    <p>This policy describes the browser extension, local desktop integration and optional desktop analytics. The Fetchrail website is hosted by Cloudflare, which may process ordinary website request logs and aggregate website analytics. Those website visits do not transmit your extension download history or session headers. GitHub handles visits, software downloads and support issues under its own policies.</p>
     <p>For questions or requests, email <a href="mailto:support.fetchrail@rrmtools.uk">support.fetchrail@rrmtools.uk</a> or <a href="https://github.com/Beelzebub2/fetchrail/issues">contact the maintainer through GitHub</a>. Do not include private download URLs, cookies or credentials in public issues.</p>
     <h2>Changes</h2>
     <p>This page will be updated when the extension's data handling changes. The date above identifies the current policy.</p>

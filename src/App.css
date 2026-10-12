@@ -566,3 +566,12 @@ h1, h2, p { margin: 0; }
 @media (prefers-reduced-motion:reduce) {
   *,*::before,*::after { animation: none !important; transition: none !important; }
 }
+
+.analytics-prompt { margin: auto; color: var(--text); width: min(640px, calc(100vw - 24px)); max-height: calc(100vh - 24px); overflow-y: auto; background: var(--surface); }
+.analytics-prompt::backdrop { background: rgba(0, 0, 0, .65); }
+.analytics-prompt:not([open]) { display: none; }
+.privacy-details { display: grid; gap: 12px; font-size: 13px; line-height: 1.55; color: var(--text-2); }
+.privacy-details a { color: var(--accent-text); overflow-wrap: anywhere; }
+.analytics-actions { position: sticky; bottom: 0; padding: 12px 0; background: var(--surface); }
+.analytics-actions button { flex: 1; }
+.privacy-card { max-width: 850px; }

@@ -134,7 +134,7 @@ fn task() -> Arc<DownloadTask> {
         "createdAt": Utc::now(), "finishedAt": null
     }))
     .unwrap();
-    Arc::new(DownloadTask::new(record, None))
+    Arc::new(DownloadTask::new(record, None, None))
 }
 
 async fn parts(total: u64, connections: usize) -> (PathBuf, Segments, ProbeResult) {
