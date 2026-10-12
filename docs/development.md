@@ -173,7 +173,7 @@ Pushing a tag in the form `vMAJOR.MINOR.PATCH` is the automatic trigger for the 
 
 Tag-only runs do not seed the shared `main` Rust and Windows vcpkg caches. A manual Release workflow run on `main` can warm those caches before a release when that is useful; vcpkg still validates compiler, port and dependency ABI hashes before restoring them. Superseded manual runs are cancelled; tag builds finish independently. Update-service-only changes continue to use the separate feed checks without rebuilding the desktop app.
 
-The publisher creates a GitHub draft release with generated notes from merged pull requests. Apply the configured `feat`/`enhancement`, `fix`/`bug` or `perf`/`performance` labels to group entries under Features, Fixes or Performance; unlabeled changes appear under Other Changes.
+The publisher creates a GitHub draft release with notes starting at the highest earlier stable version actually published on the tag's history. Failed tags, draft releases and prereleases do not advance that baseline, so their changes carry forward to the next successful release. Notes include GitHub's grouped merged pull requests plus every commit in that range, including direct fixes and merge resolutions; the first release lists the complete commit history. Apply the configured `feat`/`enhancement`, `fix`/`bug` or `perf`/`performance` labels to group pull requests under Features, Fixes or Performance; unlabeled pull requests appear under Other Changes. The README version badge also tracks published stable releases.
 
 Release assets are:
 
