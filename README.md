@@ -22,6 +22,11 @@
   <a href="https://github.com/Beelzebub2/fetchrail/issues">Report an issue</a>
 </p>
 
+<p align="center">
+  <a href="https://chromewebstore.google.com/detail/fetchrail-browser-integra/ccmbmcgihlemlheldpkgnidgohlkaipb"><img src="https://developer.chrome.com/static/docs/webstore/branding/image/iNEddTyWiMfLSwFD6qGq.png" alt="Install Fetchrail from the Chrome Web Store" height="60"></a>
+  <a href="https://addons.mozilla.org/en-US/firefox/addon/fetchrail-browser-integration/"><img src="https://extensionworkshop.com/assets/img/documentation/publish/get-the-addon-178x60px.dad84b42.png" alt="Install Fetchrail from Firefox Add-ons" height="60"></a>
+</p>
+
 > Most downloads travel down a single connection. Fetchrail opens up to thirty-two, and lets you watch every one.
 
 ## The engine
@@ -70,7 +75,7 @@ And it does more than catch:
 - **Works through download pages.** For sites with countdowns, it opens each page in turn, follows a single clear download button and captures the final file. Logins and CAPTCHAs stay with you.
 - **One right-click away.** Choose **Download with Fetchrail** on any link, or control running transfers from the toolbar.
 
-Install the official [Chrome Web Store companion](https://chromewebstore.google.com/detail/ccmbmcgihlemlheldpkgnidgohlkaipb) for automatic browser updates. Fetchrail also bundles companions for manual installation and Firefox. [Read the companion guide](browser-extension/README.md).
+Install the companion from the [Chrome Web Store](https://chromewebstore.google.com/detail/fetchrail-browser-integra/ccmbmcgihlemlheldpkgnidgohlkaipb) or [Firefox Add-ons](https://addons.mozilla.org/en-US/firefox/addon/fetchrail-browser-integration/) for automatic browser updates. [Read the companion guide](browser-extension/README.md).
 
 ## Make it yours
 
