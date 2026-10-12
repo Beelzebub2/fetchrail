@@ -87,7 +87,7 @@ fn origin_budget(url: &Url) -> Arc<crate::network::OriginGate> {
     budget
 }
 
-fn retry_after(headers: &HeaderMap, now: DateTime<Utc>) -> Option<Duration> {
+pub(crate) fn retry_after(headers: &HeaderMap, now: DateTime<Utc>) -> Option<Duration> {
     let value = headers.get(header::RETRY_AFTER)?.to_str().ok()?.trim();
     let duration = if let Ok(seconds) = value.parse::<u64>() {
         Duration::from_secs(seconds)

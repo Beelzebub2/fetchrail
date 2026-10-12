@@ -32,14 +32,19 @@ The report explicitly states these limits instead of inventing a hardware score.
 
 ## Experimental design
 
-- Quick: two opposite-order runs of 1/4/8/16 parallel requests, then the full
+- Quick: two opposite-order runs of 1/4/8 parallel requests, then the full
   receive/write/hash path. Default maximum requested payload is 1 GiB.
-- Deep: two opposite-order runs of 1/2/4/8/16/32 requests over the normal pooled
-  client, followed by a repeated HTTP/1 1/4/16/32 matrix, sustained confirmation
+- Deep: two opposite-order runs of 1/2/4/8 requests over the normal pooled
+  client, followed by a repeated HTTP/1 1/4/8 matrix, sustained confirmation
   up to 30 seconds, and the full pipeline. Default payload budget is 16 GiB.
-- Requests are at most 64 MiB, streamed without accumulating the response in RAM.
+- Requests are at most 250 MB, streamed without accumulating the response in RAM.
   Reused connections reduce handshake bias. Unique nonces and no-store requests
   prevent a local HTTP cache from masquerading as Internet throughput.
+  Two-second phase gaps and loaded probes reduce request churn. Public calibration
+  stops on a failed trial, retains partial diagnostics and reports Retry-After
+  on service refusals. It does not continue a failing matrix. The public baseline
+  tests at most eight parallel requests; higher counts are learned from ordinary
+  downloads against their actual hosts, within the existing manual ceiling.
 - Public measurements use Cloudflare's documented `__down`/`__up` endpoints.
   Their route is a baseline, not a prediction of another download host's limit.
   HTTP/1 comparisons remain diagnostic: one provider cannot justify forcing a
@@ -129,6 +134,10 @@ document. Copy detailed report strips private network/volume fingerprints.
   on the network path, congestion/windows and single versus multiple TCP sessions;
   longer tests are needed to characterize sustained behavior. Its managed-network
   methodology is not a guarantee for consumer Internet access.
+- [HTTP 429 semantics](https://www.rfc-editor.org/rfc/rfc6585.html#section-4)
+  and [the provider's default workload](https://github.com/cloudflare/speedtest/blob/main/src/config/defaultConfig.ts):
+  public endpoints can refuse an aggressive test; larger streamed payloads and
+  fewer requests reduce churn without turning a service limit into a network score.
 - [HTTP/2 connection management](https://www.rfc-editor.org/rfc/rfc9113.html#section-9.1):
   multiple streams can share one connection; parallel requests are not TCP counts.
 - [Cloudflare measurement explanation](https://blog.cloudflare.com/how-does-cloudflares-speed-test-really-work/)
