@@ -4,6 +4,13 @@
 
 Results stay in private application data as `diagnostics-latest.json`, replacing the previous report only after a completed run. It includes actual local measurements and a local run identifier for admission/share deduplication. Copy report omits identifiers, paths, endpoint addresses and exact run time/date. A cancelled run keeps the last valid report.
 
+For download tuning, use **Optimize downloads** directly; it includes its own
+hardware and sustained download measurements, so these diagnostics are optional.
+**Go to download calibration** switches views without starting a test or changing
+settings. Diagnostic grades and brief samples are kept out of tuning decisions.
+See [the recommended workflow](performance-calibration.md#which-tool-should-i-use)
+for calibration, applying results and learning from normal downloads without a test.
+
 ## What is measured
 
 Every throughput sample uses actual processed/received bytes divided by a monotonic `Instant` duration. Steps that cost only time (processor, memory copy, drive read) take five samples; steps bounded by disk writes, allocation or network payload (drive write, copy finalization, allocate-and-touch, connection) take three. The median is reported; variation is `(maximum − minimum) / median × 100%`. Samples below one second are marked **short**, so a burst is not presented as stable capacity. Decimal MB/s, GB/s and Mbps are distinct; Mbps ÷ 8 gives MB/s. MiB denotes 1,048,576 bytes.

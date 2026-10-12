@@ -395,7 +395,9 @@ try {
   await page.getByRole("button", {name:"Hardware diagnostics",exact:true}).click();
   await page.getByRole("heading", {name:"Diagnostics",exact:true}).waitFor();
   assert.equal(await page.getByRole("button", {name:"Start quick test",exact:true}).count(),0);
-  await page.getByRole("button", {name:"Optimize downloads",exact:true}).click();
+  await page.getByRole("button", {name:"Go to download calibration",exact:true}).click();
+  await page.getByRole("heading", {name:"Calibrate your connection and drive",exact:true}).waitFor();
+  assert.equal(await page.evaluate(() => window.testCalls.filter(c=>["start_diagnostics","apply_calibration","update_settings"].includes(c.name)).length),0,"Moving between tools must not run a prerequisite, apply results or save a draft");
   assert.equal(await page.evaluate(() => window.testCalls.filter(c=>c.name==="start_calibration").length),0);
   await page.getByRole("button", {name:"Deep",exact:true}).click();
   await page.getByLabel("Network payload budget").selectOption("64");
