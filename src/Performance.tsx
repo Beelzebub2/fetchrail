@@ -86,18 +86,19 @@ export function PerformancePage({ settings, draft, onChange, view, onViewChange 
   const idle = quantile(report?.idleLatencyMs ?? []);
   const peakMemory = quantile(report?.resources.flatMap(s => s.processMemoryBytes == null ? [] : [s.processMemoryBytes]) ?? [], 1);
   return <section aria-labelledby="performance-title">
-    <div className="page-head rise"><div><h1 id="performance-title">Performance</h1><p>Measure this computer, then let Fetchrail learn from real downloads.</p></div></div>
+    <div className="page-head rise"><div><h1 id="performance-title">Performance</h1><p>Optimize real downloads, or investigate this computer.</p></div></div>
     <div className="performance-view-switch">
       <div className="segmented" role="group" aria-label="Performance tools">
         <button type="button" aria-pressed={view === "calibration"} disabled={diagnosticsActive} onClick={() => onViewChange("calibration")}>Optimize downloads</button>
         <button type="button" aria-pressed={view === "diagnostics"} disabled={running} onClick={() => onViewChange("diagnostics")}>Hardware diagnostics</button>
       </div>
-      <p className="hint">{view === "calibration" ? "Repeated connection and drive tests can tune future downloads within your limits. Reports stay local." : "Inspect CPU, memory, drive and connection measurements. Diagnostic grades are informational and do not change download settings."}</p>
+      <p className="hint">{view === "calibration" ? "Start here to optimize downloads. Calibration includes its own drive, memory-pressure and download-pipeline measurements; you do not need Hardware diagnostics first. Reports stay local." : "Optional troubleshooting: inspect CPU, memory, drive and connection measurements. Grades and short samples explain this test's workload; they do not choose download settings. Download calibration measures the sustained workload it needs."}</p>
+      {view === "diagnostics" && <button type="button" className="ghost-button" disabled={diagnosticsActive || running} onClick={() => onViewChange("calibration")}>Go to download calibration</button>}
     </div>
     {view === "diagnostics" ? <Diagnostics onActivityChange={setDiagnosticsActive} /> : <>
     <div className="performance-layout">
       <section className="card rise d1" aria-labelledby="performance-test-title">
-        <div className="card-head"><h2 id="performance-test-title">Calibrate your connection and drive</h2><p>Pause downloads and torrent seeding first. New queued downloads wait while testing.</p></div>
+        <div className="card-head"><h2 id="performance-test-title">Calibrate your connection and drive</h2><p>Run a test, review the results, then apply a usable calibration. Automatic tuning keeps learning from normal downloads.</p><p>Pause downloads and torrent seeding first. New queued downloads wait while testing.</p></div>
         <fieldset className="choice-field" disabled={running}><legend>Test depth</legend><div className="segmented">
           <button type="button" aria-pressed={!options.deep} onClick={() => setOptions({ ...options, deep: false, networkBudgetMib: 1024, diskBudgetMib: 256 })}>Quick</button>
           <button type="button" aria-pressed={options.deep} onClick={() => setOptions({ ...options, deep: true, networkBudgetMib: options.downloadUrl?.trim() ? 16384 : 1024, diskBudgetMib: 1024 })}>Deep</button>
@@ -120,8 +121,8 @@ export function PerformancePage({ settings, draft, onChange, view, onViewChange 
         {note && <p role="status">{note}</p>}
       </section>
       <section className="card rise d2" aria-labelledby="performance-auto-title">
-        <div className="card-head"><h2 id="performance-auto-title">Automatic tuning</h2><p>Start from calibration, then learn which parallelism helps each server.</p></div>
-        <label className="performance-toggle"><span>Use measured automatic tuning<small>Save this setting below. Explicit per-download connection choices remain manual.</small></span><input className="switch" type="checkbox" checked={draft.performanceAuto ?? false} onChange={e => onChange({ performanceAuto: e.target.checked })} /></label>
+        <div className="card-head"><h2 id="performance-auto-title">Automatic tuning</h2><p>Learn from qualifying completed downloads. A usable calibration can supply a starting point; neither test is required.</p></div>
+        <label className="performance-toggle"><span>Use measured automatic tuning<small>Save this setting below to learn without a test. Applying calibration also enables it. Explicit per-download connection choices remain manual.</small></span><input className="switch" type="checkbox" checked={draft.performanceAuto ?? false} onChange={e => onChange({ performanceAuto: e.target.checked })} /></label>
         <p className="hint">Your connection and simultaneous-download limits remain ceilings. Healthy ranges drain naturally; verified bytes and resume checkpoints are preserved. Competing transfers, speed caps and final tails are excluded from learning.</p>
         <p className="hint">Profiles expire after 14 days and are ignored when the engine build, detected network or destination volume changes. Learning is local and bounded to 128 server/count observations and four calibration reports.</p>
         <p className="mono">{status?.learnedHosts ?? 0} learned server/count observations</p>
