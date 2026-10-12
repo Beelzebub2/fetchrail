@@ -572,6 +572,9 @@ impl Drop for RangePermit {
     }
 }
 impl LivePolicy {
+    pub(crate) fn should_drain(&self) -> bool {
+        self.active.load(Ordering::Acquire) > self.target.load(Ordering::Acquire)
+    }
     pub fn new(start: usize, ceiling: usize, buffer_bytes: usize) -> Arc<Self> {
         let start = start.clamp(1, ceiling.max(1));
         Arc::new(Self {

@@ -103,6 +103,7 @@ async fn publication_crash_stages_reconcile_exactly_one_file_and_reject_foreign_
                     total,
                     fingerprint: journal.manifest_sha256.clone(),
                     expected_sha256: saved.expected_sha256.clone(),
+                    identity: None,
                 },
             )
             .await
@@ -236,6 +237,7 @@ async fn shared_range_commitments_recover_without_an_initial_full_file_digest() 
             total,
             fingerprint: journal.manifest_sha256.clone(),
             expected_sha256: None,
+            identity: None,
         },
     )
     .await
@@ -264,134 +266,190 @@ async fn shared_range_commitments_recover_without_an_initial_full_file_digest() 
 #[tokio::test]
 async fn post_attachment_verification_rejects_mutations_and_keeps_provenance() {
     use std::io::{Seek, SeekFrom};
-    for copied in [false, true] {
-        for outcome in [
-            "unchanged",
-            "same-size",
-            "truncate",
-            "delete",
-            "replace",
-            "ads",
-            "fail",
-        ] {
-            let root = std::env::temp_dir().join(format!("fetchrail-scan-{}", Uuid::new_v4()));
-            fs::create_dir_all(&root).await.unwrap();
-            let stage = root.join("0.part");
-            let temp = root.join("scanned.part");
-            let output = root.join("published.bin");
-            let data = (0..64 * 1024).map(|i| (i % 251) as u8).collect::<Vec<_>>();
-            fs::write(&stage, &data).await.unwrap();
-            if copied {
-                fs::copy(&stage, &temp).await.unwrap();
-            } else {
-                std::fs::hard_link(&stage, &temp).unwrap();
-            }
-            let total = data.len() as u64;
-            let ranges = split_ranges(total, 4);
-            let manifest = PartManifest {
-                total_bytes: Some(total),
-                ranges: ranges.clone(),
-                validator: Some("\"source\"".into()),
-                version: 1,
-                final_url_sha256: Some("0".repeat(64)),
-                accepts_ranges: true,
-                shared_staging: true,
-            };
-            let manifest_bytes = serde_json::to_vec(&manifest).unwrap();
-            let hashes = ranges
-                .iter()
-                .map(|range| {
-                    format!(
-                        "{:x}",
-                        Sha256::digest(&data[range.start as usize..=range.end as usize])
-                    )
-                })
-                .collect::<Vec<_>>();
-            let identity = open_publication_file(&temp).unwrap().0;
-            // The controlled scanner runs before the same verifier used by real publication.
-            let scan = (|| -> std::io::Result<()> {
-                match outcome {
-                    "same-size" => {
-                        let mut file = std::fs::OpenOptions::new().write(true).open(&temp)?;
-                        file.seek(SeekFrom::Start(total / 2))?;
-                        file.write_all(b"changed bytes")?;
-                        file.sync_all()?;
-                        assert_eq!(open_publication_file(&temp).err().is_some(), cfg!(windows));
-                        drop(file);
-                        let (after_identity, after_len, _) = open_publication_file(&temp)?;
-                        assert_eq!(after_identity, identity);
-                        assert_eq!(after_len, total);
-                    }
-                    "truncate" => std::fs::OpenOptions::new()
-                        .write(true)
-                        .open(&temp)?
-                        .set_len(total / 2)?,
-                    "delete" => std::fs::remove_file(&temp)?,
-                    "replace" => {
-                        let replacement = root.join("replacement");
-                        std::fs::write(&replacement, &data)?;
-                        std::fs::remove_file(&temp)?;
-                        std::fs::rename(replacement, &temp)?;
-                    }
-                    "ads" => {
-                        #[cfg(windows)]
-                        {
-                            let mut ads = temp.as_os_str().to_os_string();
-                            ads.push(":Zone.Identifier");
-                            std::fs::write(ads, b"[ZoneTransfer]\r\nZoneId=3\r\n")?;
+    for whole_hash in [false, true] {
+        for copied in [false, true] {
+            for outcome in [
+                "unchanged",
+                "same-size",
+                "truncate",
+                "delete",
+                "replace",
+                "ads",
+                "fail",
+            ] {
+                let root = std::env::temp_dir().join(format!("fetchrail-scan-{}", Uuid::new_v4()));
+                fs::create_dir_all(&root).await.unwrap();
+                let stage = root.join("0.part");
+                let temp = root.join("scanned.part");
+                let output = root.join("published-Ω-file.bin");
+                let data = (0..64 * 1024).map(|i| (i % 251) as u8).collect::<Vec<_>>();
+                fs::write(&stage, &data).await.unwrap();
+                if copied {
+                    fs::copy(&stage, &temp).await.unwrap();
+                } else {
+                    std::fs::hard_link(&stage, &temp).unwrap();
+                }
+                let total = data.len() as u64;
+                let ranges = split_ranges(total, 4);
+                let manifest = PartManifest {
+                    total_bytes: Some(total),
+                    ranges: ranges.clone(),
+                    validator: Some("\"source\"".into()),
+                    version: 1,
+                    final_url_sha256: Some("0".repeat(64)),
+                    accepts_ranges: true,
+                    shared_staging: true,
+                };
+                let manifest_bytes = serde_json::to_vec(&manifest).unwrap();
+                let hashes = ranges
+                    .iter()
+                    .map(|range| {
+                        format!(
+                            "{:x}",
+                            Sha256::digest(&data[range.start as usize..=range.end as usize])
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                let identity = open_publication_file(&temp).unwrap().0;
+                // The controlled scanner runs before the same verifier used by real publication.
+                let scan = (|| -> std::io::Result<()> {
+                    match outcome {
+                        "same-size" => {
+                            let mut file = std::fs::OpenOptions::new().write(true).open(&temp)?;
+                            file.seek(SeekFrom::Start(total / 2))?;
+                            file.write_all(b"changed bytes")?;
+                            file.sync_all()?;
+                            drop(file);
+                            let (after_identity, after_len, _) = open_publication_file(&temp)?;
+                            assert_eq!(after_identity, identity);
+                            assert_eq!(after_len, total);
                         }
+                        "truncate" => std::fs::OpenOptions::new()
+                            .write(true)
+                            .open(&temp)?
+                            .set_len(total / 2)?,
+                        "delete" => std::fs::remove_file(&temp)?,
+                        "replace" => {
+                            let replacement = root.join("replacement");
+                            std::fs::write(&replacement, &data)?;
+                            std::fs::remove_file(&temp)?;
+                            std::fs::rename(replacement, &temp)?;
+                        }
+                        "ads" => {
+                            #[cfg(windows)]
+                            {
+                                let mut ads = temp.as_os_str().to_os_string();
+                                ads.push(":Zone.Identifier");
+                                std::fs::write(ads, b"[ZoneTransfer]\r\nZoneId=3\r\n")?;
+                            }
+                        }
+                        "fail" => return Err(std::io::ErrorKind::PermissionDenied.into()),
+                        _ => {}
                     }
-                    "fail" => return Err(std::io::ErrorKind::PermissionDenied.into()),
-                    _ => {}
+                    Ok(())
+                })();
+                let result = scan.map_err(EngineError::from).and_then(|()| {
+                    verify_scanned_publication(
+                        &temp,
+                        &identity,
+                        total,
+                        &manifest_bytes,
+                        (!whole_hash).then_some(hashes),
+                        whole_hash
+                            .then(|| format!("{:x}", Sha256::digest(&data)))
+                            .as_deref(),
+                        &CancellationToken::new(),
+                    )
+                });
+                if matches!(outcome, "unchanged" | "ads") {
+                    let verified = result.unwrap();
+                    #[cfg(windows)]
+                    assert!(
+                        std::fs::OpenOptions::new().write(true).open(&temp).is_err(),
+                        "A verified file stays protected until catalog acknowledgement"
+                    );
+                    #[cfg(windows)]
+                    assert!(
+                        std::fs::rename(&temp, root.join("swapped-name")).is_err(),
+                        "A verifier must prevent deletion/replacement through another handle"
+                    );
+                    fs::write(&output, b"foreign output").await.unwrap();
+                    assert!(crate::platform::publish_verified_noreplace(
+                        &verified.file,
+                        &temp,
+                        &output
+                    )
+                    .is_err());
+                    assert_eq!(fs::read(&output).await.unwrap(), b"foreign output");
+                    fs::remove_file(&output).await.unwrap();
+                    crate::platform::publish_verified_noreplace(&verified.file, &temp, &output)
+                        .unwrap();
+                    assert_eq!(fs::read(&output).await.unwrap(), data);
+                    #[cfg(windows)]
+                    if outcome == "ads" {
+                        let mut ads = output.as_os_str().to_os_string();
+                        ads.push(":Zone.Identifier");
+                        assert!(std::fs::read(ads)
+                            .unwrap()
+                            .windows(8)
+                            .any(|v| v == b"ZoneId=3"));
+                    }
+                    drop(verified);
+                } else {
+                    assert!(result.is_err(), "{outcome}, copied={copied}");
+                    assert!(
+                        !output.exists(),
+                        "Changed or rejected files cannot be published"
+                    );
                 }
-                Ok(())
-            })();
-            let result = scan.map_err(EngineError::from).and_then(|()| {
-                verify_scanned_publication(
-                    &temp,
-                    &identity,
-                    total,
-                    &manifest_bytes,
-                    Some(hashes),
-                    &CancellationToken::new(),
-                )
-            });
-            if matches!(outcome, "unchanged" | "ads") {
-                let verified = result.unwrap();
-                #[cfg(windows)]
                 assert!(
-                    std::fs::OpenOptions::new().write(true).open(&temp).is_err(),
-                    "A verified file stays protected until catalog acknowledgement"
+                    stage.exists(),
+                    "A failed scan must preserve owned staging for recovery"
                 );
-                crate::platform::publish_noreplace(&temp, &output).unwrap();
-                assert_eq!(fs::read(&output).await.unwrap(), data);
-                #[cfg(windows)]
-                if outcome == "ads" {
-                    let mut ads = output.as_os_str().to_os_string();
-                    ads.push(":Zone.Identifier");
-                    assert!(std::fs::read(ads)
-                        .unwrap()
-                        .windows(8)
-                        .any(|v| v == b"ZoneId=3"));
+                if copied {
+                    assert_eq!(fs::read(stage).await.unwrap(), data);
                 }
-                drop(verified);
-            } else {
-                assert!(result.is_err(), "{outcome}, copied={copied}");
-                assert!(
-                    !output.exists(),
-                    "Changed or rejected files cannot be published"
-                );
+                fs::remove_dir_all(root).await.unwrap();
             }
-            assert!(
-                stage.exists(),
-                "A failed scan must preserve owned staging for recovery"
-            );
-            if copied {
-                assert_eq!(fs::read(stage).await.unwrap(), data);
-            }
-            fs::remove_dir_all(root).await.unwrap();
         }
     }
+}
+
+#[test]
+fn grouped_progress_preserves_bytes_and_does_not_equate_sections_with_connections() {
+    let parts = (0..512)
+        .map(|index| SegmentProgress {
+            start: index * 1024,
+            length: Some(1024),
+            downloaded_bytes: index,
+            speed_bps: if index < 16 { 1000 } else { 0 },
+            active: index < 16,
+            waiting: index >= 16,
+        })
+        .collect::<Vec<_>>();
+    let downloaded = parts.iter().map(|part| part.downloaded_bytes).sum::<u64>();
+    let grouped = compact_segments(parts);
+    assert_eq!(grouped.len(), 32);
+    assert_eq!(
+        grouped
+            .iter()
+            .map(|part| part.downloaded_bytes)
+            .sum::<u64>(),
+        downloaded
+    );
+    assert_eq!(
+        grouped.iter().map(|part| part.speed_bps).sum::<u64>(),
+        16000
+    );
+    assert_eq!(
+        grouped.iter().map(|part| part.length.unwrap()).sum::<u64>(),
+        512 * 1024
+    );
+    assert_eq!(grouped.iter().filter(|part| part.active).count(), 1);
+    assert_eq!(
+        grouped.last().unwrap().start + grouped.last().unwrap().length.unwrap(),
+        512 * 1024
+    );
 }
 
 #[tokio::test]
@@ -513,6 +571,7 @@ fn publication_child_fault_fixture() {
                     total,
                     fingerprint: journal.manifest_sha256.clone(),
                     expected_sha256: saved.expected_sha256.clone(),
+                    identity: None,
                 },
             )
             .await

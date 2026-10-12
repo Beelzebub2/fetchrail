@@ -84,6 +84,9 @@ export type DownloadRecord = {
   mergedBytes: number;
   connections: number;
   requestedConnections: number | null;
+  receivingConnections?: number;
+  connectingConnections?: number;
+  plannedRanges?: number;
   error: string | null;
   createdAt: string;
   finishedAt: string | null;
@@ -368,7 +371,9 @@ export function formatBytes(value: number | null, fine = false) {
 }
 
 export function formatSpeed(value: number) {
-  return value > 0 ? formatBytes(value) + "/s" : "—";
+  if (!Number.isFinite(value) || value<=0) return "—";
+  const unit=Math.min(3,Math.floor(Math.log10(Math.max(1,value))/3));
+  return `${(value/1000**unit).toFixed(unit===0?0:1)} ${["B/s","kB/s","MB/s","GB/s"][unit]}`;
 }
 
 export function formatEta(value: number | null) {
@@ -442,7 +447,7 @@ export function statusLabel(status: DownloadStatus) {
   return labels[status];
 }
 
-// One entry per connection. Before the engine has split the file, the whole download is a single part.
+// Byte sections may group several ranges; request counts are reported separately.
 export function partsOf(item: DownloadRecord): Part[] {
   const segments = item.segments.length
     ? item.segments
@@ -470,6 +475,15 @@ export function partsOf(item: DownloadRecord): Part[] {
       state,
     };
   });
+}
+
+export function connectionCounts(item:DownloadRecord) {
+  const parts=partsOf(item);
+  const valid=(value:number|undefined,fallback:number)=>typeof value==="number"&&Number.isInteger(value)&&value>=0&&value<=32 ? value : fallback;
+  return {
+    receiving:item.status==="downloading" ? valid(item.receivingConnections,parts.filter(p=>p.state==="receiving").length):0,
+    connecting:item.status==="downloading" ? valid(item.connectingConnections,parts.filter(p=>p.state==="connecting").length):0,
+  };
 }
 
 function partNote(part: Part) {
@@ -734,7 +748,7 @@ function App() {
     () =>
       downloads
         .filter((item) => item.status === "downloading")
-        .reduce((count, item) => count + partsOf(item).filter((part) => part.state === "receiving" || part.state === "connecting").length, 0),
+        .reduce((count, item) => {const live=connectionCounts(item);return count+live.receiving+live.connecting;}, 0),
     [downloads],
   );
 
@@ -1553,22 +1567,23 @@ function DownloadRow({
 
   const parts = partsOf(item);
   const split = item.segments.length > 0;
-  const count = (state: PartState) => parts.filter((part) => part.state === state).length;
+  const live = connectionCounts(item);
+  const count = (state: PartState) => state==="receiving" ? live.receiving : state==="connecting" ? live.connecting : parts.filter((part) => part.state === state).length;
   const requested = item.requestedConnections ?? item.connections;
   const summary =
     item.status === "completed"
-      ? item.connections > 1
-        ? `Joined from ${item.connections} parts`
+      ? (item.plannedRanges??item.connections) > 1
+        ? `Completed ${item.plannedRanges??item.connections} sections`
         : "Single connection"
       : item.status === "merging"
-        ? `Joining ${parts.length} parts into one file`
+        ? "Finalizing downloaded file"
         : !split
           ? `Opens up to ${requested} connections when it starts`
           : item.status === "downloading"
             ? [
                 `${count("receiving")} receiving`,
                 count("connecting") && `${count("connecting")} connecting`,
-                count("done") && `${count("done")} done`,
+                count("done") && `${count("done")} sections done`,
               ]
                 .filter(Boolean)
                 .join(" · ")
@@ -2253,7 +2268,7 @@ function SettingsPage({
                       aria-pressed={draft.speedLimitBps === megabytes * 1024 * 1024}
                       onClick={() => onChange({ speedLimitBps: megabytes * 1024 * 1024 })}
                     >
-                      {megabytes ? `${megabytes} MB/s` : "Unlimited"}
+                      {megabytes ? `${megabytes} MiB/s` : "Unlimited"}
                     </button>
                   ))}
                 </div>

@@ -71,7 +71,7 @@ pub struct DownloadRecord {
     pub queue: String,
     #[serde(default)]
     pub scheduled_for: Option<DateTime<Utc>>,
-    /// One entry per connection of the current transfer; empty before it starts and after it completes.
+    /// Byte sections, grouped to at most 32 entries; empty before start and after completion.
     #[serde(default)]
     pub segments: Vec<SegmentProgress>,
     /// The user chose this file name; a name suggested by the server must not replace it.
