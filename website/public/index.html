@@ -47,6 +47,11 @@
     <symbol id="i-calendar" viewBox="0 0 24 24"><rect x="3" y="5" width="18" height="16" rx="2"/><path d="M3 10h18M8 3v4M16 3v4"/></symbol>
     <symbol id="i-out" viewBox="0 0 24 24"><path d="M7 7h10v10M7 17 17 7"/></symbol>
     <symbol id="i-rescan" viewBox="0 0 24 24"><path d="M21 12a9 9 0 1 1-2.6-6.4L21 8M21 3v5h-5"/></symbol>
+    <symbol id="i-magnet" viewBox="0 0 24 24"><path d="m6 15-4-4 6.75-6.77a7.79 7.79 0 0 1 11 11L13 22l-4-4 6.39-6.36a2.14 2.14 0 0 0-3-3L6 15"/><path d="m5 8 4 4M12 15l4 4"/></symbol>
+    <symbol id="i-plus" viewBox="0 0 24 24"><path d="M5 12h14M12 5v14"/></symbol>
+    <symbol id="i-sun" viewBox="0 0 24 24"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M6.34 17.66l-1.41 1.41M19.07 4.93l-1.41 1.41"/></symbol>
+    <symbol id="i-moon" viewBox="0 0 24 24"><path d="M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9Z"/></symbol>
+    <symbol id="i-gear" viewBox="0 0 24 24"><path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z"/><circle cx="12" cy="12" r="3"/></symbol>
     <symbol id="logo" viewBox="0 0 48 48"><rect width="48" height="48" rx="12"/><g transform="translate(24 24) scale(.78) translate(-24 -24)"><path d="M37 7 24 19"/><path class="cut" d="M11 7 28 22.7"/><path d="M11 7 28 22.7"/><path d="M11 18 24 30"/><path class="cut" d="M37 18 20 33.7"/><path d="M37 18 20 33.7"/><path class="cut" d="M11 29 24 41"/><path d="M11 29 24 41"/><path d="M37 29 24 41"/></g></symbol>
   </svg>
 
@@ -99,46 +104,58 @@
 
       <div class="wrap hero-stage" data-hero-stage>
         <span class="hero-glow" aria-hidden="true"></span>
-        <figure class="shot" role="img" aria-label="The Fetchrail window: a 4.2 GB download split across 16 connections, with each connection's byte range, progress and speed listed underneath.">
-          <div class="shot-side">
-            <div class="shot-brand">
-              <svg class="logo" width="28" height="28" aria-hidden="true"><use href="#logo"/></svg>
-              <span>Fetchrail</span>
+        <figure class="shot" role="img" aria-label="The Fetchrail window: a 4.2 GB download split across 16 connections, with each connection's byte range, progress and speed listed underneath, and a finished torrent being shared with 12 peers.">
+          <div class="shot-rail">
+            <div class="shot-rail-main">
+              <div class="shot-brand">
+                <svg class="logo" width="30" height="30" aria-hidden="true"><use href="#logo"/></svg>
+                <span>Fetchrail</span>
+              </div>
+              <div class="add-bar">
+                <div class="add-field"><svg class="ico"><use href="#i-link"/></svg><span>Paste a link or magnet</span><svg class="ico"><use href="#i-settings"/></svg></div>
+                <div class="btn btn-primary add-button"><svg class="ico"><use href="#i-download"/></svg><span>Download</span></div>
+                <div class="btn btn-secondary add-button add-torrent"><svg class="ico"><use href="#i-folder"/></svg><span>Open torrent</span></div>
+              </div>
+              <div class="shot-tools">
+                <div class="throughput">
+                  <svg viewBox="0 0 200 44" preserveAspectRatio="none"><path data-sim="spark-area" d="M0,44 L0,30 L14,26 L28,28 L42,20 L57,22 L71,14 L85,18 L100,10 L114,13 L128,8 L142,12 L157,6 L171,9 L185,5 L200,7 L200,44 Z"/><polyline data-sim="spark-line" points="0,30 14,26 28,28 42,20 57,22 71,14 85,18 100,10 114,13 128,8 142,12 157,6 171,9 185,5 200,7"/></svg>
+                  <div class="throughput-speed mono"><strong data-sim="total-speed">81.0</strong><span>MB/s</span></div>
+                </div>
+                <span class="icon-cell"><svg class="ico theme-sun"><use href="#i-sun"/></svg><svg class="ico theme-moon"><use href="#i-moon"/></svg></span>
+                <span class="icon-cell"><svg class="ico"><use href="#i-gear"/></svg></span>
+              </div>
             </div>
-            <div class="shot-nav">
-              <div class="shot-nav-item active"><svg class="ico"><use href="#i-list"/></svg><span>All downloads</span><span class="count mono">4</span></div>
-              <div class="shot-nav-item"><svg class="ico"><use href="#i-activity"/></svg><span>Active</span><span class="count mono">2</span></div>
-              <div class="shot-nav-item"><svg class="ico"><use href="#i-done"/></svg><span>Completed</span><span class="count mono">1</span></div>
-              <div class="shot-nav-item"><svg class="ico"><use href="#i-alert"/></svg><span>Failed</span><span class="count mono">0</span></div>
-            </div>
-            <div class="shot-nav">
-              <span class="overline shot-nav-heading">Queues</span>
-              <div class="shot-nav-item"><span class="queue-dot live"></span><span>Default</span><span class="count mono">3</span></div>
-              <div class="shot-nav-item"><span class="queue-dot"></span><span>Overnight</span><span class="count mono">1</span></div>
-            </div>
-            <div class="shot-side-bottom">
-              <div class="shot-nav-item"><svg class="ico"><use href="#i-settings"/></svg><span>Settings</span></div>
-              <div class="throughput">
-                <span class="overline">Downloading now</span>
-                <div class="throughput-speed mono"><strong data-sim="total-speed">81.0</strong><span>MB/s</span></div>
-                <svg viewBox="0 0 200 44" preserveAspectRatio="none"><path data-sim="spark-area" d="M0,44 L0,30 L14,26 L28,28 L42,20 L57,22 L71,14 L85,18 L100,10 L114,13 L128,8 L142,12 L157,6 L171,9 L185,5 L200,7 L200,44 Z"/><polyline data-sim="spark-line" points="0,30 14,26 28,28 42,20 57,22 71,14 85,18 100,10 114,13 128,8 142,12 157,6 171,9 185,5 200,7"/></svg>
-                <p><span data-sim="active-summary">2 active · 1 waiting</span><span data-sim="total-connections">20 connections</span></p>
+            <div class="shot-strip">
+              <div class="shot-tabs">
+                <span class="shot-tab active">All downloads <span class="count mono">5</span></span>
+                <span class="shot-tab">Active <span class="count mono">3</span></span>
+                <span class="shot-tab">Completed <span class="count mono">1</span></span>
+                <span class="shot-tab">Failed <span class="count mono">0</span></span>
+                <span class="shot-divider"></span>
+                <span class="shot-tab">Torrents <span class="count mono">1</span></span>
+                <span class="shot-tab">Seeding <span class="count mono">1</span></span>
+                <span class="shot-tab">Paused</span>
+              </div>
+              <div class="shot-queues">
+                <span class="overline">Queues</span>
+                <span class="queue-pill"><span class="queue-dot live"></span>Default <span class="count mono">4</span></span>
+                <span class="queue-pill"><span class="queue-dot"></span>Overnight <span class="count mono">1</span></span>
+                <span class="icon-cell"><svg class="ico"><use href="#i-plus"/></svg></span>
               </div>
             </div>
           </div>
 
           <div class="shot-main">
-            <div class="add-bar">
-              <div class="add-field"><svg class="ico"><use href="#i-link"/></svg><span>Paste a link to download</span></div>
-              <div class="btn btn-primary add-button"><svg class="ico"><use href="#i-download"/></svg><span>Download</span></div>
-            </div>
             <div class="list-head">
-              <div class="list-title">All downloads<span class="mono">4</span></div>
+              <div class="group-by">
+                <span class="overline">Group by</span>
+                <div class="shot-segmented"><span class="on">Status</span><span>Queue</span></div>
+              </div>
               <div class="search"><svg class="ico"><use href="#i-search"/></svg><span>Search name, site or queue</span></div>
             </div>
 
             <div class="download-list">
-              <div class="row-main list-columns overline"><span></span><span></span><span>Name</span><span>Progress</span><span class="col-speed">Speed</span><span class="col-eta">Time left</span><span></span></div>
+              <div class="list-section live"><span class="dot"></span><strong>Downloading</strong><span class="count mono">2</span><span class="note mono" data-sim="section-speed">81.0 MB/s</span></div>
 
               <div class="download-row expanded" data-download-row="iso">
                 <div class="row-main">
@@ -176,6 +193,8 @@
                 </div>
               </div>
 
+              <div class="list-section"><span class="dot"></span><strong>Waiting</strong><span class="count mono">1</span></div>
+
               <div class="download-row">
                 <div class="row-main">
                   <span class="col-chevron"><svg class="ico chevron"><use href="#i-chevron"/></svg></span>
@@ -187,9 +206,28 @@
                   </div>
                   <div class="col-speed"><span class="mono">—</span></div>
                   <div class="col-eta"><span class="mono">—</span></div>
-                  <div class="row-actions"><span class="icon-cell"><svg class="ico"><use href="#i-more"/></svg></span></div>
+                  <div class="row-actions"><span class="icon-cell"><svg class="ico"><use href="#i-pause"/></svg></span><span class="icon-cell"><svg class="ico"><use href="#i-folder"/></svg></span><span class="icon-cell"><svg class="ico"><use href="#i-more"/></svg></span></div>
                 </div>
               </div>
+
+              <div class="list-section"><span class="dot"></span><strong>Seeding</strong><span class="count mono">1</span><span class="note mono" data-sim="seed-speed">↑ 420 KB/s</span></div>
+
+              <div class="download-row">
+                <div class="row-main">
+                  <span class="col-chevron"><svg class="ico"><use href="#i-activity"/></svg></span>
+                  <span class="file-badge mono">P2P</span>
+                  <div class="col-name"><strong>linux-netinst-12.7-amd64.iso</strong><span>12 peers · 40 seeds · Default</span></div>
+                  <div class="col-progress">
+                    <div class="progress-line"><span>Sharing</span><span class="mono">100%</span></div>
+                    <div class="strands" data-fills="1"></div>
+                  </div>
+                  <div class="col-speed"><span class="mono">↓ —</span><small class="mono" data-sim="seed-speed">↑ 420 KB/s</small></div>
+                  <div class="col-eta"><span class="mono">0.33</span><small>ratio</small></div>
+                  <div class="row-actions"><span class="icon-cell"><svg class="ico"><use href="#i-pause"/></svg></span><span class="icon-cell"><svg class="ico"><use href="#i-folder"/></svg></span></div>
+                </div>
+              </div>
+
+              <div class="list-section"><span class="dot"></span><strong>Completed</strong><span class="count mono">1</span></div>
 
               <div class="download-row completed">
                 <div class="row-main">
@@ -302,6 +340,22 @@
               <div class="gtext">
                 <h3>URL batches</h3>
                 <p>Paste several links, one per line. A batch shares its folder, queue, start time and per-file limit, and rejected links stay in the form to fix.</p>
+              </div>
+            </article>
+
+            <article class="gcard">
+              <div class="gdemo gdemo-torrent" aria-hidden="true">
+                <div class="magnet mono"><svg class="ico"><use href="#i-magnet"/></svg><span>magnet:?xt=urn:btih:9f3c41d7a05be2…</span></div>
+                <div class="torrent-files">
+                  <div class="torrent-file on"><span class="box"><svg class="ico"><use href="#i-check"/></svg></span><span class="name mono">linux-netinst-12.7-amd64.iso</span><span class="mono">631 MB</span></div>
+                  <div class="torrent-file on"><span class="box"><svg class="ico"><use href="#i-check"/></svg></span><span class="name mono">SHA256SUMS</span><span class="mono">1 KB</span></div>
+                  <div class="torrent-file"><span class="box"></span><span class="name mono">source-12.7.tar.xz</span><span class="mono">1.4 GB</span></div>
+                </div>
+                <div class="batch-foot"><span class="mono accent">2 of 3 files</span><span>12 peers · 40 seeds</span></div>
+              </div>
+              <div class="gtext">
+                <h3>Torrents and magnets</h3>
+                <p>Paste a magnet link or open a .torrent file. Pick the files you want before anything downloads, and Fetchrail keeps sharing until the ratio or time goal you set.</p>
               </div>
             </article>
 
@@ -473,31 +527,56 @@
       </div>
     </section>
 
-    <section class="wrap section install-section" id="install">
-      <h2 data-reveal>Three steps to the first download.</h2>
-      <div class="download-choices">
-        <label>System <select data-download-os><option value="windows">Windows</option><option value="linux">Linux</option></select></label>
-        <label>CPU <select data-download-arch><option value="x64">x86_64 (x64)</option><option value="arm64">aarch64 (ARM64)</option></select></label>
-        <label>Package <select data-download-format><option value="exe">Windows setup</option><option value="deb">deb — Ubuntu / Mint / Kali</option><option value="rpm">rpm — Fedora</option><option value="AppImage">AppImage</option><option value="tar.gz">Native archive</option></select></label>
-      </div>
-      <p class="install-note" data-download-help></p>
-      <ol class="install-steps">
-        <li data-reveal class="d1"><span class="step-number mono">01</span><h3>Choose a package and download it</h3><p class="mono" data-release-file aria-live="polite">Choose your system, CPU and package above.</p></li>
-        <li data-reveal class="d2"><span class="step-number mono">02</span><h3>Install the package, then launch</h3><p>Use Windows setup, your Linux package manager, or a persistent AppImage location.</p></li>
-        <li data-reveal class="d3"><span class="step-number mono">03</span><h3>Paste a file link, pick a destination and start</h3><p>Any HTTP or HTTPS file link works.</p></li>
-      </ol>
-      <p class="install-note" data-reveal>Signed automatic updates are available for Windows setup and writable AppImages. Native Linux packages update through their package manager. Check the <a href="https://github.com/Beelzebub2/fetchrail/blob/main/docs/linux.md">Linux installation and qualification guide</a> for package availability, source builds and tested distro/CPU combinations.</p>
-    </section>
-
     <section class="final" data-final>
       <svg class="converge" data-converge aria-hidden="true"></svg>
-      <div class="wrap final-copy">
+      <div class="wrap final-copy" id="install">
         <svg class="logo final-mark" width="72" height="72" aria-hidden="true"><use href="#logo"/></svg>
         <h2>Put your downloads on rails.</h2>
-        <div class="cta-buttons">
-          <a class="btn btn-primary" href="https://github.com/Beelzebub2/fetchrail/releases/latest" data-download><svg class="ico"><use href="#i-download"/></svg><span data-download-label>View releases</span></a>
-          <a class="btn btn-secondary" href="https://github.com/Beelzebub2/fetchrail">View on GitHub</a>
+        <div class="picker" data-download-choices data-reveal>
+          <div class="picker-choices">
+            <fieldset class="pick">
+              <legend class="overline">System</legend>
+              <div class="segmented">
+                <label><input type="radio" name="os" value="windows" checked>Windows</label>
+                <label><input type="radio" name="os" value="linux">Linux</label>
+              </div>
+            </fieldset>
+            <fieldset class="pick">
+              <legend class="overline">CPU</legend>
+              <div class="segmented">
+                <label><input type="radio" name="arch" value="x64" checked>x86_64 (x64)</label>
+                <label><input type="radio" name="arch" value="arm64">aarch64 (ARM64)</label>
+              </div>
+            </fieldset>
+            <fieldset class="pick">
+              <legend class="overline">Package</legend>
+              <div class="segmented loose">
+                <label><input type="radio" name="format" value="exe" checked>Windows setup</label>
+                <label><input type="radio" name="format" value="deb">deb</label>
+                <label><input type="radio" name="format" value="rpm">rpm</label>
+                <label><input type="radio" name="format" value="AppImage">AppImage</label>
+                <label><input type="radio" name="format" value="tar.gz">Native archive</label>
+              </div>
+            </fieldset>
+          </div>
+          <div class="picker-file">
+            <p class="mono" data-release-file aria-live="polite">Choose your system, CPU and package.</p>
+            <div class="picker-actions">
+              <a class="btn btn-secondary" href="https://github.com/Beelzebub2/fetchrail">View on GitHub</a>
+              <a class="btn btn-primary" href="https://github.com/Beelzebub2/fetchrail/releases/latest" data-download><svg class="ico"><use href="#i-download"/></svg><span data-download-label>View releases</span></a>
+            </div>
+          </div>
         </div>
+        <p class="picker-note" data-download-help></p>
+      </div>
+      <div class="wrap final-steps">
+        <p class="overline" data-reveal>Three steps to the first download</p>
+        <ol class="install-steps">
+          <li data-reveal class="d1"><span class="step-number mono">01</span><h3>Choose a package and download it</h3><p>Pick your system, CPU and package above, then press Download.</p></li>
+          <li data-reveal class="d2"><span class="step-number mono">02</span><h3>Install the package, then launch</h3><p>Use Windows setup, your Linux package manager, or a persistent AppImage location.</p></li>
+          <li data-reveal class="d3"><span class="step-number mono">03</span><h3>Paste a file link, pick a destination and start</h3><p>Any HTTP or HTTPS file link works.</p></li>
+        </ol>
+        <p class="install-note" data-reveal>Signed automatic updates are available for Windows setup and writable AppImages. Native Linux packages update through their package manager. Check the <a href="https://github.com/Beelzebub2/fetchrail/blob/main/docs/linux.md">Linux installation and qualification guide</a> for package availability, source builds and tested distro/CPU combinations.</p>
       </div>
     </section>
   </main>
