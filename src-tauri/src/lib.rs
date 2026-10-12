@@ -335,9 +335,12 @@ async fn performance_status(
     manager: State<'_, Arc<DownloadManager>>,
     include_report: Option<bool>,
 ) -> Result<performance::Status, String> {
-    Ok(manager
-        .performance
-        .status_with_report(include_report.unwrap_or(true)))
+    let mut status = manager.performance.status_with_report(include_report.unwrap_or(true));
+    let settings = manager.settings().await;
+    let hardware = manager.performance.hardware(std::path::Path::new(&settings.default_download_dir));
+    status.applied_active = manager.performance.profile(&hardware).is_some();
+    status.latest_issue = status.latest.as_ref().and_then(|report| manager.performance.report_issue(report, &hardware));
+    Ok(status)
 }
 #[tauri::command]
 async fn start_calibration(
