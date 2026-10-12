@@ -74,6 +74,9 @@ try {
   session = opened.sessionId;
   assert.ok(session);
   await until(() => evaluate('return Boolean(document.querySelector("button[aria-label=Settings]"))'), "embedded main interface");
+  await until(() => evaluate('return Boolean(document.querySelector("button[aria-label=\"Close analytics choice\"]"))'), "initial analytics choice");
+  await click('button[aria-label="Close analytics choice"]');
+  await until(() => evaluate("return !document.querySelector('dialog[open]')"), "initial analytics choice kept off");
   evidence.frontendReadySeconds = (performance.now() - started) / 1000;
   const main = await wd("/window");
   assert.match(await wd("/url"), /^(tauri:\/\/localhost|https?:\/\/tauri\.localhost)(?:\/|$)/);

@@ -25,6 +25,8 @@ const ENDPOINT: &str = "https://speed.cloudflare.com/__down";
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct Options {
+    #[serde(skip_serializing)]
+    pub download_url: Option<String>,
     pub deep: bool,
     pub online: bool,
     pub upload: bool,
@@ -34,6 +36,7 @@ pub struct Options {
 impl Default for Options {
     fn default() -> Self {
         Self {
+            download_url: None,
             deep: false,
             online: true,
             upload: false,
@@ -44,6 +47,26 @@ impl Default for Options {
 }
 impl Options {
     fn validate(&self) -> Result<(), String> {
+        if let Some(source) = self
+            .download_url
+            .as_deref()
+            .filter(|s| !s.trim().is_empty())
+        {
+            let url = url::Url::parse(source)
+                .map_err(|_| "Enter a valid direct HTTP or HTTPS file URL.")?;
+            if source.len() > 8192
+                || !matches!(url.scheme(), "http" | "https")
+                || !url.username().is_empty()
+                || url.password().is_some()
+            {
+                return Err(
+                    "The direct file URL must use HTTP/HTTPS without embedded credentials.".into(),
+                );
+            }
+            if self.upload {
+                return Err("Generated upload tests use the public endpoint only. Disable upload when testing your own file.".into());
+            }
+        }
         if !(64..=32768).contains(&self.network_budget_mib)
             || !(64..=2048).contains(&self.disk_budget_mib)
         {
@@ -829,12 +852,16 @@ async fn run(
     let temp = directory.join(format!(".fetchrail-calibration-{}", Uuid::new_v4()));
     std::fs::create_dir(&temp).map_err(|_| "Could not create a new temporary test folder.")?;
     let temporary = Temporary(temp.clone());
+    crate::platform::private_dir(&temp)
+        .map_err(|_| "Could not protect the temporary test directory.")?;
     let staging_temp = if staging_hardware.drive_key == hardware.drive_key {
         temp.clone()
     } else {
         let p = staging.join(format!(".fetchrail-calibration-{}", Uuid::new_v4()));
         std::fs::create_dir(&p)
             .map_err(|_| "Could not create a new test folder beside temporary parts.")?;
+        crate::platform::private_dir(&p)
+            .map_err(|_| "Could not protect the temporary-parts test directory.")?;
         p
     };
     let staging_temporary = Temporary(staging_temp.clone());
@@ -907,18 +934,20 @@ async fn run(
             let online_result=async {
             owner.phase("DNS resolver and address-family availability",22);
             let dns_at=Instant::now();
-            if let Ok(parsed)=url::Url::parse(endpoint) {
+            if let Ok(parsed)=url::Url::parse(options.download_url.as_deref().filter(|s|!s.trim().is_empty()).unwrap_or(endpoint)) {
                 if let Some(host)=parsed.host_str() {if let Ok(Ok(addresses))=tokio::time::timeout(Duration::from_secs(5),tokio::net::lookup_host((host,parsed.port_or_known_default().unwrap_or(443)))).await {
                     report.dns_lookup_ms=Some(dns_at.elapsed().as_secs_f64()*1000.0);
                     for address in addresses {let family=if address.is_ipv4(){"IPv4"}else{"IPv6"}.to_string();if !report.resolved_address_families.contains(&family){report.resolved_address_families.push(family);}}
                 }}
             }
             let client=crate::engine::download_client_builder().redirect(reqwest::redirect::Policy::none()).build().map_err(|_|"Could not start the network test client.")?;
+            let source=if let Some(url)=options.download_url.as_deref().filter(|s|!s.trim().is_empty()){Source::direct(&client,url,cancel).await?}else{Source::public(endpoint)};
+            report.notes.push(if source.representation.is_some(){"Internet measurements used the explicitly provided file through validated ranges. The URL and validator are not retained; file contents are never uploaded."}else{"Internet measurements used the public Cloudflare endpoint; service limits can prevent long tests."}.into());
             let budget=AtomicU64::new(options.network_budget_mib*MIB);
             owner.phase("idle request latency and reachability",25);
             for _ in 0..if options.deep {8} else {6} {
                 check(cancel,started,options.deep)?;
-                match latency(&client,endpoint,cancel).await {Ok(ms)=>report.idle_latency_ms.push(ms),Err(_) if cancel.is_cancelled()=>return Err("Performance test cancelled.".into()),Err(_)=>report.failed_latency_requests+=1}
+                match latency(&client,&source,cancel).await {Ok(ms)=>report.idle_latency_ms.push(ms),Err(_) if cancel.is_cancelled()=>return Err("Performance test cancelled.".into()),Err(_)=>report.failed_latency_requests+=1}
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }
             if report.idle_latency_ms.is_empty() { return Err("The test endpoint could not be reached. Run a local-only test or try again later.".into()); }
@@ -930,7 +959,7 @@ async fn run(
                 if index>0 {tokio::select!{_=cancel.cancelled()=>return Err("Performance test cancelled.".into()),_=tokio::time::sleep(Duration::from_secs(2))=>{}}}
                 check(cancel,started,options.deep)?;
                 owner.phase(&format!("download: {count} parallel requests, repeat {}",if index<counts.len(){1}else{2}),30+index*40/matrix.len());
-                let trial=network_trial(&client,endpoint,*count,quota,&budget,cancel,if options.deep {10}else{5},None,"download").await?;
+                let trial=network_trial(&client,&source,*count,quota,&budget,cancel,if options.deep {10}else{5},None,"download").await?;
                 record_network(&mut report,trial)?;
             }
             if options.deep {
@@ -939,7 +968,7 @@ async fn run(
                 for n in [1,4,8,8,4,1] {
                     tokio::select!{_=cancel.cancelled()=>return Err("Performance test cancelled.".into()),_=tokio::time::sleep(Duration::from_secs(2))=>{}}
                     check(cancel,started,options.deep)?;
-                    let trial=network_trial(&independent,endpoint,n,quota,&budget,cancel,8,None,"http1Comparison").await?;
+                    let trial=network_trial(&independent,&source,n,quota,&budget,cancel,8,None,"http1Comparison").await?;
                     record_network(&mut report,trial)?;
                 }
             }
@@ -947,12 +976,12 @@ async fn run(
             if options.deep {
                 owner.phase("sustained throughput confirmation",80);
                 let quota=budget.load(Ordering::Relaxed).saturating_sub(options.disk_budget_mib*MIB/2+if options.upload {32*MIB}else{0});
-                let trial=network_trial(&client,endpoint,n,quota,&budget,cancel,30,None,"sustainedDownload").await?;
+                let trial=network_trial(&client,&source,n,quota,&budget,cancel,30,None,"sustainedDownload").await?;
                 record_network(&mut report,trial)?;
             }
             owner.phase("end-to-end receive, write, hash and flush",85);
             let quota=(budget.load(Ordering::Relaxed)/if options.upload {2}else{1}).min(options.disk_budget_mib*MIB/2);
-            let trial=network_trial(&client,endpoint,n,quota,&budget,cancel,if options.deep {15}else{8},Some(&staging_temp),"pipeline").await?;
+            let trial=network_trial(&client,&source,n,quota,&budget,cancel,if options.deep {15}else{8},Some(&staging_temp),"pipeline").await?;
             report.disk_written_bytes+=trial.bytes;record_network(&mut report,trial)?;
             let copied={let source=staging_temp.clone();let target=temp.clone();let token=cancel.clone();tokio::task::spawn_blocking(move||finalize_pipeline(&source,&target,n,&token)).await.map_err(|_|"Pipeline finalization worker failed.")??};
             report.disk_written_bytes+=copied.bytes;report.trials.push(copied);
@@ -962,7 +991,7 @@ async fn run(
                 report.trials.push(trial);
             }
             report.requested_network_bytes=report.trials.iter().map(|t|t.requested_bytes).sum();
-            report.notes.push("Online tests contact Cloudflare's speed endpoint, which sees your IP address. Fetchrail does not submit results, identifiers, files, cookies or tokens. The budget caps requested body payload, excluding TLS/HTTP overhead and tiny latency requests.".into());
+            report.notes.push("Online tests contact the selected test source, which sees your IP address. Fetchrail does not submit results, identifiers, files, cookies or tokens. The budget caps requested body payload, excluding TLS/HTTP overhead and tiny latency requests.".into());
             Ok::<(),String>(())
             }.await;
             if let Err(error)=online_result {if cancel.is_cancelled() {return Err(error);}report.notes.push(format!("Online measurements were incomplete: {error}"));}
@@ -974,6 +1003,7 @@ async fn run(
         report.adapter_receive_errors=after_hardware.adapters.iter().map(|a|a.receive_errors).sum::<u64>().saturating_sub(hardware.adapters.iter().map(|a|a.receive_errors).sum());
         report.adapter_receive_discards=after_hardware.adapters.iter().map(|a|a.receive_discards).sum::<u64>().saturating_sub(hardware.adapters.iter().map(|a|a.receive_discards).sum());
         if hardware.network_key!=after_hardware.network_key { return Err("The network changed during calibration. Results were discarded; repeat on a stable connection.".into()); }
+        report.options.download_url=None;
         report.elapsed_ms=millis(started.elapsed());report.profile=recommendations(&report);
         if report.profile.confidence=="insufficient" { report.notes.push("No concurrency level had two sufficiently long, successful measurements. Increase the data budget or let normal downloads provide evidence; existing settings remain unchanged.".into()); }
         Ok(report)
@@ -1240,18 +1270,113 @@ fn finalize_pipeline(
     })
 }
 
+#[derive(Clone)]
+struct Source {
+    url: String,
+    representation: Option<(u64, String)>,
+}
+impl Source {
+    fn public(url: &str) -> Self {
+        Self {
+            url: url.into(),
+            representation: None,
+        }
+    }
+    fn request(
+        &self,
+        client: &reqwest::Client,
+        bytes: u64,
+        offset: u64,
+    ) -> reqwest::RequestBuilder {
+        let request = if let Some((_, validator)) = &self.representation {
+            client
+                .get(&self.url)
+                .header(
+                    reqwest::header::RANGE,
+                    format!("bytes={offset}-{}", offset + bytes - 1),
+                )
+                .header(reqwest::header::IF_RANGE, validator)
+        } else {
+            client.get(format!(
+                "{}?bytes={bytes}&nonce={}",
+                self.url,
+                Uuid::new_v4()
+            ))
+        };
+        request
+            .header("Accept-Encoding", "identity")
+            .header("Cache-Control", "no-store")
+    }
+    fn valid_response(&self, response: &reqwest::Response, bytes: u64, offset: u64) -> bool {
+        if let Some((size, validator)) = &self.representation {
+            response.status() == reqwest::StatusCode::PARTIAL_CONTENT
+                && crate::engine::parse_content_range(response.headers())
+                    == Some((offset, offset + bytes - 1, Some(*size)))
+                && crate::engine::representation_validator(response.headers()).as_ref()
+                    == Some(validator)
+        } else {
+            response.status() == reqwest::StatusCode::OK
+        }
+    }
+    async fn direct(
+        client: &reqwest::Client,
+        url: &str,
+        cancel: &CancellationToken,
+    ) -> Result<Self, String> {
+        let request = client
+            .get(url)
+            .header(reqwest::header::RANGE, "bytes=0-0")
+            .header("Accept-Encoding", "identity")
+            .header("Cache-Control", "no-store")
+            .timeout(Duration::from_secs(10))
+            .send();
+        let response = tokio::select! {_=cancel.cancelled()=>return Err("Cancelled".into()),r=request=>r.map_err(|_|"The direct file probe failed.")?};
+        let range = crate::engine::parse_content_range(response.headers());
+        let validator = crate::engine::representation_validator(response.headers());
+        if response.status() != reqwest::StatusCode::PARTIAL_CONTENT
+            || !matches!(range,Some((0,0,Some(size))) if size>=64*MIB)
+            || validator.is_none()
+            || response
+                .headers()
+                .get(reqwest::header::CONTENT_ENCODING)
+                .is_some_and(|v| v != "identity")
+        {
+            return Err("The direct test file must be at least 64 MiB and support validated byte ranges without content encoding. Use its final direct URL; no browser credentials are sent.".into());
+        }
+        let size = range.unwrap().2.unwrap();
+        let mut stream = response.bytes_stream();
+        let mut received = 0;
+        while let Some(chunk) = tokio::select! {_=cancel.cancelled()=>return Err("Cancelled".into()),chunk=stream.next()=>chunk}
+        {
+            received += chunk.map_err(|_| "The direct probe body failed.")?.len();
+            if received > 1 {
+                return Err("The direct probe exceeded its requested range.".into());
+            }
+        }
+        if received != 1 {
+            return Err("The direct probe body was incomplete.".into());
+        }
+        Ok(Self {
+            url: url.into(),
+            representation: Some((size, validator.unwrap())),
+        })
+    }
+}
+
 async fn latency(
     client: &reqwest::Client,
-    endpoint: &str,
+    endpoint: &Source,
     cancel: &CancellationToken,
 ) -> Result<f64, String> {
     let begin = Instant::now();
-    let request = client
-        .get(format!("{endpoint}?bytes=0&nonce={}", Uuid::new_v4()))
-        .header("Cache-Control", "no-store")
-        .send();
+    let bytes = if endpoint.representation.is_some() {
+        1
+    } else {
+        0
+    };
+    let request = endpoint.request(client, bytes, 0).send();
     let response = tokio::select! { _=cancel.cancelled()=>return Err("Cancelled".into()), result=tokio::time::timeout(Duration::from_secs(5),request)=>result.map_err(|_|"Latency request timed out.")?.map_err(|_|"Latency request failed.")? };
-    if !response.status().is_success() {
+    if !endpoint.valid_response(&response, bytes, 0) {
         return Err("Latency endpoint rejected the request.".into());
     }
     // This is HTTP response latency, not an ICMP RTT or a packet-loss measurement.
@@ -1275,7 +1400,7 @@ fn record_network(report: &mut Report, trial: Trial) -> Result<(), String> {
 
 async fn network_trial(
     client: &reqwest::Client,
-    endpoint: &str,
+    endpoint: &Source,
     parallel: usize,
     quota: u64,
     budget: &AtomicU64,
@@ -1338,10 +1463,10 @@ async fn network_trial(
                 Some(tokio::io::BufWriter::with_capacity(1024 * 1024, tokio::fs::OpenOptions::new().create_new(true).write(true).open(path.join(format!("pipeline-{index}.bin"))).await.map_err(|_| "Cannot create pipeline data")?))
             } else { None };
             while done < allocation && !child.is_cancelled() {
-                // Match the provider's documented largest payload to reduce request churn.
-                let wanted = (allocation - done).min(250_000_000);
+                let mut wanted = (allocation - done).min(64 * MIB);
+                let offset=if let Some((size,_))=endpoint.representation {let offset=(index as u64*(size/parallel as u64)).wrapping_add(done)%size;wanted=wanted.min(size-offset);offset}else{0};
                 requested.fetch_add(wanted, Ordering::Relaxed);
-                let request = client.get(format!("{endpoint}?bytes={wanted}&nonce={}", Uuid::new_v4())).header("Accept-Encoding", "identity").header("Cache-Control", "no-store").send();
+                let request = endpoint.request(client,wanted,offset).send();
                 let response = tokio::select! { _ = child.cancelled() => break, response = request => response.map_err(|_| "HTTP request failed")? };
                 statuses.lock().expect("test statuses poisoned").push(response.status().as_u16());
                 if matches!(response.status().as_u16(), 403 | 429 | 503) {
@@ -1349,7 +1474,7 @@ async fn network_trial(
                     child.cancel();
                     return Err("The test service refused further requests");
                 }
-                if response.status() != reqwest::StatusCode::OK || response.headers().get("content-type").is_some_and(|v| v.to_str().is_ok_and(|v| v.to_ascii_lowercase().starts_with("text/html"))) || response.headers().get("content-encoding").is_some_and(|v| !v.to_str().is_ok_and(|v| v.eq_ignore_ascii_case("identity"))) { return Err("HTTP status, HTML page or encoded response rejected"); }
+                if !endpoint.valid_response(&response,wanted,offset) || response.headers().get("content-type").is_some_and(|v| v.to_str().is_ok_and(|v| v.to_ascii_lowercase().starts_with("text/html"))) || response.headers().get("content-encoding").is_some_and(|v| !v.to_str().is_ok_and(|v| v.eq_ignore_ascii_case("identity"))) { return Err("HTTP status, range, validator, HTML page or encoding rejected"); }
                 protocol = format!("{:?} {}", response.version(), response.remote_addr().map_or("unknown family", |v| if v.is_ipv4() { "IPv4" } else { "IPv6" }));
                 header_ms.get_or_insert_with(|| started.elapsed().as_secs_f64() * 1000.0);
                 let mut stream = response.bytes_stream(); let mut body_bytes = 0;
@@ -1672,16 +1797,36 @@ mod tests {
                         }
                     }
                     let text = String::from_utf8_lossy(&request[..used]);
-                    let count = text
-                        .split("bytes=")
-                        .nth(1)
-                        .and_then(|v| v.split(['&', ' ']).next())
-                        .and_then(|v| v.parse::<usize>().ok())
-                        .unwrap_or(0);
+                    let range = text.lines().find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        if !name.eq_ignore_ascii_case("range") {
+                            return None;
+                        }
+                        let (start, end) = value.trim().strip_prefix("bytes=")?.split_once('-')?;
+                        Some((start.parse::<u64>().ok()?, end.parse::<u64>().ok()?))
+                    });
+                    let count = range
+                        .map(|(start, end)| (end - start + 1) as usize)
+                        .unwrap_or_else(|| {
+                            text.split("bytes=")
+                                .nth(1)
+                                .and_then(|v| v.split(['&', ' ']).next())
+                                .and_then(|v| v.parse::<usize>().ok())
+                                .unwrap_or(0)
+                        });
                     if count > 0 {
                         tokio::time::sleep(Duration::from_millis(delay_ms)).await;
                     }
-                    let header=format!("HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: {count}\r\nConnection: close\r\n\r\n");
+                    let header = if let Some((start, end)) = range {
+                        let tag = if count > 1 && text.contains("/changed") {
+                            "changed"
+                        } else {
+                            "fixture"
+                        };
+                        format!("HTTP/1.1 206 Partial Content\r\nETag: \"{tag}\"\r\nContent-Range: bytes {start}-{end}/268435456\r\nContent-Type: application/octet-stream\r\nContent-Length: {count}\r\nConnection: close\r\n\r\n")
+                    } else {
+                        format!("HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: {count}\r\nConnection: close\r\n\r\n")
+                    };
                     if socket.write_all(header.as_bytes()).await.is_err() {
                         return;
                     }
@@ -1702,6 +1847,75 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn direct_source_ranges_are_bounded_private_and_reject_changed_content() {
+        let (endpoint, job) = server(10).await;
+        let client = crate::engine::download_client_builder()
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap();
+        let url = format!("{endpoint}?credential=private-fixture");
+        let options = Options {
+            download_url: Some(url.clone()),
+            ..Default::default()
+        };
+        assert!(options.validate().is_ok());
+        assert!(!serde_json::to_string(&options)
+            .unwrap()
+            .contains("private-fixture"));
+        assert!(Options {
+            upload: true,
+            ..options
+        }
+        .validate()
+        .is_err());
+        let source = Source::direct(&client, &url, &CancellationToken::new())
+            .await
+            .unwrap();
+        let budget = AtomicU64::new(16 * MIB);
+        let trial = network_trial(
+            &client,
+            &source,
+            2,
+            16 * MIB,
+            &budget,
+            &CancellationToken::new(),
+            8,
+            None,
+            "download",
+        )
+        .await
+        .unwrap();
+        assert_eq!(trial.failures, 0);
+        assert_eq!(trial.bytes, 16 * MIB);
+        assert_eq!(trial.http_statuses, vec![206, 206]);
+        let changed = Source::direct(
+            &client,
+            &endpoint.replace("/__down", "/changed"),
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        let failed = network_trial(
+            &client,
+            &changed,
+            1,
+            MIB,
+            &AtomicU64::new(MIB),
+            &CancellationToken::new(),
+            4,
+            None,
+            "download",
+        )
+        .await
+        .unwrap();
+        assert!(failed.failures > 0);
+        assert_eq!(failed.bytes, 0);
+        assert!(!failed.valid_for_tuning);
+        job.abort();
+    }
+
+    #[tokio::test]
     async fn service_refusal_cancels_trial_and_retains_retry_after() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1719,7 +1933,7 @@ mod tests {
         let budget = AtomicU64::new(8 * MIB);
         let trial = network_trial(
             &client,
-            &format!("http://{address}/__down"),
+            &Source::public(&format!("http://{address}/__down")),
             1,
             8 * MIB,
             &budget,
@@ -1749,7 +1963,7 @@ mod tests {
         let budget = AtomicU64::new(32 * MIB);
         let trial = network_trial(
             &client,
-            &endpoint,
+            &Source::public(&endpoint),
             2,
             16 * MIB,
             &budget,
@@ -1768,11 +1982,19 @@ mod tests {
         assert_eq!(trial.failures, 0);
         let token = CancellationToken::new();
         token.cancel();
-        assert!(
-            network_trial(&client, &endpoint, 4, MIB, &budget, &token, 4, None, "download")
-                .await
-                .is_err()
-        );
+        assert!(network_trial(
+            &client,
+            &Source::public(&endpoint),
+            4,
+            MIB,
+            &budget,
+            &token,
+            4,
+            None,
+            "download"
+        )
+        .await
+        .is_err());
         job.abort();
     }
 }
