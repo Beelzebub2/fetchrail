@@ -628,9 +628,7 @@ impl LivePolicy {
             c.best = sustained;
             c.best_target = target;
         }
-        if hint > 0 && sustained >= hint.saturating_mul(95) / 100 {
-            c.settled = true;
-        }
+        // A test server's throughput is a weak prior, not the ceiling of another route.
         // Drain naturally rather than cancelling healthy ranges or discarding verified bytes.
         if writes / receiving.max(1) as u64 > millis(elapsed).saturating_mul(1_000_000) / 2 {
             c.settled = true;
@@ -951,24 +949,26 @@ async fn run(
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }
             if report.idle_latency_ms.is_empty() { return Err("The test endpoint could not be reached. Run a local-only test or try again later.".into()); }
-            let counts=if options.deep {vec![1,2,4,8]} else {vec![1,4,8]};
+            let provided=source.representation.is_some();
+            let counts=if options.deep && provided {vec![1,2,4,8,16,32]} else if options.deep {vec![1,2,4,8]} else {vec![1,4,8]};
+            let comparisons=if provided {vec![1,4,16,32,32,16,4,1]}else{vec![1,4,8,8,4,1]};
             let mut matrix=counts.clone();matrix.extend(counts.iter().rev());
             let reserved=if options.deep {options.network_budget_mib*MIB*2/5}else{options.network_budget_mib*MIB/(if options.upload {4} else {5})};
-            let quota=(options.network_budget_mib*MIB-reserved)/(matrix.len()+if options.deep {6}else{0}) as u64;
+            let quota=(options.network_budget_mib*MIB-reserved)/(matrix.len()+if options.deep {comparisons.len()}else{0}) as u64;
             for (index,count) in matrix.iter().enumerate() {
                 if index>0 {tokio::select!{_=cancel.cancelled()=>return Err("Performance test cancelled.".into()),_=tokio::time::sleep(Duration::from_secs(2))=>{}}}
                 check(cancel,started,options.deep)?;
                 owner.phase(&format!("download: {count} parallel requests, repeat {}",if index<counts.len(){1}else{2}),30+index*40/matrix.len());
-                let trial=network_trial(&client,&source,*count,quota,&budget,cancel,if options.deep {10}else{5},None,"download").await?;
+                let trial=network_trial(&client,&source,*count,quota,&budget,cancel,if provided {15}else if options.deep {10}else{5},None,"download").await?;
                 record_network(&mut report,trial)?;
             }
             if options.deep {
                 owner.phase("HTTP/1 transport comparison",72);
                 let independent=crate::engine::download_client_builder().http1_only().redirect(reqwest::redirect::Policy::none()).build().map_err(|_|"Could not create the comparison client.")?;
-                for n in [1,4,8,8,4,1] {
+                for n in comparisons {
                     tokio::select!{_=cancel.cancelled()=>return Err("Performance test cancelled.".into()),_=tokio::time::sleep(Duration::from_secs(2))=>{}}
                     check(cancel,started,options.deep)?;
-                    let trial=network_trial(&independent,&source,n,quota,&budget,cancel,8,None,"http1Comparison").await?;
+                    let trial=network_trial(&independent,&source,n,quota,&budget,cancel,if provided {15}else{8},None,"http1Comparison").await?;
                     record_network(&mut report,trial)?;
                 }
             }
@@ -1384,7 +1384,13 @@ async fn latency(
 }
 
 fn record_network(report: &mut Report, trial: Trial) -> Result<(), String> {
-    let failed = trial.failures > 0;
+    let failed = trial.failures > 0
+        && !(trial.retry_after_ms == 0
+            && !trial.errors.is_empty()
+            && trial
+                .errors
+                .iter()
+                .all(|e| e == "No response body before the time budget"));
     let wait = trial.retry_after_ms;
     report.received_network_bytes += trial.bytes;
     report.trials.push(trial);
@@ -1467,7 +1473,7 @@ async fn network_trial(
                 let offset=if let Some((size,_))=endpoint.representation {let offset=(index as u64*(size/parallel as u64)).wrapping_add(done)%size;wanted=wanted.min(size-offset);offset}else{0};
                 requested.fetch_add(wanted, Ordering::Relaxed);
                 let request = endpoint.request(client,wanted,offset).send();
-                let response = tokio::select! { _ = child.cancelled() => break, response = request => response.map_err(|_| "HTTP request failed")? };
+                let response = tokio::select! { biased; _ = child.cancelled() => break, response = request => response.map_err(|_| "HTTP request failed")? };
                 statuses.lock().expect("test statuses poisoned").push(response.status().as_u16());
                 if matches!(response.status().as_u16(), 403 | 429 | 503) {
                     retry_after_ms.fetch_max(crate::engine::retry_after(response.headers(), Utc::now()).map_or(60_000, millis), Ordering::Relaxed);
@@ -1479,7 +1485,7 @@ async fn network_trial(
                 header_ms.get_or_insert_with(|| started.elapsed().as_secs_f64() * 1000.0);
                 let mut stream = response.bytes_stream(); let mut body_bytes = 0;
                 loop {
-                    let item = tokio::select! { _ = child.cancelled() => break, item = stream.next() => item };
+                    let item = tokio::select! { biased; _ = child.cancelled() => break, item = stream.next() => item };
                     let Some(chunk) = item else { break; }; let chunk = chunk.map_err(|_| "Response body failed")?;
                     if body_bytes + chunk.len() as u64 > wanted { return Err("Response exceeded the requested payload"); }
                     first_byte.get_or_insert_with(|| started.elapsed().as_secs_f64() * 1000.0);
@@ -1634,6 +1640,16 @@ mod tests {
         );
         quick.disable();
         assert!(quick.contaminated.load(Ordering::Relaxed));
+        let weak = LivePolicy::new(2, 8, 1024 * 1024);
+        weak.capacity_hint_bps.store(8 * MIB, Ordering::Relaxed);
+        for _ in 0..3 {
+            weak.observe(40 * MIB, Duration::from_secs(4), 2, true);
+        }
+        assert_eq!(
+            weak.target.load(Ordering::Relaxed),
+            4,
+            "A slow benchmark route must not impose a ceiling on a faster download route"
+        );
         let capped = LivePolicy::new(2, 8, 1024 * 1024);
         for _ in 0..5 {
             capped.observe(40 * MIB, Duration::from_secs(4), 2, false);
