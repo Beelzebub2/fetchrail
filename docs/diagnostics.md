@@ -1,6 +1,6 @@
 # Measured diagnostics
 
-**Settings → Diagnostics** runs processor, drive, memory and optional connection tests. Nothing runs automatically. The supplied design's drawings and grade animations are connected to native measurements; its random reading generator and fake elapsed timeline are not used. Opening or running Diagnostics does not save settings or display the ordinary unsaved-settings bar.
+**Settings → Performance → Hardware diagnostics** runs processor, drive, memory and optional connection tests. Nothing runs automatically. The supplied design's drawings and grade animations are connected to native measurements; its random reading generator and fake elapsed timeline are not used. Opening or running Diagnostics does not save settings or display the ordinary unsaved-settings bar. **Optimize downloads**, on the same page, uses sustained calibration and real-download learning; diagnostic grades do not train that tuning.
 
 Results stay in private application data as `diagnostics-latest.json`, replacing the previous report only after a completed run. It includes actual local measurements and a local run identifier for admission/share deduplication. Copy report omits identifiers, paths, endpoint addresses and exact run time/date. A cancelled run keeps the last valid report.
 

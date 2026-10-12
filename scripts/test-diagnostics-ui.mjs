@@ -107,7 +107,8 @@ try {
   await page.getByRole("button",{name:"Settings",exact:true}).click();
   await page.getByLabel("Minimize to tray").uncheck();
   await page.waitForFunction(() => document.querySelector(".save-dock").classList.contains("shown"));
-  await page.getByRole("tab",{name:"Diagnostics",exact:true}).click();
+  await page.getByRole("tab",{name:"Performance",exact:true}).click();
+  await page.getByRole("button",{name:"Hardware diagnostics",exact:true}).click();
   await page.getByRole("heading",{name:"Diagnostics",exact:true}).waitFor();
   assert.equal(await page.locator(".save-dock").evaluate(el => el.classList.contains("shown")),false);
   assert.equal(await page.evaluate(() => window.testCalls.filter(call=>call.name==="update_settings").length),0);
@@ -119,6 +120,7 @@ try {
   await page.evaluate(() => {window.diagBlocked=false;});
   await page.getByRole("button",{name:"Run diagnostics",exact:true}).click();
   await page.getByTestId("diagnostic-reading").filter({hasText:"123"}).waitFor();
+  assert.equal(await page.getByRole("button",{name:"Optimize downloads",exact:true}).isDisabled(),true,"Running diagnostics keep their cancellation controls visible");
   await page.evaluate(() => {window.diagState.progress={group:3,step:2,label:"Configured parallel requests",unit:"Mbps",value:250,fraction:0.25,bytes:1048576,phase:"measuring",result:null};window.testEmit("fetchrail://diagnostics",structuredClone(window.diagState));});
   await page.getByTestId("diagnostic-reading").filter({hasText:"250"}).waitFor();
   assert.equal(await page.locator(".diag-needle").getAttribute("data-angle"),"-45");
@@ -150,7 +152,7 @@ try {
   await page.screenshot({path:join(output,"diagnostics-report.png"),fullPage:true});
   // Latest report survives section remount and failures remain unavailable/ungraded.
   await page.evaluate(()=>{window.diagReport.groups[3].grade=null;window.diagReport.groups[3].steps.forEach(step=>{step.value=null;step.status="unavailable";});window.diagState.latest=window.diagReport;});
-  await page.getByRole("tab",{name:"General",exact:true}).click();await page.getByRole("tab",{name:"Diagnostics",exact:true}).click();
+  await page.getByRole("tab",{name:"General",exact:true}).click();await page.getByRole("tab",{name:"Performance",exact:true}).click();
   await page.getByRole("heading",{name:"Diagnostics report",exact:true}).waitFor();
   assert.ok(await page.getByText("Successful connection and drive-write measurements are needed for an estimate.",{exact:true}).isVisible());
   await page.getByRole("button",{name:"Grade scale",exact:true}).click();
@@ -160,5 +162,6 @@ try {
   assert.ok(await page.locator(".diagnostics").evaluate(el=>el.getBoundingClientRect().width<=window.innerWidth));
   assert.equal(await page.locator(".diag-g-F").evaluate(el=>getComputedStyle(el).animationName),"none");
   assert.deepEqual(errors,[]);
+  assert.equal(await page.evaluate(() => window.testCalls.filter(call=>call.name==="update_settings").length),0,"Diagnostic actions cannot submit unrelated pending settings");
   console.log("PASS: real sample gauge250Mbps=-45deg/no jitter, cancel/failure/latest, no settings save, exact estimates, copy exclusions, per-run permission preview/keep-local/cancel, theme+accent+reduced-motion screenshots: "+output);
 } finally {await browser.close();await new Promise(done=>server.close(done));}

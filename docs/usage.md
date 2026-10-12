@@ -83,9 +83,9 @@ Remove a native package through its package manager. For portable installations,
 
 Analytics is off until you choose **Allow**. **No thanks** or closing the prompt keeps it off, with all features available. **Settings → Privacy** shows exactly what is collected and lets you withdraw immediately, clearing unsent counts. Reports contain only broad platform/version information and combined transfer/feature counters and size buckets; they exclude URLs, filenames, credentials and identifiers. See [analytics and privacy details](analytics.md). Automatic update checks are a separate setting.
 
-## Diagnostics
+## Performance and diagnostics
 
-For download calibration and automatic tuning, open **Settings → Performance**.
+For download calibration and automatic tuning, open **Settings → Performance → Optimize downloads**.
 Choose Quick or Deep, whether to include online tests, and explicit network/temporary-space
 budgets. Pause active downloads and seeding first. A completed, usable report can enable
 automatic tuning; your connection ceiling and explicit per-download overrides remain.
@@ -94,6 +94,6 @@ profiles. Tests, detailed reports and learning stay local. You can cancel, expor
 report or reset tuning. See [measurements, research and limits](performance-calibration.md).
 Diagnostics and Performance tests cannot run together.
 
-Open **Settings → Diagnostics**, explicitly pause queued/scheduled/active transfers and seeders, and choose **Run diagnostics**. CPU, drive and memory tests measure real work; the optional connection test contacts Cloudflare with a bounded 128 MiB requested-payload budget. Disable it for local-only tests. No transfer is paused automatically. Cancellation keeps the last valid report and removes the uniquely owned fixture when OS I/O finishes.
+Open **Settings → Performance → Hardware diagnostics**, explicitly pause queued/scheduled/active transfers and seeders, and choose **Run diagnostics**. CPU, drive and memory tests measure real work; the optional connection test contacts Cloudflare with a bounded 128 MiB requested-payload budget. Disable it for local-only tests. No transfer is paused automatically. Cancellation keeps the last valid report and removes the uniquely owned fixture when OS I/O finishes.
 
 The report shows measured numbers, short-sample warnings, provisional grades and conditional download/copy estimates. It does not assume unpacking. Full results stay local; **Preview optional summary** explains a separate per-run Share choice for coarse bands. The ordinary analytics switch does not authorize diagnostic sharing. See [methods and limits](diagnostics.md).
