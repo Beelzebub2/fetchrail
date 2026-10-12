@@ -1,6 +1,7 @@
 #[cfg(all(not(debug_assertions), dev))]
 compile_error!("Release builds must embed the frontend: enable --features tauri/custom-protocol.");
 
+mod analytics;
 mod browser_bridge;
 mod browser_extension;
 mod download_window;
@@ -234,6 +235,14 @@ fn open_browser_extension_folder(
     browser: browser_extension::Browser,
 ) -> Result<(), String> {
     browser_extension::open_folder(&app, browser)
+}
+
+#[tauri::command]
+async fn set_analytics_consent(
+    manager: State<'_, Arc<DownloadManager>>,
+    enabled: bool,
+) -> Result<DownloadSettings, String> {
+    manager.set_analytics_consent(enabled).await
 }
 
 #[tauri::command]
@@ -810,6 +819,7 @@ pub fn run() {
             open_browser_extension_store,
             open_browser_extension_folder,
             update_settings,
+            set_analytics_consent,
             organize_existing_downloads,
             list_queues,
             create_queue,

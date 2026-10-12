@@ -1,5 +1,5 @@
 Fetchrail Browser Integration Privacy Policy
-Last updated: 11 October 2026.
+Last updated: 12 October 2026.
 Canonical policy: https://fetchrail.rrmtools.uk/privacy
 
 Fetchrail Browser Integration connects Firefox to the Fetchrail download manager installed on your Windows or Linux computer. It handles information needed to select, route and control downloads. This information is not sent to the developer, an analytics service or an advertising service.
@@ -29,6 +29,12 @@ Fetchrail stores download history and unfinished transfer details locally. When 
 Your choices
 
 You may turn off automatic routing, keep browser session support disabled, revoke optional website access, stop a batch, remove downloads or uninstall the extension. Page scanning uses temporary active-tab access when requested. Broader website access is optional, requested when starting page batches or session support. Private/incognito downloads are not captured.
+
+Optional desktop improvement analytics
+
+The extension has no analytics instrumentation. Separately, the desktop Fetchrail app offers optional first-party improvement analytics, off by default. Choosing Allow in the desktop app permits combined counts of launches, HTTP/torrent downloads and feature use plus broad app version, operating system, CPU architecture and completed-download size buckets. A browser handoff may contribute a count; its URL, filename, browsing/session information and local preferences are never included. There are no user, device, session or transfer identifiers or exact event times. Declining or closing the choice sends no analytics and changes no functionality. Settings → Privacy lets you withdraw, clearing unsent memory-only counts.
+
+Desktop counters are sent at most every 30 minutes to Fetchrail's Cloudflare-hosted endpoint and combined into protected daily totals for the latest 30 UTC calendar days. No raw reports or IP addresses are stored by our analytics code; Cloudflare recovery copies may retain deleted aggregate data another 30 days. Cloudflare sees IP addresses in transit and may process ordinary network/security metadata. Full fields, purposes, recipients and choices are explained at https://fetchrail.rrmtools.uk/privacy. App update checks remain a separate feature.
 
 Website, support and changes
 

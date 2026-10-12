@@ -36,6 +36,8 @@ import {
   X,
 } from "lucide-react";
 import "./App.css";
+import { AnalyticsPrompt, PrivacySettings } from "./Privacy";
+import type { AnalyticsConsent } from "./Privacy";
 import { usePlatformCapabilities } from "./platform";
 import { TorrentImportDialog, TorrentInspector, TorrentRow, TorrentSettingsFields } from "./Torrents";
 import type { TorrentImport, TorrentSummary, TorrentSettings } from "./Torrents";
@@ -128,6 +130,7 @@ type SetupInfo = {
 };
 
 export type DownloadSettings = Appearance & {
+  analyticsConsent: AnalyticsConsent;
   torrent: TorrentSettings;
   speedLimitBps: number;
   autoUpdate: boolean;
@@ -224,6 +227,7 @@ const settingsSections = [
   ["categories", "File categories", FolderOpen],
   ["torrents", "Torrents", Share2],
   ["browser", "Browser", Globe],
+  ["privacy", "Privacy", Monitor],
 ] as const;
 type SettingsSection = (typeof settingsSections)[number][0];
 
@@ -912,8 +916,13 @@ function App() {
   // Without a chosen folder, the engine files the download under its category.
   const dialogCategory = settings?.sortIntoCategoryFolders ? categoryFor(nameFromUrl(url), settings) : null;
 
+  async function chooseAnalytics(enabled: boolean) {
+    setSettings(await invoke<DownloadSettings>("set_analytics_consent", { enabled }));
+  }
+
   return (
     <div className="app-shell">
+      <AnalyticsPrompt settings={settings} onChoice={chooseAnalytics} />
       <header className="top-rail">
         <div className="rail-main">
           <div className="brand">
@@ -1090,6 +1099,7 @@ function App() {
             onSave={() => void saveSettings()}
             onRestart={() => void invoke("restart_app").catch((error) => setMessage(String(error)))}
             onAppearance={applySettings}
+            onAnalytics={chooseAnalytics}
             onCreateQueue={(name) => queueCommand("create_queue", { name })}
             onDeleteQueue={(name) => queueCommand("delete_queue", { name })}
             onToggleQueue={(name, paused) => queueCommand("set_queue_paused", { name, paused })}
@@ -1899,6 +1909,7 @@ function SettingsPage({
   onSave,
   onRestart,
   onAppearance,
+  onAnalytics,
   onCreateQueue,
   onDeleteQueue,
   onToggleQueue,
@@ -1919,6 +1930,7 @@ function SettingsPage({
   onSave: () => void;
   onRestart: () => void;
   onAppearance: (look: Partial<Appearance>) => Promise<void>;
+  onAnalytics: (enabled: boolean) => Promise<void>;
   onCreateQueue: (name: string) => Promise<boolean>;
   onDeleteQueue: (name: string) => Promise<boolean>;
   onToggleQueue: (name: string, paused: boolean) => Promise<boolean>;
@@ -1990,6 +2002,7 @@ function SettingsPage({
     >
       {/* Keyed by section, so each one rises in when it is opened. */}
       <div className="settings-panel" id="settings-panel" role="tabpanel" aria-labelledby={"settings-tab-" + section} key={section}>
+        {section === "privacy" && <PrivacySettings settings={settings} onChoice={onAnalytics} />}
         {section === "general" && (
           <section aria-labelledby="general-settings-title">
             <div className="page-head rise">
