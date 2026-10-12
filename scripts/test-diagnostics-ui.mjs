@@ -113,6 +113,9 @@ try {
   assert.equal(await page.locator(".save-dock").evaluate(el => el.classList.contains("shown")),false);
   assert.equal(await page.evaluate(() => window.testCalls.filter(call=>call.name==="update_settings").length),0);
   await page.waitForTimeout(600);
+  const moving = selector => page.locator(selector).first().evaluate(el => getComputedStyle(el).animationName);
+  const track = () => page.locator(".diag-track i").evaluateAll(fills => fills.map(fill => fill.style.transform));
+  assert.equal(await moving(".diag-idle-grid .diag-cores rect"),"diag-core","Idle drawings move");
   await page.screenshot({path:join(output,"diagnostics-idle.png"),fullPage:true});
   await page.evaluate(() => {window.diagBlocked=true;});
   await page.getByRole("button",{name:"Run diagnostics",exact:true}).click();
@@ -124,27 +127,56 @@ try {
   assert.equal(await page.getByRole("button",{name:"Optimize downloads",exact:true}).isDisabled(),true,"Starting diagnostics cannot be hidden while the native command is pending");
   await page.evaluate(()=>{window.delayDiagStart=false;window.finishDiagStart();});
   await page.getByTestId("diagnostic-reading").filter({hasText:"123"}).waitFor();
+  assert.equal(await moving(".diag-drawing.working .diag-cores rect"),"diag-core","The drawing keeps moving between native samples");
+  assert.deepEqual(await track(),["scaleX(0.2)","scaleX(0)","scaleX(0)"]);
+  assert.equal(await page.locator(".diag-row.active .diag-spin").count(),1);
+  assert.equal(await page.locator(".diag-row.queued").count(),3);
+  await page.screenshot({path:join(output,"diagnostics-processor.png"),fullPage:true});
   assert.equal(await page.getByRole("button",{name:"Optimize downloads",exact:true}).isDisabled(),true,"Running diagnostics keep their cancellation controls visible");
   await page.evaluate(() => {window.diagState.progress={group:3,step:2,label:"Configured parallel requests",unit:"Mbps",value:250,fraction:0.25,bytes:1048576,phase:"measuring",result:null};window.testEmit("fetchrail://diagnostics",structuredClone(window.diagState));});
   await page.getByTestId("diagnostic-reading").filter({hasText:"250"}).waitFor();
   assert.equal(await page.locator(".diag-needle").getAttribute("data-angle"),"-45");
   await page.waitForTimeout(350);
   assert.equal(await page.locator(".diag-needle").getAttribute("data-angle"),"-45","Gauge cannot invent jitter between native samples");
-  assert.ok((await page.locator(".diag-stage").innerText()).includes("Values and sample progress reset"));
+  assert.deepEqual(await track(),["scaleX(1)","scaleX(1)","scaleX(0.25)"],"The step track covers the whole step and never rewinds");
   await page.screenshot({path:join(output,"diagnostics-network-250.png"),fullPage:true});
-  // Native completion events deliberately have no live reading or unit.
-  await page.evaluate(() => {window.diagState.completed=window.diagReport.groups;window.diagState.progress={group:3,step:2,label:"",unit:"",value:null,fraction:0,bytes:0,phase:"graded",result:window.diagReport.groups[3]};window.testEmit("fetchrail://diagnostics",structuredClone(window.diagState));});
-  await page.getByRole("heading",{name:"Connection complete",exact:true}).waitFor();
-  assert.equal(await page.getByTestId("diagnostic-reading").count(),0);
+  // A completed group lands its grade on the stage; the native event keeps the last reading and unit.
+  await page.evaluate(() => {window.diagState.completed=window.diagReport.groups;window.diagState.progress={group:3,step:2,label:"Configured parallel requests",unit:"Mbps",value:500,fraction:1,bytes:0,phase:"graded",result:window.diagReport.groups[3]};window.testEmit("fetchrail://diagnostics",structuredClone(window.diagState));});
+  const stamp=page.locator(".diag-stamp");
+  await stamp.getByRole("heading",{name:"Connection: great",exact:true}).waitFor();
+  assert.equal(await stamp.locator(".diag-badge").evaluate(el=>el.style.fontSize),"132px");
+  assert.equal(await page.getByTestId("diagnostic-reading").innerText(),"500","The reading holds its last value under the grade");
   assert.ok((await page.locator(".diag-row").last().innerText()).includes("Best download: 500 Mbps"));
   assert.ok(!(await page.locator(".diag-row").last().innerText()).includes("12 ms"));
-  assert.equal(await page.locator(".diag-completed-stage .diag-badge").evaluate(el=>getComputedStyle(el).animationName),"none");
-  await page.screenshot({path:join(output,"diagnostics-group-complete.png"),fullPage:true});
+  assert.equal(await page.locator(".diag-row").last().locator(".diag-badge").count(),0,"A row badge waits until the stage moves on");
+  await page.waitForTimeout(700);
+  assert.ok(Number(await page.locator(".diag-solo .diag-drawing").evaluate(el=>getComputedStyle(el).opacity))<0.1,"The drawing dims under the grade");
+  await page.screenshot({path:join(output,"diagnostics-grade.png"),fullPage:true});
   await page.getByRole("button",{name:"Cancel diagnostics",exact:true}).click();
   await page.getByRole("alert").filter({hasText:"Diagnostics cancelled"}).waitFor();
   await page.getByRole("button",{name:"Run diagnostics",exact:true}).click();
   assert.equal(await page.locator(".diag-row .diag-badge").count(),0,"A new run clears old group results from the native snapshot");
-  await page.evaluate(() => {window.diagState={...window.diagState,active:false,message:null,latest:window.diagReport};window.testEmit("fetchrail://diagnostics",structuredClone(window.diagState));});
+  await page.evaluate(() => {window.diagState.completed=[window.diagReport.groups[0]];window.diagState.progress={group:0,step:2,label:"Decompress · zlib",unit:"MB/s",value:900,fraction:1,bytes:0,phase:"graded",result:window.diagReport.groups[0]};window.testEmit("fetchrail://diagnostics",structuredClone(window.diagState));});
+  await stamp.getByRole("heading",{name:"Processor: great",exact:true}).waitFor();
+  assert.equal(await page.locator(".diag-row .diag-badge").count(),0);
+  await page.evaluate(() => {window.diagState.progress={group:1,step:0,label:"Sequential write · sync included",unit:"MB/s",value:480,fraction:0.5,bytes:1048576,phase:"measuring",result:null};window.testEmit("fetchrail://diagnostics",structuredClone(window.diagState));});
+  await page.locator(".diag-row .diag-badge").waitFor();
+  assert.equal(await stamp.count(),0);
+  await page.screenshot({path:join(output,"diagnostics-drive.png"),fullPage:true});
+  // The run ends on its own stage; the report opens when asked.
+  await page.evaluate(() => {window.diagState={...window.diagState,active:false,progress:null,message:null,latest:window.diagReport};window.testEmit("fetchrail://diagnostics",structuredClone(window.diagState));});
+  const finish=page.locator(".diag-finish");await finish.waitFor();
+  assert.equal(await page.getByRole("heading",{name:"Diagnostics report",exact:true}).count(),0);
+  assert.equal(await finish.locator(".diag-badge").evaluate(el=>el.style.fontSize),"176px");
+  await finish.getByText("Overall grade · great",{exact:true}).waitFor();
+  await finish.getByRole("heading",{name:"About 20 MB/s",exact:true}).waitFor();
+  assert.ok((await finish.innerText()).includes("62.5 MB/s"));
+  assert.deepEqual(await finish.locator(".diag-chips span").evaluateAll(chips=>chips.map(chip=>chip.textContent)),["1 GB 50 s","10 GB 8.33 min","60 GB 50 min"]);
+  assert.equal(await page.locator(".diag-row .diag-badge").count(),4);
+  assert.ok(await page.locator(".diag-row .diag-badge").evaluateAll(badges=>badges.every(badge=>[badge,...badge.querySelectorAll("*")].every(el=>getComputedStyle(el).animationName==="none"))),"Row grades rest; only the stage grade lands");
+  await page.waitForTimeout(900);
+  await page.screenshot({path:join(output,"diagnostics-finished.png"),fullPage:true});
+  await page.getByRole("button",{name:"Open full report",exact:true}).click();
   await page.getByRole("heading",{name:"Diagnostics report",exact:true}).waitFor();
   await page.locator(".diag-speed").filter({hasText:"20 MB/s"}).waitFor();
   assert.ok((await page.locator(".diag-overall").innerText()).includes("Measured potential: 62.5 MB/s"));
@@ -187,6 +219,8 @@ try {
   await page.evaluate(()=>{window.diagState.active=true;window.diagState.progress={group:3,step:2,label:"Parallel requests",unit:"Mbps",value:321,fraction:.5,bytes:1,phase:"measuring",result:null};window.testEmit("fetchrail://diagnostics",structuredClone(window.diagState));window.finishDiagState();window.delayDiagState=false;});
   await page.getByTestId("diagnostic-reading").filter({hasText:"321"}).waitFor();
   await page.evaluate(()=>{window.diagState.active=false;window.testEmit("fetchrail://diagnostics",structuredClone(window.diagState));});
+  await finish.waitFor();
+  await page.getByRole("button",{name:"Open full report",exact:true}).click();
   await page.getByRole("heading",{name:"Diagnostics report",exact:true}).waitFor();
   // Latest report survives section remount and failures remain unavailable/ungraded.
   await page.evaluate(()=>{window.diagReport.groups[3].grade=null;window.diagReport.groups[3].steps.forEach(step=>{step.value=null;step.status="unavailable";step.samples=[];step.variationPercent=null;step.note="Network test disabled; local-only run.";});window.diagState.latest=window.diagReport;});
@@ -209,7 +243,11 @@ try {
   await page.screenshot({path:join(output,"diagnostics-grades-narrow-reduced.png"),fullPage:true});
   assert.ok(await page.locator(".diagnostics").evaluate(el=>el.getBoundingClientRect().width<=window.innerWidth));
   assert.equal(await page.locator(".diag-g-F").evaluate(el=>getComputedStyle(el).animationName),"none");
+  await page.getByRole("button",{name:"Back to report",exact:true}).click();
+  await page.getByRole("button",{name:"Run again",exact:true}).click();
+  assert.equal(await moving(".diag-idle-grid .diag-cores rect"),"none","Reduced motion stops the drawings");
+  await page.screenshot({path:join(output,"diagnostics-idle-narrow-reduced.png"),fullPage:true});
   assert.deepEqual(errors,[]);
   assert.equal(await page.evaluate(() => window.testCalls.filter(call=>call.name==="update_settings").length),0,"Diagnostic actions cannot submit unrelated pending settings");
-  console.log("PASS: real sample gauge250Mbps=-45deg/no jitter, cancel/failure/latest, no settings save, exact estimates, copy exclusions, per-run permission preview/keep-local/cancel, theme+accent+reduced-motion screenshots: "+output);
+  console.log("PASS: moving idle+running drawings, forward-only step track, grade lands on stage before its row, finished stage before report, real sample gauge250Mbps=-45deg/no jitter, cancel/failure/latest, no settings save, exact estimates, copy exclusions, per-run permission preview/keep-local/cancel, theme+accent+reduced-motion screenshots: "+output);
 } finally {await browser.close();await new Promise(done=>server.close(done));}
