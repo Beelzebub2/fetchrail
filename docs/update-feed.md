@@ -129,3 +129,7 @@ including exact partial-download resume. One throughput benchmark is deliberatel
 excluded from each correctness suite. The Windows truncated-response fixture
 uses HTTP connection closure after delivering its prefix; this avoids a flaky
 low-level socket close without relaxing its exact-byte assertions.
+
+## Optional analytics isolation
+
+The same Worker hosts optional desktop analytics in a separate `AnalyticsStore` SQLite binding and migration; release snapshots remain in `ReleaseFeed`. Protected report access uses a separately configured secret and does not affect public update availability. Automatic invocation logs and tracing are disabled to avoid persisting analytics request metadata, while explicitly sanitized release logs remain enabled. See [analytics scope, retention and operator setup](analytics.md). Analytics consent does not enable or disable updater checks.

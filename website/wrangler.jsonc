@@ -34,6 +34,10 @@
       {
         "name": "RELEASE_FEED",
         "class_name": "ReleaseFeed"
+      },
+      {
+        "name": "ANALYTICS",
+        "class_name": "AnalyticsStore"
       }
     ]
   },
@@ -43,12 +47,22 @@
       "new_sqlite_classes": [
         "ReleaseFeed"
       ]
+    },
+    {
+      "tag": "analytics-v1",
+      "new_sqlite_classes": [
+        "AnalyticsStore"
+      ]
     }
   ],
   "observability": {
     "enabled": true,
+    "logs": {
+      "enabled": true,
+      "invocation_logs": false
+    },
     "traces": {
-      "enabled": true
+      "enabled": false
     }
   }
 }
