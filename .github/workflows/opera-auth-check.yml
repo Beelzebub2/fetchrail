@@ -1,0 +1,40 @@
+name: Opera Add-ons authentication check
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: Verify Opera publisher session
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '24'
+          cache: npm
+      - name: Build production extension package
+        run: |
+          npm ci
+          npm run browser:build
+          version="$(node -p 'require("./package.json").version')"
+          node scripts/prepare-chrome-web-store.mjs "v$version"
+          mkdir -p release-artifacts
+          (cd "release-artifacts/chrome-web-store-$version" && zip -qr "../opera-addons-$version.zip" .)
+      - name: Verify publisher authentication (no upload)
+        env:
+          OPERA_SESSION_ID: ${{ secrets.OPERA_SESSION_ID }}
+          OPERA_PACKAGE_ID: ${{ vars.OPERA_PACKAGE_ID }}
+        run: |
+          if [ -z "$OPERA_SESSION_ID" ] || [ -z "$OPERA_PACKAGE_ID" ]; then
+            echo "Missing OPERA_SESSION_ID or OPERA_PACKAGE_ID." >&2
+            exit 1
+          fi
+          version="$(node -p 'require("./package.json").version')"
+          ./node_modules/.bin/publish-extension --dry-run --opera-zip "release-artifacts/opera-addons-$version.zip"
