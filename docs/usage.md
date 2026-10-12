@@ -78,3 +78,13 @@ Use a `.deb` for Ubuntu, Mint, Kali or Debian, an `.rpm` for Fedora, or the Arch
 Writable AppImages use signed automatic updates. Native packages update through their package manager; native archives and extracted AppImages use manual updates.
 
 Remove a native package through its package manager. For portable installations, follow the [Linux removal instructions](linux.md#removal-and-troubleshooting). Downloaded files and saved data remain unless you explicitly remove them.
+
+## Optional improvement analytics
+
+Analytics is off until you choose **Allow**. **No thanks** or closing the prompt keeps it off, with all features available. **Settings → Privacy** shows exactly what is collected and lets you withdraw immediately, clearing unsent counts. Reports contain only broad platform/version information and combined transfer/feature counters and size buckets; they exclude URLs, filenames, credentials and identifiers. See [analytics and privacy details](analytics.md). Automatic update checks are a separate setting.
+
+## Diagnostics
+
+Open **Settings → Diagnostics**, explicitly pause queued/scheduled/active transfers and seeders, and choose **Run diagnostics**. CPU, drive and memory tests measure real work; the optional connection test contacts Cloudflare with a bounded 128 MiB requested-payload budget. Disable it for local-only tests. No transfer is paused automatically. Cancellation keeps the last valid report and removes the uniquely owned fixture when OS I/O finishes.
+
+The report shows measured numbers, short-sample warnings, provisional grades and conditional download/copy estimates. It does not assume unpacking. Full results stay local; **Preview optional summary** explains a separate per-run Share choice for coarse bands. The ordinary analytics switch does not authorize diagnostic sharing. See [methods and limits](diagnostics.md).

@@ -64,6 +64,10 @@ npm run engine:bench
 
 This benchmark starts a standard Node HTTP/1.1 server, builds the release transfer tests, and measures completion through finalization and file sync. Every output then passes exact SHA-256 verification outside the timer, including the comparator clients. It records network and finalization time separately and does not predict a remote host's speed. Set `FETCHRAIL_BENCH_CONNECTIONS` to a comma-separated list to limit the connection counts tested. The benchmark is ignored during normal test runs and removes its temporary files after successful runs.
 
+## Optional analytics validation
+
+Run `npm run analytics:ui` after the frontend build (or `node scripts/test-analytics-ui.mjs @playwright/test` when using the installed Playwright package). This checks consent, refusal, revocation, save failures, scope changes and narrow layout with mocked native commands, saving screenshots in a temporary folder. Native consent/counter checks are included in the Rust suite. `npm test --prefix update-service` covers real Workers/SQLite validation, private report access, retention, limits and release regressions. See [analytics design](analytics.md).
+
 ## Torrent validation
 
 Set `VCPKG_ROOT` to the pinned vcpkg checkout before `npm run torrent:deps`. This builds libtorrent 2.1.2, Boost and OpenSSL 3.5.9 using the committed overlay ports and verifies the pinned JSON header. Windows uses static native libraries and the static C++ runtime; no separate torrent daemon is installed.
@@ -202,3 +206,7 @@ For local signed packaging, set `TAURI_SIGNING_PRIVATE_KEY_PATH` to the private 
 Preserve the signing key: installed copies only accept updates signed with its matching private key. Keep it outside the repository.
 
 Installed copies check for an update shortly after launch and every six hours after that. A development copy or executable started without setup does not replace itself.
+
+## Diagnostics validation
+
+After `npm run build`, run `node scripts/test-diagnostics-ui.mjs @playwright/test`. Native measurement fixtures are part of `cargo test --manifest-path src-tauri/Cargo.toml --locked --lib`. To verify optimized local measurements without any public network benchmark, run `cargo test --manifest-path src-tauri/Cargo.toml --release --features tauri/custom-protocol --locked --lib diagnostics::tests::local_only_runner_is_complete_verified_and_private`. The fixture uses an isolated temporary directory, validates all local groups and asserts zero network bytes. See [diagnostics methodology](diagnostics.md).
