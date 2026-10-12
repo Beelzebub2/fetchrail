@@ -24,7 +24,12 @@
 
 <p align="center">
   <a href="https://chromewebstore.google.com/detail/fetchrail-browser-integra/ccmbmcgihlemlheldpkgnidgohlkaipb"><img src="https://developer.chrome.com/static/docs/webstore/branding/image/iNEddTyWiMfLSwFD6qGq.png" alt="Install Fetchrail from the Chrome Web Store" height="60"></a>
-  <a href="https://addons.mozilla.org/en-US/firefox/addon/fetchrail-browser-integration/"><img src="https://extensionworkshop.com/assets/img/documentation/publish/get-the-addon-178x60px.dad84b42.png" alt="Install Fetchrail from Firefox Add-ons" height="60"></a>
+  <a href="https://addons.mozilla.org/en-US/firefox/addon/fetchrail-browser-integration/"><img src="https://extensionworkshop.com/assets/img/documentation/publish/get-the-addon-178x60px.dad84b42.png" alt="Firefox Add-ons listing, awaiting approval" height="60"></a>
+</p>
+
+<p align="center">
+  <a href="#browser-store-status"><img src="https://img.shields.io/badge/Chrome-approved%20%26%20public-238636?style=flat-square" alt="Chrome extension approved and public"></a>
+  <a href="#browser-store-status"><img src="https://img.shields.io/badge/Firefox-awaiting%20approval-d29922?style=flat-square" alt="Firefox extension awaiting approval"></a>
 </p>
 
 > Most downloads travel down a single connection. Fetchrail opens up to thirty-two, and lets you watch every one.
@@ -75,7 +80,18 @@ And it does more than catch:
 - **Works through download pages.** For sites with countdowns, it opens each page in turn, follows a single clear download button and captures the final file. Logins and CAPTCHAs stay with you.
 - **One right-click away.** Choose **Download with Fetchrail** on any link, or control running transfers from the toolbar.
 
-Install the companion from the [Chrome Web Store](https://chromewebstore.google.com/detail/fetchrail-browser-integra/ccmbmcgihlemlheldpkgnidgohlkaipb) or [Firefox Add-ons](https://addons.mozilla.org/en-US/firefox/addon/fetchrail-browser-integration/) for automatic browser updates. [Read the companion guide](browser-extension/README.md).
+Install the companion from the [Chrome Web Store](https://chromewebstore.google.com/detail/fetchrail-browser-integra/ccmbmcgihlemlheldpkgnidgohlkaipb) for automatic updates. Firefox will also support store updates once its [Add-ons listing](https://addons.mozilla.org/en-US/firefox/addon/fetchrail-browser-integration/) is approved; until then, use the [manual installation guide](browser-extension/README.md#firefox).
+
+### Browser store status
+
+The current source tree contains companion **[v0.7.1](browser-extension/manifests/chromium.json)** for Chromium and Firefox. Published desktop and browser store releases can be older because they ship and undergo review separately.
+
+| Store | Extension version | Approval status |
+| :-- | :-- | :-- |
+| [Chrome Web Store](https://chromewebstore.google.com/detail/ccmbmcgihlemlheldpkgnidgohlkaipb) | [![Chrome Web Store published version](https://img.shields.io/chrome-web-store/v/ccmbmcgihlemlheldpkgnidgohlkaipb?label=public%20version&style=flat-square&color=ff8a3d)](https://chromewebstore.google.com/detail/ccmbmcgihlemlheldpkgnidgohlkaipb) | **Approved and public** |
+| [Firefox Add-ons](https://addons.mozilla.org/en-US/firefox/addon/fetchrail-browser-integration/) | **v0.7.1 submitted** | **Awaiting Mozilla approval**; not publicly available yet |
+
+**Status checked 12 October 2026:** Google's [store status check](https://github.com/Beelzebub2/fetchrail/actions/runs/38296087862) confirmed Chrome **v0.6.0** is published. Firefox **v0.7.1** was [submitted successfully](https://github.com/Beelzebub2/fetchrail/actions/runs/38172309596), but its public store listing is not yet available. The Chrome version badge updates with the public store release; review statuses are dated snapshots and should be refreshed after store decisions.
 
 ## Make it yours
 
