@@ -7,17 +7,20 @@ export const METRICS = Object.freeze([
   "size_under_10mb", "size_10mb_1gb", "size_over_1gb",
   "pause", "resume", "speed_limit", "queue", "schedule", "browser_handoff", "batch",
 ]);
+export const DIAGNOSTIC_METRICS = Object.freeze(["cpu", "drive", "memory", "network"].flatMap(group => ["f", "d", "c", "b", "a", "s", "ss"].map(grade => `diagnostics_${group}_${grade}`)));
 const keys = (value, allowed) => value && typeof value === "object" && !Array.isArray(value)
   && Object.keys(value).every(key => allowed.includes(key));
 export function validateReport(report) {
-  if (!keys(report, ["schema", "version", "os", "arch", "counters"])
-    || Object.keys(report).length !== 5 || report.schema !== 1
+  const diagnostic = report?.purpose === "diagnostics-summary-v1";
+  if (!keys(report, diagnostic ? ["schema", "purpose", "version", "os", "arch", "counters"] : ["schema", "version", "os", "arch", "counters"])
+    || Object.keys(report).length !== (diagnostic ? 6 : 5) || report.schema !== 1
     || typeof report.version !== "string" || !/^(0|[1-9]\d{0,2})\.(0|[1-9]\d{0,2})\.(0|[1-9]\d{0,2})$/.test(report.version)
     || !["windows", "linux", "other"].includes(report.os) || !["x64", "arm64", "other"].includes(report.arch)
-    || !keys(report.counters, METRICS) || !Object.keys(report.counters).length
-    || !Object.values(report.counters).every(count => Number.isInteger(count) && count > 0 && count <= 1000)) {
+    || !keys(report.counters, diagnostic ? DIAGNOSTIC_METRICS : METRICS) || !Object.keys(report.counters).length
+    || !Object.values(report.counters).every(count => Number.isInteger(count) && count > 0 && count <= (diagnostic ? 1 : 1000))) {
     throw new FeedError(400, "Invalid analytics report.");
   }
+  if (diagnostic && (["cpu", "drive", "memory", "network"].some(group => Object.keys(report.counters).filter(key => key.startsWith(`diagnostics_${group}_`)).length > 1))) throw new FeedError(400, "Invalid diagnostic summary.");
   return report;
 }
 const dayOf = now => new Date(now).toISOString().slice(0, 10);

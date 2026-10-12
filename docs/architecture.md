@@ -10,6 +10,7 @@ Fetchrail combines a Rust transfer engine, a Tauri desktop shell, a React interf
 | --- | --- |
 | `src/` | React interface, download list, queues, settings, and download confirmation. |
 | `src-tauri/src/engine.rs` | Download scheduling, HTTP transfers, range validation, partial files, and finalization. |
+| `src-tauri/src/diagnostics.rs`, `src/Diagnostics.tsx` | Bounded measured diagnostics, real progress events, local reports and separate per-run sharing; see [methods](diagnostics.md). |
 | `src-tauri/src/analytics.rs`, `src/Privacy.tsx`, `update-service/analytics.mjs` | Optional native consent, memory-only counters and protected daily aggregates; see [analytics](analytics.md). |
 | `src-tauri/src/model.rs` | Download, queue, category, and settings models. |
 | `src-tauri/src/rate_limit.rs` | Shared token buckets for global and per-download bandwidth limits. |

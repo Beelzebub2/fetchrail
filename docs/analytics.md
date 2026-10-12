@@ -50,6 +50,10 @@ Set `FETCHRAIL_ANALYTICS_READ_TOKEN` privately in the operator environment, then
 
 Opt-in bias, short runs under 30 minutes, exits, capped counters, drops and network failures underrepresent activity. Launch/report counts do not count unique people. With no identifiers or retry IDs, no cohorts, retention, user funnels or precise population failure rates can be derived. Already combined totals cannot identify a contribution for removal; withdrawal prevents future collection and clears unsent memory.
 
+## Diagnostic summaries use separate per-run permission
+
+The usage grant does not authorize performance fields. [Diagnostics](diagnostics.md) keeps exact measurements local and only offers coarse fixed bands under an explicit preview/Share action for a completed run. `purpose: diagnostics-summary-v1` accepts one count per successful group band, with the same protected daily aggregation/retention and no remote run IDs or raw rows. Ordinary usage payloads cannot include those counters; no sharing happens from the usage toggle.
+
 ## Verification
 
 Run `npm run build`, `node scripts/test-analytics-ui.mjs @playwright/test`, native `cargo test --manifest-path src-tauri/Cargo.toml --locked --lib`, and `npm test --prefix update-service`. Tests cover explicit/versioned consent, no preconsent collection, no backfill, revoke/cancellation/epoch exclusion, bounded payloads, idempotent outcomes, accessible equal choices, persisted refusal, grant/revoke, native save failure including settings events, scope renewal, strict runtime intake, protected reads, SQLite persistence, cleanup alarms, volume/cardinality caps and release-feed regressions. The public policy and settings disclosures must change together with any future scope change.

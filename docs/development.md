@@ -206,3 +206,7 @@ For local signed packaging, set `TAURI_SIGNING_PRIVATE_KEY_PATH` to the private 
 Preserve the signing key: installed copies only accept updates signed with its matching private key. Keep it outside the repository.
 
 Installed copies check for an update shortly after launch and every six hours after that. A development copy or executable started without setup does not replace itself.
+
+## Diagnostics validation
+
+After `npm run build`, run `node scripts/test-diagnostics-ui.mjs @playwright/test`. Native measurement fixtures are part of `cargo test --manifest-path src-tauri/Cargo.toml --locked --lib`. To verify optimized local measurements without any public network benchmark, run `cargo test --manifest-path src-tauri/Cargo.toml --release --features tauri/custom-protocol --locked --lib diagnostics::tests::local_only_runner_is_complete_verified_and_private`. The fixture uses an isolated temporary directory, validates all local groups and asserts zero network bytes. See [diagnostics methodology](diagnostics.md).

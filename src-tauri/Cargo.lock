@@ -1075,6 +1075,7 @@ dependencies = [
  "base64 0.22.1",
  "chrono",
  "cmake",
+ "flate2",
  "futures-util",
  "libc",
  "minisign-verify",

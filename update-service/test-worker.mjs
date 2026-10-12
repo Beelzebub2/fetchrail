@@ -73,6 +73,14 @@ try {
   assert.equal(analytics.rows[0].reports, 2);
   assert.deepEqual(analytics.rows[0].counters, { launch: 2, http_added: 6, http_completed: 4, size_under_10mb: 4 });
   assert.deepEqual(Object.keys(analytics.rows[0]).sort(), ["arch", "counters", "day", "os", "reports", "version"]);
+  const summary = { ...reportFixture, purpose: "diagnostics-summary-v1", counters: { diagnostics_cpu_b: 1, diagnostics_drive_a: 1 } };
+  for (const data of [
+    { ...summary, runId: "local-only-id" }, { ...summary, cpuMbps: 1234 },
+    { ...summary, counters: { diagnostics_cpu_b: 2 } }, { ...summary, counters: { diagnostics_cpu_b: 1, diagnostics_cpu_a: 1 } },
+    { ...summary, counters: { launch: 1 } }, { ...reportFixture, counters: { diagnostics_cpu_b: 1 } },
+  ]) assert.equal((await collect(data)).status, 400, "Separate diagnostic purpose cannot carry raw metrics, IDs, usage counters or duplicate bands");
+  assert.equal((await collect(summary)).status, 204);
+  assert.equal((await (await readAnalytics()).json()).rows[0].counters.diagnostics_cpu_b, 1);
   const namespace = await worker.getDurableObjectNamespace("ANALYTICS");
   const store = namespace.get(namespace.idFromName("daily-v1"));
   assert.ok(await store.testAlarm(), "Cleanup is scheduled without requiring further intake");

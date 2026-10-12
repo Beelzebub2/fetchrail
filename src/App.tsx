@@ -36,6 +36,7 @@ import {
   X,
 } from "lucide-react";
 import "./App.css";
+import { Diagnostics } from "./Diagnostics";
 import { AnalyticsPrompt, PrivacySettings } from "./Privacy";
 import type { AnalyticsConsent } from "./Privacy";
 import { usePlatformCapabilities } from "./platform";
@@ -227,6 +228,7 @@ const settingsSections = [
   ["categories", "File categories", FolderOpen],
   ["torrents", "Torrents", Share2],
   ["browser", "Browser", Globe],
+  ["diagnostics", "Diagnostics", Activity],
   ["privacy", "Privacy", Monitor],
 ] as const;
 type SettingsSection = (typeof settingsSections)[number][0];
@@ -903,7 +905,7 @@ function App() {
   // The bar keeps its last message while it slides away, so it never reads "0 unsaved changes".
   if (unsaved) savedBar.current = { done: false, text: `${unsaved} unsaved ${unsaved === 1 ? "change" : "changes"}` };
   else if (saveState === "done") savedBar.current = { done: true, text: "Settings saved" };
-  const barShown = inSettings && (unsaved > 0 || saveState !== "idle");
+  const barShown = inSettings && !["diagnostics", "privacy"].includes(settingsSection) && (unsaved > 0 || saveState !== "idle");
 
   const shown = (id: string) => !inSettings && activeFilter === id;
   const tabClass = (id: string) => (shown(id) ? "rail-tab active" : "rail-tab");
@@ -2002,6 +2004,7 @@ function SettingsPage({
     >
       {/* Keyed by section, so each one rises in when it is opened. */}
       <div className="settings-panel" id="settings-panel" role="tabpanel" aria-labelledby={"settings-tab-" + section} key={section}>
+        {section === "diagnostics" && <Diagnostics />}
         {section === "privacy" && <PrivacySettings settings={settings} onChoice={onAnalytics} />}
         {section === "general" && (
           <section aria-labelledby="general-settings-title">

@@ -190,6 +190,7 @@ impl Analytics {
     }
     pub async fn run(self: std::sync::Arc<Self>) {
         let Ok(client) = reqwest::Client::builder()
+            .retry(reqwest::retry::never())
             .redirect(reqwest::redirect::Policy::none())
             .timeout(std::time::Duration::from_secs(8))
             .build()
@@ -273,5 +274,92 @@ mod tests {
         assert!(json.to_string().len() < 2048);
         assert!(!json.to_string().contains("private"));
         assert!(analytics.take_report().is_none());
+    }
+}
+
+/// Per-run consent is separate from usage telemetry. Only fixed coarse diagnostic bands qualify.
+pub async fn share_diagnostics(
+    counters: BTreeMap<String, u32>,
+    version: &str,
+    os: &str,
+    arch: &str,
+    cancel: CancellationToken,
+) -> Result<(), String> {
+    if !["windows", "linux", "other"].contains(&os)
+        || !["x64", "arm64", "other"].contains(&arch)
+        || version.split('.').count() != 3
+        || version.split('.').any(|part| {
+            part.is_empty()
+                || part.len() > 3
+                || !part.bytes().all(|b| b.is_ascii_digit())
+                || (part.len() > 1 && part.starts_with('0'))
+        })
+    {
+        return Err("Invalid diagnostic report metadata.".into());
+    }
+    if ["cpu", "drive", "memory", "network"].iter().any(|group| {
+        counters
+            .keys()
+            .filter(|key| key.starts_with(&format!("diagnostics_{group}_")))
+            .count()
+            > 1
+    }) {
+        return Err("Only one band per diagnostic group may be shared.".into());
+    }
+    if counters.is_empty()
+        || counters.len() > 4
+        || counters.iter().any(|(key, count)| {
+            *count != 1
+                || !["cpu", "drive", "memory", "network"].iter().any(|group| {
+                    ["f", "d", "c", "b", "a", "s", "ss"]
+                        .iter()
+                        .any(|grade| key == &format!("diagnostics_{group}_{grade}"))
+                })
+        })
+    {
+        return Err("Invalid coarse diagnostic summary.".into());
+    }
+    let report = serde_json::json!({"schema":1,"purpose":"diagnostics-summary-v1","version":version,"os":os,"arch":arch,"counters":counters});
+    let client = reqwest::Client::builder()
+        .retry(reqwest::retry::never())
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(std::time::Duration::from_secs(8))
+        .build()
+        .map_err(|_| "Could not initialize summary sharing.")?;
+    tokio::select! { biased;
+        _=cancel.cancelled()=>Err("Sharing cancelled. The report stays local.".into()),
+        result=client.post(ENDPOINT).json(&report).send()=>match result {Ok(response) if response.status().is_success()=>Ok(()),_=>Err("Summary was not confirmed. No retry is queued; the report stays available locally.".into())},
+    }
+}
+
+#[cfg(test)]
+mod diagnostic_sharing_tests {
+    use super::*;
+    #[tokio::test]
+    async fn multiple_bands_and_sensitive_metadata_are_rejected_before_transport() {
+        let duplicate = BTreeMap::from([
+            ("diagnostics_cpu_f".into(), 1),
+            ("diagnostics_cpu_s".into(), 1),
+        ]);
+        let error = share_diagnostics(
+            duplicate,
+            "0.6.1",
+            "windows",
+            "x64",
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.contains("one band"));
+        let coarse = BTreeMap::from([("diagnostics_cpu_b".into(), 1)]);
+        assert!(share_diagnostics(
+            coarse,
+            "https://private.example",
+            "windows",
+            "x64",
+            CancellationToken::new()
+        )
+        .await
+        .is_err());
     }
 }
