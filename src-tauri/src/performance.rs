@@ -72,6 +72,7 @@ pub struct Trial {
     pub first_byte_ms: Vec<f64>,
     pub response_header_ms: Vec<f64>,
     pub http_statuses: Vec<u16>,
+    pub retry_after_ms: u64,
     pub errors: Vec<String>,
     pub loaded_latency_ms: Vec<f64>,
     pub protocols: Vec<String>,
@@ -915,29 +916,31 @@ async fn run(
             let client=crate::engine::download_client_builder().redirect(reqwest::redirect::Policy::none()).build().map_err(|_|"Could not start the network test client.")?;
             let budget=AtomicU64::new(options.network_budget_mib*MIB);
             owner.phase("idle request latency and reachability",25);
-            for _ in 0..if options.deep {12} else {6} {
+            for _ in 0..if options.deep {8} else {6} {
                 check(cancel,started,options.deep)?;
                 match latency(&client,endpoint,cancel).await {Ok(ms)=>report.idle_latency_ms.push(ms),Err(_) if cancel.is_cancelled()=>return Err("Performance test cancelled.".into()),Err(_)=>report.failed_latency_requests+=1}
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }
             if report.idle_latency_ms.is_empty() { return Err("The test endpoint could not be reached. Run a local-only test or try again later.".into()); }
-            let counts=if options.deep {vec![1,2,4,8,16,32]} else {vec![1,4,8,16]};
+            let counts=if options.deep {vec![1,2,4,8]} else {vec![1,4,8]};
             let mut matrix=counts.clone();matrix.extend(counts.iter().rev());
             let reserved=if options.deep {options.network_budget_mib*MIB*2/5}else{options.network_budget_mib*MIB/(if options.upload {4} else {5})};
-            let quota=(options.network_budget_mib*MIB-reserved)/(matrix.len()+if options.deep {8}else{0}) as u64;
+            let quota=(options.network_budget_mib*MIB-reserved)/(matrix.len()+if options.deep {6}else{0}) as u64;
             for (index,count) in matrix.iter().enumerate() {
+                if index>0 {tokio::select!{_=cancel.cancelled()=>return Err("Performance test cancelled.".into()),_=tokio::time::sleep(Duration::from_secs(2))=>{}}}
                 check(cancel,started,options.deep)?;
                 owner.phase(&format!("download: {count} parallel requests, repeat {}",if index<counts.len(){1}else{2}),30+index*40/matrix.len());
                 let trial=network_trial(&client,endpoint,*count,quota,&budget,cancel,if options.deep {10}else{5},None,"download").await?;
-                report.received_network_bytes+=trial.bytes;report.trials.push(trial);
+                record_network(&mut report,trial)?;
             }
             if options.deep {
                 owner.phase("HTTP/1 transport comparison",72);
                 let independent=crate::engine::download_client_builder().http1_only().redirect(reqwest::redirect::Policy::none()).build().map_err(|_|"Could not create the comparison client.")?;
-                for n in [1,4,16,32,32,16,4,1] {
+                for n in [1,4,8,8,4,1] {
+                    tokio::select!{_=cancel.cancelled()=>return Err("Performance test cancelled.".into()),_=tokio::time::sleep(Duration::from_secs(2))=>{}}
                     check(cancel,started,options.deep)?;
                     let trial=network_trial(&independent,endpoint,n,quota,&budget,cancel,8,None,"http1Comparison").await?;
-                    report.received_network_bytes+=trial.bytes;report.trials.push(trial);
+                    record_network(&mut report,trial)?;
                 }
             }
             let n=recommendations(&report).connections;
@@ -945,12 +948,12 @@ async fn run(
                 owner.phase("sustained throughput confirmation",80);
                 let quota=budget.load(Ordering::Relaxed).saturating_sub(options.disk_budget_mib*MIB/2+if options.upload {32*MIB}else{0});
                 let trial=network_trial(&client,endpoint,n,quota,&budget,cancel,30,None,"sustainedDownload").await?;
-                report.received_network_bytes+=trial.bytes;report.trials.push(trial);
+                record_network(&mut report,trial)?;
             }
             owner.phase("end-to-end receive, write, hash and flush",85);
             let quota=(budget.load(Ordering::Relaxed)/if options.upload {2}else{1}).min(options.disk_budget_mib*MIB/2);
             let trial=network_trial(&client,endpoint,n,quota,&budget,cancel,if options.deep {15}else{8},Some(&staging_temp),"pipeline").await?;
-            report.disk_written_bytes+=trial.bytes;report.received_network_bytes+=trial.bytes;report.trials.push(trial);
+            report.disk_written_bytes+=trial.bytes;record_network(&mut report,trial)?;
             let copied={let source=staging_temp.clone();let target=temp.clone();let token=cancel.clone();tokio::task::spawn_blocking(move||finalize_pipeline(&source,&target,n,&token)).await.map_err(|_|"Pipeline finalization worker failed.")??};
             report.disk_written_bytes+=copied.bytes;report.trials.push(copied);
             if options.upload {
@@ -1255,6 +1258,21 @@ async fn latency(
     Ok(begin.elapsed().as_secs_f64() * 1000.0)
 }
 
+fn record_network(report: &mut Report, trial: Trial) -> Result<(), String> {
+    let failed = trial.failures > 0;
+    let wait = trial.retry_after_ms;
+    report.received_network_bytes += trial.bytes;
+    report.trials.push(trial);
+    if failed {
+        return Err(if wait > 0 {
+            format!("The test service refused further requests. Remaining online tests stopped; wait at least {} seconds before trying again.", wait.div_ceil(1000))
+        } else {
+            "A network test failed. Remaining online tests stopped; partial diagnostics were retained.".into()
+        });
+    }
+    Ok(())
+}
+
 async fn network_trial(
     client: &reqwest::Client,
     endpoint: &str,
@@ -1284,6 +1302,7 @@ async fn network_trial(
     let received = AtomicU64::new(0);
     let requested = AtomicU64::new(0);
     let statuses = Mutex::new(Vec::new());
+    let retry_after_ms = AtomicU64::new(0);
     let loaded_samples = Arc::new(Mutex::new(Vec::new()));
     let loaded_task = {
         let client = client.clone();
@@ -1292,7 +1311,7 @@ async fn network_trial(
         let samples = loaded_samples.clone();
         tokio::spawn(async move {
             loop {
-                tokio::select! {_=child.cancelled()=>break,_=tokio::time::sleep(Duration::from_millis(500))=>{}}
+                tokio::select! {_=child.cancelled()=>break,_=tokio::time::sleep(Duration::from_secs(2))=>{}}
                 if let Ok(ms) = latency(&client, &endpoint, &child).await {
                     let mut samples = samples.lock().expect("loaded latency poisoned");
                     if samples.len() < 30 {
@@ -1310,7 +1329,7 @@ async fn network_trial(
         allocations.push(bytes);
     }
     let workers = allocations.into_iter().enumerate().map(|(index, allocation)| {
-        let child = &child; let received = &received; let requested = &requested; let statuses = &statuses;
+        let child = &child; let received = &received; let requested = &requested; let statuses = &statuses; let retry_after_ms = &retry_after_ms;
         async move {
             let started = Instant::now();
             let mut done = 0u64; let mut header_ms = None; let mut first_byte = None;
@@ -1319,12 +1338,17 @@ async fn network_trial(
                 Some(tokio::io::BufWriter::with_capacity(1024 * 1024, tokio::fs::OpenOptions::new().create_new(true).write(true).open(path.join(format!("pipeline-{index}.bin"))).await.map_err(|_| "Cannot create pipeline data")?))
             } else { None };
             while done < allocation && !child.is_cancelled() {
-                // Fixed-size requests permit connection reuse and work within public endpoint limits.
-                let wanted = (allocation - done).min(64 * MIB);
+                // Match the provider's documented largest payload to reduce request churn.
+                let wanted = (allocation - done).min(250_000_000);
                 requested.fetch_add(wanted, Ordering::Relaxed);
                 let request = client.get(format!("{endpoint}?bytes={wanted}&nonce={}", Uuid::new_v4())).header("Accept-Encoding", "identity").header("Cache-Control", "no-store").send();
                 let response = tokio::select! { _ = child.cancelled() => break, response = request => response.map_err(|_| "HTTP request failed")? };
                 statuses.lock().expect("test statuses poisoned").push(response.status().as_u16());
+                if matches!(response.status().as_u16(), 403 | 429 | 503) {
+                    retry_after_ms.fetch_max(crate::engine::retry_after(response.headers(), Utc::now()).map_or(60_000, millis), Ordering::Relaxed);
+                    child.cancel();
+                    return Err("The test service refused further requests");
+                }
                 if response.status() != reqwest::StatusCode::OK || response.headers().get("content-type").is_some_and(|v| v.to_str().is_ok_and(|v| v.to_ascii_lowercase().starts_with("text/html"))) || response.headers().get("content-encoding").is_some_and(|v| !v.to_str().is_ok_and(|v| v.eq_ignore_ascii_case("identity"))) { return Err("HTTP status, HTML page or encoded response rejected"); }
                 protocol = format!("{:?} {}", response.version(), response.remote_addr().map_or("unknown family", |v| if v.is_ipv4() { "IPv4" } else { "IPv6" }));
                 header_ms.get_or_insert_with(|| started.elapsed().as_secs_f64() * 1000.0);
@@ -1414,6 +1438,7 @@ async fn network_trial(
         first_byte_ms,
         response_header_ms,
         http_statuses,
+        retry_after_ms: retry_after_ms.load(Ordering::Relaxed),
         errors,
         loaded_latency_ms: loaded,
         protocols,
@@ -1674,6 +1699,44 @@ mod tests {
             }
         });
         (format!("http://{address}/__down"), job)
+    }
+
+    #[tokio::test]
+    async fn service_refusal_cancels_trial_and_retains_retry_after() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0; 8192];
+            socket.read(&mut request).await.unwrap();
+            socket.write_all(b"HTTP/1.1 429 Too Many Requests\r\nRetry-After: 120\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await.unwrap();
+        });
+        let client = crate::engine::download_client_builder()
+            .no_proxy()
+            .build()
+            .unwrap();
+        let budget = AtomicU64::new(8 * MIB);
+        let trial = network_trial(
+            &client,
+            &format!("http://{address}/__down"),
+            1,
+            8 * MIB,
+            &budget,
+            &CancellationToken::new(),
+            4,
+            None,
+            "download",
+        )
+        .await
+        .unwrap();
+        server.await.unwrap();
+        assert_eq!(trial.http_statuses, vec![429]);
+        assert_eq!(trial.retry_after_ms, 120_000);
+        assert_eq!(trial.bytes, 0);
+        assert_eq!(trial.failures, 1);
+        assert!(!trial.valid_for_tuning);
+        assert!(trial.elapsed_ms < 1000);
     }
 
     #[tokio::test]
