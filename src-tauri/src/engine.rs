@@ -4513,7 +4513,7 @@ impl DownloadManager {
                     segment.downloaded.fetch_add(size as u64, Ordering::Relaxed);
                     offset += size;
                 }
-                if part_hash.is_some() && checkpoint_at.elapsed() >= Duration::from_secs(5) {
+                if let Some(hash) = part_hash.as_ref().filter(|_| checkpoint_at.elapsed() >= Duration::from_secs(5)) {
                     let durable_at = Instant::now();
                     transfer_span!(task.trace.as_deref(),Flush,output.flush().await)?;
                     transfer_span!(task.trace.as_deref(),Sync,output.get_ref().sync_data().await)?;
@@ -4521,7 +4521,7 @@ impl DownloadManager {
                         &part_dir.join(format!("{index}.progress.json")),
                         &PartCheckpoint {
                             bytes: segment.downloaded.load(Ordering::Relaxed),
-                            sha256: format!("{:x}", part_hash.as_ref().unwrap().clone().finalize()),
+                            sha256: format!("{:x}", hash.clone().finalize()),
                         },
                     )
                     .await)?;
