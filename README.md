@@ -10,7 +10,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/Beelzebub2/fetchrail/releases/latest"><img src="https://img.shields.io/github/package-json/v/Beelzebub2/fetchrail?style=flat-square&amp;color=ff8a3d&amp;label=version" alt="Project version"></a>
+  <a href="https://github.com/Beelzebub2/fetchrail/releases/latest"><img src="https://img.shields.io/github/v/release/Beelzebub2/fetchrail?display_name=tag&amp;sort=date&amp;style=flat-square&amp;color=ff8a3d&amp;label=version" alt="Latest published release"></a>
   <img src="https://img.shields.io/badge/platforms-Windows%20%C2%B7%20Linux-252b3a?style=flat-square" alt="Platforms: Windows and Linux">
   <a href="https://github.com/Beelzebub2/fetchrail/actions/workflows/release.yml"><img src="https://github.com/Beelzebub2/fetchrail/actions/workflows/release.yml/badge.svg" alt="Release workflow"></a>
 </p>
