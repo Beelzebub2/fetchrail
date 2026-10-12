@@ -26,6 +26,8 @@ mod rate_limit;
 mod staging;
 mod state_store;
 pub mod torrent;
+#[cfg(windows)]
+mod windows_tray;
 
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -39,11 +41,12 @@ use model::{
     QueueRecord,
 };
 use organize::{OrganizeMode, OrganizeReport};
+#[cfg(not(windows))]
 use tauri::{
     menu::{Menu, MenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
-    AppHandle, Manager, State, WindowEvent,
 };
+use tauri::{AppHandle, Manager, State, WindowEvent};
 use uuid::Uuid;
 
 struct FrontendReady(AtomicBool, std::sync::Mutex<Option<String>>);
@@ -842,6 +845,9 @@ pub fn run() {
             tauri::async_runtime::block_on(browser_bridge::start(app.handle().clone(), manager))
                 .map_err(std::io::Error::other)?;
 
+            #[cfg(windows)]
+            let tray_result = windows_tray::create(app.handle());
+            #[cfg(not(windows))]
             let tray_result = (|| -> tauri::Result<_> {
                 let show_item =
                     MenuItem::with_id(app, "show", "Show Fetchrail", true, None::<&str>)?;
@@ -861,16 +867,7 @@ pub fn run() {
                     .tooltip("Fetchrail Download Manager")
                     .menu(&tray_menu)
                     .show_menu_on_left_click(false)
-                    .on_menu_event(|app, event| match event.id().as_ref() {
-                        "show" => show_main_window(app),
-                        "extension" => {
-                            if let Err(error) = browser_extension::open_store(app) {
-                                eprintln!("Fetchrail browser extension: {error}");
-                            }
-                        }
-                        "quit" => app.exit(0),
-                        _ => {}
-                    })
+                    .on_menu_event(handle_tray_menu_event)
                     .on_tray_icon_event(|tray, event| {
                         if matches!(
                             event,
@@ -1054,6 +1051,10 @@ pub fn run() {
         .build(context())
         .expect("error while building Fetchrail")
         .run(|app, event| {
+            #[cfg(windows)]
+            if matches!(event, tauri::RunEvent::Exit) {
+                windows_tray::remove();
+            }
             if let tauri::RunEvent::ExitRequested { api, code, .. } = event {
                 let Some(manager) = app.try_state::<Arc<DownloadManager>>() else {
                     return;
@@ -1069,6 +1070,19 @@ pub fn run() {
                 }
             }
         });
+}
+
+fn handle_tray_menu_event(app: &AppHandle, event: tauri::menu::MenuEvent) {
+    match event.id().as_ref() {
+        "show" => show_main_window(app),
+        "extension" => {
+            if let Err(error) = browser_extension::open_store(app) {
+                eprintln!("Fetchrail browser extension: {error}");
+            }
+        }
+        "quit" => app.exit(0),
+        _ => {}
+    }
 }
 
 fn offer_torrent_arguments(
