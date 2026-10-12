@@ -4,7 +4,7 @@ import { createHash } from "node:crypto";
 import { createServer } from "node:http";
 import { createServer as tcpServer } from "node:net";
 import { createReadStream } from "node:fs";
-import { readFile, writeFile, mkdir } from "node:fs/promises";
+import { readFile, writeFile, mkdir, stat } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { chromium } from "playwright";
@@ -45,16 +45,17 @@ function fixtureServer(mode,workers) {
     const limit=mode==="ignored"?total:end-start+1;
     function pump() {
       if(response.destroyed)return;
-      let budget=Math.max(block.length,Math.floor((performance.now()-first)/1000*speed)-sent);
+      let budget=Math.max(0,block.length+Math.floor((performance.now()-first)/1000*speed)-sent);
       while(sent<limit&&budget>0){
         const at=(mode==="ignored"?0:start)+sent,offset=at%block.length;
         const size=Math.min(block.length-offset,limit-sent,budget);
         sent+=size;budget-=size;visit.bytes+=size;state.bytes+=size;
-        if(!response.write(block.subarray(offset,offset+size))){response.once("drain",pump);return;}
+        const writable=response.write(block.subarray(offset,offset+size));
         if(mode==="disconnect"&&!broken&&sent>=1024*1024){broken=true;response.destroy();return;}
+        if(!writable){response.once("drain",pump);return;}
       }
       if(sent>=limit){response.end();return;}
-      timer=setTimeout(pump,Math.max(1,(sent+block.length)/speed*1000-(performance.now()-first)));
+      timer=setTimeout(pump,Math.max(1,sent/speed*1000-(performance.now()-first)));
     }
     response.once("close",()=>clearTimeout(timer));pump();
   });
@@ -75,6 +76,7 @@ async function run(label,exe,plan,mode="uniform",workers=8,tracing=true) {
   const fixture=await createFixture("http-app-benchmark"),{server,state}=fixtureServer(mode,workers);
   let app,browser,closed,verified=false;const samples=[];
   try {
+    await writeFile(join(fixture.stateDir,"settings.json"),JSON.stringify({defaultDownloadDir:join(fixture.root,"downloads"),maxConcurrentDownloads:3,connectionsPerDownload:workers,minSegmentSizeMb:4,autoUpdate:false,launchOnStart:false,performanceAuto:false,analyticsConsent:{enabled:false,decided:true,schema:1,purpose:"product-improvement-v1"}}));
     await new Promise(done=>server.listen(0,"127.0.0.1",done));const port=await freePort();
     app=spawn(exe,["--background"],{windowsHide:true,env:{...fixture.env,FETCHRAIL_TEST_RANGE_PLAN:plan,FETCHRAIL_TEST_TRACE:tracing?"1":"0",WEBVIEW2_USER_DATA_FOLDER:join(fixture.root,"webview"),WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS:`--remote-debugging-port=${port}`},stdio:"ignore"});
     closed=new Promise(done=>app.once("exit",done));
@@ -92,29 +94,37 @@ async function run(label,exe,plan,mode="uniform",workers=8,tracing=true) {
       window.benchListener=await window.__TAURI_INTERNALS__.invoke("plugin:event|listen",{event:"fetchrail://download-updated",target:{kind:"Any"},handler});
     });
     const settings=await invoke("get_settings");await invoke("update_settings",{settings:{...settings,autoUpdate:false,launchOnStart:false,performanceAuto:false,adaptiveConnections:false,connectionsPerDownload:workers,sortIntoCategoryFolders:false}});
-    const start=performance.now();
+    const start=performance.now(),startedAt=new Date().toISOString();
     const job=await page.evaluate(async request=>{window.benchStarted=performance.now();return window.__TAURI_INTERNALS__.invoke("add_download",{request});},{url:`http://127.0.0.1:${server.address().port}/fixture.bin`,fileName:"fixture.bin",directory:join(fixture.root,"output"),connections:workers});
     let record,lastSample=-1;
     await until(async()=>{
       record=await invoke("get_download",{id:job.id});const now=performance.now(),seconds=(now-start)/1000;
       if(seconds-lastSample>=1||["completed","failed"].includes(record.status)){
-        samples.push({seconds,status:record.status,bytes:record.downloadedBytes,speedBps:record.speedBps,receiving:record.receivingConnections??record.segments.filter(s=>s.active).length,connecting:record.connectingConnections??0,groups:record.segments.length,planned:record.plannedRanges??record.connections,trace:record.testTrace??null});lastSample=seconds;
+        samples.push({seconds,time:new Date().toISOString(),status:record.status,bytes:record.downloadedBytes,speedBps:record.speedBps,receiving:record.receivingConnections??record.segments.filter(s=>s.active).length,connecting:record.connectingConnections??0,groups:record.segments.length,planned:record.plannedRanges??record.connections,trace:record.testTrace??null});lastSample=seconds;
       }
       return !!(await page.evaluate(id=>window.benchTerminal[id],job.id));
     },"durable full-app completion",180000);
     record=await invoke("get_download",{id:job.id});
-    const done=performance.now(),result={label,plan,mode,workers,status:record.status,...summarize(samples,start,done,total),serverPeak:state.peak,serverRequests:state.requests.length,serverBodyBytes:state.bytes,serverRefusals:state.refusals,samples,trace:record.testTrace??null};
+    const done=performance.now(),result={label,plan,mode,workers,startedAt,status:record.status,...summarize(samples,start,done,total),serverPeak:state.peak,serverRequests:state.requests.length,serverBodyBytes:state.bytes,serverRefusals:state.refusals,samples,trace:record.testTrace??null};
     const duration=await page.evaluate(id=>(window.benchTerminal[id].at-window.benchStarted)/1000,job.id);
-    result.seconds=duration;result.endToEndMBps=total/duration/1e6;result.durationBasis="frontend start to terminal event after catalog acknowledgement";
+    result.seconds=duration;result.endToEndMBps=record.status==="completed"?total/duration/1e6:null;result.durationBasis="frontend start to terminal event after catalog acknowledgement";
     const visits=state.requests.filter(v=>v.done!=null);result.firstRequestDoneSeconds=visits.length?(Math.min(...visits.map(v=>v.done))-Math.min(...state.requests.map(v=>v.at)))/1000:null;
     result.lastRequestDoneSeconds=visits.length?(Math.max(...visits.map(v=>v.done))-Math.min(...state.requests.map(v=>v.at)))/1000:null;
-    if(["invalid","changed"].includes(mode)) {assert.equal(record.status,"failed");verified=true;}
+    if(["invalid","changed"].includes(mode)) {
+      assert.equal(record.status,"failed");
+      assert.equal(await stat(record.destination).then(()=>true,error=>{if(error.code==="ENOENT")return false;throw error;}),false);
+      const saved=parseStateSnapshot(await readFile(join(fixture.stateDir,"downloads.json")));
+      assert(saved.some(row=>row.id===job.id&&row.status==="failed"));verified=true;
+    }
     else {
       assert.equal(record.status,"completed",`Fixture failed: ${record.failureCategory??"unclassified"}`);
       const saved=parseStateSnapshot(await readFile(join(fixture.stateDir,"downloads.json"))),backup=parseStateSnapshot(await readFile(join(fixture.stateDir,"downloads.json.backup")));
       assert(saved.some(row=>row.id===job.id&&row.status==="completed"));assert(backup.some(row=>row.id===job.id&&row.status==="completed"));
       assert.equal(await digest(record.destination),expectedHash);assert.equal(record.downloadedBytes,total);assert(state.peak<=workers,"Worker ceiling exceeded");
       result.outputSha256=expectedHash;result.catalogVerified=true;verified=true;
+      if(result.trace){assert.equal(result.trace.catalogAcknowledged,true);assert.equal(result.trace.durableBytes,total);}
+      if(mode==="disconnect")assert(result.trace?.retries>=1&&state.requests.length>workers,"Disconnect must actually trigger a suffix retry");
+      if(mode==="refusal")assert.equal(state.refusals,1,"Refusal fixture must exercise server backoff");
     }
     results.push(result);await writeFile(join(output,`${label}.json`),JSON.stringify(result,null,2));
     console.log(JSON.stringify({label,status:result.status,seconds:result.seconds,endToEndMBps:result.endToEndMBps,serverPeak:state.peak,requests:state.requests.length,verified}));
