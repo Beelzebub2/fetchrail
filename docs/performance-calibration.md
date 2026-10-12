@@ -25,6 +25,27 @@ measurements remain separately labelled: short diagnostic bursts and grade bands
 cannot substitute for repeated sustained evidence. The selected view survives
 navigation away and back; a running test keeps its cancellation controls visible.
 
+### Which tool should I use?
+
+For download tuning, start with **Optimize downloads**: choose a budget, run the
+test, review its evidence and apply a usable report. It already gathers its own
+hardware context and measures the relevant drive and receive/write/hash/finalize
+workloads. **Hardware diagnostics is not a prerequisite.** Automatically using its
+grades, cache-influenced reads or brief connection samples would risk choosing
+settings from a different workload instead of sustained download evidence.
+
+Use **Hardware diagnostics** when investigating this computer's processor, memory,
+drive or connection. Its **Go to download calibration** shortcut returns to the
+tuning workflow without starting a test, applying results or saving settings. The
+shortcut is disabled while diagnostics starts or runs, preserving cancellation.
+
+Neither benchmark is required to use automatic tuning. Enable it and save the
+setting to learn from qualifying normal completed downloads, or apply a usable
+calibration for a measured starting point. All three routes keep the user's
+connection and bandwidth ceilings; diagnostic reporting and per-run sharing remain
+separate from tuning. Running both tests is optional and spends each test's own
+disclosed budget; one never silently starts the other.
+
 ## Measurement inventory
 
 | Measurement | Method and limits |
