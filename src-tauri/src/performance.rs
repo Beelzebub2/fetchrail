@@ -255,12 +255,14 @@ impl Performance {
             error,
             prompt: !store.dismissed && store.reports.is_empty(),
             latest: include_report
-                .then(|| store.reports.first().cloned().map(|mut report| {
-                    if report.engine_build == env!("FETCHRAIL_ENGINE_BUILD") {
-                        report.profile = recommendations(&report);
-                    }
-                    report
-                }))
+                .then(|| {
+                    store.reports.first().cloned().map(|mut report| {
+                        if report.engine_build == env!("FETCHRAIL_ENGINE_BUILD") {
+                            report.profile = recommendations(&report);
+                        }
+                        report
+                    })
+                })
                 .flatten(),
             applied: store.applied,
             learned_hosts: store.hosts.len(),
@@ -367,7 +369,9 @@ impl Performance {
             .iter()
             .find(|r| r.id == id)
             .ok_or("Calibration report is no longer available.")?;
-        if let Some(reason) = self.report_issue(report, hardware) { return Err(reason.into()); }
+        if let Some(reason) = self.report_issue(report, hardware) {
+            return Err(reason.into());
+        }
         let profile = recommendations(report);
         store.applied = Some(id);
         self.save(&mut store)?;
@@ -382,7 +386,10 @@ impl Performance {
             .map(|r| {
                 let mut profile = recommendations(r);
                 // Memory pressure is current context, not a two-week restriction from the test.
-                if hardware.available_memory_bytes.is_some_and(|v| v < 256 * MIB) {
+                if hardware
+                    .available_memory_bytes
+                    .is_some_and(|v| v < 256 * MIB)
+                {
                     profile.simultaneous_downloads = 1;
                     profile.buffer_bytes = 64 * 1024;
                 }
@@ -394,7 +401,9 @@ impl Performance {
             Some("This report is no longer applicable: the engine, network or drive changed, or it expired. Run a new calibration to use its recommendations.")
         } else if recommendations(report).confidence == "insufficient" {
             Some("This report has insufficient sustained evidence. Keep the current defaults or increase the test budget and try again.")
-        } else { None }
+        } else {
+            None
+        }
     }
     fn same_staging(&self, report: &Report) -> bool {
         let Some(parent) = self.path.parent() else {
@@ -423,21 +432,21 @@ impl Performance {
                     && r.completed_at <= Utc::now()
                     && Utc::now().signed_duration_since(r.completed_at).num_days() < EXPIRY_DAYS
             })
-            .filter_map(|r| repeated_floor(&r.recent_completion_bps).map(|bps| (r.connections,bps)))
-            .max_by_key(|(_,bps)| *bps);
-        best.map(|(connections,_)| connections)
+            .filter_map(|r| {
+                repeated_floor(&r.recent_completion_bps).map(|bps| (r.connections, bps))
+            })
+            .max_by_key(|(_, bps)| *bps);
+        best.map(|(connections, _)| connections)
             .or_else(|| {
                 store
                     .reports
                     .iter()
                     .find(|r| {
-                        Some(r.id) == store.applied
-                            && fresh(r, hardware)
-                            && self.same_staging(r)
+                        Some(r.id) == store.applied && fresh(r, hardware) && self.same_staging(r)
                     })
                     .and_then(|r| {
-                        let profile=recommendations(r);
-                        (profile.measured_network_bps>0).then_some(profile)
+                        let profile = recommendations(r);
+                        (profile.measured_network_bps > 0).then_some(profile)
                     })
                     .map(|profile| {
                         if size < 256 * MIB {
@@ -447,7 +456,11 @@ impl Performance {
                         }
                     })
             })
-            .unwrap_or(if size < 256*MIB {ceiling}else{ceiling.min(16)})
+            .unwrap_or(if size < 256 * MIB {
+                ceiling
+            } else {
+                ceiling.min(16)
+            })
             .clamp(1, ceiling.max(1))
     }
     pub fn learn(
@@ -475,7 +488,9 @@ impl Performance {
             result.samples = result.samples.saturating_add(1).min(1000);
             result.completed_at = Utc::now();
             result.recent_completion_bps.push(completion);
-            if result.recent_completion_bps.len()>4 { result.recent_completion_bps.remove(0); }
+            if result.recent_completion_bps.len() > 4 {
+                result.recent_completion_bps.remove(0);
+            }
         } else {
             store.hosts.insert(
                 0,
@@ -603,7 +618,14 @@ impl LivePolicy {
             tokio::select! { _=wait=>{}, _=cancel.cancelled()=>return None }
         }
     }
-    pub fn observe(&self, bytes: u64, elapsed: Duration, receiving: usize, eligible: bool, generation: u64) {
+    pub fn observe(
+        &self,
+        bytes: u64,
+        elapsed: Duration,
+        receiving: usize,
+        eligible: bool,
+        generation: u64,
+    ) {
         let target = self.target.load(Ordering::Relaxed);
         let writes = self.write_wait_ns.swap(0, Ordering::Relaxed);
         let mut c = self
@@ -615,8 +637,12 @@ impl LivePolicy {
         if !eligible {
             self.contaminated.store(true, Ordering::Relaxed);
         }
-        if !eligible || receiving != target || self.active.load(Ordering::Acquire) != target
-            || generation != self.generation.load(Ordering::Acquire) || elapsed < Duration::from_secs(3) {
+        if !eligible
+            || receiving != target
+            || self.active.load(Ordering::Acquire) != target
+            || generation != self.generation.load(Ordering::Acquire)
+            || elapsed < Duration::from_secs(3)
+        {
             c.windows = 0;
             c.previous = 0;
             return;
@@ -671,7 +697,9 @@ impl LivePolicy {
         // A test server's throughput is a weak prior, not the ceiling of another route.
         // Drain naturally rather than cancelling healthy ranges or discarding verified bytes.
         // Stable work can re-probe after a transient disk/server condition; no permanent low target.
-        if c.settled && c.windows >= 6 { c.settled = false; }
+        if c.settled && c.windows >= 6 {
+            c.settled = false;
+        }
         if !c.settled && target < self.ceiling {
             c.baseline = sustained;
             c.previous_target = target;
@@ -759,30 +787,64 @@ fn repeated_floor(values: &[u64]) -> Option<u64> {
     (values.len() >= 2 && low > 0 && high <= low.saturating_mul(150) / 100).then_some(low)
 }
 fn usable_network(trial: &Trial) -> bool {
-    trial.valid_for_tuning && trial.failures == 0 && (1..=32).contains(&trial.parallel_requests)
-        && trial.elapsed_ms >= 3000 && trial.bytes >= MIB
+    trial.valid_for_tuning
+        && trial.failures == 0
+        && (1..=32).contains(&trial.parallel_requests)
+        && trial.elapsed_ms >= 3000
+        && trial.bytes >= MIB
         && trial.samples_bps.iter().filter(|v| **v > 0).count() >= 2
 }
-fn pipelines(report: &Report, count: usize, buffer: usize) -> impl Iterator<Item=&Trial> {
+fn pipelines(report: &Report, count: usize, buffer: usize) -> impl Iterator<Item = &Trial> {
     report.trials.windows(2).filter_map(move |pair| {
-        let (p,f)=(&pair[0],&pair[1]);
-        (p.kind=="pipeline" && p.parallel_requests==count && p.buffer_bytes==buffer && usable_network(p)
-            && f.kind=="pipelineFinalization" && f.parallel_requests==count
-            && f.failures==0 && f.bytes==p.bytes).then_some(p)
+        let (p, f) = (&pair[0], &pair[1]);
+        (p.kind == "pipeline"
+            && p.parallel_requests == count
+            && p.buffer_bytes == buffer
+            && usable_network(p)
+            && f.kind == "pipelineFinalization"
+            && f.parallel_requests == count
+            && f.failures == 0
+            && f.bytes == p.bytes)
+            .then_some(p)
     })
 }
 
 fn disk_recommendation(report: &Report) -> (usize, u64) {
-    let kind = if report.staging_hardware.is_some() { "stagingSequentialWrite" } else { "sequentialWrite" };
+    let kind = if report.staging_hardware.is_some() {
+        "stagingSequentialWrite"
+    } else {
+        "sequentialWrite"
+    };
     let mut buffers: BTreeMap<usize, Vec<u64>> = BTreeMap::new();
-    for trial in report.trials.iter().filter(|t| t.kind == kind && t.valid_for_tuning && t.failures == 0) {
-        buffers.entry(trial.buffer_bytes).or_default().push(trial.throughput_bps);
+    for trial in report
+        .trials
+        .iter()
+        .filter(|t| t.kind == kind && t.valid_for_tuning && t.failures == 0)
+    {
+        buffers
+            .entry(trial.buffer_bytes)
+            .or_default()
+            .push(trial.throughput_bps);
     }
-    let proven: Vec<_> = buffers.iter().filter_map(|(buffer, values)| repeated_floor(values).map(|bps| (*buffer,bps))).collect();
-    let disk = proven.iter().map(|(_,bps)| *bps).max().unwrap_or(0);
-    let buffer = proven.iter().find(|(_,bps)| *bps >= disk.saturating_mul(95)/100).map_or(1024*1024,|(buffer,_)|*buffer);
-    let cap = if report.hardware.available_memory_bytes.is_some_and(|v| v >= 1024*MIB) {4*1024*1024}else{1024*1024};
-    (buffer.clamp(64*1024,cap),disk)
+    let proven: Vec<_> = buffers
+        .iter()
+        .filter_map(|(buffer, values)| repeated_floor(values).map(|bps| (*buffer, bps)))
+        .collect();
+    let disk = proven.iter().map(|(_, bps)| *bps).max().unwrap_or(0);
+    let buffer = proven
+        .iter()
+        .find(|(_, bps)| *bps >= disk.saturating_mul(95) / 100)
+        .map_or(1024 * 1024, |(buffer, _)| *buffer);
+    let cap = if report
+        .hardware
+        .available_memory_bytes
+        .is_some_and(|v| v >= 1024 * MIB)
+    {
+        4 * 1024 * 1024
+    } else {
+        1024 * 1024
+    };
+    (buffer.clamp(64 * 1024, cap), disk)
 }
 
 fn recommendations(report: &Report) -> Profile {
@@ -807,23 +869,38 @@ fn recommendations(report: &Report) -> Profile {
         .find(|(_, bps)| *bps >= best.saturating_mul(95) / 100)
         .map(|(n, _)| *n)
         .unwrap_or(8);
-    let (mut buffer,disk) = disk_recommendation(report);
+    let (mut buffer, disk) = disk_recommendation(report);
     if buffer != 1024 * 1024 {
-        let rates = |size| pipelines(report,connections,size).map(|t| t.throughput_bps).collect::<Vec<_>>();
+        let rates = |size| {
+            pipelines(report, connections, size)
+                .map(|t| t.throughput_bps)
+                .collect::<Vec<_>>()
+        };
         let candidate = repeated_floor(&rates(buffer));
         let baseline_rates = rates(1024 * 1024);
-        let baseline = repeated_floor(&baseline_rates).and_then(|_| baseline_rates.iter().copied().max());
-        let required = if buffer > 1024*1024 { 105 } else { 100 };
-        if !candidate.zip(baseline).is_some_and(|(candidate, baseline)| candidate >= baseline.saturating_mul(required) / 100) {
+        let baseline =
+            repeated_floor(&baseline_rates).and_then(|_| baseline_rates.iter().copied().max());
+        let required = if buffer > 1024 * 1024 { 105 } else { 100 };
+        if !candidate
+            .zip(baseline)
+            .is_some_and(|(candidate, baseline)| {
+                candidate >= baseline.saturating_mul(required) / 100
+            })
+        {
             buffer = 1024 * 1024;
         }
     }
-    let confirmed = !report.options.deep || report.trials.iter().any(|t|
-        t.kind == "sustainedDownload" && t.parallel_requests == connections && usable_network(t)
-            && t.elapsed_ms >= 10_000 && t.samples_bps.iter().filter(|v| **v > 0).count() >= 6
-            && t.throughput_bps >= best.saturating_mul(80) / 100
-            && t.throughput_bps <= best.saturating_mul(150) / 100);
-    let healthy_pipeline = pipelines(report,connections,buffer).next().is_some();
+    let confirmed = !report.options.deep
+        || report.trials.iter().any(|t| {
+            t.kind == "sustainedDownload"
+                && t.parallel_requests == connections
+                && usable_network(t)
+                && t.elapsed_ms >= 10_000
+                && t.samples_bps.iter().filter(|v| **v > 0).count() >= 6
+                && t.throughput_bps >= best.saturating_mul(80) / 100
+                && t.throughput_bps <= best.saturating_mul(150) / 100
+        });
+    let healthy_pipeline = pipelines(report, connections, buffer).next().is_some();
     Profile {
         connections,
         buffer_bytes: buffer,
@@ -1125,7 +1202,7 @@ fn disk_trials(
                 let offset = done as usize % block.len();
                 let bytes = (length - done).min(64 * 1024) as usize;
                 output
-                    .write_all(&block[offset..offset+bytes])
+                    .write_all(&block[offset..offset + bytes])
                     .map_err(|_| "The drive write test failed.")?;
                 done += bytes as u64;
             }
@@ -1662,11 +1739,19 @@ mod tests {
     async fn lanes(policy: &Arc<LivePolicy>, count: usize) -> Vec<RangePermit> {
         let cancel = CancellationToken::new();
         let mut permits = Vec::new();
-        for _ in 0..count { permits.push(policy.acquire(&cancel).await.unwrap()); }
+        for _ in 0..count {
+            permits.push(policy.acquire(&cancel).await.unwrap());
+        }
         permits
     }
     fn observe(policy: &LivePolicy, bytes: u64, receiving: usize, eligible: bool) {
-        policy.observe(bytes, Duration::from_secs(4), receiving, eligible, policy.generation.load(Ordering::Acquire));
+        policy.observe(
+            bytes,
+            Duration::from_secs(4),
+            receiving,
+            eligible,
+            policy.generation.load(Ordering::Acquire),
+        );
     }
     #[tokio::test]
     async fn validates_budgets_and_conservative_controller() {
@@ -1678,24 +1763,29 @@ mod tests {
         .validate()
         .is_err());
         let policy = LivePolicy::new(2, 8, 1024 * 1024);
-        let permits = lanes(&policy,2).await;
+        let permits = lanes(&policy, 2).await;
         for _ in 0..3 {
-            observe(&policy,40*MIB,2,true);
+            observe(&policy, 40 * MIB, 2, true);
         }
         assert_eq!(policy.target.load(Ordering::Relaxed), 4);
-        let more = lanes(&policy,2).await;
+        let more = lanes(&policy, 2).await;
         for _ in 0..3 {
-            observe(&policy,41*MIB,4,true);
+            observe(&policy, 41 * MIB, 4, true);
         }
         assert_eq!(policy.target.load(Ordering::Relaxed), 2);
-        assert_eq!(policy.best().1,0,"Mixed counts cannot label a whole-file completion");
-        drop(more);drop(permits);
+        assert_eq!(
+            policy.best().1,
+            0,
+            "Mixed counts cannot label a whole-file completion"
+        );
+        drop(more);
+        drop(permits);
         policy.throttled();
         assert_eq!(policy.target.load(Ordering::Relaxed), 1);
         let quick = LivePolicy::new(2, 16, 1024 * 1024);
-        let _quick_lanes = lanes(&quick,2).await;
+        let _quick_lanes = lanes(&quick, 2).await;
         quick.capacity_hint_bps.store(100 * MIB, Ordering::Relaxed);
-        observe(&quick,8*MIB,2,true);
+        observe(&quick, 8 * MIB, 2, true);
         assert_eq!(
             quick.target.load(Ordering::Relaxed),
             16,
@@ -1704,10 +1794,10 @@ mod tests {
         quick.disable();
         assert!(quick.contaminated.load(Ordering::Relaxed));
         let weak = LivePolicy::new(2, 8, 1024 * 1024);
-        let _weak_lanes = lanes(&weak,2).await;
+        let _weak_lanes = lanes(&weak, 2).await;
         weak.capacity_hint_bps.store(8 * MIB, Ordering::Relaxed);
         for _ in 0..3 {
-            observe(&weak,40*MIB,2,true);
+            observe(&weak, 40 * MIB, 2, true);
         }
         assert_eq!(
             weak.target.load(Ordering::Relaxed),
@@ -1716,7 +1806,7 @@ mod tests {
         );
         let capped = LivePolicy::new(2, 8, 1024 * 1024);
         for _ in 0..5 {
-            observe(&capped,40*MIB,2,false);
+            observe(&capped, 40 * MIB, 2, false);
         }
         assert_eq!(capped.target.load(Ordering::Relaxed), 2);
         assert!(capped.contaminated.load(Ordering::Relaxed));
@@ -1734,109 +1824,232 @@ mod tests {
     }
     #[tokio::test]
     async fn changing_lanes_and_draining_lanes_do_not_label_a_lower_count_and_reprobes_recover() {
-        let policy=LivePolicy::new(2,8,1024*1024);
-        let _first=lanes(&policy,2).await;
-        let before=policy.generation.load(Ordering::Acquire);
+        let policy = LivePolicy::new(2, 8, 1024 * 1024);
+        let _first = lanes(&policy, 2).await;
+        let before = policy.generation.load(Ordering::Acquire);
         // Even the same number of lanes is a different workload if a lane was replaced mid-window.
-        let original=LivePolicy::new(2,2,1024*1024);
-        let mut leases=lanes(&original,2).await;
-        let token=original.generation.load(Ordering::Acquire);
-        leases.pop();leases.extend(lanes(&original,1).await);
-        original.observe(80*MIB,Duration::from_secs(4),2,true,token);
-        assert_eq!(original.best().1,0);
-        for _ in 0..3 { observe(&original,80*MIB,2,true); }
-        assert_eq!(original.best(),(2,20*MIB));
-        for _ in 0..3 { policy.observe(40*MIB,Duration::from_secs(4),2,true,before); }
-        assert_eq!(policy.target.load(Ordering::Acquire),4);
-        let extra=lanes(&policy,2).await;
-        for _ in 0..3 { observe(&policy,41*MIB,4,true); }
-        assert_eq!(policy.target.load(Ordering::Acquire),2);
-        for _ in 0..8 { observe(&policy,100*MIB,4,true); }
-        assert_eq!(policy.target.load(Ordering::Acquire),2,"Draining extra lanes do not train a two-lane result");
-        assert_eq!(policy.control.lock().unwrap().best_target,2);
+        let original = LivePolicy::new(2, 2, 1024 * 1024);
+        let mut leases = lanes(&original, 2).await;
+        let token = original.generation.load(Ordering::Acquire);
+        leases.pop();
+        leases.extend(lanes(&original, 1).await);
+        original.observe(80 * MIB, Duration::from_secs(4), 2, true, token);
+        assert_eq!(original.best().1, 0);
+        for _ in 0..3 {
+            observe(&original, 80 * MIB, 2, true);
+        }
+        assert_eq!(original.best(), (2, 20 * MIB));
+        for _ in 0..3 {
+            policy.observe(40 * MIB, Duration::from_secs(4), 2, true, before);
+        }
+        assert_eq!(policy.target.load(Ordering::Acquire), 4);
+        let extra = lanes(&policy, 2).await;
+        for _ in 0..3 {
+            observe(&policy, 41 * MIB, 4, true);
+        }
+        assert_eq!(policy.target.load(Ordering::Acquire), 2);
+        for _ in 0..8 {
+            observe(&policy, 100 * MIB, 4, true);
+        }
+        assert_eq!(
+            policy.target.load(Ordering::Acquire),
+            2,
+            "Draining extra lanes do not train a two-lane result"
+        );
+        assert_eq!(policy.control.lock().unwrap().best_target, 2);
         drop(extra);
-        for _ in 0..6 { observe(&policy,40*MIB,2,true); }
-        assert_eq!(policy.target.load(Ordering::Acquire),4,"A temporary plateau must not freeze admission forever");
+        for _ in 0..6 {
+            observe(&policy, 40 * MIB, 2, true);
+        }
+        assert_eq!(
+            policy.target.load(Ordering::Acquire),
+            4,
+            "A temporary plateau must not freeze admission forever"
+        );
     }
 
     #[tokio::test]
     async fn temporary_write_pressure_recovers_and_server_refusals_are_not_training() {
-        let policy=LivePolicy::new(2,8,1024*1024);
-        let _lanes=lanes(&policy,2).await;
-        policy.write_wait_ns.store(6_000_000_000,Ordering::Relaxed);
-        observe(&policy,40*MIB,2,true);
-        assert_eq!(policy.target.load(Ordering::Acquire),2);
-        for _ in 0..6 { observe(&policy,40*MIB,2,true); }
-        assert_eq!(policy.target.load(Ordering::Acquire),4);
+        let policy = LivePolicy::new(2, 8, 1024 * 1024);
+        let _lanes = lanes(&policy, 2).await;
+        policy.write_wait_ns.store(6_000_000_000, Ordering::Relaxed);
+        observe(&policy, 40 * MIB, 2, true);
+        assert_eq!(policy.target.load(Ordering::Acquire), 2);
+        for _ in 0..6 {
+            observe(&policy, 40 * MIB, 2, true);
+        }
+        assert_eq!(policy.target.load(Ordering::Acquire), 4);
         policy.throttled();
         assert!(policy.contaminated.load(Ordering::Acquire));
-        assert_eq!(policy.best().1,0);
+        assert_eq!(policy.best().1, 0);
     }
 
-    fn measurement(kind: &str,count:usize,buffer:usize,bps:u64)->Trial {
-        Trial{kind:kind.into(),parallel_requests:count,buffer_bytes:buffer,bytes:64*MIB,elapsed_ms:10_000,
-            throughput_bps:bps,samples_bps:vec![bps;10],valid_for_tuning:true,..Default::default()}
+    fn measurement(kind: &str, count: usize, buffer: usize, bps: u64) -> Trial {
+        Trial {
+            kind: kind.into(),
+            parallel_requests: count,
+            buffer_bytes: buffer,
+            bytes: 64 * MIB,
+            elapsed_ms: 10_000,
+            throughput_bps: bps,
+            samples_bps: vec![bps; 10],
+            valid_for_tuning: true,
+            ..Default::default()
+        }
     }
 
     #[tokio::test]
     async fn incomplete_unstable_wrong_buffer_and_wrong_count_evidence_cannot_apply() {
-        let root=std::env::temp_dir().join(format!("fetchrail-evidence-{}",Uuid::new_v4()));
+        let root = std::env::temp_dir().join(format!("fetchrail-evidence-{}", Uuid::new_v4()));
         std::fs::create_dir(&root).unwrap();
-        let owner=Performance::load(&root);
-        let mut report=run(&owner,&root,Options{online:false,disk_budget_mib:64,..Default::default()},
-            &CancellationToken::new(),ENDPOINT).await.unwrap();
-        report.options.online=true;
-        report.trials=vec![measurement("download",4,0,100*MIB),measurement("download",4,0,102*MIB),
-            measurement("pipeline",4,1024*1024,100*MIB),measurement("pipelineFinalization",4,1024*1024,100*MIB)];
-        assert_eq!(recommendations(&report).confidence,"measured");
-        report.trials[2].elapsed_ms=200;
-        assert_eq!(recommendations(&report).confidence,"insufficient","A stale valid flag cannot turn a burst into evidence");
-        report.trials[2].elapsed_ms=10_000;
-        report.trials[1].throughput_bps=200*MIB;
-        assert_eq!(recommendations(&report).confidence,"insufficient","Large repeat drift does not choose a count");
-        report.trials[1].throughput_bps=102*MIB;
-        report.trials[2].parallel_requests=8;
-        assert_eq!(recommendations(&report).confidence,"insufficient");
-        report.trials[2].parallel_requests=4;
-        report.trials[2].buffer_bytes=64*1024;
-        assert_eq!(recommendations(&report).confidence,"insufficient");
-        report.trials[2].buffer_bytes=1024*1024;
-        report.options.deep=true;
-        assert_eq!(recommendations(&report).confidence,"insufficient","Deep must confirm the selected count");
-        report.trials.push(measurement("sustainedDownload",4,0,100*MIB));
-        assert_eq!(recommendations(&report).confidence,"measured");
-        report.trials.last_mut().unwrap().throughput_bps=60*MIB;
-        assert_eq!(recommendations(&report).confidence,"insufficient","A late route slowdown is not a good hardware limit");
-        report.trials.last_mut().unwrap().throughput_bps=100*MIB;
-        report.trials.extend(vec![measurement("sequentialWrite",0,64*1024,500*MIB);2]);
-        assert_eq!(recommendations(&report).buffer_bytes,1024*1024,"Microbenchmarks alone do not replace the buffer");
-        for _ in 0..2 {report.trials.extend([measurement("pipeline",4,64*1024,80*MIB),measurement("pipelineFinalization",4,64*1024,80*MIB)]);}
+        let owner = Performance::load(&root);
+        let mut report = run(
+            &owner,
+            &root,
+            Options {
+                online: false,
+                disk_budget_mib: 64,
+                ..Default::default()
+            },
+            &CancellationToken::new(),
+            ENDPOINT,
+        )
+        .await
+        .unwrap();
+        report.options.online = true;
+        report.trials = vec![
+            measurement("download", 4, 0, 100 * MIB),
+            measurement("download", 4, 0, 102 * MIB),
+            measurement("pipeline", 4, 1024 * 1024, 100 * MIB),
+            measurement("pipelineFinalization", 4, 1024 * 1024, 100 * MIB),
+        ];
+        assert_eq!(recommendations(&report).confidence, "measured");
+        report.trials[2].elapsed_ms = 200;
+        assert_eq!(
+            recommendations(&report).confidence,
+            "insufficient",
+            "A stale valid flag cannot turn a burst into evidence"
+        );
+        report.trials[2].elapsed_ms = 10_000;
+        report.trials[1].throughput_bps = 200 * MIB;
+        assert_eq!(
+            recommendations(&report).confidence,
+            "insufficient",
+            "Large repeat drift does not choose a count"
+        );
+        report.trials[1].throughput_bps = 102 * MIB;
+        report.trials[2].parallel_requests = 8;
+        assert_eq!(recommendations(&report).confidence, "insufficient");
+        report.trials[2].parallel_requests = 4;
+        report.trials[2].buffer_bytes = 64 * 1024;
+        assert_eq!(recommendations(&report).confidence, "insufficient");
+        report.trials[2].buffer_bytes = 1024 * 1024;
+        report.options.deep = true;
+        assert_eq!(
+            recommendations(&report).confidence,
+            "insufficient",
+            "Deep must confirm the selected count"
+        );
+        report
+            .trials
+            .push(measurement("sustainedDownload", 4, 0, 100 * MIB));
+        assert_eq!(recommendations(&report).confidence, "measured");
+        report.trials.last_mut().unwrap().throughput_bps = 60 * MIB;
+        assert_eq!(
+            recommendations(&report).confidence,
+            "insufficient",
+            "A late route slowdown is not a good hardware limit"
+        );
+        report.trials.last_mut().unwrap().throughput_bps = 100 * MIB;
+        report.trials.extend(vec![
+            measurement("sequentialWrite", 0, 64 * 1024, 500 * MIB);
+            2
+        ]);
+        assert_eq!(
+            recommendations(&report).buffer_bytes,
+            1024 * 1024,
+            "Microbenchmarks alone do not replace the buffer"
+        );
+        for _ in 0..2 {
+            report.trials.extend([
+                measurement("pipeline", 4, 64 * 1024, 80 * MIB),
+                measurement("pipelineFinalization", 4, 64 * 1024, 80 * MIB),
+            ]);
+        }
         // A single baseline cannot justify a candidate either.
-        assert_eq!(recommendations(&report).buffer_bytes,1024*1024);
-        report.trials.extend([measurement("pipeline",4,1024*1024,100*MIB),measurement("pipelineFinalization",4,1024*1024,100*MIB)]);
-        assert_eq!(recommendations(&report).buffer_bytes,1024*1024,"Keep the default when a candidate loses sustained speed");
-        for t in report.trials.iter_mut().filter(|t|t.kind=="pipeline"&&t.buffer_bytes==64*1024){t.throughput_bps=99*MIB;}
-        assert_eq!(recommendations(&report).buffer_bytes,1024*1024,"Do not give up measured speed just to save a small buffer");
-        for t in report.trials.iter_mut().filter(|t|t.kind=="pipeline"&&t.buffer_bytes==64*1024){t.throughput_bps=102*MIB;}
-        assert_eq!(recommendations(&report).buffer_bytes,64*1024);
-        report.hardware.disk_seek_penalty=Some(true);
-        report.trials.extend(vec![measurement("parallelWrite",4,0,50*MIB);2]);
-        assert_eq!(recommendations(&report).simultaneous_downloads,12,"One-file scatter writes cannot choose a whole-download queue limit");
-        report.hardware.available_memory_bytes=Some(64*MIB);
-        assert_eq!(recommendations(&report).simultaneous_downloads,12,"A transient memory snapshot is not persisted as a queue cap");
-        report.profile=recommendations(&report);
-        report.profile.connections=32;
-        report.profile.buffer_bytes=4*1024*1024;
-        let mut recovered=report.hardware.clone();recovered.available_memory_bytes=Some(4*1024*MIB);
-        let id=report.id;
-        {let mut store=owner.store.lock().unwrap();store.reports.push(report);owner.save(&mut store).unwrap();}
-        let applied=owner.apply(id,&recovered).unwrap();
-        assert_eq!(applied.connections,4,"Re-derive settings instead of trusting cached profile fields");
-        assert_eq!(applied.buffer_bytes,64*1024);
-        assert_eq!(owner.profile(&recovered).unwrap().simultaneous_downloads,12);
-        let mut pressure=recovered.clone();pressure.available_memory_bytes=Some(64*MIB);
-        assert_eq!(owner.profile(&pressure).unwrap().simultaneous_downloads,1);
-        assert_eq!(owner.profile(&recovered).unwrap().simultaneous_downloads,12);
+        assert_eq!(recommendations(&report).buffer_bytes, 1024 * 1024);
+        report.trials.extend([
+            measurement("pipeline", 4, 1024 * 1024, 100 * MIB),
+            measurement("pipelineFinalization", 4, 1024 * 1024, 100 * MIB),
+        ]);
+        assert_eq!(
+            recommendations(&report).buffer_bytes,
+            1024 * 1024,
+            "Keep the default when a candidate loses sustained speed"
+        );
+        for t in report
+            .trials
+            .iter_mut()
+            .filter(|t| t.kind == "pipeline" && t.buffer_bytes == 64 * 1024)
+        {
+            t.throughput_bps = 99 * MIB;
+        }
+        assert_eq!(
+            recommendations(&report).buffer_bytes,
+            1024 * 1024,
+            "Do not give up measured speed just to save a small buffer"
+        );
+        for t in report
+            .trials
+            .iter_mut()
+            .filter(|t| t.kind == "pipeline" && t.buffer_bytes == 64 * 1024)
+        {
+            t.throughput_bps = 102 * MIB;
+        }
+        assert_eq!(recommendations(&report).buffer_bytes, 64 * 1024);
+        report.hardware.disk_seek_penalty = Some(true);
+        report
+            .trials
+            .extend(vec![measurement("parallelWrite", 4, 0, 50 * MIB); 2]);
+        assert_eq!(
+            recommendations(&report).simultaneous_downloads,
+            12,
+            "One-file scatter writes cannot choose a whole-download queue limit"
+        );
+        report.hardware.available_memory_bytes = Some(64 * MIB);
+        assert_eq!(
+            recommendations(&report).simultaneous_downloads,
+            12,
+            "A transient memory snapshot is not persisted as a queue cap"
+        );
+        report.profile = recommendations(&report);
+        report.profile.connections = 32;
+        report.profile.buffer_bytes = 4 * 1024 * 1024;
+        let mut recovered = report.hardware.clone();
+        recovered.available_memory_bytes = Some(4 * 1024 * MIB);
+        let id = report.id;
+        {
+            let mut store = owner.store.lock().unwrap();
+            store.reports.push(report);
+            owner.save(&mut store).unwrap();
+        }
+        let applied = owner.apply(id, &recovered).unwrap();
+        assert_eq!(
+            applied.connections, 4,
+            "Re-derive settings instead of trusting cached profile fields"
+        );
+        assert_eq!(applied.buffer_bytes, 64 * 1024);
+        assert_eq!(
+            owner.profile(&recovered).unwrap().simultaneous_downloads,
+            12
+        );
+        let mut pressure = recovered.clone();
+        pressure.available_memory_bytes = Some(64 * MIB);
+        assert_eq!(owner.profile(&pressure).unwrap().simultaneous_downloads, 1);
+        assert_eq!(
+            owner.profile(&recovered).unwrap().simultaneous_downloads,
+            12
+        );
         std::fs::remove_dir_all(root).unwrap();
     }
     #[test]
@@ -1870,23 +2083,48 @@ mod tests {
 
     #[tokio::test]
     async fn pipeline_uses_and_records_the_requested_buffer_and_finalizes_exact_received_bytes() {
-        let root=std::env::temp_dir().join(format!("fetchrail-buffer-fixture-{}",Uuid::new_v4()));
+        let root =
+            std::env::temp_dir().join(format!("fetchrail-buffer-fixture-{}", Uuid::new_v4()));
         std::fs::create_dir(&root).unwrap();
-        let (endpoint,job)=server(2).await;
-        let client=crate::engine::download_client_builder().no_proxy().build().unwrap();
-        let budget=AtomicU64::new(32*MIB);
-        let trial=network_trial(&client,&Source::public(&endpoint),2,32*MIB,&budget,&CancellationToken::new(),
-            3,Some((&root,64*1024)),"pipeline").await.unwrap();
-        assert_eq!(trial.buffer_bytes,64*1024);
-        assert_eq!(trial.failures,0);
-        let parts: u64=std::fs::read_dir(&root).unwrap().map(|p|p.unwrap().metadata().unwrap().len()).sum();
-        assert_eq!(parts,trial.bytes);
-        assert!(parts<=32*MIB);
-        let finalization=finalize_pipeline(&root,&root,2,&CancellationToken::new()).unwrap();
-        assert_eq!(finalization.bytes,trial.bytes);
-        let footprint: u64=std::fs::read_dir(&root).unwrap().map(|p|p.unwrap().metadata().unwrap().len()).sum();
-        assert!(footprint<=64*MIB,"Input parts and final output fit the chosen space");
-        std::fs::remove_dir_all(&root).unwrap();job.abort();
+        let (endpoint, job) = server(2).await;
+        let client = crate::engine::download_client_builder()
+            .no_proxy()
+            .build()
+            .unwrap();
+        let budget = AtomicU64::new(32 * MIB);
+        let trial = network_trial(
+            &client,
+            &Source::public(&endpoint),
+            2,
+            32 * MIB,
+            &budget,
+            &CancellationToken::new(),
+            3,
+            Some((&root, 64 * 1024)),
+            "pipeline",
+        )
+        .await
+        .unwrap();
+        assert_eq!(trial.buffer_bytes, 64 * 1024);
+        assert_eq!(trial.failures, 0);
+        let parts: u64 = std::fs::read_dir(&root)
+            .unwrap()
+            .map(|p| p.unwrap().metadata().unwrap().len())
+            .sum();
+        assert_eq!(parts, trial.bytes);
+        assert!(parts <= 32 * MIB);
+        let finalization = finalize_pipeline(&root, &root, 2, &CancellationToken::new()).unwrap();
+        assert_eq!(finalization.bytes, trial.bytes);
+        let footprint: u64 = std::fs::read_dir(&root)
+            .unwrap()
+            .map(|p| p.unwrap().metadata().unwrap().len())
+            .sum();
+        assert!(
+            footprint <= 64 * MIB,
+            "Input parts and final output fit the chosen space"
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+        job.abort();
     }
     #[tokio::test]
     async fn full_local_calibration_is_bounded_private_and_restartable() {
@@ -1921,9 +2159,9 @@ mod tests {
                     kind: "download".into(),
                     parallel_requests: n,
                     throughput_bps: if n == 1 { 50 * MIB } else { 100 * MIB },
-                    bytes: 500*MIB,
+                    bytes: 500 * MIB,
                     elapsed_ms: 5000,
-                    samples_bps: vec![100*MIB;5],
+                    samples_bps: vec![100 * MIB; 5],
                     valid_for_tuning: true,
                     ..Default::default()
                 };
@@ -1934,17 +2172,17 @@ mod tests {
             kind: "pipeline".into(),
             bytes: MIB,
             parallel_requests: 4,
-            buffer_bytes: 1024*1024,
+            buffer_bytes: 1024 * 1024,
             valid_for_tuning: true,
             elapsed_ms: 4000,
-            samples_bps: vec![MIB;4],
+            samples_bps: vec![MIB; 4],
             ..Default::default()
         });
         report.trials.push(Trial {
             kind: "pipelineFinalization".into(),
             bytes: MIB,
             parallel_requests: 4,
-            buffer_bytes: 1024*1024,
+            buffer_bytes: 1024 * 1024,
             ..Default::default()
         });
         report.options.online = true;
@@ -1980,12 +2218,34 @@ mod tests {
             restored.connections("https://private-host.invalid", &hardware, 64 * MIB, 16),
             4
         );
-        restored.learn("https://private-host.invalid",&hardware,64*MIB,4,10*MIB,Duration::from_secs(40));
-        assert_eq!(restored.connections("https://private-host.invalid",&hardware,64*MIB,16),16,
-            "A highly inconsistent completion sequence must not choose the next starting count");
-        for _ in 0..4 {restored.learn("https://private-host.invalid",&hardware,64*MIB,4,10*MIB,Duration::from_secs(10));}
-        assert_eq!(restored.connections("https://private-host.invalid",&hardware,64*MIB,16),4,
-            "Recent consistent evidence replaces old noise instead of poisoning a model forever");
+        restored.learn(
+            "https://private-host.invalid",
+            &hardware,
+            64 * MIB,
+            4,
+            10 * MIB,
+            Duration::from_secs(40),
+        );
+        assert_eq!(
+            restored.connections("https://private-host.invalid", &hardware, 64 * MIB, 16),
+            16,
+            "A highly inconsistent completion sequence must not choose the next starting count"
+        );
+        for _ in 0..4 {
+            restored.learn(
+                "https://private-host.invalid",
+                &hardware,
+                64 * MIB,
+                4,
+                10 * MIB,
+                Duration::from_secs(10),
+            );
+        }
+        assert_eq!(
+            restored.connections("https://private-host.invalid", &hardware, 64 * MIB, 16),
+            4,
+            "Recent consistent evidence replaces old noise instead of poisoning a model forever"
+        );
         let saved = std::fs::read_to_string(path.join("performance.json")).unwrap();
         assert!(!saved.contains("private-host.invalid"));
         assert!(!saved.contains(&path.to_string_lossy().to_string()));

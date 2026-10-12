@@ -3830,8 +3830,12 @@ impl DownloadManager {
                 .collect::<Vec<_>>();
             let mut previous_rate = 0;
             let mut sampled_at = Instant::now();
-            let mut generation = task.performance.lock().expect("task performance poisoned")
-                .as_ref().map(|p| p.generation.load(Ordering::Acquire));
+            let mut generation = task
+                .performance
+                .lock()
+                .expect("task performance poisoned")
+                .as_ref()
+                .map(|p| p.generation.load(Ordering::Acquire));
             loop {
                 tokio::time::sleep(Duration::from_secs(4)).await;
                 let elapsed = sampled_at.elapsed().as_secs_f64();
