@@ -25,15 +25,20 @@
   <main id="main" class="wrap guide">
     <h1>Download Fetchrail for Windows</h1>
     <p class="lede">A free Windows download manager for HTTP and HTTPS files. Use up to 32 connections, pause and resume supported transfers, and organize downloads with queues, schedules and speed limits.</p><p class="eyebrow mono" data-release-version>Latest release</p>
-<div class="download-choices">
-<label>System <select data-download-os><option value="windows">Windows</option></select></label>
-<label>CPU <select data-download-arch><option value="x64">x86_64 (x64)</option></select></label>
-<label>Package <select data-download-format><option value="exe">Windows setup</option></select></label>
-</div><p data-download-help>Windows x64 requires Microsoft Edge WebView2.</p>
-<p class="mono" data-release-file aria-live="polite">Choose your package on the GitHub release page if the feed is unavailable.</p>
-<div class="cta-buttons"><a class="btn btn-primary" href="https://github.com/Beelzebub2/fetchrail/releases/latest" data-download><span data-download-label>View releases</span></a><a class="btn btn-secondary" href="https://github.com/Beelzebub2/fetchrail/releases">All releases and signatures</a></div>
+<div class="picker" data-download-choices>
+  <div class="picker-choices">
+    <fieldset class="pick"><legend class="overline">System</legend><div class="segmented loose"><label><input type="radio" name="os" value="windows" checked>Windows</label></div></fieldset>
+    <fieldset class="pick"><legend class="overline">CPU</legend><div class="segmented loose"><label><input type="radio" name="arch" value="x64" checked>x86_64 (x64)</label></div></fieldset>
+    <fieldset class="pick"><legend class="overline">Package</legend><div class="segmented loose"><label><input type="radio" name="format" value="exe" checked>Windows setup</label></div></fieldset>
+  </div>
+  <div class="picker-file">
+    <p class="mono" data-release-file aria-live="polite">Choose your package on the GitHub release page if the feed is unavailable.</p>
+    <div class="picker-actions"><a class="btn btn-secondary" href="https://github.com/Beelzebub2/fetchrail/releases">All releases and signatures</a><a class="btn btn-primary" href="https://github.com/Beelzebub2/fetchrail/releases/latest" data-download><span data-download-label>View releases</span></a></div>
+  </div>
+</div>
+<p class="picker-note" data-download-help>Windows x64 requires Microsoft Edge WebView2.</p>
 <h2>Install for your Windows account</h2><ol><li>Download the Windows x64 setup from the latest release. Windows ARM64 does not have a native setup package in this release.</li><li>Run setup. It installs in your account at <code>%LOCALAPPDATA%\Programs\Fetchrail</code> without an administrator prompt.</li><li>Ensure the <a href="https://developer.microsoft.com/en-us/microsoft-edge/webview2/">Microsoft Edge WebView2 Runtime</a> is installed, then launch Fetchrail.</li><li>Paste an HTTP or HTTPS file link, choose a destination and start.</li></ol>
-<h2>Updates and browser downloads</h2><p>Windows setup supports signed automatic updates. Use Settings → Background behavior to check for updates; restart the app to apply a downloaded update. A newer setup can also update an existing installation.</p><p>Install the <a href="/browser-integration">browser companion</a> to send selected links and browser downloads to Fetchrail. For a paused or interrupted transfer, follow the <a href="/guides/resume-interrupted-downloads">resume guide</a>.</p>
+<h2>Updates and browser downloads</h2><p>Windows setup supports signed automatic updates. Use Settings → General to check for updates; restart the app to apply a downloaded update. A newer setup can also update an existing installation.</p><p>Install the <a href="/browser-integration">browser companion</a> to send selected links and browser downloads to Fetchrail. For a paused or interrupted transfer, follow the <a href="/guides/resume-interrupted-downloads">resume guide</a>.</p>
 <h2>Questions before installing</h2><h3>Is Fetchrail free?</h3><p>Fetchrail is free to download and does not require an account. The source is available to inspect on GitHub; the repository does not currently provide an open-source license.</p><h3>Does it always make downloads faster?</h3><p>No. Parallel connections can help when a file server supports byte ranges and your connection has spare capacity. Your network and the server's limits still determine throughput.</p><h3>Will uninstalling delete downloaded files?</h3><p>Uninstall through Windows Settings → Apps → Installed apps. Downloaded files stay on disk; removing history and settings is optional.</p><p>See the <a href="https://github.com/Beelzebub2/fetchrail/blob/main/docs/usage.md">full user guide</a>, or <a href="/download/linux">download for Linux</a>.</p>
   </main>
   <footer class="wrap site-foot"><nav class="resource-links" aria-label="Download and help"><a href="/download/windows">Download for Windows</a><a href="/download/linux">Download for Linux</a><a href="/browser-integration">Browser integration</a><a href="/compare/fetchrail-vs-idm">Fetchrail vs IDM</a><a href="/guides/resume-interrupted-downloads">Resume a download</a></nav><p><a href="/privacy">Privacy policy</a> · <a href="https://github.com/Beelzebub2/fetchrail/issues">Report an issue</a></p></footer>

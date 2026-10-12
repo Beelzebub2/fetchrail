@@ -25,13 +25,18 @@
   <main id="main" class="wrap guide">
     <h1>Download Fetchrail for Linux</h1>
     <p class="lede">Parallel HTTP and HTTPS downloads, safe resume, queues and a browser companion on Linux. Fetchrail is free to download. Choose an x64 or ARM64 package for your desktop.</p><p class="eyebrow mono" data-release-version>Latest release</p>
-<div class="download-choices">
-<label>System <select data-download-os><option value="linux">Linux</option></select></label>
-<label>CPU <select data-download-arch><option value="x64">x86_64 (x64)</option><option value="arm64">aarch64 (ARM64)</option></select></label>
-<label>Package <select data-download-format><option value="deb">deb — Ubuntu / Mint / Kali / Debian</option><option value="rpm">rpm — Fedora</option><option value="AppImage">AppImage</option><option value="tar.gz">Native archive</option></select></label>
-</div><p data-download-help>Choose your CPU with uname -m and a package for your distribution.</p>
-<p class="mono" data-release-file aria-live="polite">Choose your package on the GitHub release page if the feed is unavailable.</p>
-<div class="cta-buttons"><a class="btn btn-primary" href="https://github.com/Beelzebub2/fetchrail/releases/latest" data-download><span data-download-label>View releases</span></a><a class="btn btn-secondary" href="https://github.com/Beelzebub2/fetchrail/releases">All releases and signatures</a></div>
+<div class="picker" data-download-choices>
+  <div class="picker-choices">
+    <fieldset class="pick"><legend class="overline">System</legend><div class="segmented loose"><label><input type="radio" name="os" value="linux" checked>Linux</label></div></fieldset>
+    <fieldset class="pick"><legend class="overline">CPU</legend><div class="segmented"><label><input type="radio" name="arch" value="x64" checked>x86_64 (x64)</label><label><input type="radio" name="arch" value="arm64">aarch64 (ARM64)</label></div></fieldset>
+    <fieldset class="pick"><legend class="overline">Package</legend><div class="segmented loose"><label><input type="radio" name="format" value="deb" checked>deb</label><label><input type="radio" name="format" value="rpm">rpm</label><label><input type="radio" name="format" value="AppImage">AppImage</label><label><input type="radio" name="format" value="tar.gz">Native archive</label></div></fieldset>
+  </div>
+  <div class="picker-file">
+    <p class="mono" data-release-file aria-live="polite">Choose your package on the GitHub release page if the feed is unavailable.</p>
+    <div class="picker-actions"><a class="btn btn-secondary" href="https://github.com/Beelzebub2/fetchrail/releases">All releases and signatures</a><a class="btn btn-primary" href="https://github.com/Beelzebub2/fetchrail/releases/latest" data-download><span data-download-label>View releases</span></a></div>
+  </div>
+</div>
+<p class="picker-note" data-download-help>Choose your CPU with uname -m and a package for your distribution.</p>
 <h2>Choose a package for your distribution</h2><ul><li><strong>Ubuntu, Mint, Kali and Debian:</strong> choose a matching deb package. Install with <code>sudo apt install ./Fetchrail-vVERSION-linux-x64.deb</code>, substituting the downloaded filename.</li><li><strong>Fedora:</strong> choose rpm and use <code>sudo dnf install ./Fetchrail-vVERSION-linux-x64.rpm</code>, substituting the downloaded filename.</li><li><strong>Other glibc desktops:</strong> use an AppImage or native archive. Native archives require compatible GTK3 and WebKitGTK 4.1 libraries.</li><li><strong>Arch:</strong> the release's <code>release-metadata.tar.gz</code> includes a binary PKGBUILD recipe. Inspect it before running <code>makepkg -si</code>.</li></ul>
 <p>Run <code>uname -m</code>: x86_64 means x64; aarch64 means ARM64. Browser CPU detection is unreliable. Release glibc artifacts are not certified for musl/Alpine or older WebKitGTK systems. Check the <a href="https://github.com/Beelzebub2/fetchrail/blob/main/docs/linux.md">Linux guide</a> and <a href="https://github.com/Beelzebub2/fetchrail/blob/main/docs/linux-support-matrix.md">tested distro and CPU combinations</a> before installing.</p>
 <h2>AppImage installation and updates</h2><p>Keep the AppImage in a persistent, writable location. Make it executable with <code>chmod +x Fetchrail-vVERSION-linux-x64.AppImage</code>, using your filename. The Linux guide covers FUSE requirements and the alternative extracted launch. Writable AppImages support signed automatic updates; native packages update through their package manager, while archives and extracted AppImages update manually.</p>

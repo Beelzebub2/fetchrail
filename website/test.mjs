@@ -28,8 +28,10 @@ assert.match(home, /google-site-verification/);
 assert.ok(!sitemap.includes("404"));
 assert.match(await readFile(new URL("robots.txt", publicDir), "utf8"), /Sitemap: https:\/\/fetchrail\.rrmtools\.uk\/sitemap.xml/);
 assert.match(await readFile(new URL("404.html", publicDir), "utf8"), /name="robots" content="noindex"/);
-assert.equal(await readFile(new URL("public/downloads.mjs", import.meta.url), "utf8"), await readFile(new URL("../scripts/release-downloads.mjs", import.meta.url), "utf8"));
-assert.equal(await readFile(new URL("public/release-feed.mjs", import.meta.url), "utf8"), await readFile(new URL("../update-service/website-release.mjs", import.meta.url), "utf8"));
+// Git may check out the shared modules with CRLF on Windows and LF on Linux.
+const normalizedSource = async (url) => (await readFile(url, "utf8")).replace(/\r\n/g, "\n");
+assert.equal(await normalizedSource(new URL("public/downloads.mjs", import.meta.url)), await normalizedSource(new URL("../scripts/release-downloads.mjs", import.meta.url)));
+assert.equal(await normalizedSource(new URL("public/release-feed.mjs", import.meta.url)), await normalizedSource(new URL("../update-service/website-release.mjs", import.meta.url)));
 const canonical = JSON.parse(await readFile(new URL("../update-service/wrangler.jsonc", import.meta.url), "utf8"));
 const mirrored = JSON.parse(await readFile(new URL("wrangler.jsonc", import.meta.url), "utf8"));
 assert.deepEqual(mirrored.assets.run_worker_first, canonical.assets.run_worker_first);
