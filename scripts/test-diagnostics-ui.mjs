@@ -146,6 +146,11 @@ try {
   await page.locator(".content").evaluate(el=>el.scrollTop=el.scrollHeight);
   assert.ok(await page.locator(".diagnostics").evaluate(el=>el.scrollWidth<=el.clientWidth),"Report content must fit a narrow window");
   await page.screenshot({path:join(output,"diagnostics-report-narrow.png"),fullPage:true});
+  await page.setViewportSize({width:940,height:800});
+  await page.locator(".content").evaluate(el=>el.scrollTop=0);
+  await page.waitForTimeout(500);
+  assert.ok(await page.evaluate(()=>document.documentElement.scrollWidth<=window.innerWidth),"Report must fit the supported desktop minimum width");
+  await page.screenshot({path:join(output,"diagnostics-report-desktop-minimum.png"),fullPage:true});
   await page.setViewportSize({width:1280,height:1000});
   await page.locator(".content").evaluate(el=>el.scrollTop=0);
   assert.ok((await page.locator(".diag-result-guide").innerText()).includes("8 Mbps = 1 MB/s"));
