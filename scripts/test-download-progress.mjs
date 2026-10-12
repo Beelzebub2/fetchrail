@@ -239,7 +239,7 @@ try {
   await gear.click();
   await page.getByRole("heading", { name: "General", exact: true }).waitFor();
   assert.equal(await gear.getAttribute("aria-pressed"), "true");
-  assert.equal(await rail.getByRole("tab").count(), 7, "The settings sections live in the rail.");
+  assert.equal(await rail.getByRole("tab").count(), 8, "The settings sections live in the rail.");
   assert.equal(await page.locator(".content").getByRole("tab").count(), 0, "Settings must not stack a tab bar of its own under the rail.");
   assert.equal(await page.getByRole("button", { name: /^All downloads/ }).count(), 0, "The view tabs give way to the settings sections.");
   assert.equal(await page.getByRole("heading", { name: "Settings", exact: true }).count(), 0, "There is no shared Settings page head.");

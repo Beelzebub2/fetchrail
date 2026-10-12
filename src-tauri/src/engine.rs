@@ -293,6 +293,8 @@ impl DownloadTask {
 }
 
 pub struct DownloadManager {
+    closing: AtomicBool,
+    diagnostics: Arc<crate::diagnostics::Service>,
     analytics: Arc<crate::analytics::Analytics>,
     settings_update_lock: tokio::sync::Mutex<()>,
     torrent_engine: TorrentEngine,
@@ -405,6 +407,11 @@ impl DownloadManager {
         }
 
         let manager = Arc::new(Self {
+            closing: AtomicBool::new(false),
+            diagnostics: Arc::new(crate::diagnostics::Service::new(
+                app.clone(),
+                data_dir.clone(),
+            )),
             analytics: Arc::new(crate::analytics::Analytics::new(
                 &settings.analytics_consent,
             )),
@@ -463,11 +470,48 @@ impl DownloadManager {
         Ok(manager)
     }
 
+    fn reject_diagnostics(&self) -> Result<(), String> {
+        if self.closing.load(Ordering::Acquire) {
+            return Err("Fetchrail is shutting down.".into());
+        }
+        if self.diagnostics.active() {
+            Err("Diagnostics is running. Cancel it or wait before starting transfers.".into())
+        } else {
+            Ok(())
+        }
+    }
+    pub fn diagnostics(&self) -> &Arc<crate::diagnostics::Service> {
+        &self.diagnostics
+    }
+    pub async fn start_diagnostics(&self, network: bool) -> Result<String, String> {
+        let _dispatch = self.dispatch_lock.lock().await;
+        self.reject_diagnostics()?;
+        if !self.torrent_imports.read().await.is_empty() {
+            return Err("Finish or cancel the open torrent import before diagnostics.".into());
+        }
+        for task in self.tasks.read().await.values() {
+            let record = task.record.read().await;
+            if task.running.load(Ordering::Acquire)
+                || record.status.is_active()
+                || matches!(
+                    record.status,
+                    DownloadStatus::Queued | DownloadStatus::Scheduled
+                )
+            {
+                return Err("Pause active, queued and scheduled transfers, including seeders, before diagnostics. Transfers are never paused automatically.".into());
+            }
+        }
+        self.diagnostics
+            .start(self.settings.read().await.clone(), network)
+    }
+
     pub async fn add(
         self: &Arc<Self>,
         request: AddDownloadRequest,
     ) -> Result<DownloadRecord, String> {
+        self.reject_diagnostics()?;
         let _dispatch = self.dispatch_lock.lock().await;
+        self.reject_diagnostics()?;
         self.add_inner(request, true).await
     }
 
@@ -491,7 +535,9 @@ impl DownloadManager {
         key: &str,
         auto_start: bool,
     ) -> Result<Vec<DownloadRecord>, String> {
+        self.reject_diagnostics()?;
         let dispatch = self.dispatch_lock.lock().await;
+        self.reject_diagnostics()?;
         let prefix = format!("{key}:");
         let mut records = self
             .list()
@@ -554,6 +600,8 @@ impl DownloadManager {
         &self,
         request: TorrentImportRequest,
     ) -> Result<serde_json::Value, String> {
+        let _dispatch = self.dispatch_lock.lock().await;
+        self.reject_diagnostics()?;
         let _import = self.torrent_import_lock.lock().await;
         if self.torrent_imports.read().await.len() >= 4 {
             return Err("Finish or cancel an open torrent import first.".into());
@@ -696,6 +744,7 @@ impl DownloadManager {
         request: TorrentCommitRequest,
     ) -> Result<DownloadRecord, String> {
         let _dispatch = self.dispatch_lock.lock().await;
+        self.reject_diagnostics()?;
         let (source, metadata, _) = self
             .torrent_imports
             .read()
@@ -820,12 +869,14 @@ impl DownloadManager {
         id: Uuid,
         mut request: serde_json::Value,
     ) -> Result<serde_json::Value, String> {
+        self.reject_diagnostics()?;
         // Details do not take the scheduler lock; mutating storage/selection does.
         let _dispatch = if request["op"] != "details" {
             Some(self.dispatch_lock.lock().await)
         } else {
             None
         };
+        self.reject_diagnostics()?;
         let task = self.task(id).await?;
         if task.record.read().await.torrent.is_none() {
             return Err("This transfer is not a torrent.".into());
@@ -960,6 +1011,7 @@ impl DownloadManager {
 
     async fn remove_torrent(&self, id: Uuid, delete_file: bool) -> Result<(), String> {
         let _dispatch = self.dispatch_lock.lock().await;
+        self.reject_diagnostics()?;
         let task = self.task(id).await?;
         let record = task.record.read().await.clone();
         self.torrent_engine
@@ -1249,7 +1301,19 @@ impl DownloadManager {
     }
 
     pub async fn shutdown(&self) {
+        self.closing.store(true, Ordering::Release);
         self.dispatch_suspended.store(true, Ordering::Release);
+        {
+            let _dispatch = self.dispatch_lock.lock().await;
+            self.diagnostics.cancel();
+            self.diagnostics.cancel_share();
+        }
+        let began = Instant::now();
+        while (self.diagnostics.active() || self.diagnostics.snapshot().sharing == "sending")
+            && began.elapsed() < Duration::from_secs(15)
+        {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
         let _dispatch = self.dispatch_lock.lock().await;
         let tasks = self
             .tasks
@@ -1447,11 +1511,13 @@ impl DownloadManager {
         self: &Arc<Self>,
         requests: Vec<AddDownloadRequest>,
     ) -> Result<BatchDownloadResult, String> {
+        self.reject_diagnostics()?;
         if requests.is_empty() || requests.len() > 1000 {
             return Err("Choose between 1 and 1,000 downloads.".into());
         }
         // Keep dispatch from observing a partially added batch.
         let _dispatch = self.dispatch_lock.lock().await;
+        self.reject_diagnostics()?;
         let mut result = BatchDownloadResult {
             accepted: Vec::new(),
             errors: Vec::new(),
@@ -1681,7 +1747,9 @@ impl DownloadManager {
     }
 
     pub async fn resume(self: &Arc<Self>, id: Uuid) -> Result<DownloadRecord, String> {
+        self.reject_diagnostics()?;
         let _dispatch = self.dispatch_lock.lock().await;
+        self.reject_diagnostics()?;
         let task = self.task(id).await?;
         let snapshot = {
             let mut record = task.record.write().await;
@@ -1830,6 +1898,7 @@ impl DownloadManager {
     ) -> Result<OrganizeReport, String> {
         // New download creation and filename reassignment must not race the scan.
         let _dispatch = self.dispatch_lock.lock().await;
+        self.reject_diagnostics()?;
         let settings = self.settings.read().await.clone();
         if matches!(mode, OrganizeMode::Flatten) && settings.sort_into_category_folders {
             return Err(
@@ -2263,11 +2332,11 @@ impl DownloadManager {
     }
 
     async fn dispatch_ready_downloads(self: &Arc<Self>) {
-        if self.dispatch_suspended.load(Ordering::Acquire) {
+        if self.dispatch_suspended.load(Ordering::Acquire) || self.diagnostics.active() {
             return;
         }
         let _dispatch = self.dispatch_lock.lock().await;
-        if self.dispatch_suspended.load(Ordering::Acquire) {
+        if self.dispatch_suspended.load(Ordering::Acquire) || self.diagnostics.active() {
             return;
         }
         let max_concurrent = self.settings.read().await.max_concurrent_downloads;
@@ -4355,6 +4424,23 @@ fn join_parts(
         expected_sha256,
         &CancellationToken::new(),
     )
+}
+
+pub(crate) fn diagnostics_join(
+    root: &Path,
+    output: &Path,
+    part_bytes: u64,
+    merged: &AtomicU64,
+    cancel: &CancellationToken,
+) -> Result<(), String> {
+    let ranges = (0..8)
+        .map(|index| ByteRange {
+            start: index * part_bytes,
+            end: (index + 1) * part_bytes - 1,
+        })
+        .collect::<Vec<_>>();
+    join_parts_cancellable(root, output, &ranges, part_bytes * 8, merged, None, cancel)
+        .map_err(|_| "Copy finalization could not complete.".into())
 }
 
 fn join_parts_cancellable(
