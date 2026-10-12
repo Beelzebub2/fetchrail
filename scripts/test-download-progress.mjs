@@ -98,6 +98,19 @@ try {
   });
   await page.waitForFunction(() => document.querySelector('[role="progressbar"]')?.getAttribute("aria-valuenow") === "25");
   await page.screenshot({ path: join(output, "download-status.png"), fullPage: true });
+  assert((await page.locator("body").innerText()).includes("78.6 MB/s"), "Download speeds use decimal MB/s");
+  await page.evaluate(() => {
+    Object.assign(window.testRecord, {requestedConnections:16, receivingConnections:16, connectingConnections:0, plannedRanges:128});
+    window.testEmit("fetchrail://download-updated", structuredClone(window.testRecord));
+  });
+  await page.getByText("16 receiving · 16 max · 128 sections", {exact:true}).waitFor();
+  await page.getByText("128 sections are shown in 4 groups. Requests can move between sections.", {exact:true}).waitFor();
+  assert.equal(await page.locator("tbody tr").count(), 4);
+  await page.evaluate(() => {
+    for(const key of ["receivingConnections", "connectingConnections", "plannedRanges"]) delete window.testRecord[key];
+    window.testRecord.requestedConnections=4;
+    window.testEmit("fetchrail://download-updated", structuredClone(window.testRecord));
+  });
   await page.getByRole("button", { name: "Hide details" }).click();
   assert.equal(await page.locator("tbody").count(), 0);
   await page.getByRole("button", { name: "Show details" }).click();

@@ -1,7 +1,7 @@
 # HTTP throughput and large-file finalization: source audit and measured next steps
 
 Date: 12 October 2026. Application: Fetchrail 0.7.1 task branch
-`perf/destination-local-staging-audit`. Scope: Windows HTTP(S) downloads; torrents
+`fix/download-pipeline-reliability`. Scope: Windows HTTP(S) downloads; torrents
 have a separate libtorrent storage engine. This is an engineering audit, not a
 claim of an externally verified download-speed record.
 
@@ -57,19 +57,20 @@ matched evidence before claiming a speed advantage.
 | Discovery | HEAD / ranged GET; strong ETag, exact redirects and byte-range validators | Retain strict HTTP 206 checks and avoid redundant probes when possible |
 | Requests | Shared reqwest client; 32-per-origin/64-global permits; 16 configured ranges on this PC | Compare real HTTP/2 streams and HTTP/1.1 socket behavior under identical loads |
 | Adaptive policy | Adjusts admission of **existing** static ranges from sustained observations | Preserve controller while adding truly work-conserving scheduling |
-| Range completion | A worker completes its preassigned range and has no new work once all ranges have started | Queue immutable micro-ranges for new validated downloads, so an idle worker can take another piece |
+| Range completion | A bounded worker pool claims successive immutable ranges; existing manifests retain their layout | Compare larger queues in an isolated preview before changing normal range planning |
 | Persistence | Private `data_dir/parts/<id>`, shared sparse `0.part` for new >=8 MiB validated multipart jobs; 5-second synced range SHA-256 checkpoints | Keep disjoint positioned writes, bounded checkpoints and exact restart verification |
 | Assembly | Hard link on the same volume, otherwise checked full-file copy | Avoid a cross-volume copy only after secure destination-local private staging exists |
 | Windows publication | Attachment policy, Zone.Identifier, post-scan content verification, durable journal and no-replace publication | Measure scanning and verification separately; retain byte integrity |
 
-**Important limitation:** The current scheduler uses a fixed
-`split_ranges(total, connection_count)` layout and creates one future for
-each range. When every range has already started, finishing one range does
-**not** make that worker assist with a slower, unfinished range. If automatic
-admission initially held some original ranges back, a freed permit can start
-one of those waiting ranges; it still cannot split an active range. This is a
-potential explanation for throughput dips near completion, not a measured
-diagnosis for any particular WAN host.
+The original scheduler assigned one future per range. The bounded worker pool
+now claims queued immutable ranges and retains its controller permit across
+successful claims, releasing it at a boundary when the controller asks to drain.
+It never splits an active range. Normal planning still retains the original
+layout pending full-app qualification. The isolated preview can compare up to
+32 planned ranges with fewer workers, or version-2 manifests containing up to
+512 ranges of approximately 64/128 MiB. Existing validated manifests are reused,
+including when the user changes the worker ceiling. More planned ranges do not
+authorize more simultaneous requests.
 
 Fetchrail source map: `src-tauri/src/engine.rs` (`download_client_builder`,
 `send_admitted`, `download_ranges`, `download_segment`, `prepare_parts`,
@@ -94,8 +95,10 @@ Matching file identity and size therefore cannot authorize a content-verificatio
 shortcut. After scanning, publication checks the pre-scan identity and length,
 then re-reads every range against its original commitment. This applies to
 both hard links and freshly synced copies. The verified Windows handle denies
-write sharing until the Completed catalog and its backup have been acknowledged;
-rename sharing remains enabled for no-replace publication. ADS-only provenance
+write and delete sharing until the Completed catalog and its backup have been
+acknowledged. Windows publishes by renaming that protected handle with
+`SetFileInformationByHandle(FileRenameInfo)` and replacement disabled; recovery
+uses the same protection. ADS-only provenance
 changes are preserved. Expected whole-file checksums still use full SHA-256.
 Crash recovery retains V1 full-hash and V2 per-range validation. The historical
 23.3-second hash measurement is a verification cost, not an established saving
@@ -128,12 +131,11 @@ symlinks/reparse points, removable/network drives, permission changes, quota
 and low disk space. Existing downloads must keep their previous layout.
 This migration has not yet been implemented or measured here.
 
-Another candidate is a bounded work-conserving **micro-range queue** for new
-strong-ETag downloads. The original manifest and per-range SHA-256 resume
-mechanism expect static ranges (and the current version-2 journal caps their
-number), so adding this requires an explicitly versioned immutable chunk
-layout with separate 1–32 active worker lanes, durable checkpoints and a
-bounded progress UI. Splitting an *already active* range would require a
+The isolated micro-range experiment uses version-2 immutable manifests, the
+existing durable range SHA-256 checkpoints and 1–32 bounded worker lanes.
+Progress remains bounded to 32 contiguous display groups; separate actual
+request counts prevent treating a displayed group as one connection.
+Splitting an *already active* range would require a
 transactionally acknowledged shortened endpoint, strictly disjoint write
 leases and crash-safe rebalancing. Do not blindly adopt forced
 HTTP/1.1, new independent reqwest clients, greater concurrency, thinner sync
@@ -170,3 +172,30 @@ Technical references: [RFC 9110 HTTP semantics, ranges and validators](https://w
 [Windows hard links](https://learn.microsoft.com/en-us/windows/win32/fileio/hard-links-and-junctions),
 [Win32 file identity](https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-getfileinformationbyhandle),
 and [Windows attachment policy](https://learn.microsoft.com/en-us/windows/win32/api/shobjidl_core/nn-shobjidl_core-iattachmentexecute).
+
+## Reproducible isolated application benchmark
+
+Build an optimized baseline and a `test-tools` candidate, then run
+`node scripts/benchmark-http-app.mjs <baseline.exe> <candidate.exe>` on Windows.
+It creates separate UUID-scoped app roots, never registers a browser host and
+never changes the installed app's settings or downloads. HTTP fixtures use
+localhost; an empty isolated torrent history does not start a torrent session.
+The default payload is 2 GiB; `FETCHRAIL_APP_BENCH_BYTES` accepts 64 MiB–4 GiB.
+`FETCHRAIL_APP_BENCH_CASES` selects uniform, skew or faults. Results are private
+ignored artifacts, with an independently calculated payload SHA-256 and both
+durable catalogs checked after the terminal app event. Failed runs are retained.
+
+Tracing requires both the `test-tools` build and `FETCHRAIL_TEST_TRACE=1` in a
+valid isolated root. Fixed-size counters cover admission, headers, body waits,
+limiting, write/flush/sync/checkpoint, retries, assembly, attachment handling,
+post-scan verification, journal, publication and catalog acknowledgement.
+Concurrent worker totals are aggregate work, not percentages of wall time.
+The trace has no source URLs or paths and is never ordinary product analytics.
+It does not attribute attachment time to a particular antivirus, distinguish
+TLS setup from header latency, or establish power-loss durability from a process
+kill. Local cache and loopback results cannot predict WAN speed.
+
+Benchmark experimental range plans are ignored by ordinary builds. A separately
+named `Fetchrail-Preview.exe` refuses to start without its isolated launcher.
+Any full WAN comparison requires a fresh link and an explicit traffic budget;
+do not reuse a small calibration budget for repeated full-file transfers.
