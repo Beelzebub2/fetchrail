@@ -24,6 +24,9 @@ jobs:
     name: Check browser extension changes
     if: github.ref_type == 'tag'
     runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      actions: read
     outputs:
       chromium: ${{ steps.check.outputs.chromium }}
       firefox: ${{ steps.check.outputs.firefox }}
@@ -36,7 +39,7 @@ jobs:
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: '24'
-      - name: Compare extension contents with previous release
+      - name: Compare extension contents with last successful store submissions
         id: check
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -420,7 +423,7 @@ jobs:
   publish:
     name: Verify and publish one complete release
     if: startsWith(github.ref, 'refs/tags/')
-    needs: [windows, linux, distros, update-service]
+    needs: [windows, linux, distros, update-service, extension-changes]
     runs-on: windows-2022
     permissions:
       contents: write
