@@ -4493,7 +4493,7 @@ fn content_length_from_headers(headers: &HeaderMap) -> Option<u64> {
         .ok()
 }
 
-fn representation_validator(headers: &HeaderMap) -> Option<String> {
+pub(crate) fn representation_validator(headers: &HeaderMap) -> Option<String> {
     headers
         .get(header::ETAG)
         .and_then(|value| value.to_str().ok())
@@ -4625,7 +4625,7 @@ async fn prepare_parts(
     Ok(())
 }
 
-fn parse_content_range(headers: &HeaderMap) -> Option<(u64, u64, Option<u64>)> {
+pub(crate) fn parse_content_range(headers: &HeaderMap) -> Option<(u64, u64, Option<u64>)> {
     let value = headers.get(CONTENT_RANGE)?.to_str().ok()?.trim();
     let value = value.strip_prefix("bytes ")?;
     let (range, total) = value.split_once('/')?;

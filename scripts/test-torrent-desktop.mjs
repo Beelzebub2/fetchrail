@@ -76,6 +76,8 @@ try {
     throw error;
   }
   await launch();
+  await page.getByRole("button", { name: "No thanks", exact: true }).click();
+  await until(async () => await page.locator("dialog[open]").count() === 0, "initial analytics choice kept off");
   let settings = await invoke("get_settings");
   settings.autoUpdate = false; settings.maxConcurrentDownloads = 2; settings.speedLimitBps = 2 * 1024 * 1024;
   Object.assign(settings.torrent, localTorrentConfig, { ratioLimit: 0, seedTimeLimit: 0, maxSeeds: 1 });
