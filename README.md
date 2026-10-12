@@ -30,6 +30,8 @@
 <p align="center">
   <a href="#browser-store-status"><img src="https://img.shields.io/badge/Chrome-approved%20%26%20public-238636?style=flat-square" alt="Chrome extension approved and public"></a>
   <a href="#browser-store-status"><img src="https://img.shields.io/badge/Firefox-awaiting%20approval-d29922?style=flat-square" alt="Firefox extension awaiting approval"></a>
+  <a href="#browser-store-status"><img src="https://img.shields.io/badge/Edge-package%20ready-64748b?style=flat-square" alt="Edge Add-ons upload package ready; not submitted"></a>
+  <a href="#browser-store-status"><img src="https://img.shields.io/badge/Opera%20GX-package%20ready-64748b?style=flat-square" alt="Opera GX Add-ons upload package ready; not submitted"></a>
 </p>
 
 > Most downloads travel down a single connection. Fetchrail opens up to thirty-two, and lets you watch every one.
@@ -90,8 +92,12 @@ The current source tree contains companion **[v0.7.1](browser-extension/manifest
 | :-- | :-- | :-- |
 | [Chrome Web Store](https://chromewebstore.google.com/detail/ccmbmcgihlemlheldpkgnidgohlkaipb) | [![Chrome Web Store published version](https://img.shields.io/chrome-web-store/v/ccmbmcgihlemlheldpkgnidgohlkaipb?label=public%20version&style=flat-square&color=ff8a3d)](https://chromewebstore.google.com/detail/ccmbmcgihlemlheldpkgnidgohlkaipb) | **Approved and public** |
 | [Firefox Add-ons](https://addons.mozilla.org/en-US/firefox/addon/fetchrail-browser-integration/) | **v0.7.1 submitted** | **Awaiting Mozilla approval**; not publicly available yet |
+| [Microsoft Edge Add-ons](https://microsoftedge.microsoft.com/addons) | **v0.7.1 package prepared** | **Not submitted**; publisher registration and first listing required |
+| [Opera Add-ons (Opera GX)](https://addons.opera.com/) | **v0.7.1 package prepared** | **Not submitted**; publisher sign-in and first listing required |
 
 **Status checked 12 October 2026:** Google's [store status check](https://github.com/Beelzebub2/fetchrail/actions/runs/38296087862) confirmed Chrome **v0.6.0** is published. Firefox **v0.7.1** was [submitted successfully](https://github.com/Beelzebub2/fetchrail/actions/runs/38172309596), but its public store listing is not yet available. The Chrome version badge updates with the public store release; review statuses are dated snapshots and should be refreshed after store decisions.
+
+Microsoft Edge and Opera GX now have a tested upload package. The [Edge/Opera submission guide](docs/edge-opera-addons.md) covers the [package workflow](.github/workflows/edge-opera-addons-package.yml), developer accounts and native-host ID that must be registered after each store creates the listing. The grey badges above mean the package is ready, not that store submission or approval has occurred.
 
 ## Make it yours
 
