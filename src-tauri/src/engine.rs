@@ -554,6 +554,7 @@ fn segment_progress(segments: &[SegmentCounter], speeds: &[f64]) -> Vec<SegmentP
 }
 
 struct DownloadTask {
+    analytics_sample: Mutex<Option<crate::analytics::Sample>>,
     record: RwLock<DownloadRecord>,
     paused: AtomicBool,
     cancelled: AtomicBool,
@@ -575,8 +576,13 @@ pub(crate) struct StoredDownload {
 }
 
 impl DownloadTask {
-    fn new(record: DownloadRecord, request_context: Option<BrowserRequestContext>) -> Self {
+    fn new(
+        record: DownloadRecord,
+        request_context: Option<BrowserRequestContext>,
+        analytics_sample: Option<crate::analytics::Sample>,
+    ) -> Self {
         Self {
+            analytics_sample: Mutex::new(analytics_sample),
             limiter: RateLimiter::new(record.speed_limit_bps),
             request_context,
             paused: AtomicBool::new(record.status == DownloadStatus::Paused),
@@ -616,6 +622,10 @@ impl DownloadTask {
 }
 
 pub struct DownloadManager {
+    closing: AtomicBool,
+    diagnostics: Arc<crate::diagnostics::Service>,
+    analytics: Arc<crate::analytics::Analytics>,
+    settings_update_lock: tokio::sync::Mutex<()>,
     torrent_engine: TorrentEngine,
     torrent_imports: RwLock<HashMap<Uuid, PendingTorrentImport>>,
     torrent_checkpoint: Mutex<Instant>,
@@ -773,10 +783,14 @@ impl DownloadManager {
         record.resume_supported = None;
         record.extra.remove("retryAttempts");
         record.extra.remove("nextRetryAt");
-        self.tasks
-            .write()
-            .await
-            .insert(id, Arc::new(DownloadTask::new(record.clone(), None)));
+        self.tasks.write().await.insert(
+            id,
+            Arc::new(DownloadTask::new(
+                record.clone(),
+                None,
+                self.analytics.prepare(),
+            )),
+        );
         if let Err(error) = self.persist_records().await {
             self.tasks.write().await.insert(id, task);
             if moved {
@@ -784,6 +798,7 @@ impl DownloadManager {
             }
             return Err(error.to_string());
         }
+        self.register_analytics(&record).await;
         self.emit_record(&record);
         Ok(record)
     }
@@ -900,12 +915,21 @@ impl DownloadManager {
                 }
                 task_map.insert(
                     record.id,
-                    Arc::new(DownloadTask::new(record, stored.request_context)),
+                    Arc::new(DownloadTask::new(record, stored.request_context, None)),
                 );
             }
         }
 
         let manager = Arc::new(Self {
+            closing: AtomicBool::new(false),
+            diagnostics: Arc::new(crate::diagnostics::Service::new(
+                app.clone(),
+                data_dir.clone(),
+            )),
+            analytics: Arc::new(crate::analytics::Analytics::new(
+                &settings.analytics_consent,
+            )),
+            settings_update_lock: tokio::sync::Mutex::new(()),
             torrent_engine: TorrentEngine::new(&data_dir.join("torrents"))?,
             torrent_imports: RwLock::new(HashMap::new()),
             torrent_checkpoint: Mutex::new(Instant::now()),
@@ -982,14 +1006,52 @@ impl DownloadManager {
             }
         }
         manager.start_scheduler();
+        tauri::async_runtime::spawn(manager.analytics.clone().run());
         Ok(manager)
+    }
+
+    fn reject_diagnostics(&self) -> Result<(), String> {
+        if self.closing.load(Ordering::Acquire) {
+            return Err("Fetchrail is shutting down.".into());
+        }
+        if self.diagnostics.active() {
+            Err("Diagnostics is running. Cancel it or wait before starting transfers.".into())
+        } else {
+            Ok(())
+        }
+    }
+    pub fn diagnostics(&self) -> &Arc<crate::diagnostics::Service> {
+        &self.diagnostics
+    }
+    pub async fn start_diagnostics(&self, network: bool) -> Result<String, String> {
+        let _dispatch = self.dispatch_lock.lock().await;
+        self.reject_diagnostics()?;
+        if !self.torrent_imports.read().await.is_empty() {
+            return Err("Finish or cancel the open torrent import before diagnostics.".into());
+        }
+        for task in self.tasks.read().await.values() {
+            let record = task.record.read().await;
+            if task.running.load(Ordering::Acquire)
+                || record.status.is_active()
+                || matches!(
+                    record.status,
+                    DownloadStatus::Queued | DownloadStatus::Scheduled
+                )
+            {
+                return Err("Pause active, queued and scheduled transfers, including seeders, before diagnostics. Transfers are never paused automatically.".into());
+            }
+        }
+        self.diagnostics
+            .start(self.settings.read().await.clone(), network)
     }
 
     pub async fn add(
         self: &Arc<Self>,
         request: AddDownloadRequest,
     ) -> Result<DownloadRecord, String> {
+        self.reject_diagnostics()?;
         let _dispatch = self.dispatch_lock.lock().await;
+        self.reject_diagnostics()?;
         self.add_inner(request, true).await
     }
 
@@ -1013,7 +1075,9 @@ impl DownloadManager {
         key: &str,
         auto_start: bool,
     ) -> Result<Vec<DownloadRecord>, String> {
+        self.reject_diagnostics()?;
         let dispatch = self.dispatch_lock.lock().await;
+        self.reject_diagnostics()?;
         let prefix = format!("{key}:");
         let mut records = self
             .list()
@@ -1076,6 +1140,10 @@ impl DownloadManager {
         self: &Arc<Self>,
         request: TorrentImportRequest,
     ) -> Result<serde_json::Value, String> {
+        // Reserve a cancellable metadata import while holding shared admission.
+        // Never retain the dispatch lock during an untrusted remote metadata fetch.
+        let dispatch = self.dispatch_lock.lock().await;
+        self.reject_diagnostics()?;
         let mut imports = self.torrent_imports.write().await;
         if self.dispatch_suspended.load(Ordering::Acquire) {
             return Err("App is shutting down.".into());
@@ -1098,6 +1166,7 @@ impl DownloadManager {
             },
         );
         drop(imports);
+        drop(dispatch);
         let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
         let manager = self.clone();
         tauri::async_runtime::spawn(async move {
@@ -1306,6 +1375,7 @@ impl DownloadManager {
         request: TorrentCommitRequest,
     ) -> Result<DownloadRecord, String> {
         let _dispatch = self.dispatch_lock.lock().await;
+        self.reject_diagnostics()?;
         let import = self
             .torrent_imports
             .read()
@@ -1403,10 +1473,14 @@ impl DownloadManager {
                 ..Default::default()
             }),
         };
-        self.tasks
-            .write()
-            .await
-            .insert(id, Arc::new(DownloadTask::new(record.clone(), None)));
+        self.tasks.write().await.insert(
+            id,
+            Arc::new(DownloadTask::new(
+                record.clone(),
+                None,
+                self.analytics.prepare(),
+            )),
+        );
         if let Err(error) = self.persist_records().await {
             self.tasks.write().await.remove(&id);
             return Err(error.to_string());
@@ -1419,6 +1493,7 @@ impl DownloadManager {
             *self.task(id).await?.record.write().await = record.clone();
             let _ = self.persist_records().await;
         }
+        self.register_analytics(&record).await;
         self.torrent_imports.write().await.remove(&id);
         // The durable row is committed. Configuration failure must not turn success into a ghost job.
         if let Err(error) = self.apply_torrent_budget().await {
@@ -1440,12 +1515,14 @@ impl DownloadManager {
         id: Uuid,
         mut request: serde_json::Value,
     ) -> Result<serde_json::Value, String> {
+        self.reject_diagnostics()?;
         // Details do not take the scheduler lock; mutating storage/selection does.
         let _dispatch = if request["op"] != "details" {
             Some(self.dispatch_lock.lock().await)
         } else {
             None
         };
+        self.reject_diagnostics()?;
         let task = self.task(id).await?;
         if task.record.read().await.torrent.is_none() {
             return Err("This transfer is not a torrent.".into());
@@ -1580,6 +1657,7 @@ impl DownloadManager {
 
     async fn remove_torrent(&self, id: Uuid, delete_file: bool) -> Result<(), String> {
         let _dispatch = self.dispatch_lock.lock().await;
+        self.reject_diagnostics()?;
         let task = self.task(id).await?;
         let record = task.record.read().await.clone();
         // Removing history needs no live handle or metadata. Payload deletion does.
@@ -1837,6 +1915,7 @@ impl DownloadManager {
                 structural = true;
             }
             structural |= record.status != old;
+            self.observe_analytics(&task, &record);
             if *record != before {
                 updates.push(record.clone());
             }
@@ -1883,7 +1962,8 @@ impl DownloadManager {
     }
 
     pub async fn shutdown(&self) {
-        if tokio::time::timeout(Duration::from_secs(45), self.shutdown_inner())
+        self.closing.store(true, Ordering::Release);
+        if tokio::time::timeout(Duration::from_secs(65), self.shutdown_inner())
             .await
             .is_err()
         {
@@ -1893,6 +1973,17 @@ impl DownloadManager {
 
     async fn shutdown_inner(&self) {
         self.dispatch_suspended.store(true, Ordering::Release);
+        {
+            let _dispatch = self.dispatch_lock.lock().await;
+            self.diagnostics.cancel();
+            self.diagnostics.cancel_share();
+        }
+        let began = Instant::now();
+        while (self.diagnostics.active() || self.diagnostics.snapshot().sharing == "sending")
+            && began.elapsed() < Duration::from_secs(15)
+        {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
         let imports = self
             .torrent_imports
             .read()
@@ -2081,13 +2172,18 @@ impl DownloadManager {
             progress_requested: false,
         };
 
-        let task = Arc::new(DownloadTask::new(record.clone(), request.request_context));
+        let task = Arc::new(DownloadTask::new(
+            record.clone(),
+            request.request_context,
+            self.analytics.prepare(),
+        ));
         self.tasks.write().await.insert(id, task.clone());
         if persist {
             if let Err(error) = self.persist_records().await {
                 self.tasks.write().await.remove(&id);
                 return Err(error.to_string());
             }
+            self.register_analytics(&record).await;
             self.emit_record(&record);
         }
         Ok(record)
@@ -2097,11 +2193,13 @@ impl DownloadManager {
         self: &Arc<Self>,
         requests: Vec<AddDownloadRequest>,
     ) -> Result<BatchDownloadResult, String> {
+        self.reject_diagnostics()?;
         if requests.is_empty() || requests.len() > 1000 {
             return Err("Choose between 1 and 1,000 downloads.".into());
         }
         // Keep dispatch from observing a partially added batch.
         let _dispatch = self.dispatch_lock.lock().await;
+        self.reject_diagnostics()?;
         let mut result = BatchDownloadResult {
             accepted: Vec::new(),
             errors: Vec::new(),
@@ -2127,7 +2225,11 @@ impl DownloadManager {
             }
             return Err(error.to_string());
         }
+        if !result.accepted.is_empty() {
+            self.analytics.feature("batch");
+        }
         for record in &result.accepted {
+            self.register_analytics(record).await;
             self.emit_record(record);
         }
         Ok(result)
@@ -2149,6 +2251,7 @@ impl DownloadManager {
         self.persist_records()
             .await
             .map_err(|error| error.to_string())?;
+        self.analytics.feature("speed_limit");
         self.emit_record(&snapshot);
         Ok(snapshot)
     }
@@ -2320,12 +2423,15 @@ impl DownloadManager {
         self.persist_records()
             .await
             .map_err(|error| error.to_string())?;
+        self.analytics.feature("pause");
         self.emit_record(&snapshot);
         Ok(snapshot)
     }
 
     pub async fn resume(self: &Arc<Self>, id: Uuid) -> Result<DownloadRecord, String> {
+        self.reject_diagnostics()?;
         let _dispatch = self.dispatch_lock.lock().await;
+        self.reject_diagnostics()?;
         let task = self.task(id).await?;
         let snapshot = {
             let mut record = task.record.write().await;
@@ -2352,6 +2458,7 @@ impl DownloadManager {
         self.persist_records()
             .await
             .map_err(|error| error.to_string())?;
+        self.analytics.feature("resume");
         self.emit_record(&snapshot);
         Ok(snapshot)
     }
@@ -2478,6 +2585,7 @@ impl DownloadManager {
     ) -> Result<OrganizeReport, String> {
         // New download creation and filename reassignment must not race the scan.
         let _dispatch = self.dispatch_lock.lock().await;
+        self.reject_diagnostics()?;
         let settings = self.settings.read().await.clone();
         if matches!(mode, OrganizeMode::Flatten) && settings.sort_into_category_folders {
             return Err(
@@ -2727,24 +2835,51 @@ impl DownloadManager {
         Ok(snapshot)
     }
 
+    /// Consent has its own command so stale full-settings drafts cannot reinstate it.
+    pub async fn set_analytics_consent(&self, enabled: bool) -> Result<DownloadSettings, String> {
+        let _update = self.settings_update_lock.lock().await;
+        if !enabled {
+            self.analytics
+                .configure(&crate::analytics::Consent::choice(false));
+        }
+        let _persist = self.persist_lock.lock().await;
+        let result = persist_analytics_choice(
+            &self.settings,
+            &self.analytics,
+            &self.data_dir.join(SETTINGS_FILE),
+            enabled,
+        )
+        .await;
+        let _ = self.app.emit(SETTINGS_EVENT, &*self.settings.read().await);
+        result
+    }
+
     pub async fn update_settings(
         &self,
-        settings: DownloadSettings,
+        mut settings: DownloadSettings,
     ) -> Result<DownloadSettings, String> {
+        let _update = self.settings_update_lock.lock().await;
+        settings.preserve_analytics_consent(&*self.settings.read().await);
         let settings = settings.normalized();
         let path = PathBuf::from(&settings.default_download_dir);
         fs::create_dir_all(&path)
             .await
             .map_err(|error| format!("Could not use that download directory: {error}"))?;
         sync_startup_registration(settings.launch_on_start)?;
-
+        {
+            let _persist = self.persist_lock.lock().await;
+            write_json_atomic(&self.data_dir.join(SETTINGS_FILE), &settings)
+                .await
+                .map_err(|error| error.to_string())?;
+        }
+        let prior_limit = self.settings.read().await.speed_limit_bps;
         *self.settings.write().await = settings.clone();
         self.apply_torrent_budget().await?;
         self.minimize_to_tray
             .store(settings.minimize_to_tray, Ordering::Release);
-        self.persist_settings()
-            .await
-            .map_err(|error| error.to_string())?;
+        if prior_limit != settings.speed_limit_bps && settings.speed_limit_bps > 0 {
+            self.analytics.feature("speed_limit");
+        }
         let _ = self.app.emit(SETTINGS_EVENT, &settings);
         Ok(settings)
     }
@@ -2907,11 +3042,11 @@ impl DownloadManager {
     }
 
     async fn dispatch_ready_downloads(self: &Arc<Self>) {
-        if self.dispatch_suspended.load(Ordering::Acquire) {
+        if self.dispatch_suspended.load(Ordering::Acquire) || self.diagnostics.active() {
             return;
         }
         let _dispatch = self.dispatch_lock.lock().await;
-        if self.dispatch_suspended.load(Ordering::Acquire) {
+        if self.dispatch_suspended.load(Ordering::Acquire) || self.diagnostics.active() {
             return;
         }
         let max_concurrent = self.settings.read().await.max_concurrent_downloads;
@@ -4345,7 +4480,43 @@ impl DownloadManager {
         write_catalog_atomic(&self.data_dir.join(QUEUES_FILE), queues).await
     }
 
+    async fn register_analytics(&self, record: &DownloadRecord) {
+        if let Ok(task) = self.task(record.id).await {
+            if let Some(sample) = task.analytics_sample.lock().unwrap().as_mut() {
+                self.analytics.added(
+                    sample,
+                    record.torrent.is_some(),
+                    record.scheduled_for.is_some(),
+                    record.queue != "Default",
+                    record.extra.contains_key("handoffId"),
+                );
+            }
+        }
+    }
+
+    fn observe_analytics(&self, task: &DownloadTask, record: &DownloadRecord) {
+        let outcome = match record.status {
+            DownloadStatus::Completed | DownloadStatus::Seeding => "completed",
+            DownloadStatus::Failed => "failed",
+            DownloadStatus::Cancelled => "cancelled",
+            _ => return,
+        };
+        if let Some(sample) = task.analytics_sample.lock().unwrap().as_mut() {
+            self.analytics.outcome(
+                sample,
+                record.torrent.is_some(),
+                outcome,
+                record.downloaded_bytes,
+            );
+        }
+    }
+
     fn emit_record(&self, record: &DownloadRecord) {
+        if let Ok(tasks) = self.tasks.try_read() {
+            if let Some(task) = tasks.get(&record.id) {
+                self.observe_analytics(task, record);
+            }
+        }
         let mut events = self.dirty_progress.lock().unwrap();
         events.structural(record);
         let _ = self.app.emit(DOWNLOAD_EVENT, record.clone().public_view());
@@ -4432,8 +4603,34 @@ pub(crate) fn saved_settings() -> Option<DownloadSettings> {
     Some(saved.normalized())
 }
 
+async fn persist_analytics_choice(
+    settings_lock: &RwLock<DownloadSettings>,
+    analytics: &crate::analytics::Analytics,
+    path: &Path,
+    enabled: bool,
+) -> Result<DownloadSettings, String> {
+    let mut settings = settings_lock.read().await.clone();
+    let previous_consent = settings.analytics_consent.clone();
+    settings.analytics_consent = crate::analytics::Consent::choice(enabled);
+    // Stop collection and cancel a pending request immediately on withdrawal.
+    if !enabled {
+        analytics.configure(&settings.analytics_consent);
+    }
+    if let Err(error) = write_json_atomic(path, &settings).await {
+        settings.analytics_consent = previous_consent;
+        settings.analytics_consent.enabled = false;
+        analytics.configure(&settings.analytics_consent);
+        *settings_lock.write().await = settings.clone();
+        return Err(format!("Could not save privacy choice: {error}. Analytics is off for this run; an earlier saved choice may return after restart. Please retry."));
+    }
+    *settings_lock.write().await = settings.clone();
+    analytics.configure(&settings.analytics_consent);
+    Ok(settings)
+}
+
 fn default_settings(download_dir: &Path) -> DownloadSettings {
     DownloadSettings {
+        analytics_consent: Default::default(),
         extra: Default::default(),
         torrent: Default::default(),
         speed_limit_bps: 0,
@@ -5083,6 +5280,23 @@ fn join_parts(
     )
 }
 
+pub(crate) fn diagnostics_join(
+    root: &Path,
+    output: &Path,
+    part_bytes: u64,
+    merged: &AtomicU64,
+    cancel: &CancellationToken,
+) -> Result<(), String> {
+    let ranges = (0..8)
+        .map(|index| ByteRange {
+            start: index * part_bytes,
+            end: (index + 1) * part_bytes - 1,
+        })
+        .collect::<Vec<_>>();
+    join_parts_cancellable(root, output, &ranges, part_bytes * 8, merged, None, cancel)
+        .map_err(|_| "Copy finalization could not complete.".into())
+}
+
 fn join_parts_cancellable(
     part_dir: &Path,
     temp_path: &Path,
@@ -5242,6 +5456,69 @@ mod tests {
         record_is_dispatch_ready, safe_file_name, split_ranges, suggested_connection_count,
     };
     use crate::model::{DownloadRecord, DownloadStatus};
+
+    #[tokio::test]
+    async fn analytics_choice_persists_and_failure_does_not_enable_or_hide_an_undecided_choice() {
+        use crate::analytics::{Analytics, Consent};
+        use tokio::sync::RwLock;
+        let root = std::env::temp_dir().join(format!("fetchrail-consent-{}", Uuid::new_v4()));
+        tokio::fs::create_dir_all(&root).await.unwrap();
+        let settings = RwLock::new(default_settings(Path::new("Downloads")));
+        let collector = Analytics::new(&Consent::default());
+        let path = root.join("settings.json");
+        super::persist_analytics_choice(&settings, &collector, &path, true)
+            .await
+            .unwrap();
+        let saved: DownloadSettings = super::read_saved_json(&path).await.unwrap().unwrap();
+        assert!(saved.analytics_consent.active());
+        let stale = saved.clone();
+        super::persist_analytics_choice(&settings, &collector, &path, false)
+            .await
+            .unwrap();
+        let saved: DownloadSettings = super::read_saved_json(&path).await.unwrap().unwrap();
+        assert!(saved.analytics_consent.decided && !saved.analytics_consent.active());
+        let mut stale_draft = stale;
+        stale_draft.preserve_analytics_consent(&*settings.read().await);
+        assert!(
+            !stale_draft.analytics_consent.active(),
+            "Stale full-settings draft cannot restore a grant"
+        );
+        // A file used as the parent directory guarantees saving fails on every platform.
+        let blocked = root.join("not-a-directory");
+        tokio::fs::write(&blocked, b"blocked").await.unwrap();
+        *settings.write().await = default_settings(Path::new("Downloads"));
+        let result = super::persist_analytics_choice(
+            &settings,
+            &collector,
+            &blocked.join("settings.json"),
+            true,
+        )
+        .await;
+        assert!(result.is_err());
+        assert!(
+            !settings.read().await.analytics_consent.decided,
+            "Failure keeps an initial choice undecided so its error remains visible"
+        );
+        assert!(collector.prepare().is_none());
+        super::persist_analytics_choice(&settings, &collector, &path, true)
+            .await
+            .unwrap();
+        assert!(collector.prepare().is_some());
+        assert!(super::persist_analytics_choice(
+            &settings,
+            &collector,
+            &blocked.join("settings.json"),
+            false
+        )
+        .await
+        .is_err());
+        assert!(!settings.read().await.analytics_consent.active());
+        assert!(
+            collector.prepare().is_none(),
+            "Failed withdrawal still stops collection in this run"
+        );
+        tokio::fs::remove_dir_all(root).await.unwrap();
+    }
 
     #[test]
     fn mixed_engine_budgets_reclaim_capacity_without_exceeding_the_cap() {

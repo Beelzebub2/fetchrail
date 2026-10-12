@@ -1,6 +1,8 @@
 import { DurableObject } from "cloudflare:workers";
 import { AUDIENCE, FeedError, authorize, compareTags, loadRelease, publicationDecision, readJson, sha256 } from "./policy.mjs";
 import bootstrap from "./bootstrap.mjs";
+import { analyticsApi } from "./analytics.mjs";
+export { AnalyticsStore } from "./analytics.mjs";
 
 export class ReleaseFeed extends DurableObject {
   constructor(ctx, env) {
@@ -45,6 +47,7 @@ async function website(request, env) {
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
+    if (["/api/analytics", "/api/analytics/report"].includes(url.pathname)) return analyticsApi(request, env);
     if (!url.pathname.startsWith("/api/")) return website(request, env);
     try {
       if (url.pathname === "/api/updates/notify") {

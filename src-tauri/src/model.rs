@@ -175,6 +175,8 @@ pub enum Accent {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DownloadSettings {
+    #[serde(default)]
+    pub analytics_consent: crate::analytics::Consent,
     #[serde(default, flatten)]
     pub extra: std::collections::BTreeMap<String, serde_json::Value>,
     #[serde(default)]
@@ -208,6 +210,11 @@ pub struct DownloadSettings {
 }
 
 impl DownloadSettings {
+    /// Full-settings drafts never control consent; only the dedicated native command does.
+    pub fn preserve_analytics_consent(&mut self, current: &Self) {
+        self.analytics_consent = current.analytics_consent.clone();
+    }
+
     /// Takes over what setup handed to this launch: the look and the download folder chosen
     /// there, and "Start with Windows". Says whether that changed anything.
     pub fn apply_setup_arguments(&mut self, arguments: &[String]) -> bool {
@@ -507,6 +514,7 @@ mod tests {
             "/tmp/Films"
         };
         let settings = DownloadSettings {
+            analytics_consent: Default::default(),
             extra: Default::default(),
             torrent: Default::default(),
             speed_limit_bps: 0,
@@ -552,6 +560,7 @@ mod tests {
         assert_eq!(settings.folder_for("data.bin"), base);
         assert_eq!(settings.folder_for("README"), base);
         let flat = DownloadSettings {
+            analytics_consent: Default::default(),
             extra: Default::default(),
             sort_into_category_folders: false,
             ..settings.clone()

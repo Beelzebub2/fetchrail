@@ -36,6 +36,9 @@ import {
   X,
 } from "lucide-react";
 import "./App.css";
+import { Diagnostics } from "./Diagnostics";
+import { AnalyticsPrompt, PrivacySettings } from "./Privacy";
+import type { AnalyticsConsent } from "./Privacy";
 import { usePlatformCapabilities } from "./platform";
 import { TorrentImportDialog, TorrentInspector, TorrentRow, TorrentSettingsFields } from "./Torrents";
 import type { TorrentImport, TorrentSummary, TorrentSettings } from "./Torrents";
@@ -131,6 +134,7 @@ type SetupInfo = {
 };
 
 export type DownloadSettings = Appearance & {
+  analyticsConsent: AnalyticsConsent;
   torrent: TorrentSettings;
   speedLimitBps: number;
   autoUpdate: boolean;
@@ -227,6 +231,8 @@ const settingsSections = [
   ["categories", "File categories", FolderOpen],
   ["torrents", "Torrents", Share2],
   ["browser", "Browser", Globe],
+  ["diagnostics", "Diagnostics", Activity],
+  ["privacy", "Privacy", Monitor],
 ] as const;
 type SettingsSection = (typeof settingsSections)[number][0];
 
@@ -911,7 +917,7 @@ function App() {
   // The bar keeps its last message while it slides away, so it never reads "0 unsaved changes".
   if (unsaved) savedBar.current = { done: false, text: `${unsaved} unsaved ${unsaved === 1 ? "change" : "changes"}` };
   else if (saveState === "done") savedBar.current = { done: true, text: "Settings saved" };
-  const barShown = inSettings && (unsaved > 0 || saveState !== "idle");
+  const barShown = inSettings && !["diagnostics", "privacy"].includes(settingsSection) && (unsaved > 0 || saveState !== "idle");
 
   const shown = (id: string) => !inSettings && activeFilter === id;
   const tabClass = (id: string) => (shown(id) ? "rail-tab active" : "rail-tab");
@@ -924,10 +930,15 @@ function App() {
   // Without a chosen folder, the engine files the download under its category.
   const dialogCategory = settings?.sortIntoCategoryFolders ? categoryFor(nameFromUrl(url), settings) : null;
 
+  async function chooseAnalytics(enabled: boolean) {
+    setSettings(await invoke<DownloadSettings>("set_analytics_consent", { enabled }));
+  }
+
   if (recovery) return <main className="app-shell" style={{ padding: 32 }}><h1>Recover saved downloads</h1><p role="alert">{recovery.error}</p><p>Your files and broken state were preserved. Restore a validated previous snapshot, or open the private state folder to export the broken files for repair.</p>{recovery.files.map(file => <p key={file.name}>{file.name} <button disabled={!file.backupAvailable} onClick={() => void invoke("restore_state_backup", { name: file.name }).catch(e => setMessage(String(e)))}>Restore last valid state</button></p>)}<button onClick={() => void invoke("open_recovery_files").catch(e => setMessage(String(e)))}>Open preserved files</button><button onClick={() => void invoke("restart_app").catch(e => setMessage(String(e)))}>Retry startup</button>{message && <p role="alert">{message}</p>}</main>;
 
   return (
     <div className="app-shell">
+      <AnalyticsPrompt settings={settings} onChoice={chooseAnalytics} />
       <header className="top-rail">
         <div className="rail-main">
           <div className="brand">
@@ -1104,6 +1115,7 @@ function App() {
             onSave={() => void saveSettings()}
             onRestart={() => void invoke("restart_app").catch((error) => setMessage(String(error)))}
             onAppearance={applySettings}
+            onAnalytics={chooseAnalytics}
             onCreateQueue={(name) => queueCommand("create_queue", { name })}
             onDeleteQueue={(name) => queueCommand("delete_queue", { name })}
             onToggleQueue={(name, paused) => queueCommand("set_queue_paused", { name, paused })}
@@ -1919,6 +1931,7 @@ function SettingsPage({
   onSave,
   onRestart,
   onAppearance,
+  onAnalytics,
   onCreateQueue,
   onDeleteQueue,
   onToggleQueue,
@@ -1939,6 +1952,7 @@ function SettingsPage({
   onSave: () => void;
   onRestart: () => void;
   onAppearance: (look: Partial<Appearance>) => Promise<void>;
+  onAnalytics: (enabled: boolean) => Promise<void>;
   onCreateQueue: (name: string) => Promise<boolean>;
   onDeleteQueue: (name: string) => Promise<boolean>;
   onToggleQueue: (name: string, paused: boolean) => Promise<boolean>;
@@ -2010,6 +2024,8 @@ function SettingsPage({
     >
       {/* Keyed by section, so each one rises in when it is opened. */}
       <div className="settings-panel" id="settings-panel" role="tabpanel" aria-labelledby={"settings-tab-" + section} key={section}>
+        {section === "diagnostics" && <Diagnostics />}
+        {section === "privacy" && <PrivacySettings settings={settings} onChoice={onAnalytics} />}
         {section === "general" && (
           <section aria-labelledby="general-settings-title">
             <div className="page-head rise">
