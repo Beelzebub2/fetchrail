@@ -9,6 +9,8 @@ use std::{
 mod linux;
 #[cfg(windows)]
 mod windows_attachment;
+#[cfg(windows)]
+mod windows_publication;
 #[cfg(target_os = "linux")]
 pub(crate) use linux::torrent_argument_source;
 #[cfg(target_os = "linux")]
@@ -222,13 +224,28 @@ pub fn reveal(path: &Path) -> Result<(), String> {
         .map_err(|e| format!("Could not open the destination folder: {e}"))
 }
 
-/// Publish a complete file without a check/rename race with another application.
+#[must_use = "Keep the data and final name protected through catalog acknowledgment"]
+pub(crate) struct PublicationGuard {
+    _data: fs::File,
+    _entry: Option<fs::File>,
+}
+impl From<fs::File> for PublicationGuard {
+    fn from(file: fs::File) -> Self {
+        Self {
+            _data: file,
+            _entry: None,
+        }
+    }
+}
+
+/// Publish a complete file without replacing another application's file.
 pub(crate) fn publish_verified_noreplace(
     file: &fs::File,
     source: &Path,
     destination: &Path,
     #[cfg(feature = "test-tools")] trace: Option<&crate::engine::trace::Trace>,
-) -> std::io::Result<()> {
+) -> std::io::Result<PublicationGuard> {
+    let data_guard = file.try_clone()?;
     #[cfg(windows)]
     {
         use std::os::windows::{ffi::OsStrExt, io::AsRawHandle};
@@ -240,6 +257,33 @@ pub(crate) fn publish_verified_noreplace(
             return Err(std::io::Error::other(
                 "Publication destination must be absolute",
             ));
+        }
+        let linked = {
+            #[cfg(feature = "test-tools")]
+            let _link_span =
+                trace.map(|trace| trace.guard(crate::engine::trace::Phase::PublishLink));
+            windows_publication::link_verified(file, destination)
+        };
+        match linked {
+            Ok(Some(entry)) => {
+                {
+                    #[cfg(feature = "test-tools")]
+                    let _sync_span =
+                        trace.map(|trace| trace.guard(crate::engine::trace::Phase::PublishSync));
+                    file.sync_all()?;
+                }
+                #[cfg(feature = "test-tools")]
+                let _retire_span =
+                    trace.map(|trace| trace.guard(crate::engine::trace::Phase::PublishRetire));
+                windows_publication::retire_temporary_name(file)?;
+                return Ok(PublicationGuard {
+                    _data: data_guard,
+                    _entry: Some(entry),
+                });
+            }
+            // Unsupported filesystems retain the existing protected rename path.
+            Ok(None) => {}
+            Err(error) => return Err(error),
         }
         let name: Vec<u16> = destination
             .as_os_str()
@@ -273,14 +317,16 @@ pub(crate) fn publish_verified_noreplace(
         let _ = source;
         #[cfg(feature = "test-tools")]
         let _sync_span = trace.map(|trace| trace.guard(crate::engine::trace::Phase::PublishSync));
-        file.sync_all()
+        file.sync_all()?;
+        Ok(data_guard.into())
     }
     #[cfg(not(windows))]
     {
         let _ = file;
         #[cfg(feature = "test-tools")]
         let _ = trace;
-        publish_noreplace(source, destination)
+        publish_noreplace(source, destination)?;
+        Ok(data_guard.into())
     }
 }
 

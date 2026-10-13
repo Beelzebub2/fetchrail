@@ -553,7 +553,7 @@ async fn benchmark_synthetic_windows_attachment_and_publish() {
         "Synthetic file was changed by attachment policy"
     );
     let publish_started = Instant::now();
-    crate::platform::publish_verified_noreplace(
+    let publication_guard = crate::platform::publish_verified_noreplace(
         &protected,
         &staging,
         &target,
@@ -563,18 +563,83 @@ async fn benchmark_synthetic_windows_attachment_and_publish() {
     let publish_ms = publish_started.elapsed().as_millis();
     let spans = trace.snapshot();
     assert_eq!(spans["spans"]["attachmentSave"]["calls"], 1);
-    assert_eq!(spans["spans"]["publishRename"]["calls"], 1);
+    assert_eq!(spans["spans"]["publishLink"]["calls"], 1);
+    assert!(spans["spans"]["publishRename"]["calls"].as_u64().unwrap() <= 1);
     let save_ms = spans["spans"]["attachmentSave"]["totalMs"]
         .as_f64()
         .unwrap();
     let rename_ms = spans["spans"]["publishRename"]["totalMs"].as_f64().unwrap();
     assert_eq!(std::fs::metadata(&target).unwrap().len(), length);
-    assert!(!staging.exists(), "Rename left its temporary file behind");
+    drop(protected);
+    drop(publication_guard);
+    assert!(
+        !staging.exists(),
+        "Publication left its temporary file behind"
+    );
     println!(
         "Synthetic {}GiB extension={} populated={} Internet-source={} create+sync={}ms, COM Save={:.3}ms (wrapper={}ms), no-clobber rename={:.3}ms (wrapper={}ms); no scanner attribution",
         gib, extension, populated, internet_source, populate_ms, save_ms, attachment_ms, rename_ms, publish_ms
     );
-    drop(protected);
+}
+
+#[cfg(windows)]
+#[test]
+fn handle_link_publication_pins_bytes_and_retires_only_the_temporary_name() {
+    let root =
+        std::env::temp_dir().join(format!("fetchrail-linked-publication-{}", Uuid::new_v4()));
+    std::fs::create_dir(&root).unwrap();
+    let source = root.join("temporary.fetchrail-part");
+    let destination = root.join("published-Ω.bin");
+    let bytes = b"verified publication with a surviving final name";
+    std::fs::write(&source, bytes).unwrap();
+    let mut ads = source.as_os_str().to_os_string();
+    ads.push(":Zone.Identifier");
+    std::fs::write(&ads, b"[ZoneTransfer]\r\nZoneId=3\r\n").unwrap();
+    let (identity, _, file) =
+        open_publication_file_with_access(&source, PublicationAccess::Publish).unwrap();
+    #[cfg(feature = "test-tools")]
+    let trace = trace::Trace::default();
+    let publication_guard = crate::platform::publish_verified_noreplace(
+        &file,
+        &source,
+        &destination,
+        #[cfg(feature = "test-tools")]
+        Some(&trace),
+    )
+    .unwrap();
+    #[cfg(feature = "test-tools")]
+    {
+        let spans = trace.snapshot();
+        assert_eq!(spans["spans"]["publishLink"]["calls"], 1);
+        assert_eq!(spans["spans"]["publishRename"]["calls"], 0);
+        assert_eq!(spans["spans"]["publishRetire"]["calls"], 1);
+    }
+    assert_eq!(open_publication_file(&destination).unwrap().0, identity);
+    assert_eq!(std::fs::read(&destination).unwrap(), bytes);
+    assert!(std::fs::OpenOptions::new()
+        .write(true)
+        .open(&destination)
+        .is_err());
+    assert!(std::fs::rename(&destination, root.join("unexpected.bin")).is_err());
+    // The last duplicate holds the guard through both durable catalog writes.
+    let duplicate = file.try_clone().unwrap();
+    drop(file);
+    assert!(std::fs::OpenOptions::new()
+        .write(true)
+        .open(&destination)
+        .is_err());
+    drop(duplicate);
+    assert!(std::fs::rename(&destination, root.join("unexpected.bin")).is_err());
+    drop(publication_guard);
+    assert!(!source.exists());
+    assert_eq!(std::fs::read(&destination).unwrap(), bytes);
+    let mut published_ads = destination.as_os_str().to_os_string();
+    published_ads.push(":Zone.Identifier");
+    assert_eq!(
+        std::fs::read(published_ads).unwrap(),
+        b"[ZoneTransfer]\r\nZoneId=3\r\n"
+    );
+    std::fs::remove_dir_all(root).unwrap();
 }
 
 #[tokio::test]
@@ -698,7 +763,7 @@ async fn post_attachment_verification_rejects_mutations_and_keeps_provenance() {
                     .is_err());
                     assert_eq!(fs::read(&output).await.unwrap(), b"foreign output");
                     fs::remove_file(&output).await.unwrap();
-                    crate::platform::publish_verified_noreplace(
+                    let publication_guard = crate::platform::publish_verified_noreplace(
                         &verified.file,
                         &temp,
                         &output,
@@ -706,6 +771,8 @@ async fn post_attachment_verification_rejects_mutations_and_keeps_provenance() {
                         None,
                     )
                     .unwrap();
+                    #[cfg(windows)]
+                    assert!(std::fs::rename(&output, root.join("unexpected.bin")).is_err());
                     assert_eq!(fs::read(&output).await.unwrap(), data);
                     #[cfg(windows)]
                     if outcome == "ads" {
@@ -717,6 +784,7 @@ async fn post_attachment_verification_rejects_mutations_and_keeps_provenance() {
                             .any(|v| v == b"ZoneId=3"));
                     }
                     drop(verified);
+                    drop(publication_guard);
                 } else {
                     assert!(result.is_err(), "{outcome}, copied={copied}");
                     assert!(
