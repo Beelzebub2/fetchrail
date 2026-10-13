@@ -71,6 +71,7 @@ pub(crate) enum RetryCause {
     Decode,
     Request,
     Http429,
+    Http503,
     Http408,
     HttpServer,
     RetryAfter,
@@ -88,8 +89,19 @@ impl RetryCause {
             EngineError::Request(error) if error.is_decode() => Self::Decode,
             EngineError::Request(_) => Self::Request,
             EngineError::Http(reqwest::StatusCode::TOO_MANY_REQUESTS) => Self::Http429,
+            EngineError::Http(reqwest::StatusCode::SERVICE_UNAVAILABLE) => Self::Http503,
             EngineError::Http(reqwest::StatusCode::REQUEST_TIMEOUT) => Self::Http408,
             EngineError::Http(_) => Self::HttpServer,
+            EngineError::RetryAfter { status, .. }
+                if *status == reqwest::StatusCode::SERVICE_UNAVAILABLE =>
+            {
+                Self::Http503
+            }
+            EngineError::RetryAfter { status, .. }
+                if *status == reqwest::StatusCode::TOO_MANY_REQUESTS =>
+            {
+                Self::Http429
+            }
             EngineError::RetryAfter { .. } => Self::RetryAfter,
             _ => Self::Other,
         }
@@ -104,6 +116,7 @@ impl RetryCause {
             Self::Decode => "decode",
             Self::Request => "request",
             Self::Http429 => "http429",
+            Self::Http503 => "http503",
             Self::Http408 => "http408",
             Self::HttpServer => "httpServer",
             Self::RetryAfter => "retryAfter",
@@ -547,6 +560,22 @@ mod tests {
             RetryCause::from_error(&super::super::EngineError::Http(
                 reqwest::StatusCode::TOO_MANY_REQUESTS
             ))
+            .label(),
+            "http429"
+        );
+        assert_eq!(
+            RetryCause::from_error(&super::super::EngineError::RetryAfter {
+                status: reqwest::StatusCode::SERVICE_UNAVAILABLE,
+                delay: Duration::from_secs(2),
+            })
+            .label(),
+            "http503"
+        );
+        assert_eq!(
+            RetryCause::from_error(&super::super::EngineError::RetryAfter {
+                status: reqwest::StatusCode::TOO_MANY_REQUESTS,
+                delay: Duration::from_secs(2),
+            })
             .label(),
             "http429"
         );
