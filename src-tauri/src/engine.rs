@@ -3570,9 +3570,11 @@ impl DownloadManager {
         let mut running = 0;
         let mut seeds = 0;
         let mut calibrated_running = 0;
+        let mut busy = 0usize;
         let max_seeds = self.settings.read().await.torrent.max_seeds;
         for task in &tasks {
             if task.running.load(Ordering::Acquire) {
+                busy += 1;
                 if task
                     .record
                     .read()
@@ -3598,7 +3600,7 @@ impl DownloadManager {
                     } else {
                         seeds += 1;
                     }
-                } else {
+                } else if record_uses_transfer_slot(&*task.record.read().await) {
                     running += 1;
                 }
             }
@@ -3626,7 +3628,7 @@ impl DownloadManager {
                 .expect("task performance poisoned")
                 .as_ref()
             {
-                policy.set_eligible(running <= 1 && seeds == 0);
+                policy.set_eligible(busy <= 1 && seeds == 0);
             }
         }
         let now = Utc::now();
@@ -3690,7 +3692,10 @@ impl DownloadManager {
             if is_seed && seeds >= max_seeds {
                 continue;
             }
-            if !is_seed && running >= max_concurrent {
+            if !is_seed
+                && (running >= max_concurrent
+                    || busy.saturating_sub(seeds) >= max_concurrent.saturating_add(1))
+            {
                 continue;
             }
             let uses_calibrated_drive = if is_seed {
@@ -3767,6 +3772,7 @@ impl DownloadManager {
                     calibrated_running += 1;
                 }
             }
+            busy += 1;
         }
         let _ = self.apply_torrent_budget().await;
     }
@@ -5253,6 +5259,15 @@ impl DownloadManager {
         };
         self.emit_record(&snapshot);
         #[cfg(feature = "test-tools")]
+        if task.trace.is_some()
+            && std::env::var("FETCHRAIL_TEST_FINALIZE_DELAY").is_ok_and(|value| value == "1")
+        {
+            tokio::select! {
+                _ = tokio::time::sleep(Duration::from_secs(2)) => {},
+                _ = cancel.cancelled() => return Err(EngineError::Cancelled),
+            }
+        }
+        #[cfg(feature = "test-tools")]
         if let Some(trace) = &task.trace {
             trace.phase(trace::Phase::Attachment);
         }
@@ -5888,6 +5903,15 @@ fn normalize_queue_name(value: &str) -> Result<String, String> {
         return Err("Queue names cannot contain control characters.".into());
     }
     Ok(name.to_string())
+}
+
+fn record_uses_transfer_slot(record: &DownloadRecord) -> bool {
+    // Final checks still count as busy work for calibration and disk admission.
+    record.torrent.is_some()
+        || !matches!(
+            record.status,
+            DownloadStatus::Merging | DownloadStatus::Completed
+        )
 }
 
 fn record_is_dispatch_ready(
