@@ -16,7 +16,7 @@ pub use linux::{
     capabilities, completion_actions, native_launcher, sync_startup_registration, tray_available,
 };
 #[cfg(windows)]
-pub use windows_attachment::mark_download;
+pub(crate) use windows_attachment::mark_download;
 
 pub const APP_ID: &str = "com.rrmtools.braid";
 
@@ -223,10 +223,11 @@ pub fn reveal(path: &Path) -> Result<(), String> {
 }
 
 /// Publish a complete file without a check/rename race with another application.
-pub fn publish_verified_noreplace(
+pub(crate) fn publish_verified_noreplace(
     file: &fs::File,
     source: &Path,
     destination: &Path,
+    #[cfg(feature = "test-tools")] trace: Option<&crate::engine::trace::Trace>,
 ) -> std::io::Result<()> {
     #[cfg(windows)]
     {
@@ -251,6 +252,9 @@ pub fn publish_verified_noreplace(
         // Word storage supplies the native structure's alignment and its variable-length name.
         let mut storage = vec![0usize; bytes.div_ceil(std::mem::size_of::<usize>())];
         unsafe {
+            #[cfg(feature = "test-tools")]
+            let _rename_span =
+                trace.map(|trace| trace.guard(crate::engine::trace::Phase::PublishRename));
             let info = storage.as_mut_ptr().cast::<FILE_RENAME_INFO>();
             (*info).Anonymous.ReplaceIfExists = false;
             (*info).FileNameLength = ((name.len() - 1) * 2) as u32;
@@ -267,11 +271,15 @@ pub fn publish_verified_noreplace(
             }
         }
         let _ = source;
+        #[cfg(feature = "test-tools")]
+        let _sync_span = trace.map(|trace| trace.guard(crate::engine::trace::Phase::PublishSync));
         file.sync_all()
     }
     #[cfg(not(windows))]
     {
         let _ = file;
+        #[cfg(feature = "test-tools")]
+        let _ = trace;
         publish_noreplace(source, destination)
     }
 }
