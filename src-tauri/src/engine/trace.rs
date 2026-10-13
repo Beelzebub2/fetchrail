@@ -9,7 +9,7 @@ use std::{
 };
 
 #[derive(Clone, Copy)]
-pub(super) enum Phase {
+pub(crate) enum Phase {
     Probe,
     Origin,
     Global,
@@ -27,8 +27,15 @@ pub(super) enum Phase {
     Journal,
     Publish,
     Catalog,
+    AttachmentSetup,
+    AttachmentSave,
+    AttachmentAdsOpen,
+    AttachmentAdsWrite,
+    AttachmentAdsSync,
+    PublishRename,
+    PublishSync,
 }
-const NAMES: [&str; 17] = [
+const NAMES: [&str; 24] = [
     "probe",
     "originAdmission",
     "globalAdmission",
@@ -46,6 +53,13 @@ const NAMES: [&str; 17] = [
     "journal",
     "publish",
     "catalog",
+    "attachmentSetup",
+    "attachmentSave",
+    "attachmentAdsOpen",
+    "attachmentAdsWrite",
+    "attachmentAdsSync",
+    "publishRename",
+    "publishSync",
 ];
 #[derive(serde::Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -66,8 +80,8 @@ struct Span {
     histogram: [AtomicU64; 32],
 }
 #[derive(Default)]
-pub(super) struct Trace {
-    spans: [Span; 17],
+pub(crate) struct Trace {
+    spans: [Span; 24],
     pub network_bytes: AtomicU64,
     pub durable_bytes: AtomicU64,
     pub requests: AtomicU64,
@@ -189,7 +203,7 @@ impl Trace {
         self.protocols[index].fetch_add(1, Ordering::Relaxed);
     }
     pub fn snapshot(&self) -> Value {
-        let phases: [(&str, Value); 17] = std::array::from_fn(|i| {
+        let phases: [(&str, Value); 24] = std::array::from_fn(|i| {
             let span = &self.spans[i];
             let calls = span.calls.load(Ordering::Relaxed);
             let mut cumulative = 0;
@@ -210,7 +224,7 @@ impl Trace {
     }
 }
 
-pub(super) struct SpanGuard<'a> {
+pub(crate) struct SpanGuard<'a> {
     trace: &'a Trace,
     phase: Phase,
     started: Instant,
