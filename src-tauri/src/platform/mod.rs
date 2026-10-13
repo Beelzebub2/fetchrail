@@ -16,12 +16,22 @@ pub use linux::{
     capabilities, completion_actions, native_launcher, sync_startup_registration, tray_available,
 };
 #[cfg(windows)]
-pub use windows_attachment::mark_download;
+pub(crate) use windows_attachment::mark_download;
 
 pub const APP_ID: &str = "com.rrmtools.braid";
 
 pub fn test_root() -> Result<Option<PathBuf>, String> {
     let Some(root) = std::env::var_os("FETCHRAIL_TEST_ROOT") else {
+        if std::env::current_exe()
+            .ok()
+            .and_then(|path| {
+                path.file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+            })
+            .is_some_and(|name| name.eq_ignore_ascii_case("Fetchrail-Preview.exe"))
+        {
+            return Err("Start the isolated preview through its launcher.".into());
+        }
         return Ok(None);
     };
     let path = PathBuf::from(root);
@@ -213,6 +223,68 @@ pub fn reveal(path: &Path) -> Result<(), String> {
 }
 
 /// Publish a complete file without a check/rename race with another application.
+pub(crate) fn publish_verified_noreplace(
+    file: &fs::File,
+    source: &Path,
+    destination: &Path,
+    #[cfg(feature = "test-tools")] trace: Option<&crate::engine::trace::Trace>,
+) -> std::io::Result<()> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::{ffi::OsStrExt, io::AsRawHandle};
+        use windows::Win32::{
+            Foundation::HANDLE,
+            Storage::FileSystem::{FileRenameInfo, SetFileInformationByHandle, FILE_RENAME_INFO},
+        };
+        if !destination.is_absolute() {
+            return Err(std::io::Error::other(
+                "Publication destination must be absolute",
+            ));
+        }
+        let name: Vec<u16> = destination
+            .as_os_str()
+            .encode_wide()
+            .chain(Some(0))
+            .collect();
+        let bytes = std::mem::size_of::<FILE_RENAME_INFO>() + name.len() * 2;
+        let length = u32::try_from(bytes)
+            .map_err(|_| std::io::Error::other("Publication name is too long"))?;
+        // Word storage supplies the native structure's alignment and its variable-length name.
+        let mut storage = vec![0usize; bytes.div_ceil(std::mem::size_of::<usize>())];
+        unsafe {
+            #[cfg(feature = "test-tools")]
+            let _rename_span =
+                trace.map(|trace| trace.guard(crate::engine::trace::Phase::PublishRename));
+            let info = storage.as_mut_ptr().cast::<FILE_RENAME_INFO>();
+            (*info).Anonymous.ReplaceIfExists = false;
+            (*info).FileNameLength = ((name.len() - 1) * 2) as u32;
+            std::ptr::copy_nonoverlapping(name.as_ptr(), (*info).FileName.as_mut_ptr(), name.len());
+            if SetFileInformationByHandle(
+                HANDLE(file.as_raw_handle()),
+                FileRenameInfo,
+                info.cast(),
+                length,
+            )
+            .is_err()
+            {
+                return Err(std::io::Error::last_os_error());
+            }
+        }
+        let _ = source;
+        #[cfg(feature = "test-tools")]
+        let _sync_span = trace.map(|trace| trace.guard(crate::engine::trace::Phase::PublishSync));
+        file.sync_all()
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = file;
+        #[cfg(feature = "test-tools")]
+        let _ = trace;
+        publish_noreplace(source, destination)
+    }
+}
+
+/// Publish a complete file without replacing an existing destination.
 pub fn publish_noreplace(source: &Path, destination: &Path) -> std::io::Result<()> {
     #[cfg(windows)]
     {

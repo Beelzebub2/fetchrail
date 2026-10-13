@@ -74,9 +74,11 @@ The report explicitly states these limits instead of inventing a hardware score.
 - Quick: two opposite-order runs of 1/4/8 parallel requests, then the full
   receive/write/hash path. Default maximum requested payload is 1 GiB.
 - Deep: two opposite-order runs of 1/2/4/8 public or 1/2/4/8/16/32 provided-file requests over the normal pooled
-  client, followed by repeated HTTP/1 comparisons (1/4/8 public or 1/4/16/32
-  provided-file requests), sustained confirmation
-  up to 30 seconds, and the full pipeline. The public baseline defaults to 1 GiB;
+  client, followed by sustained confirmation up to 30 seconds and the full
+  pipeline. Repeated HTTP/1 comparisons (1/4/8 public or 1/4/16/32 provided-file
+  requests) run after the primary evidence, using the remaining selected budget.
+  Optional transport failures cannot erase already valid primary measurements.
+  The public baseline defaults to 1 GiB;
   choosing Deep with a provided direct file defaults to 16 GiB.
 - Requests are at most 64 MiB, streamed without accumulating the response in RAM.
   Reused connections reduce handshake bias. Unique nonces and no-store requests
@@ -104,16 +106,37 @@ The report explicitly states these limits instead of inventing a hardware score.
   protocol change for every server.
 - Each count must have two successful runs lasting at least three seconds with
   at least two nonzero full-interval samples before it can influence initial
-  parallelism. Use the worse of the two runs, then the smallest count within
+  parallelism. Repeats with more than 50% throughput drift are diagnostic only.
+  Use the worse of the two runs, then the smallest count within
   95% of the best repeated result. Brief bursts do not select an aggressive count.
 - Applying online results additionally requires a healthy receive/write/hash
-  sample. Failed or too-short tests still provide diagnostic results but cannot
+  sample lasting at least three seconds with two positive full intervals, using
+  the selected request count and actual selected buffer, paired with its own
+  successful same-byte finalization. Deep also requires a healthy selected-count
+  confirmation lasting at least ten seconds with six positive intervals; its
+  throughput must be within 80–150% of the repeated matrix floor. A material late
+  route change is not accepted as a hardware recommendation. These are product
+  guardrails within explicit budgets, not full RFC 6349 certification.
+  Failed or too-short tests still provide diagnostic results but cannot
   be applied as a measured network profile. Local-only profiles tune local work.
 - A quick test on a very fast connection may not use enough data to establish
   sustained behavior. Deep budgets can be explicitly raised to 32 GiB; the app
   never silently exceeds the selected payload budget.
 - Disk buffer selection also requires repeated sufficiently long measurements;
-  otherwise the existing 1 MiB buffer remains. Low available memory limits buffers.
+  writes arrive in 64 KiB pieces so smaller buffers do not bypass buffering with
+  an identical 1 MiB write call. A proposed replacement then undergoes two full
+  pipeline trials against two 1 MiB baseline trials in opposite order. Its worse
+  repeat must match the best baseline repeat; larger buffers must improve by at
+  least 5%. Each trial needs its own adjacent finalization evidence. Otherwise the
+  default remains. Local-only tests retain buffer and network defaults; applying
+  one can enable learning from normal downloads. Low current memory limits buffers.
+
+Completed disk fixtures are removed before the network phase. Each pipeline's
+owned input/output directories are removed before the next trial, so comparisons
+reuse the selected footprint instead of accumulating files. Requested network
+payload remains atomically budgeted; the confirmation reserves room for the
+required pipeline comparisons. Samplers use actual elapsed time and delayed
+missed ticks, avoiding artificial immediate catch-up samples.
 
 The thresholds above are conservative product heuristics, not universal optima or
 an RFC certification. Opposite ordering reduces warm-up/time drift; it cannot
@@ -124,6 +147,29 @@ eliminate ISP congestion, server variation, SSD caching or background processes.
 The original validated equal-range ledger and the shared HTTP/2-capable client
 remain. Automatic mode changes admission of those ranges, not their offsets.
 It never repartitions a valid partial transfer when settings or calibration change.
+
+A fresh measured report's request count is respected, including one request;
+unknown large routes start at up to 16 within the configured ceiling and can probe
+higher. A slow benchmark route is never a hard bandwidth ceiling for another host.
+The controller only compares windows whose admitted lanes, receiving lanes and
+target agree and whose lane-generation token stayed constant across the interval.
+Completed-range bytes are included in aggregate accounting, while peer recovery
+uses only currently receiving peers. Extra draining lanes are not labelled as the
+lower target. After six healthy four-second windows, a temporary plateau or write
+pressure can be re-probed. Healthy streams still drain; no data is discarded.
+
+Whole-file completion learning only records runs that retained the same request
+target; mixed-count runs and server refusals cannot attribute a whole-file time to
+one peak phase. Queued-file limits are not inferred from scatter writes inside a
+single fixture. The user's simultaneous-download limit stays authoritative;
+critical memory pressure below 256 MiB of current available RAM can temporarily
+restrict a valid profile, then recovers with the cached live inventory. A temporary
+snapshot during calibration is never saved as a two-week queue restriction.
+
+The UI distinguishes a saved report from a currently applicable profile. Expired
+or changed-engine/network/volume reports show their reason and cannot be applied.
+Too-short drive measurements display insufficient evidence, not zero hardware
+performance. Existing automatic learning can continue without an applicable report.
 Unknown-length, unvalidated or non-range downloads retain their single-stream path.
 The ordinary retry/representation/checksum/publication guards remain authoritative.
 
@@ -137,16 +183,24 @@ HTTP throttling reduces admission and retains shared Retry-After handling.
 Healthy ranges drain naturally instead of being cancelled to manufacture a smoother
 graph. Waiters are labelled Waiting separately from Connecting/Receiving.
 
-Competing downloads/torrent seeding, bandwidth caps, partial resumes and final tails
-are excluded from training. Completed full transfers of at least 16 MiB/10 seconds
+Competing downloads/torrent seeding, bandwidth caps and partial resumes exclude
+whole runs from completion learning. Final-tail intervals do not compare request
+counts; the complete fixed-count duration still includes the tail and finalization.
+Completed full transfers of at least 16 MiB/10 seconds
 provide bounded host/count observations based on actual full completion time,
 including finalization. Host keys contain only hashed origin, network, destination
 volume, size class and engine build. They exclude URLs, queries and filenames.
 Models remain hints and are revalidated during real transfers.
 
-Slow-drive admission limits require measured same-volume seek pressure; a slow
-destination alone does not justify preventing overlap with a separate staging
-drive. Explicit user ceilings, existing global/origin budgets, torrent settings
+Host/count priors require at least two consistent results from the most recent four
+qualifying completions. Their conservative floor ranks counts; more than 50%
+variation prevents choosing that prior until fresh consistent results replace the
+noise. The complete time includes setup and finalization. Saved profile fields are
+re-derived from the underlying trials before application and use, so a stale or
+inconsistent cached recommendation is not authoritative.
+
+Drive-scatter tests remain diagnostic and do not impose a saved whole-file queue
+limit. Explicit user ceilings, existing global/origin budgets, torrent settings
 and speed limits remain. Turning automatic mode off releases adaptive waiters
 without throwing away bytes or restarting healthy work.
 
@@ -203,6 +257,11 @@ document. Copy detailed report strips private network/volume fingerprints.
 - [Microsoft DiskSpd methodology](https://github.com/microsoft/diskspd/wiki/Customizing-tests):
   cache mode, workload, warm-up and flush semantics determine what a drive result
   means. These generated file tests match application work and can remain cached.
+- [Google Benchmark variance guidance](https://github.com/google/benchmark/blob/main/docs/reducing_variance.md)
+  and [interleaved repetitions](https://github.com/google/benchmark/blob/main/docs/random_interleaving.md):
+  scheduling, cache effects and frequency changes can bias measurements. The
+  balanced repeated comparisons here reduce order bias; Fetchrail does not change
+  OS power policies, security settings or processor affinity to improve a score.
 - [Windows memory availability](https://learn.microsoft.com/en-us/windows/win32/api/sysinfoapi/nf-sysinfoapi-globalmemorystatusex)
   is volatile, not a static hardware capacity guarantee.
 - [Windows MTA lifetime](https://learn.microsoft.com/en-us/windows/win32/api/combaseapi/nf-combaseapi-coincrementmtausage)
