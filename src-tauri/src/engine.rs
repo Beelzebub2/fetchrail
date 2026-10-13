@@ -30,7 +30,7 @@ use tokio_util::sync::CancellationToken;
 use url::Url;
 use uuid::Uuid;
 #[cfg(feature = "test-tools")]
-mod trace;
+pub(crate) mod trace;
 
 macro_rules! transfer_span {
     ($trace:expr, $phase:ident, $work:expr) => {{
@@ -388,6 +388,7 @@ enum PublicationAccess {
     Inspect,
     Verify,
     Publish,
+    ConcurrentRead,
 }
 fn open_publication_file_with_access(
     path: &Path,
@@ -421,6 +422,11 @@ fn open_publication_file_with_access(
             PublicationAccess::Inspect => {}
             PublicationAccess::Verify => {
                 options.share_mode(0x00000001);
+            }
+            PublicationAccess::ConcurrentRead => {
+                // The primary Publish handle already denies third-party writes/deletes.
+                // These read-only handles must still share its existing write/delete access.
+                options.share_mode(0x00000001 | 0x00000002 | 0x00000004);
             }
             PublicationAccess::Publish => {
                 options
@@ -503,6 +509,8 @@ fn journal_verified_file(
         }
         2 if journal.sha256.is_empty() && expected_sha256.is_none() => committed_ranges_match(
             file.try_clone()?,
+            path,
+            &identity,
             journal.total,
             manifest_bytes,
             &journal.range_sha256,
@@ -513,8 +521,88 @@ fn journal_verified_file(
     Ok(valid.then_some(file))
 }
 
-fn committed_ranges_match(
+fn range_hashes_match(
     mut file: std::fs::File,
+    path: &Path,
+    identity: &FileIdentity,
+    ranges: &[ByteRange],
+    hashes: &[String],
+    cancel: &CancellationToken,
+    workers: usize,
+) -> EngineResult<bool> {
+    let total = ranges
+        .last()
+        .and_then(|range| range.end.checked_add(1))
+        .ok_or_else(|| EngineError::Message("Invalid committed range length.".into()))?;
+    let check = |worker_file: &mut std::fs::File, index: usize| -> EngineResult<bool> {
+        use std::io::{Seek, SeekFrom};
+        let range = &ranges[index];
+        worker_file.seek(SeekFrom::Start(range.start))?;
+        let mut bounded = (&mut *worker_file).take(range.len());
+        let actual = crate::integrity::sha256_reader(&mut bounded, cancel)?;
+        Ok(bounded.limit() == 0 && actual == hashes[index])
+    };
+    if workers <= 1 {
+        for index in 0..ranges.len() {
+            if !check(&mut file, index)? {
+                return Ok(false);
+            }
+        }
+        return Ok(true);
+    }
+    // Windows cloned handles share their seek cursor, including seek_read. Instead
+    // reopen one independent, identity-checked read handle per worker while the
+    // protected Publish handle remains open and denies writes and replacement.
+    // Bound CPU, disk pressure and the integrity reader's two 8 MiB buffers.
+    let _protected_file = file;
+    let next = AtomicUsize::new(0);
+    let rejected = AtomicBool::new(false);
+    let results = std::thread::scope(|scope| {
+        let threads: Vec<_> = (0..workers.min(ranges.len()))
+            .map(|_| {
+                scope.spawn(|| -> EngineResult<bool> {
+                    let (worker_identity, worker_length, mut worker_file) =
+                        open_publication_file_with_access(path, PublicationAccess::ConcurrentRead)
+                            .inspect_err(|_| rejected.store(true, Ordering::Release))?;
+                    if worker_identity != *identity || worker_length != total {
+                        rejected.store(true, Ordering::Release);
+                        return Ok(false);
+                    }
+                    while !rejected.load(Ordering::Acquire) {
+                        let index = next.fetch_add(1, Ordering::Relaxed);
+                        if index >= ranges.len() {
+                            return Ok(true);
+                        }
+                        let valid = check(&mut worker_file, index).inspect_err(|_| {
+                            rejected.store(true, Ordering::Release);
+                        })?;
+                        if !valid {
+                            rejected.store(true, Ordering::Release);
+                            return Ok(false);
+                        }
+                    }
+                    Ok(false)
+                })
+            })
+            .collect();
+        threads
+            .into_iter()
+            .map(|thread| thread.join())
+            .collect::<Vec<_>>()
+    });
+    let mut matches = true;
+    for result in results {
+        matches &= result.map_err(|_| {
+            EngineError::Message("Integrity verification worker panicked.".into())
+        })??;
+    }
+    Ok(matches)
+}
+
+fn committed_ranges_match(
+    file: std::fs::File,
+    path: &Path,
+    identity: &FileIdentity,
     total: u64,
     manifest_bytes: &[u8],
     hashes: &[String],
@@ -537,16 +625,23 @@ fn committed_ranges_match(
     {
         return Ok(false);
     }
-    for (range, expected) in manifest.ranges.iter().zip(hashes) {
-        use std::io::{Seek, SeekFrom};
-        file.seek(SeekFrom::Start(range.start))?;
-        let mut bounded = (&mut file).take(range.len());
-        let actual = crate::integrity::sha256_reader(&mut bounded, cancel)?;
-        if bounded.limit() != 0 || actual != *expected {
-            return Ok(false);
-        }
-    }
-    Ok(true)
+    // Parallelize only large verified representations; tiny files avoid the thread overhead.
+    let workers = if total >= 128 * 1024 * 1024 {
+        std::thread::available_parallelism()
+            .map(|cores| cores.get().min(4))
+            .unwrap_or(1)
+    } else {
+        1
+    };
+    range_hashes_match(
+        file,
+        path,
+        identity,
+        &manifest.ranges,
+        hashes,
+        cancel,
+        workers,
+    )
 }
 
 struct VerifiedPublication {
@@ -573,7 +668,15 @@ fn verify_scanned_publication(
         ));
     }
     let (sha256, range_sha256) = if let Some(hashes) = complete_hashes {
-        if !committed_ranges_match(file.try_clone()?, total, manifest_bytes, &hashes, cancel)? {
+        if !committed_ranges_match(
+            file.try_clone()?,
+            path,
+            &identity,
+            total,
+            manifest_bytes,
+            &hashes,
+            cancel,
+        )? {
             return Err(EngineError::Message(
                 "SHA-256 checksum mismatch after attachment processing. File was not published."
                     .into(),
@@ -687,7 +790,13 @@ async fn recover_verified_publication(
         let destination = journal.destination.clone();
         verified_file = Some(
             tokio::task::spawn_blocking(move || {
-                crate::platform::publish_verified_noreplace(&file, &temporary, &destination)?;
+                crate::platform::publish_verified_noreplace(
+                    &file,
+                    &temporary,
+                    &destination,
+                    #[cfg(feature = "test-tools")]
+                    None,
+                )?;
                 Ok::<_, std::io::Error>(file)
             })
             .await
@@ -5114,7 +5223,14 @@ impl DownloadManager {
         transfer_span!(
             task.trace.as_deref(),
             Attachment,
-            crate::platform::mark_download(&temp_path, &record.url, desired_name).await
+            crate::platform::mark_download(
+                &temp_path,
+                &record.url,
+                desired_name,
+                #[cfg(feature = "test-tools")]
+                task.trace.clone(),
+            )
+            .await
         )?;
         task.check_stopped(cancel)?;
         let path = temp_path.clone();
@@ -5172,6 +5288,8 @@ impl DownloadManager {
             let to = destination.clone();
             let publishing_file = verified.file.try_clone()?;
             #[cfg(feature = "test-tools")]
+            let publish_trace = task.trace.clone();
+            #[cfg(feature = "test-tools")]
             if let Some(trace) = &task.trace {
                 trace.phase(trace::Phase::Publish);
             }
@@ -5179,7 +5297,13 @@ impl DownloadManager {
                 task.trace.as_deref(),
                 Publish,
                 tokio::task::spawn_blocking(move || {
-                    crate::platform::publish_verified_noreplace(&publishing_file, &from, &to)
+                    crate::platform::publish_verified_noreplace(
+                        &publishing_file,
+                        &from,
+                        &to,
+                        #[cfg(feature = "test-tools")]
+                        publish_trace.as_deref(),
+                    )
                 })
                 .await
             )

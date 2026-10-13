@@ -263,6 +263,152 @@ async fn shared_range_commitments_recover_without_an_initial_full_file_digest() 
     fs::remove_dir_all(root).await.unwrap();
 }
 
+#[test]
+fn independent_parallel_range_handles_reject_truncation_and_mutation() {
+    use std::io::{Seek, SeekFrom};
+
+    let root = std::env::temp_dir().join(format!("fetchrail-parallel-sha-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&root).unwrap();
+    let path = root.join("staged.bin");
+    let bytes = (0..1024 * 1024)
+        .map(|i| (i / (64 * 1024)) as u8)
+        .collect::<Vec<_>>();
+    std::fs::write(&path, &bytes).unwrap();
+    let ranges = split_ranges(bytes.len() as u64, 16);
+    let hashes = ranges
+        .iter()
+        .map(|range| {
+            format!(
+                "{:x}",
+                Sha256::digest(&bytes[range.start as usize..=range.end as usize])
+            )
+        })
+        .collect::<Vec<_>>();
+    let cancel = CancellationToken::new();
+    let (identity, _, mut file) =
+        open_publication_file_with_access(&path, PublicationAccess::Publish).unwrap();
+    assert!(range_hashes_match(
+        file.try_clone().unwrap(),
+        &path,
+        &identity,
+        &ranges,
+        &hashes,
+        &cancel,
+        1
+    )
+    .unwrap());
+    file.seek(SeekFrom::Start(31)).unwrap();
+    assert!(range_hashes_match(
+        file.try_clone().unwrap(),
+        &path,
+        &identity,
+        &ranges,
+        &hashes,
+        &cancel,
+        4
+    )
+    .unwrap());
+    assert_eq!(
+        file.stream_position().unwrap(),
+        31,
+        "Parallel readers must have their own Windows file objects and cursors"
+    );
+    cancel.cancel();
+    assert!(range_hashes_match(
+        file.try_clone().unwrap(),
+        &path,
+        &identity,
+        &ranges,
+        &hashes,
+        &cancel,
+        4
+    )
+    .is_err());
+    drop(file);
+
+    let mut changed = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+    changed
+        .seek(SeekFrom::Start(ranges[8].start + 123))
+        .unwrap();
+    changed.write_all(b"tampered").unwrap();
+    changed.sync_all().unwrap();
+    drop(changed);
+    let (identity, _, file) =
+        open_publication_file_with_access(&path, PublicationAccess::Publish).unwrap();
+    assert!(!range_hashes_match(
+        file,
+        &path,
+        &identity,
+        &ranges,
+        &hashes,
+        &CancellationToken::new(),
+        4
+    )
+    .unwrap());
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .set_len(128 * 1024)
+        .unwrap();
+    let (identity, _, file) =
+        open_publication_file_with_access(&path, PublicationAccess::Publish).unwrap();
+    assert!(!range_hashes_match(
+        file,
+        &path,
+        &identity,
+        &ranges,
+        &hashes,
+        &CancellationToken::new(),
+        4
+    )
+    .unwrap());
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+#[ignore = "256 MiB local-only finalization benchmark; not part of routine tests"]
+fn benchmark_protected_range_hashes_serial_and_parallel() {
+    let root = std::env::temp_dir().join(format!("fetchrail-sha-bench-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&root).unwrap();
+    let path = root.join("synthetic-staging.bin");
+    let payload = (0..8 * 1024 * 1024)
+        .map(|i| (i / 4096) as u8)
+        .collect::<Vec<_>>();
+    let mut output = std::fs::File::create(&path).unwrap();
+    for _ in 0..32 {
+        output.write_all(&payload).unwrap();
+    }
+    output.sync_all().unwrap();
+    drop(output);
+    let mut hasher = Sha256::new();
+    hasher.update(&payload);
+    hasher.update(&payload);
+    let expected = format!("{:x}", hasher.finalize());
+    let (identity, total, protected) =
+        open_publication_file_with_access(&path, PublicationAccess::Publish).unwrap();
+    let ranges = split_ranges(total, 16);
+    let hashes = vec![expected; 16];
+    let mut times = Vec::new();
+    for workers in [1, 4, 4, 1] {
+        let started = Instant::now();
+        assert!(range_hashes_match(
+            protected.try_clone().unwrap(),
+            &path,
+            &identity,
+            &ranges,
+            &hashes,
+            &CancellationToken::new(),
+            workers
+        )
+        .unwrap());
+        times.push((workers, started.elapsed().as_millis()));
+    }
+    println!("Protected 256MiB range SHA-256 [workers, elapsed_ms] = {times:?}");
+    drop(protected);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
 #[tokio::test]
 async fn post_attachment_verification_rejects_mutations_and_keeps_provenance() {
     use std::io::{Seek, SeekFrom};
@@ -377,13 +523,21 @@ async fn post_attachment_verification_rejects_mutations_and_keeps_provenance() {
                     assert!(crate::platform::publish_verified_noreplace(
                         &verified.file,
                         &temp,
-                        &output
+                        &output,
+                        #[cfg(feature = "test-tools")]
+                        None,
                     )
                     .is_err());
                     assert_eq!(fs::read(&output).await.unwrap(), b"foreign output");
                     fs::remove_file(&output).await.unwrap();
-                    crate::platform::publish_verified_noreplace(&verified.file, &temp, &output)
-                        .unwrap();
+                    crate::platform::publish_verified_noreplace(
+                        &verified.file,
+                        &temp,
+                        &output,
+                        #[cfg(feature = "test-tools")]
+                        None,
+                    )
+                    .unwrap();
                     assert_eq!(fs::read(&output).await.unwrap(), data);
                     #[cfg(windows)]
                     if outcome == "ads" {
