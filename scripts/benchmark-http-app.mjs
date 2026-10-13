@@ -4,8 +4,8 @@ import { createHash } from "node:crypto";
 import { createServer } from "node:http";
 import { createServer as tcpServer } from "node:net";
 import { createReadStream } from "node:fs";
-import { readFile, writeFile, mkdir, stat } from "node:fs/promises";
-import { join, resolve } from "node:path";
+import { readFile, writeFile, mkdir, stat, mkdtemp, rm } from "node:fs/promises";
+import { join, resolve, dirname, isAbsolute } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { chromium } from "playwright";
 import { createFixture } from "./test-runtime.mjs";
@@ -77,8 +77,13 @@ function summarize(samples,start,done,total) {
 }
 async function run(label,exe,plan,mode="uniform",workers=8,tracing=true) {
   const fixture=await createFixture("http-app-benchmark"),{server,state}=fixtureServer(mode,workers);
-  let app,browser,closed,verified=false;const samples=[];
+  let app,browser,closed,verified=false,crossOutput;const samples=[];
   try {
+    if(mode==="cross-volume") {
+      const volume=process.env.FETCHRAIL_APP_BENCH_OUTPUT_VOLUME;
+      assert(volume&&isAbsolute(volume),"Pass an absolute output-volume directory");
+      crossOutput=await mkdtemp(join(volume,"fetchrail-owned-benchmark-"));
+    }
     await writeFile(join(fixture.stateDir,"settings.json"),JSON.stringify({defaultDownloadDir:join(fixture.root,"downloads"),maxConcurrentDownloads:3,connectionsPerDownload:workers,minSegmentSizeMb:4,autoUpdate:false,launchOnStart:false,performanceAuto:false,analyticsConsent:{enabled:false,decided:true,schema:1,purpose:"product-improvement-v1"}}));
     await new Promise(done=>server.listen(0,"127.0.0.1",done));
     let page;
@@ -103,7 +108,7 @@ async function run(label,exe,plan,mode="uniform",workers=8,tracing=true) {
     const invoke=(command,args={})=>page.evaluate(({command,args})=>window.__TAURI_INTERNALS__.invoke(command,args),{command,args});
     const settings=await invoke("get_settings");await invoke("update_settings",{settings:{...settings,autoUpdate:false,launchOnStart:false,performanceAuto:false,adaptiveConnections:false,connectionsPerDownload:workers,sortIntoCategoryFolders:false}});
     const start=performance.now(),startedAt=new Date().toISOString();
-    const job=await page.evaluate(async request=>{window.benchStarted=performance.now();return window.__TAURI_INTERNALS__.invoke("add_download",{request});},{url:`http://127.0.0.1:${server.address().port}/fixture.bin`,fileName:"fixture.bin",directory:join(fixture.root,"output"),connections:workers});
+    const job=await page.evaluate(async request=>{window.benchStarted=performance.now();return window.__TAURI_INTERNALS__.invoke("add_download",{request});},{url:`http://127.0.0.1:${server.address().port}/fixture.bin`,fileName:"fixture.bin",directory:crossOutput??join(fixture.root,"output"),connections:workers});
     let record,lastSample=-1,recovered=false,savedManifest;const traceEpochs=[];
     await until(async()=>{
       record=await invoke("get_download",{id:job.id});const now=performance.now(),seconds=(now-start)/1000;
@@ -142,11 +147,14 @@ async function run(label,exe,plan,mode="uniform",workers=8,tracing=true) {
       const saved=parseStateSnapshot(await readFile(join(fixture.stateDir,"downloads.json"))),backup=parseStateSnapshot(await readFile(join(fixture.stateDir,"downloads.json.backup")));
       assert(saved.some(row=>row.id===job.id&&row.status==="completed"));assert(backup.some(row=>row.id===job.id&&row.status==="completed"));
       assert.equal(await digest(record.destination),expectedHash);assert.equal(record.downloadedBytes,total);assert(state.peak<=workers,"Worker ceiling exceeded");
-      result.outputSha256=expectedHash;result.catalogVerified=true;verified=true;
+      result.outputSha256=expectedHash;result.catalogVerified=true;
       if(result.trace){assert.equal(result.trace.catalogAcknowledged,true);assert.equal(result.trace.durableBytes,total);}
+      if(mode==="cross-volume")assert.equal(result.trace?.hardLinks,0,"Cross-volume finalization must exercise the checked copy");
+      if(record.testTrace?.elapsedMs!=null){const persisted=JSON.parse(await readFile(join(fixture.stateDir,"dev-transfer-traces.json")));assert(persisted.captures.some(capture=>capture.downloadId===job.id&&capture.status==="completed"&&capture.metrics.catalogAcknowledged));result.traceSaved=true;}
       if(mode==="disconnect")assert(result.trace?.retries>=1&&state.requests.length>workers,"Disconnect must actually trigger a suffix retry");
       if(mode==="refusal")assert.equal(state.refusals,1,"Refusal fixture must exercise server backoff");
       if(mode==="uniform")assert(duration>=total/120e6-state.requests.length*block.length/120e6-.1,"Fixture rate budget was bypassed");
+      verified=true;
     }
     results.push(result);await writeFile(join(output,`${label}.json`),JSON.stringify(result,null,2));
     console.log(JSON.stringify({label,status:result.status,seconds:result.seconds,endToEndMBps:result.endToEndMBps,serverPeak:state.peak,requests:state.requests.length,verified}));
@@ -156,7 +164,7 @@ async function run(label,exe,plan,mode="uniform",workers=8,tracing=true) {
     await browser?.close().catch(()=>{});
     if(app){const stop=spawn(exe,["--quit"],{windowsHide:true,env:fixture.env,stdio:"ignore"});await new Promise(done=>stop.once("exit",done));const timeout=new AbortController();try{await Promise.race([closed,delay(40000,undefined,{signal:timeout.signal}).then(()=>{throw Error("Isolated app did not quit");})]);}finally{timeout.abort();}}
     server.closeAllConnections();await new Promise(done=>server.close(done));
-    if(verified)await fixture.cleanup();else console.log(`Owned failed fixture preserved: ${fixture.root}`);
+    if(verified){await fixture.cleanup();if(crossOutput){assert.equal(dirname(resolve(crossOutput)),resolve(process.env.FETCHRAIL_APP_BENCH_OUTPUT_VOLUME));assert(crossOutput.includes("fetchrail-owned-benchmark-"));await rm(crossOutput,{recursive:true,maxRetries:5,retryDelay:200});}}else console.log(`Owned failed fixture preserved: ${fixture.root}`);
   }
 }
 
@@ -167,4 +175,5 @@ if(cases.includes("uniform"))for(const [label,exe,plan]of [["uniform-A1",baselin
 if(cases.includes("skew"))for(const [label,exe,plan]of [["skew-A1",baseline,"fixed"],["skew-B1",candidate,"double"],["skew-B2",candidate,"64m"],["skew-A2",baseline,"fixed"]])await run(label,exe,plan,"skew");
 if(cases.includes("faults"))for(const mode of["disconnect","refusal","invalid","changed","ignored"])await run(`fault-${mode}`,candidate,"64m",mode,4);
 if(cases.includes("resume"))for(const mode of["pause","kill"])await run(`v2-${mode}`,candidate,"64m",mode);
+if(cases.includes("cross-volume"))await run("cross-volume",candidate,"64m","cross-volume");
 await writeFile(join(output,"results.json"),JSON.stringify({bytes:total,unit:"decimal MB/s",scope:"localhost full-app; does not predict WAN throughput",provenance,results},null,2));
