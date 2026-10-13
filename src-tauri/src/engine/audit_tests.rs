@@ -449,6 +449,134 @@ fn benchmark_protected_range_hashes_serial_and_parallel() {
     std::fs::remove_dir_all(root).unwrap();
 }
 
+#[cfg(all(windows, feature = "test-tools"))]
+#[tokio::test]
+#[ignore = "opt-in isolated synthetic Windows attachment and publish timing; never user files"]
+async fn benchmark_synthetic_windows_attachment_and_publish() {
+    use std::io::Write;
+    // This diagnostic intentionally tests the exact Windows APIs used in a
+    // publication, not actual source data. Use a brand-new, private test file;
+    // never invoke this test on an existing download or user-supplied path.
+    let scratch = PathBuf::from(
+        std::env::var_os("FETCHRAIL_SCAN_BENCH_ROOT")
+            .expect("Set FETCHRAIL_SCAN_BENCH_ROOT to an existing isolated scratch directory"),
+    );
+    assert!(
+        scratch.is_absolute(),
+        "Synthetic scratch path must be absolute"
+    );
+    assert!(
+        scratch.is_dir(),
+        "Isolated scan benchmark directory must exist"
+    );
+    for ancestor in scratch.ancestors() {
+        use std::os::windows::fs::MetadataExt;
+        let metadata = std::fs::symlink_metadata(ancestor).unwrap();
+        assert_eq!(
+            metadata.file_attributes() & 0x400,
+            0,
+            "Synthetic scratch path must not contain reparse points"
+        );
+    }
+    let gib = std::env::var("FETCHRAIL_SCAN_BENCH_GIB")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|size| [1, 4, 20].contains(size))
+        .expect("Set FETCHRAIL_SCAN_BENCH_GIB to 1, 4, or 20");
+    let root = scratch.join(format!("fetchrail-synthetic-scan-{}", Uuid::new_v4()));
+    let length = gib * 1024 * 1024 * 1024;
+    let available = crate::platform::available_space(&scratch).unwrap();
+    assert!(
+        available >= length + 4 * 1024 * 1024 * 1024,
+        "Insufficient free space for isolated synthetic benchmark"
+    );
+    std::fs::create_dir(&root).unwrap();
+    struct OwnedFixtureDir(PathBuf);
+    impl Drop for OwnedFixtureDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    let _owned_cleanup = OwnedFixtureDir(root.clone());
+    let staging = root.join(".fetchrail-owned-synthetic.fetchrail-part");
+    let extension = if std::env::var("FETCHRAIL_SCAN_BENCH_EXTENSION").as_deref() == Ok("bin") {
+        "bin"
+    } else {
+        "rar"
+    };
+    let filename = format!("fetchrail-owned-synthetic.{extension}");
+    let target = root.join(&filename);
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&staging)
+        .unwrap();
+    let populated = std::env::var("FETCHRAIL_SCAN_BENCH_POPULATE").as_deref() == Ok("1");
+    let internet_source = std::env::var("FETCHRAIL_SCAN_BENCH_SOURCE").as_deref() == Ok("internet");
+    let populate_started = Instant::now();
+    if populated {
+        let mut buffer = vec![0u8; 8 * 1024 * 1024];
+        let mut x = 0x9e37_79b9_u32;
+        for byte in &mut buffer {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            *byte = x as u8;
+        }
+        for _ in 0..length / buffer.len() as u64 {
+            file.write_all(&buffer).unwrap();
+        }
+        assert_eq!(file.metadata().unwrap().len(), length);
+    } else {
+        file.set_len(length).unwrap();
+    }
+    file.sync_all().unwrap();
+    drop(file);
+    let populate_ms = populate_started.elapsed().as_millis();
+
+    let trace = std::sync::Arc::new(trace::Trace::default());
+    let scan_started = Instant::now();
+    let source = if internet_source {
+        // Source metadata only. This test never performs an HTTP request.
+        format!("https://example.com/{filename}")
+    } else {
+        format!("http://127.0.0.1/{filename}")
+    };
+    crate::platform::mark_download(&staging, &source, &filename, Some(trace.clone()))
+        .await
+        .unwrap();
+    let attachment_ms = scan_started.elapsed().as_millis();
+    let (_, actual, protected) =
+        open_publication_file_with_access(&staging, PublicationAccess::Publish).unwrap();
+    assert_eq!(
+        actual, length,
+        "Synthetic file was changed by attachment policy"
+    );
+    let publish_started = Instant::now();
+    crate::platform::publish_verified_noreplace(
+        &protected,
+        &staging,
+        &target,
+        Some(trace.as_ref()),
+    )
+    .unwrap();
+    let publish_ms = publish_started.elapsed().as_millis();
+    let spans = trace.snapshot();
+    assert_eq!(spans["spans"]["attachmentSave"]["calls"], 1);
+    assert_eq!(spans["spans"]["publishRename"]["calls"], 1);
+    let save_ms = spans["spans"]["attachmentSave"]["totalMs"]
+        .as_f64()
+        .unwrap();
+    let rename_ms = spans["spans"]["publishRename"]["totalMs"].as_f64().unwrap();
+    assert_eq!(std::fs::metadata(&target).unwrap().len(), length);
+    assert!(!staging.exists(), "Rename left its temporary file behind");
+    println!(
+        "Synthetic {}GiB extension={} populated={} Internet-source={} create+sync={}ms, COM Save={:.3}ms (wrapper={}ms), no-clobber rename={:.3}ms (wrapper={}ms); no scanner attribution",
+        gib, extension, populated, internet_source, populate_ms, save_ms, attachment_ms, rename_ms, publish_ms
+    );
+    drop(protected);
+}
+
 #[tokio::test]
 async fn post_attachment_verification_rejects_mutations_and_keeps_provenance() {
     use std::io::{Seek, SeekFrom};

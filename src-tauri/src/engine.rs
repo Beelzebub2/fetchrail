@@ -3801,6 +3801,10 @@ impl DownloadManager {
             let record = task.record.read().await;
             Url::parse(&record.url)?
         };
+        #[cfg(feature = "test-tools")]
+        if let Some(trace) = &task.trace {
+            trace.phase(trace::Phase::Probe);
+        }
         let probe = transfer_span!(
             task.trace.as_deref(),
             Probe,
