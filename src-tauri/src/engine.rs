@@ -4197,9 +4197,25 @@ impl DownloadManager {
                     };
                     // Retry only this range so healthy connections keep their throughput.
                     let result = async {
+                        #[cfg(feature = "test-tools")]
+                        let mut previous_retry_cause = None;
                         for attempt in 0..3 {
                             #[cfg(feature = "test-tools")]
-                            if let Some(trace) = &task.trace {if attempt>0 {trace.retries.fetch_add(1,Ordering::Relaxed);}}
+                            if attempt > 0 {
+                                if let Some(trace) = &task.trace {
+                                    let remaining = (segment.range.end != u64::MAX).then(|| {
+                                        segment.range.len().saturating_sub(
+                                            segment.downloaded.load(Ordering::Relaxed),
+                                        )
+                                    });
+                                    trace.retry(
+                                        index,
+                                        attempt,
+                                        previous_retry_cause.unwrap_or(trace::RetryCause::Other),
+                                        remaining,
+                                    );
+                                }
+                            }
                             task.check_stopped(batch_cancel)?;
                             if let Some(policy) = &policy {
                                 if range_permit.is_none() || policy.should_drain() {
@@ -4258,6 +4274,10 @@ impl DownloadManager {
                             };
                             if !transient || attempt == 2 {
                                 return Err(error);
+                            }
+                            #[cfg(feature = "test-tools")]
+                            {
+                                previous_retry_cause = Some(trace::RetryCause::from_error(&error));
                             }
                             if matches!(error, EngineError::Slow) {
                                 client = download_client_builder().build()?;
