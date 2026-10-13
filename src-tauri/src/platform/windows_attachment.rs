@@ -8,12 +8,19 @@ fn wide(path: &Path) -> Vec<u16> {
     path.as_os_str().encode_wide().chain(Some(0)).collect()
 }
 
-pub async fn mark_download(path: &Path, url: &str, file_name: &str) -> io::Result<()> {
+pub(crate) async fn mark_download(
+    path: &Path,
+    url: &str,
+    file_name: &str,
+    #[cfg(feature = "test-tools")] trace: Option<std::sync::Arc<crate::engine::trace::Trace>>,
+) -> io::Result<()> {
     #[cfg(windows)]
     {
         let scan_path = path.to_path_buf();
         let source = url.to_string();
         let file_name = file_name.to_string();
+        #[cfg(feature = "test-tools")]
+        let scan_trace = trace.clone();
         tokio::task::spawn_blocking(move || -> io::Result<()> {
             use windows::{
                 core::{GUID, PCWSTR},
@@ -26,6 +33,10 @@ pub async fn mark_download(path: &Path, url: &str, file_name: &str) -> io::Resul
                 },
             };
             unsafe {
+                #[cfg(feature = "test-tools")]
+                let setup_span = scan_trace
+                    .as_deref()
+                    .map(|trace| trace.guard(crate::engine::trace::Phase::AttachmentSetup));
                 CoInitializeEx(None, COINIT_APARTMENTTHREADED)
                     .ok()
                     .map_err(io::Error::other)?;
@@ -61,6 +72,12 @@ pub async fn mark_download(path: &Path, url: &str, file_name: &str) -> io::Resul
                 attachment
                     .SetSource(PCWSTR(source_wide.as_ptr()))
                     .map_err(io::Error::other)?;
+                #[cfg(feature = "test-tools")]
+                drop(setup_span);
+                #[cfg(feature = "test-tools")]
+                let _save_span = scan_trace
+                    .as_deref()
+                    .map(|trace| trace.guard(crate::engine::trace::Phase::AttachmentSave));
                 attachment.Save().map_err(io::Error::other)?;
             }
             Ok(())
@@ -69,13 +86,19 @@ pub async fn mark_download(path: &Path, url: &str, file_name: &str) -> io::Resul
         .map_err(io::Error::other)??;
         // Preserve internet provenance after attachment policy/scanning has accepted the staging file.
         let ads = PathBuf::from(format!("{}:Zone.Identifier", path.display()));
-        let mut file = match fs::OpenOptions::new()
+        #[cfg(feature = "test-tools")]
+        let ads_open_span = trace
+            .as_deref()
+            .map(|trace| trace.guard(crate::engine::trace::Phase::AttachmentAdsOpen));
+        let result = fs::OpenOptions::new()
             .write(true)
             .create(true)
             .truncate(true)
             .open(ads)
-            .await
-        {
+            .await;
+        #[cfg(feature = "test-tools")]
+        drop(ads_open_span);
+        let mut file = match result {
             Ok(file) => file,
             Err(error) if matches!(error.raw_os_error(), Some(1 | 50 | 123)) => {
                 eprintln!("Attachment policy accepted the file; this filesystem cannot store Zone.Identifier.");
@@ -93,11 +116,23 @@ pub async fn mark_download(path: &Path, url: &str, file_name: &str) -> io::Resul
                 url.to_string()
             })
             .unwrap_or_default();
-        file.write_all(
-            format!("[ZoneTransfer]\r\nZoneId=3\r\nHostUrl={public_url}\r\n").as_bytes(),
-        )
-        .await?;
-        file.sync_all().await?;
+        {
+            #[cfg(feature = "test-tools")]
+            let _write_span = trace
+                .as_deref()
+                .map(|trace| trace.guard(crate::engine::trace::Phase::AttachmentAdsWrite));
+            file.write_all(
+                format!("[ZoneTransfer]\r\nZoneId=3\r\nHostUrl={public_url}\r\n").as_bytes(),
+            )
+            .await?;
+        }
+        {
+            #[cfg(feature = "test-tools")]
+            let _sync_span = trace
+                .as_deref()
+                .map(|trace| trace.guard(crate::engine::trace::Phase::AttachmentAdsSync));
+            file.sync_all().await?;
+        }
     }
     #[cfg(not(windows))]
     let _ = (path, url, file_name);

@@ -11,8 +11,10 @@ const HTTP_FIXTURE: &str = r#"
 import { createServer } from 'node:http';
 const total = Number(process.argv[1]), mode = process.argv[2];
 const body = Buffer.alloc(mode === 'uneven-rates' ? 64 * 1024 : 16 * 1024, 0x5a);
-let failed = false;
+let failed = false, active = 0, peak = 0;
+const served = [];
 const handler = (request, response) => {
+  if (request.url === '/stats') { response.end(JSON.stringify({peak, served})); return; }
   if (mode === 'redirect-secret' && request.url !== '/destination') {
     response.writeHead(302, {Location: `http://127.0.0.1:${target.address().port}/destination`}).end(); return;
   }
@@ -25,6 +27,11 @@ const handler = (request, response) => {
   let start = range ? Number(range[1]) : 0;
   let end = range?.[2] ? Number(range[2]) : total - 1;
   console.log(JSON.stringify([start, end]));
+  const visit = {start, end, at: performance.now()}; served.push(visit);
+  active++; peak = Math.max(peak, active);
+  let ended = false;
+  const done = () => { if (!ended) { ended = true; active--; visit.done = performance.now(); } };
+  response.once('finish', done); response.once('close', done);
   const fail = start === 0 && !failed;
   if (start === 0) failed = true;
   if (mode === 'retry' && fail) {
@@ -47,11 +54,16 @@ const handler = (request, response) => {
   const count = ['drop', 'short'].includes(mode) && fail ? 123456 : end - start + 1;
   let remaining = count;
   let paused = false;
+  const began = performance.now();
   function pump() {
     if (mode === 'host-pause' && !paused && remaining < count - 1024 * 1024) { paused = true; setTimeout(pump, 12000); return; }
     while (!response.destroyed && remaining > 0) {
+      // Assert queue order without depending on disk/CPU timing under parallel CI load.
+      if (mode === 'queued-gated' && start === 0 && remaining <= body.length && !served.some(visit => visit.start >= total / 2) && performance.now()-began < 20000) { setTimeout(pump, 5); return; }
       const trickling = mode === 'trickle' && fail && remaining < count - 1024 * 1024;
-      const size = Math.min(remaining, trickling ? 64 : mode === 'uneven-rates' && start > 0 ? 16 * 1024 : body.length);
+      const budget = ['queued-skew', 'queued-gated'].includes(mode) && start === 0 ? Math.max(0, body.length + Math.floor((performance.now()-began)/1000*2e6) - (count-remaining)) : body.length;
+      if (!budget) { setTimeout(pump, Math.max(1,(count-remaining)/2e6*1000-(performance.now()-began))); return; }
+      const size = Math.min(remaining, budget, trickling ? 64 : mode === 'uneven-rates' && start > 0 ? 16 * 1024 : body.length);
       const blocked = !response.write(body.subarray(0, size));
       remaining -= size;
       if (remaining === 0) {
@@ -173,6 +185,242 @@ async fn verify_parts(dir: &Path, segments: &[SegmentCounter]) {
         );
         assert!(!segment.active.load(Ordering::Relaxed));
     }
+}
+
+#[tokio::test]
+async fn micro_range_manifest_resumes_exact_prefixes_and_keeps_legacy_bounds() {
+    let total = 40 * 1024 * 1024;
+    let server = TestServer::new(total, "validated-slow");
+    let (dir, _, mut probe) = parts(total, 40).await;
+    probe.validator = Some("\"v1\"".into());
+    probe.final_url = Some(server.url.clone());
+    let ranges = split_ranges(total, 40);
+    prepare_parts(&dir, &probe, &ranges).await.unwrap();
+    let saved = fs::read(dir.join("transfer.json")).await.unwrap();
+    let mut manifest: PartManifest = serde_json::from_slice(&saved).unwrap();
+    assert_eq!(manifest.version, 2);
+    assert!(valid_manifest_ranges(&manifest, total));
+    manifest.version = 1;
+    assert!(!valid_manifest_ranges(&manifest, total));
+    manifest.version = 2;
+    manifest.ranges[1].start -= 1;
+    assert!(!valid_manifest_ranges(&manifest, total));
+    let job = task();
+    let client = download_client_builder().no_proxy().build().unwrap();
+    let limiter = RateLimiter::new(0);
+    let segments = segment_counters(&dir, &ranges).await.unwrap();
+    let cancel = CancellationToken::new();
+    let (result, _) = tokio::join!(
+        DownloadManager::download_ranges(
+            &client,
+            &limiter,
+            &job,
+            &cancel,
+            &server.url,
+            &dir,
+            &segments,
+            &probe
+        ),
+        async {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while segments
+                .iter()
+                .map(|s| s.downloaded.load(Ordering::Relaxed))
+                .sum::<u64>()
+                < 128 * 1024
+            {
+                assert!(
+                    Instant::now() < deadline,
+                    "The fixture must receive a real prefix before cancellation"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            cancel.cancel();
+        }
+    );
+    assert!(matches!(result, Err(EngineError::Cancelled)));
+    let prefixes: Vec<_> = segments
+        .iter()
+        .map(|s| s.downloaded.load(Ordering::Relaxed))
+        .collect();
+    assert!(prefixes.iter().any(|b| *b > 0));
+    prepare_parts(&dir, &probe, &ranges).await.unwrap();
+    assert_eq!(fs::read(dir.join("transfer.json")).await.unwrap(), saved);
+    job.record.write().await.connections = 2;
+    let resumed = segment_counters(&dir, &ranges).await.unwrap();
+    DownloadManager::download_ranges(
+        &client,
+        &limiter,
+        &job,
+        &CancellationToken::new(),
+        &server.url,
+        &dir,
+        &resumed,
+        &probe,
+    )
+    .await
+    .unwrap();
+    let data = fs::read(dir.join("0.part")).await.unwrap();
+    assert_eq!(data.len(), total as usize);
+    assert!(data.iter().all(|b| *b == 0x5a));
+    let hashes = completed_shared_hashes(&dir, total).await.unwrap().unwrap();
+    let identity = open_publication_file(&dir.join("0.part")).unwrap().0;
+    let verified = verify_scanned_publication(
+        &dir.join("0.part"),
+        &identity,
+        total,
+        &saved,
+        Some(hashes),
+        None,
+        &CancellationToken::new(),
+    )
+    .unwrap();
+    assert_eq!(verified.range_sha256.len(), 40);
+    drop(verified);
+    let requested = server.requests.lock().unwrap();
+    for (range, prefix) in ranges.iter().zip(prefixes) {
+        if prefix > 0 && prefix < range.len() {
+            assert!(requested.contains(&(range.start + prefix, range.end)));
+        }
+    }
+    drop(requested);
+    fs::remove_dir_all(dir).await.unwrap();
+}
+
+#[tokio::test]
+async fn queued_ranges_keep_worker_ceiling_and_permits_across_successive_claims() {
+    let total = 128 * 1024 * 1024;
+    let expected = format!("{:x}", Sha256::digest(vec![0x5a; total as usize]));
+    for workers in [1, 4, 8, 16, 32] {
+        let planned = (workers * 2).min(32);
+        let server = TestServer::new(total, "uniform");
+        let (dir, _, mut probe) = parts(total, planned).await;
+        probe.final_url = Some(server.url.clone());
+        let ranges = split_ranges(total, planned);
+        prepare_parts(&dir, &probe, &ranges).await.unwrap();
+        let segments = segment_counters(&dir, &ranges).await.unwrap();
+        let job = task();
+        job.record.write().await.connections = workers;
+        let policy = crate::performance::LivePolicy::new(workers, workers, 1024 * 1024);
+        *job.performance.lock().unwrap() = Some(policy.clone());
+        DownloadManager::download_ranges(
+            &download_client_builder().no_proxy().build().unwrap(),
+            &RateLimiter::new(0),
+            &job,
+            &CancellationToken::new(),
+            &server.url,
+            &dir,
+            &segments,
+            &probe,
+        )
+        .await
+        .unwrap();
+        let stats: serde_json::Value = reqwest::get(server.url.join("/stats").unwrap())
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert!(stats["peak"].as_u64().unwrap() <= workers as u64);
+        assert_eq!(stats["served"].as_array().unwrap().len(), planned);
+        assert_eq!(
+            policy.generation.load(Ordering::Acquire),
+            2 * workers as u64,
+            "Chunk completion must not invalidate every live-policy window"
+        );
+        assert_eq!(
+            format!(
+                "{:x}",
+                Sha256::digest(fs::read(dir.join("0.part")).await.unwrap())
+            ),
+            expected
+        );
+        assert_eq!(
+            completed_shared_hashes(&dir, total)
+                .await
+                .unwrap()
+                .unwrap()
+                .len(),
+            planned
+        );
+        fs::remove_dir_all(dir).await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn queued_ranges_fill_idle_workers_before_a_slow_range_finishes() {
+    let total = 64 * 1024 * 1024;
+    let mut timings = Vec::new();
+    for planned in [4, 8, 8, 4] {
+        let server = TestServer::new(
+            total,
+            if planned == 8 {
+                "queued-gated"
+            } else {
+                "queued-skew"
+            },
+        );
+        let (dir, _, mut probe) = parts(total, planned).await;
+        probe.final_url = Some(server.url.clone());
+        let ranges = split_ranges(total, planned);
+        prepare_parts(&dir, &probe, &ranges).await.unwrap();
+        let segments = segment_counters(&dir, &ranges).await.unwrap();
+        let started = Instant::now();
+        DownloadManager::download_ranges(
+            &download_client_builder().no_proxy().build().unwrap(),
+            &RateLimiter::new(0),
+            &task(),
+            &CancellationToken::new(),
+            &server.url,
+            &dir,
+            &segments,
+            &probe,
+        )
+        .await
+        .unwrap();
+        timings.push((planned, started.elapsed().as_secs_f64()));
+        assert_eq!(
+            server.requests.lock().unwrap().len(),
+            planned,
+            "All useful ranges requested exactly once"
+        );
+        assert!(fs::read(dir.join("0.part"))
+            .await
+            .unwrap()
+            .iter()
+            .all(|&b| b == 0x5a));
+        if planned == 8 {
+            let stats: serde_json::Value = download_client_builder()
+                .no_proxy()
+                .build()
+                .unwrap()
+                .get(server.url.join("/stats").unwrap())
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            let served = stats["served"].as_array().unwrap();
+            let slow_done = served.iter().find(|visit| visit["start"] == 0).unwrap()["done"]
+                .as_f64()
+                .unwrap();
+            assert!(served.iter().any(|visit| visit["start"].as_u64().unwrap() >= total / 2 && visit["at"].as_f64().unwrap() < slow_done), "Idle workers must claim later queued ranges while the first range is still receiving");
+        }
+        fs::remove_dir_all(dir).await.unwrap();
+    }
+    let baseline: f64 = timings
+        .iter()
+        .filter(|(n, _)| *n == 4)
+        .map(|(_, s)| s)
+        .sum();
+    let queued: f64 = timings
+        .iter()
+        .filter(|(n, _)| *n == 8)
+        .map(|(_, s)| s)
+        .sum();
+    eprintln!("Bounded queued-range experiment: {timings:?}");
+    eprintln!("Baseline aggregate {baseline:.3}s, queued aggregate {queued:.3}s; speed qualification belongs in quiet full-app trials");
 }
 
 #[tokio::test]
@@ -387,9 +635,15 @@ async fn redirect_credentials_are_origin_scoped_and_loops_fail_boundedly() {
         .header(header::AUTHORIZATION, "Bearer private")
         .header(header::ORIGIN, "https://initial.test")
         .header(header::REFERER, "https://initial.test/private");
-    let (response, _origin, _global) = send_admitted(&client, request, &CancellationToken::new())
-        .await
-        .unwrap();
+    let (response, _origin, _global) = send_admitted(
+        &client,
+        request,
+        &CancellationToken::new(),
+        #[cfg(feature = "test-tools")]
+        None,
+    )
+    .await
+    .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     assert_ne!(response.url().origin(), server.url.origin());
     assert_eq!(response.bytes().await.unwrap().len(), 1024);
@@ -398,6 +652,8 @@ async fn redirect_credentials_are_origin_scoped_and_loops_fail_boundedly() {
         &client,
         client.get(looping.url.clone()),
         &CancellationToken::new(),
+        #[cfg(feature = "test-tools")]
+        None,
     )
     .await;
     assert!(matches!(result, Err(EngineError::Message(_))));
@@ -920,11 +1176,13 @@ async fn transfer_throughput() {
     {
         for run in 0..=5 {
             let (dir, segments, probe) = parts(total, connections).await;
+            let job = task();
+            job.record.write().await.connections = connections;
             let started = Instant::now();
             DownloadManager::download_ranges(
                 &client,
                 &limiter,
-                &task(),
+                &job,
                 &CancellationToken::new(),
                 &url,
                 &dir,

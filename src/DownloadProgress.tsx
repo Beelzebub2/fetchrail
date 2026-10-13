@@ -5,7 +5,7 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import { Activity, Check, ChevronDown, ChevronUp, FolderOpen, Gauge, Pause, Play, X } from "lucide-react";
 import {
   applyLook, CompletionOptions, DownloadRecord, DownloadSettings, formatBytes,
-  formatEta, formatSpeed, Logo, partsOf, progressOf, statusLabel, Strands,
+  formatEta, formatSpeed, connectionCounts, Logo, partsOf, progressOf, statusLabel, Strands,
 } from "./App";
 import "./DownloadProgress.css";
 import { usePlatformCapabilities } from "./platform";
@@ -175,7 +175,7 @@ export function DownloadProgress({ id }: { id: string }) {
             <label className="check"><input type="checkbox" checked={limitEnabled} onChange={(event) => setLimitEnabled(event.target.checked)} disabled={busy || complete} />Use speed limiter</label>
             <div className="transfer-limit">
               <label>Maximum transfer rate<input type="number" min={1 / unit} step="any" required={limitEnabled} value={limit} disabled={!limitEnabled || busy || complete} onChange={(event) => setLimit(event.target.value)} /></label>
-              <label>Unit<select aria-label="Speed limit unit" value={unit} disabled={!limitEnabled || busy || complete} onChange={(event) => setUnit(Number(event.target.value))}><option value={1024}>KB/s</option><option value={1048576}>MB/s</option></select></label>
+              <label>Unit<select aria-label="Speed limit unit" value={unit} disabled={!limitEnabled || busy || complete} onChange={(event) => setUnit(Number(event.target.value))}><option value={1024}>KiB/s</option><option value={1048576}>MiB/s</option></select></label>
             </div>
             <p className="hint">The limit is shared by all connections for this download. Changes take effect while it is running.</p>
             {globalLimit > 0 && <p className="hint">The app’s overall limit of {formatSpeed(globalLimit)} also applies.</p>}
@@ -205,7 +205,7 @@ export function DownloadProgress({ id }: { id: string }) {
           <div className={"transfer-progress " + item.status + (item.totalBytes == null ? " unknown" : "")} role="progressbar" aria-label={item.status === "merging" ? "Joining downloaded parts" : "Download progress"} aria-valuemin={0} aria-valuemax={100} aria-valuenow={item.totalBytes || complete ? Math.floor(progress) : undefined} aria-valuetext={item.totalBytes || complete ? `${progress.toFixed(1)}%` : `${formatBytes(item.downloadedBytes)} downloaded; total size unknown`}>
             <i style={{ width: `${progress}%` }} />
           </div>
-          <div className="transfer-progress-caption"><span>{item.status === "merging" ? "Joining parts" : complete ? "File saved" : "Overall progress"}</span><strong className="mono">{item.totalBytes || complete ? `${progress.toFixed(1)}%` : formatBytes(item.downloadedBytes)}</strong></div>
+          <div className="transfer-progress-caption"><span>{item.status === "merging" ? "Finalizing file" : complete ? "File saved" : "Overall progress"}</span><strong className="mono">{item.totalBytes || complete ? `${progress.toFixed(1)}%` : formatBytes(item.downloadedBytes)}</strong></div>
           <div className="transfer-actions">
             <button type="button" className="ghost-button" aria-expanded={details} aria-controls="transfer-connections" onClick={() => setDetails(!details)}>{details ? <ChevronUp size={16} /> : <ChevronDown size={16} />}{details ? "Hide details" : "Show details"}</button>
             <div>
@@ -217,11 +217,12 @@ export function DownloadProgress({ id }: { id: string }) {
             </div>
           </div>
           {details && <section className="transfer-connections" id="transfer-connections" aria-label="Connection details">
-            <div className="transfer-connections-head"><span><Activity size={14} />Start positions and progress by connection</span><small>{item.segments.length || (complete ? item.connections : 1)} connections</small></div>
+            <div className="transfer-connections-head"><span><Activity size={14} />Byte sections and progress</span><small>{connectionCounts(item).receiving} receiving · {item.requestedConnections??item.connections} max · {item.plannedRanges??item.segments.length} sections</small></div>
             <Strands parts={parts} />
+            {item.plannedRanges!=null && item.plannedRanges>item.segments.length && item.segments.length>0 && <p className="hint">{item.plannedRanges} sections are shown in {item.segments.length} groups. Requests can move between sections.</p>}
             <div className="transfer-table-scroll">
               <table><thead><tr><th>No.</th><th>Downloaded</th><th>Info</th><th className="right">Progress</th></tr></thead><tbody>
-                {parts.map((part, index) => <tr key={part.start} title={`Starts at byte ${part.start}${part.length != null ? ` · ${formatBytes(part.length, true)} part` : ""}`}>
+                {parts.map((part, index) => <tr key={part.start} title={`Starts at byte ${part.start}${part.length != null ? ` · ${formatBytes(part.length, true)} section` : ""}`}>
                   <td>{index + 1}</td><td>{formatBytes(part.downloaded, true)}</td><td>{part.state === "receiving" ? `Receiving data… ${formatSpeed(part.speed)}` : part.state === "connecting" ? "Connecting…" : part.state === "done" ? "Complete" : part.state === "paused" ? "Paused" : part.state === "stopped" ? "Stopped" : "Waiting…"}</td><td className="right">{part.length == null ? "—" : `${(part.fraction * 100).toFixed(1)}%`}</td>
                 </tr>)}
               </tbody></table>

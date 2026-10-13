@@ -3,7 +3,7 @@ use std::{
     io::{Read, Write},
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         Arc, Mutex,
     },
     time::Instant,
@@ -29,6 +29,16 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 use url::Url;
 use uuid::Uuid;
+#[cfg(feature = "test-tools")]
+pub(crate) mod trace;
+
+macro_rules! transfer_span {
+    ($trace:expr, $phase:ident, $work:expr) => {{
+        #[cfg(feature = "test-tools")]
+        let _trace_span = $trace.map(|trace| trace.guard(trace::Phase::$phase));
+        $work
+    }};
+}
 
 use crate::model::{
     default_categories, default_queue_name, AddDownloadRequest, BatchDownloadError,
@@ -92,6 +102,7 @@ async fn send_admitted(
     client: &Client,
     request: reqwest::RequestBuilder,
     cancel: &CancellationToken,
+    #[cfg(feature = "test-tools")] trace: Option<&trace::Trace>,
 ) -> EngineResult<(
     reqwest::Response,
     crate::network::OriginPermit,
@@ -107,21 +118,27 @@ async fn send_admitted(
             ));
         }
         let origin = origin_budget(&url);
-        let permit = origin
-            .acquire(32, cancel)
-            .await
+        let permit = transfer_span!(trace, Origin, origin.acquire(32, cancel).await)
             .ok_or(EngineError::Cancelled)?;
-        let global = tokio::select! {
-            permit = global_budget().acquire() => permit.map_err(|e| EngineError::Message(e.to_string()))?,
-            _ = cancel.cancelled() => return Err(EngineError::Cancelled),
-        };
+        let global = transfer_span!(
+            trace,
+            Global,
+            tokio::select! {
+                permit = global_budget().acquire() => permit.map_err(|e| EngineError::Message(e.to_string())),
+                _ = cancel.cancelled() => Err(EngineError::Cancelled),
+            }
+        )?;
         let replay = request
             .try_clone()
             .ok_or_else(|| EngineError::Message("HTTP request cannot be replayed.".into()))?;
-        let response = tokio::select! {
-            response = client.execute(request) => response?,
-            _ = cancel.cancelled() => return Err(EngineError::Cancelled),
-        };
+        let response = transfer_span!(
+            trace,
+            Headers,
+            tokio::select! {
+                response = client.execute(request) => response.map_err(EngineError::from),
+                _ = cancel.cancelled() => Err(EngineError::Cancelled),
+            }
+        )?;
         if !matches!(
             response.status(),
             StatusCode::MOVED_PERMANENTLY
@@ -329,6 +346,8 @@ struct MergeCheckpoint {
     total: u64,
     fingerprint: String,
     expected_sha256: Option<String>,
+    #[serde(default)]
+    identity: Option<FileIdentity>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -337,7 +356,7 @@ struct FileIdentity {
     file: u64,
 }
 
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct PublicationJournal {
     version: u8,
     id: Uuid,
@@ -345,6 +364,8 @@ struct PublicationJournal {
     total: u64,
     manifest_sha256: String,
     sha256: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    range_sha256: Vec<String>,
     identity: FileIdentity,
     published: bool,
 }
@@ -353,6 +374,26 @@ fn file_fingerprint(
     path: &Path,
     cancel: &CancellationToken,
 ) -> std::io::Result<(FileIdentity, u64, String)> {
+    let (identity, len, file) = open_publication_file(path)?;
+    let digest = crate::integrity::sha256_reader(file, cancel)?;
+    Ok((identity, len, digest))
+}
+
+// Obtain stable file identity with the same path checks used by the full hash pass.
+fn open_publication_file(path: &Path) -> std::io::Result<(FileIdentity, u64, std::fs::File)> {
+    open_publication_file_with_access(path, PublicationAccess::Inspect)
+}
+#[derive(Clone, Copy)]
+enum PublicationAccess {
+    Inspect,
+    Verify,
+    Publish,
+    ConcurrentRead,
+}
+fn open_publication_file_with_access(
+    path: &Path,
+    access: PublicationAccess,
+) -> std::io::Result<(FileIdentity, u64, std::fs::File)> {
     for ancestor in path.ancestors() {
         let metadata = std::fs::symlink_metadata(ancestor)?;
         #[cfg(windows)]
@@ -377,7 +418,25 @@ fn file_fingerprint(
     {
         use std::os::windows::fs::OpenOptionsExt;
         options.custom_flags(0x00200000);
+        match access {
+            PublicationAccess::Inspect => {}
+            PublicationAccess::Verify => {
+                options.share_mode(0x00000001);
+            }
+            PublicationAccess::ConcurrentRead => {
+                // The primary Publish handle already denies third-party writes/deletes.
+                // These read-only handles must still share its existing write/delete access.
+                options.share_mode(0x00000001 | 0x00000002 | 0x00000004);
+            }
+            PublicationAccess::Publish => {
+                options
+                    .access_mode(0x80000000 | 0x40000000 | 0x00010000)
+                    .share_mode(0x00000001);
+            }
+        }
     }
+    #[cfg(not(windows))]
+    let _ = access;
     let file = options.open(path)?;
     let metadata = file.metadata()?;
     if !metadata.is_file() {
@@ -409,23 +468,275 @@ fn file_fingerprint(
             file: ((info.nFileIndexHigh as u64) << 32) | info.nFileIndexLow as u64,
         }
     };
-    let digest = crate::integrity::sha256_reader(file, cancel)?;
-    Ok((identity, metadata.len(), digest))
+    Ok((identity, metadata.len(), file))
 }
 
+// A version-2 journal commits the hashes calculated while receiving each verified
+// range. Both post-scan publication and crash recovery re-read their contents.
+// Version-1 publications retain their original full-file hash.
+#[cfg(test)]
+fn journal_file_matches(
+    path: &Path,
+    journal: &PublicationJournal,
+    manifest_bytes: &[u8],
+    expected_sha256: Option<&str>,
+) -> EngineResult<bool> {
+    Ok(journal_verified_file(path, journal, manifest_bytes, expected_sha256, false)?.is_some())
+}
+fn journal_verified_file(
+    path: &Path,
+    journal: &PublicationJournal,
+    manifest_bytes: &[u8],
+    expected_sha256: Option<&str>,
+    publishing: bool,
+) -> EngineResult<Option<std::fs::File>> {
+    let (identity, length, file) = open_publication_file_with_access(
+        path,
+        if publishing {
+            PublicationAccess::Publish
+        } else {
+            PublicationAccess::Verify
+        },
+    )?;
+    if identity != journal.identity || length != journal.total {
+        return Ok(None);
+    }
+    let cancel = CancellationToken::new();
+    let valid = match journal.version {
+        1 if journal.range_sha256.is_empty() && journal.sha256.len() == 64 => {
+            let digest = crate::integrity::sha256_reader(file.try_clone()?, &cancel)?;
+            digest == journal.sha256 && expected_sha256.is_none_or(|expected| expected == digest)
+        }
+        2 if journal.sha256.is_empty() && expected_sha256.is_none() => committed_ranges_match(
+            file.try_clone()?,
+            path,
+            &identity,
+            journal.total,
+            manifest_bytes,
+            &journal.range_sha256,
+            &cancel,
+        )?,
+        _ => false,
+    };
+    Ok(valid.then_some(file))
+}
+
+fn range_hashes_match(
+    mut file: std::fs::File,
+    path: &Path,
+    identity: &FileIdentity,
+    ranges: &[ByteRange],
+    hashes: &[String],
+    cancel: &CancellationToken,
+    workers: usize,
+) -> EngineResult<bool> {
+    let total = ranges
+        .last()
+        .and_then(|range| range.end.checked_add(1))
+        .ok_or_else(|| EngineError::Message("Invalid committed range length.".into()))?;
+    let check = |worker_file: &mut std::fs::File, index: usize| -> EngineResult<bool> {
+        use std::io::{Seek, SeekFrom};
+        let range = &ranges[index];
+        worker_file.seek(SeekFrom::Start(range.start))?;
+        let mut bounded = (&mut *worker_file).take(range.len());
+        let actual = crate::integrity::sha256_reader(&mut bounded, cancel)?;
+        Ok(bounded.limit() == 0 && actual == hashes[index])
+    };
+    if workers <= 1 {
+        for index in 0..ranges.len() {
+            if !check(&mut file, index)? {
+                return Ok(false);
+            }
+        }
+        return Ok(true);
+    }
+    // Windows cloned handles share their seek cursor, including seek_read. Instead
+    // reopen one independent, identity-checked read handle per worker while the
+    // protected Publish handle remains open and denies writes and replacement.
+    // Bound CPU, disk pressure and the integrity reader's two 8 MiB buffers.
+    let _protected_file = file;
+    let next = AtomicUsize::new(0);
+    let rejected = AtomicBool::new(false);
+    let results = std::thread::scope(|scope| {
+        let threads: Vec<_> = (0..workers.min(ranges.len()))
+            .map(|_| {
+                scope.spawn(|| -> EngineResult<bool> {
+                    let (worker_identity, worker_length, mut worker_file) =
+                        open_publication_file_with_access(path, PublicationAccess::ConcurrentRead)
+                            .inspect_err(|_| rejected.store(true, Ordering::Release))?;
+                    if worker_identity != *identity || worker_length != total {
+                        rejected.store(true, Ordering::Release);
+                        return Ok(false);
+                    }
+                    while !rejected.load(Ordering::Acquire) {
+                        let index = next.fetch_add(1, Ordering::Relaxed);
+                        if index >= ranges.len() {
+                            return Ok(true);
+                        }
+                        let valid = check(&mut worker_file, index).inspect_err(|_| {
+                            rejected.store(true, Ordering::Release);
+                        })?;
+                        if !valid {
+                            rejected.store(true, Ordering::Release);
+                            return Ok(false);
+                        }
+                    }
+                    Ok(false)
+                })
+            })
+            .collect();
+        threads
+            .into_iter()
+            .map(|thread| thread.join())
+            .collect::<Vec<_>>()
+    });
+    let mut matches = true;
+    for result in results {
+        matches &= result.map_err(|_| {
+            EngineError::Message("Integrity verification worker panicked.".into())
+        })??;
+    }
+    Ok(matches)
+}
+
+fn postscan_verification_workers(total: u64, parallelism: usize) -> usize {
+    // Large publications justify more independent disk/CPU lanes. Keep the
+    // allocation bounded: each lane's SHA reader uses two 8 MiB buffers and
+    // a separate read thread. Small publications avoid thread overhead.
+    let cap = if total >= 1024 * 1024 * 1024 {
+        8
+    } else if total >= 128 * 1024 * 1024 {
+        4
+    } else {
+        1
+    };
+    parallelism.max(1).min(cap)
+}
+
+fn committed_ranges_match(
+    file: std::fs::File,
+    path: &Path,
+    identity: &FileIdentity,
+    total: u64,
+    manifest_bytes: &[u8],
+    hashes: &[String],
+    cancel: &CancellationToken,
+) -> EngineResult<bool> {
+    let manifest: PartManifest = serde_json::from_slice(manifest_bytes).map_err(|_| {
+        EngineError::Message("Saved transfer layout is damaged; staging was preserved.".into())
+    })?;
+    if !manifest.shared_staging
+        || !manifest.accepts_ranges
+        || manifest.validator.is_none()
+        || !valid_manifest_ranges(&manifest, total)
+        || manifest.final_url_sha256.is_none()
+        || manifest.total_bytes != Some(total)
+        || manifest.ranges.len() < 2
+        || hashes.len() != manifest.ranges.len()
+        || hashes
+            .iter()
+            .any(|hash| hash.len() != 64 || !hash.bytes().all(|byte| byte.is_ascii_hexdigit()))
+    {
+        return Ok(false);
+    }
+    // Tune bounded postscan parallelism with measured, optimized local hashing.
+    let workers = postscan_verification_workers(
+        total,
+        std::thread::available_parallelism()
+            .map(|cores| cores.get())
+            .unwrap_or(1),
+    );
+    range_hashes_match(
+        file,
+        path,
+        identity,
+        &manifest.ranges,
+        hashes,
+        cancel,
+        workers,
+    )
+}
+
+struct VerifiedPublication {
+    identity: FileIdentity,
+    file: std::fs::File,
+    sha256: String,
+    range_sha256: Vec<String>,
+}
+
+fn verify_scanned_publication(
+    path: &Path,
+    expected_identity: &FileIdentity,
+    total: u64,
+    manifest_bytes: &[u8],
+    complete_hashes: Option<Vec<String>>,
+    expected_sha256: Option<&str>,
+    cancel: &CancellationToken,
+) -> EngineResult<VerifiedPublication> {
+    let (identity, bytes, file) =
+        open_publication_file_with_access(path, PublicationAccess::Publish)?;
+    if identity != *expected_identity || bytes != total {
+        return Err(EngineError::Message(
+            "File changed during attachment processing; no file was published.".into(),
+        ));
+    }
+    let (sha256, range_sha256) = if let Some(hashes) = complete_hashes {
+        if !committed_ranges_match(
+            file.try_clone()?,
+            path,
+            &identity,
+            total,
+            manifest_bytes,
+            &hashes,
+            cancel,
+        )? {
+            return Err(EngineError::Message(
+                "SHA-256 checksum mismatch after attachment processing. File was not published."
+                    .into(),
+            ));
+        }
+        (String::new(), hashes)
+    } else {
+        (
+            crate::integrity::sha256_reader(file.try_clone()?, cancel)?,
+            Vec::new(),
+        )
+    };
+    if expected_sha256.is_some_and(|expected| expected != sha256) {
+        return Err(EngineError::Message(
+            "SHA-256 checksum mismatch after attachment processing. File was not published.".into(),
+        ));
+    }
+    Ok(VerifiedPublication {
+        identity,
+        file,
+        sha256,
+        range_sha256,
+    })
+}
+
+#[cfg(test)]
 async fn recover_publication(part_dir: &Path, record: &mut DownloadRecord) -> EngineResult<bool> {
+    Ok(recover_verified_publication(part_dir, record)
+        .await?
+        .is_some())
+}
+async fn recover_verified_publication(
+    part_dir: &Path,
+    record: &mut DownloadRecord,
+) -> EngineResult<Option<std::fs::File>> {
     let bytes = match fs::read(part_dir.join("publication.json")).await {
         Ok(bytes) => bytes,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e.into()),
     };
     let mut journal: PublicationJournal = serde_json::from_slice(&bytes).map_err(|_| {
         EngineError::Message("Publication journal is damaged; staging was preserved.".into())
     })?;
     let manifest = fs::read(part_dir.join("transfer.json")).await?;
-    if journal.version != 1
+    if !matches!(journal.version, 1 | 2)
         || journal.id != record.id
-        || journal.manifest_sha256 != format!("{:x}", Sha256::digest(manifest))
+        || journal.manifest_sha256 != format!("{:x}", Sha256::digest(&manifest))
         || !journal.destination.is_absolute()
         || journal.destination.parent() != Path::new(&record.destination).parent()
     {
@@ -433,6 +744,7 @@ async fn recover_publication(part_dir: &Path, record: &mut DownloadRecord) -> En
             "Publication journal does not match this download; files were preserved.".into(),
         ));
     }
+    let mut verified_file = None;
     if !fs::try_exists(&journal.destination).await? {
         if journal.published {
             return Err(EngineError::Message(
@@ -454,6 +766,10 @@ async fn recover_publication(part_dir: &Path, record: &mut DownloadRecord) -> En
             || checkpoint.total != journal.total
             || checkpoint.fingerprint != journal.manifest_sha256
             || checkpoint.expected_sha256 != record.expected_sha256
+            || checkpoint
+                .identity
+                .as_ref()
+                .is_some_and(|identity| *identity != journal.identity)
         {
             return Err(EngineError::Message(
                 "Unpublished assembly does not match its journal; files were preserved.".into(),
@@ -465,45 +781,61 @@ async fn recover_publication(part_dir: &Path, record: &mut DownloadRecord) -> En
             .unwrap()
             .join(checkpoint.file_name);
         let path = temporary.clone();
-        let (identity, total, digest) =
-            tokio::task::spawn_blocking(move || file_fingerprint(&path, &CancellationToken::new()))
-                .await
-                .map_err(|e| EngineError::Message(e.to_string()))??;
-        if identity != journal.identity
-            || total != journal.total
-            || digest != journal.sha256
-            || record
-                .expected_sha256
-                .as_ref()
-                .is_some_and(|expected| *expected != digest)
-        {
-            return Err(EngineError::Message(
-                "Unpublished assembly changed; no file was published.".into(),
-            ));
-        }
-        let destination = journal.destination.clone();
-        tokio::task::spawn_blocking(move || {
-            crate::platform::publish_noreplace(&temporary, &destination)
+        let saved_journal = journal.clone();
+        let saved_manifest = manifest.clone();
+        let expected_sha256 = record.expected_sha256.clone();
+        let valid = tokio::task::spawn_blocking(move || {
+            journal_verified_file(
+                &path,
+                &saved_journal,
+                &saved_manifest,
+                expected_sha256.as_deref(),
+                true,
+            )
         })
         .await
         .map_err(|e| EngineError::Message(e.to_string()))??;
+        let Some(file) = valid else {
+            return Err(EngineError::Message(
+                "Unpublished assembly changed; no file was published.".into(),
+            ));
+        };
+        let destination = journal.destination.clone();
+        verified_file = Some(
+            tokio::task::spawn_blocking(move || {
+                crate::platform::publish_verified_noreplace(
+                    &file,
+                    &temporary,
+                    &destination,
+                    #[cfg(feature = "test-tools")]
+                    None,
+                )?;
+                Ok::<_, std::io::Error>(file)
+            })
+            .await
+            .map_err(|e| EngineError::Message(e.to_string()))??,
+        );
         journal.published = true;
         write_json_atomic(&part_dir.join("publication.json"), &journal).await?;
         // Recover the already-verified assembly without contacting an expired source URL.
     }
-    let path = journal.destination.clone();
-    let (identity, total, digest) =
-        tokio::task::spawn_blocking(move || file_fingerprint(&path, &CancellationToken::new()))
-            .await
-            .map_err(|e| EngineError::Message(e.to_string()))??;
-    if identity != journal.identity
-        || total != journal.total
-        || digest != journal.sha256
-        || record
-            .expected_sha256
-            .as_ref()
-            .is_some_and(|expected| *expected != digest)
-    {
+    if verified_file.is_none() {
+        let path = journal.destination.clone();
+        let saved_journal = journal.clone();
+        let expected_sha256 = record.expected_sha256.clone();
+        verified_file = tokio::task::spawn_blocking(move || {
+            journal_verified_file(
+                &path,
+                &saved_journal,
+                &manifest,
+                expected_sha256.as_deref(),
+                false,
+            )
+        })
+        .await
+        .map_err(|e| EngineError::Message(e.to_string()))??;
+    }
+    if verified_file.is_none() {
         return Err(EngineError::Message("Published file changed or belongs to another owner; no file was replaced. Inspect the preserved staging before retrying.".into()));
     }
     record.destination = journal.destination.to_string_lossy().into_owned();
@@ -513,16 +845,16 @@ async fn recover_publication(part_dir: &Path, record: &mut DownloadRecord) -> En
         .unwrap_or_default()
         .to_string_lossy()
         .into_owned();
-    record.total_bytes = Some(total);
-    record.downloaded_bytes = total;
-    record.merged_bytes = total;
+    record.total_bytes = Some(journal.total);
+    record.downloaded_bytes = journal.total;
+    record.merged_bytes = journal.total;
     record.status = DownloadStatus::Completed;
     record.finished_at = Some(Utc::now());
     record.error = None;
     record.speed_bps = 0;
     record.eta_seconds = Some(0);
     record.segments.clear();
-    Ok(true)
+    Ok(verified_file)
 }
 
 impl ByteRange {
@@ -537,6 +869,8 @@ struct SegmentCounter {
     downloaded: AtomicU64,
     active: AtomicBool,
     waiting: AtomicBool,
+    #[cfg(feature = "test-tools")]
+    durable: AtomicU64,
 }
 
 type Segments = Arc<Vec<SegmentCounter>>;
@@ -561,6 +895,8 @@ fn segment_progress(segments: &[SegmentCounter], speeds: &[f64]) -> Vec<SegmentP
 }
 
 struct DownloadTask {
+    #[cfg(feature = "test-tools")]
+    trace: Option<Arc<trace::Trace>>,
     analytics_sample: Mutex<Option<crate::analytics::Sample>>,
     record: RwLock<DownloadRecord>,
     paused: AtomicBool,
@@ -570,6 +906,7 @@ struct DownloadTask {
     request_context: Option<BrowserRequestContext>,
     limiter: RateLimiter,
     performance: Mutex<Option<Arc<crate::performance::LivePolicy>>>,
+    received_sha256: Mutex<Option<String>>,
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -590,9 +927,12 @@ impl DownloadTask {
         analytics_sample: Option<crate::analytics::Sample>,
     ) -> Self {
         Self {
+            #[cfg(feature = "test-tools")]
+            trace: trace::Trace::enabled(),
             analytics_sample: Mutex::new(analytics_sample),
             limiter: RateLimiter::new(record.speed_limit_bps),
             performance: Mutex::new(None),
+            received_sha256: Mutex::new(None),
             request_context,
             paused: AtomicBool::new(record.status == DownloadStatus::Paused),
             record: RwLock::new(record),
@@ -908,11 +1248,14 @@ impl DownloadManager {
                     record.merged_bytes = 0;
                 }
                 if record.torrent.is_none() {
-                    match recover_publication(&parts_dir.join(record.id.to_string()), &mut record)
-                        .await
+                    match recover_verified_publication(
+                        &parts_dir.join(record.id.to_string()),
+                        &mut record,
+                    )
+                    .await
                     {
-                        Ok(true) => recovered_publications.push(record.id),
-                        Ok(false) => (),
+                        Ok(Some(file)) => recovered_publications.push((record.id, file)),
+                        Ok(None) => (),
                         Err(error) => {
                             record.status = DownloadStatus::Failed;
                             record.error = Some(error.to_string());
@@ -974,7 +1317,8 @@ impl DownloadManager {
                 .acknowledge_catalog()
                 .await
                 .map_err(|e| e.to_string())?;
-            for id in recovered_publications {
+            for (id, file) in recovered_publications {
+                drop(file);
                 let _ = fs::remove_dir_all(manager.part_dir(id)).await;
             }
         }
@@ -1298,6 +1642,8 @@ impl DownloadManager {
                     &self.client,
                     self.client.get(source),
                     &CancellationToken::new(),
+                    #[cfg(feature = "test-tools")]
+                    None,
                 )
                 .await
                 .map_err(|e| e.to_string())?;
@@ -3012,7 +3358,12 @@ impl DownloadManager {
 
     pub async fn get_download(&self, id: Uuid) -> Result<DownloadRecord, String> {
         let task = self.task(id).await?;
-        let record = task.record.read().await.clone();
+        #[allow(unused_mut)]
+        let mut record = task.record.read().await.clone();
+        #[cfg(feature = "test-tools")]
+        if let Some(trace) = &task.trace {
+            record.extra.insert("testTrace".into(), trace.snapshot());
+        }
         Ok(record)
     }
 
@@ -3120,10 +3471,29 @@ impl DownloadManager {
             let result = manager.run(task.clone(), cancel).await;
             if let Err(error) = result {
                 manager.handle_run_error(&task, error).await;
+                #[cfg(feature = "test-tools")]
+                manager.save_test_trace(&task).await;
             }
             task.running.store(false, Ordering::Release);
             let _ = manager.persist_records().await;
         });
+    }
+
+    #[cfg(feature = "test-tools")]
+    async fn save_test_trace(&self, task: &Arc<DownloadTask>) {
+        if let Some(trace) = &task.trace {
+            let trace = trace.clone();
+            let root = self.data_dir.clone();
+            let record = task.record.read().await;
+            let (id, status) = (record.id, record.status.clone());
+            drop(record);
+            if !matches!(
+                tokio::task::spawn_blocking(move || trace.save(&root, id, status)).await,
+                Ok(Ok(()))
+            ) {
+                eprintln!("Isolated developer trace could not be saved");
+            }
+        }
     }
 
     fn start_scheduler(self: &Arc<Self>) {
@@ -3411,11 +3781,14 @@ impl DownloadManager {
         {
             let mut record = task.record.read().await.clone();
             let part_dir = self.part_dir(record.id);
-            if recover_publication(&part_dir, &mut record).await? {
+            if let Some(verified_file) =
+                recover_verified_publication(&part_dir, &mut record).await?
+            {
                 let completed = record.clone();
                 *task.record.write().await = record;
                 self.persist_records().await?;
                 self.acknowledge_catalog().await?;
+                drop(verified_file);
                 let _ = fs::remove_dir_all(&part_dir).await;
                 self.emit_record(&completed);
                 return Ok(());
@@ -3428,10 +3801,18 @@ impl DownloadManager {
             let record = task.record.read().await;
             Url::parse(&record.url)?
         };
-        let probe = tokio::select! {
-            result = self.probe(&url, task.request_context.as_ref()) => result?,
-            _ = cancel.cancelled() => return Err(EngineError::Cancelled),
-        };
+        #[cfg(feature = "test-tools")]
+        if let Some(trace) = &task.trace {
+            trace.phase(trace::Phase::Probe);
+        }
+        let probe = transfer_span!(
+            task.trace.as_deref(),
+            Probe,
+            tokio::select! {
+                result = self.probe(&url, task.request_context.as_ref()) => result?,
+                _ = cancel.cancelled() => return Err(EngineError::Cancelled),
+            }
+        );
 
         let settings = self.settings.read().await.clone();
         let snapshot = task.record.read().await.clone();
@@ -3508,7 +3889,28 @@ impl DownloadManager {
         let total = probe.total_bytes;
         self.emit_record(&*task.record.read().await);
         let part_dir = self.part_dir(task.record.read().await.id);
-
+        #[cfg(feature = "test-tools")]
+        let connection_count = if crate::platform::test_root()
+            .map_err(EngineError::Message)?
+            .is_some()
+            && probe.accepts_ranges
+            && probe.validator.is_some()
+        {
+            match std::env::var("FETCHRAIL_TEST_RANGE_PLAN").as_deref() {
+                Ok("double") => suggested_connection_count(
+                    total.unwrap_or(0),
+                    (connection_count * 2).min(32),
+                    settings.min_segment_size_mb * 1024 * 1024,
+                ),
+                Ok("64m") => (total.unwrap_or(0).div_ceil(64 * 1024 * 1024).min(512) as usize)
+                    .max(connection_count),
+                Ok("128m") => (total.unwrap_or(0).div_ceil(128 * 1024 * 1024).min(512) as usize)
+                    .max(connection_count),
+                _ => connection_count,
+            }
+        } else {
+            connection_count
+        };
         let mut ranges = match total {
             Some(total) => split_ranges(total, connection_count),
             None => vec![ByteRange {
@@ -3518,16 +3920,14 @@ impl DownloadManager {
         };
 
         // A tuning change must never repartition or erase an existing resumable transfer.
-        if settings.performance_auto && snapshot.downloaded_bytes > 0 && probe.validator.is_some() {
+        if probe.total_bytes.is_some() && probe.validator.is_some() {
             if let Ok(bytes) = fs::read(part_dir.join("transfer.json")).await {
                 if let Ok(saved) = serde_json::from_slice::<PartManifest>(&bytes) {
                     if saved.total_bytes == probe.total_bytes
                         && saved.validator == probe.validator
                         && saved.accepts_ranges == probe.accepts_ranges
                         && !saved.ranges.is_empty()
-                        && saved.ranges.len() <= 32
-                        && saved.ranges
-                            == split_ranges(probe.total_bytes.unwrap_or(0), saved.ranges.len())
+                        && valid_manifest_ranges(&saved, probe.total_bytes.unwrap_or(0))
                     {
                         ranges = saved.ranges;
                     }
@@ -3660,6 +4060,16 @@ impl DownloadManager {
         let _ = progress_handle.await;
         // The reporter's last tick can trail the final bytes; settle the record before leaving.
         let settled = segment_progress(&current_segments(&segments), &[]);
+        #[cfg(feature = "test-tools")]
+        if let Some(trace) = &task.trace {
+            trace.durable_bytes.store(
+                current_segments(&segments)
+                    .iter()
+                    .map(|s| s.durable.load(Ordering::Relaxed))
+                    .sum(),
+                Ordering::Relaxed,
+            );
+        }
         let transferred = settled
             .iter()
             .map(|part| part.downloaded_bytes)
@@ -3670,7 +4080,8 @@ impl DownloadManager {
 
         self.set_status(&task, &cancel, DownloadStatus::Merging, None)
             .await?;
-        let destination = self.merge_parts(&task, &cancel, &part_dir, &ranges).await?;
+        let (destination, verified_file) =
+            self.merge_parts(&task, &cancel, &part_dir, &ranges).await?;
         let final_bytes = total.unwrap_or(transferred);
         let snapshot = {
             let mut record = task.record.write().await;
@@ -3692,8 +4103,24 @@ impl DownloadManager {
             record.finished_at = Some(Utc::now());
             record.clone()
         };
-        self.persist_records().await?;
-        self.acknowledge_catalog().await?;
+        #[cfg(feature = "test-tools")]
+        if let Some(trace) = &task.trace {
+            trace.phase(trace::Phase::Catalog);
+        }
+        transfer_span!(
+            task.trace.as_deref(),
+            Catalog,
+            async {
+                self.persist_records().await?;
+                self.acknowledge_catalog().await
+            }
+            .await
+        )?;
+        #[cfg(feature = "test-tools")]
+        if let Some(trace) = &task.trace {
+            trace.catalog_acknowledged.store(true, Ordering::Release);
+        }
+        drop(verified_file);
         if initial_downloaded == 0 {
             if let (Some(policy), Some(hardware)) = (policy, hardware) {
                 let (connections, bps) = policy.best();
@@ -3713,6 +4140,8 @@ impl DownloadManager {
             }
         }
         let _ = fs::remove_dir_all(&part_dir).await;
+        #[cfg(feature = "test-tools")]
+        self.save_test_trace(&task).await;
         self.emit_record(&snapshot);
         crate::download_window::on_completion(&self.app, &snapshot).await;
         Ok(())
@@ -3731,96 +4160,160 @@ impl DownloadManager {
     ) -> EngineResult<()> {
         task.check_stopped(cancel)?;
         let batch_cancel = cancel.child_token();
+        *task.received_sha256.lock().expect("received hash poisoned") = None;
         let peer_rate = AtomicU64::new(0);
         let live_peer_rate = AtomicU64::new(0);
         let shared = shared_staging(part_dir).await?;
-        let futures = segments.iter().enumerate().map(|(index, segment)| {
+        #[cfg(feature = "test-tools")]
+        if let Some(trace) = &task.trace {
+            trace.phase(trace::Phase::Body);
+        }
+        let next_range = AtomicUsize::new(0);
+        let record = task.record.read().await;
+        let workers = record
+            .requested_connections
+            .unwrap_or(record.connections)
+            .clamp(1, 32)
+            .min(segments.len());
+        drop(record);
+        let futures = (0..workers).map(|_| {
             let batch_cancel = &batch_cancel;
             let peer_rate = &peer_rate;
             let live_peer_rate = &live_peer_rate;
+            let next_range = &next_range;
             async move {
                 let mut client = client.clone();
-                // Retry only this range so healthy connections keep their throughput.
-                let result = async {
-                    for attempt in 0..3 {
-                        task.check_stopped(batch_cancel)?;
-                        let result = Self::download_segment(
-                            &client,
-                            limiter,
-                            task,
-                            batch_cancel,
-                            url,
-                            part_dir,
-                            index,
-                            segment,
-                            probe,
-                            peer_rate,
-                            segments.len(),
-                            shared,
-                            live_peer_rate,
-                            attempt == 0 && probe.accepts_ranges && probe.validator.is_some(),
-                        )
-                        .await;
-                        let Err(error) = result else {
-                            return Ok(());
-                        };
-                        #[cfg(test)]
-                        eprintln!("Range {index}, attempt {attempt}: {error:?}");
-                        let transient = match &error {
-                            EngineError::Slow | EngineError::Incomplete => true,
-                            EngineError::Request(error) => {
-                                error.is_timeout()
-                                    || error.is_connect()
-                                    || error.is_request()
-                                    || error.is_body()
-                                    || error.is_decode()
+                let policy = task
+                    .performance
+                    .lock()
+                    .expect("task performance poisoned")
+                    .clone();
+                let mut range_permit = None;
+                loop {
+                    task.check_stopped(batch_cancel)?;
+                    let index = next_range.fetch_add(1, Ordering::Relaxed);
+                    let Some(segment) = segments.get(index) else {
+                        return Ok(());
+                    };
+                    // Retry only this range so healthy connections keep their throughput.
+                    let result = async {
+                        #[cfg(feature = "test-tools")]
+                        let mut previous_retry_cause = None;
+                        for attempt in 0..3 {
+                            #[cfg(feature = "test-tools")]
+                            if attempt > 0 {
+                                if let Some(trace) = &task.trace {
+                                    let remaining = (segment.range.end != u64::MAX).then(|| {
+                                        segment.range.len().saturating_sub(
+                                            segment.downloaded.load(Ordering::Relaxed),
+                                        )
+                                    });
+                                    trace.retry(
+                                        index,
+                                        attempt,
+                                        previous_retry_cause.unwrap_or(trace::RetryCause::Other),
+                                        remaining,
+                                    );
+                                }
                             }
-                            EngineError::Http(status) => {
-                                status.is_server_error()
-                                    || *status == StatusCode::TOO_MANY_REQUESTS
-                                    || *status == StatusCode::REQUEST_TIMEOUT
+                            task.check_stopped(batch_cancel)?;
+                            if let Some(policy) = &policy {
+                                if range_permit.is_none() || policy.should_drain() {
+                                    drop(range_permit.take());
+                                    segment.waiting.store(true, Ordering::Relaxed);
+                                    range_permit = Some(
+                                        policy
+                                            .acquire(batch_cancel)
+                                            .await
+                                            .ok_or(EngineError::Cancelled)?,
+                                    );
+                                    segment.waiting.store(false, Ordering::Relaxed);
+                                }
                             }
-                            EngineError::RetryAfter { delay, .. } => {
-                                *delay <= Duration::from_secs(3600)
+                            let result = Self::download_segment(
+                                &client,
+                                limiter,
+                                task,
+                                batch_cancel,
+                                url,
+                                part_dir,
+                                index,
+                                segment,
+                                probe,
+                                peer_rate,
+                                segments,
+                                workers,
+                                shared,
+                                live_peer_rate,
+                                attempt == 0 && probe.accepts_ranges && probe.validator.is_some(),
+                            )
+                            .await;
+                            let Err(error) = result else {
+                                return Ok(());
+                            };
+                            #[cfg(test)]
+                            eprintln!("Range {index}, attempt {attempt}: {error:?}");
+                            let transient = match &error {
+                                EngineError::Slow | EngineError::Incomplete => true,
+                                EngineError::Request(error) => {
+                                    error.is_timeout()
+                                        || error.is_connect()
+                                        || error.is_request()
+                                        || error.is_body()
+                                        || error.is_decode()
+                                }
+                                EngineError::Http(status) => {
+                                    status.is_server_error()
+                                        || *status == StatusCode::TOO_MANY_REQUESTS
+                                        || *status == StatusCode::REQUEST_TIMEOUT
+                                }
+                                EngineError::RetryAfter { delay, .. } => {
+                                    *delay <= Duration::from_secs(3600)
+                                }
+                                _ => false,
+                            };
+                            if !transient || attempt == 2 {
+                                return Err(error);
                             }
-                            _ => false,
-                        };
-                        if !transient || attempt == 2 {
-                            return Err(error);
-                        }
-                        if matches!(error, EngineError::Slow) {
-                            client = download_client_builder().build()?;
-                            // Re-establish available throughput on the new transport. A link
-                            // capacity change must not repeatedly reject a steady slower source.
-                            peer_rate.store(0, Ordering::Relaxed);
-                        }
-                        let delay = match &error {
-                            EngineError::RetryAfter { delay, .. } => *delay,
-                            _ => Duration::from_millis(
-                                (500u64 << attempt) + u64::from(Uuid::new_v4().as_bytes()[0]),
-                            ),
-                        };
-                        tokio::select! {
-                            _ = tokio::time::sleep(delay) => {},
-                            _ = batch_cancel.cancelled() => return Err(EngineError::Cancelled),
-                        }
-                        // Appending requires both range support and an unchanged representation.
-                        if !probe.accepts_ranges || probe.validator.is_none() {
-                            match fs::remove_file(part_dir.join(format!("{index}.part"))).await {
-                                Ok(()) => {}
-                                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                                Err(error) => return Err(error.into()),
+                            #[cfg(feature = "test-tools")]
+                            {
+                                previous_retry_cause = Some(trace::RetryCause::from_error(&error));
                             }
-                            segment.downloaded.store(0, Ordering::Relaxed);
+                            if matches!(error, EngineError::Slow) {
+                                client = download_client_builder().build()?;
+                                // Re-establish available throughput on the new transport. A link
+                                // capacity change must not repeatedly reject a steady slower source.
+                                peer_rate.store(0, Ordering::Relaxed);
+                            }
+                            let delay = match &error {
+                                EngineError::RetryAfter { delay, .. } => *delay,
+                                _ => Duration::from_millis(
+                                    (500u64 << attempt) + u64::from(Uuid::new_v4().as_bytes()[0]),
+                                ),
+                            };
+                            transfer_span!(task.trace.as_deref(),Retry,tokio::select! {
+                                _ = tokio::time::sleep(delay) => {},
+                                _ = batch_cancel.cancelled() => return Err(EngineError::Cancelled),
+                            });
+                            // Appending requires both range support and an unchanged representation.
+                            if !probe.accepts_ranges || probe.validator.is_none() {
+                                match fs::remove_file(part_dir.join(format!("{index}.part"))).await
+                                {
+                                    Ok(()) => {}
+                                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                                    Err(error) => return Err(error.into()),
+                                }
+                                segment.downloaded.store(0, Ordering::Relaxed);
+                            }
                         }
+                        unreachable!()
                     }
-                    unreachable!()
+                    .await;
+                    if result.is_err() {
+                        batch_cancel.cancel();
+                        return result;
+                    }
                 }
-                .await;
-                if result.is_err() {
-                    batch_cancel.cancel();
-                }
-                result
             }
         });
         let receiving_rates = async {
@@ -3830,15 +4323,22 @@ impl DownloadManager {
                 .collect::<Vec<_>>();
             let mut previous_rate = 0;
             let mut sampled_at = Instant::now();
+            let mut generation = task
+                .performance
+                .lock()
+                .expect("task performance poisoned")
+                .as_ref()
+                .map(|p| p.generation.load(Ordering::Acquire));
             loop {
                 tokio::time::sleep(Duration::from_secs(4)).await;
                 let elapsed = sampled_at.elapsed().as_secs_f64();
-                let (mut bytes, mut receiving) = (0u64, 0usize);
+                let (mut bytes, mut peer_bytes, mut receiving) = (0u64, 0u64, 0usize);
                 for (segment, prior) in segments.iter().zip(&mut previous) {
                     let current = segment.downloaded.load(Ordering::Relaxed);
                     let delta = current.saturating_sub(*prior);
+                    bytes += delta;
                     if segment.active.load(Ordering::Relaxed) && delta > 0 {
-                        bytes += delta;
+                        peer_bytes += delta;
                         receiving += 1;
                     }
                     *prior = current;
@@ -3847,7 +4347,7 @@ impl DownloadManager {
                     && limiter.quantum() == usize::MAX
                     && task.limiter.quantum() == usize::MAX
                 {
-                    (bytes as f64 / elapsed / receiving as f64) as u64
+                    (peer_bytes as f64 / elapsed / receiving as f64) as u64
                 } else {
                     0
                 };
@@ -3863,7 +4363,9 @@ impl DownloadManager {
                         Duration::from_secs_f64(elapsed),
                         receiving,
                         limiter.quantum() == usize::MAX && task.limiter.quantum() == usize::MAX,
+                        generation.unwrap_or(u64::MAX),
                     );
+                    generation = Some(policy.generation.load(Ordering::Acquire));
                 }
                 previous_rate = rate;
                 sampled_at = Instant::now();
@@ -3896,7 +4398,8 @@ impl DownloadManager {
         segment: &SegmentCounter,
         probe: &ProbeResult,
         peer_rate: &AtomicU64,
-        peer_count: usize,
+        peers: &[SegmentCounter],
+        worker_count: usize,
         shared: bool,
         live_peer_rate: &AtomicU64,
         recover_peer: bool,
@@ -3908,8 +4411,8 @@ impl DownloadManager {
         } else {
             Some(range.len())
         };
-        let saved = if shared {
-            part_checkpoint(part_dir, index, range.len()).await?
+        let saved = if shared || peers.len() == 1 {
+            part_checkpoint(part_dir, index, expected_len.unwrap_or(u64::MAX)).await?
         } else {
             None
         };
@@ -3952,11 +4455,35 @@ impl DownloadManager {
             } else {
                 Some(hash)
             }
+        } else if peers.len() == 1 {
+            existing = saved
+                .as_ref()
+                .map_or(existing, |saved| saved.bytes.min(existing));
+            let hash = if existing == 0 {
+                Sha256::new()
+            } else {
+                crate::staging::prefix_hasher(&part_path, 0, existing, cancel).await?
+            };
+            Some(
+                if saved
+                    .as_ref()
+                    .is_some_and(|saved| format!("{:x}", hash.clone().finalize()) != saved.sha256)
+                {
+                    existing = 0;
+                    Sha256::new()
+                } else {
+                    hash
+                },
+            )
         } else {
             None
         };
         segment.downloaded.store(existing, Ordering::Relaxed);
         if expected_len == Some(existing) {
+            if !shared {
+                *task.received_sha256.lock().expect("received hash poisoned") =
+                    part_hash.map(|hash| format!("{:x}", hash.finalize()));
+            }
             return Ok(());
         }
 
@@ -3966,12 +4493,6 @@ impl DownloadManager {
             .lock()
             .expect("task performance poisoned")
             .clone();
-        segment.waiting.store(policy.is_some(), Ordering::Relaxed);
-        let _range_permit = if let Some(policy) = &policy {
-            Some(policy.acquire(cancel).await.ok_or(EngineError::Cancelled)?)
-        } else {
-            None
-        };
         segment.waiting.store(false, Ordering::Relaxed);
         let absolute_start = range.start.saturating_add(existing);
         let requested_range = probe.accepts_ranges && (range.end != u64::MAX || existing > 0);
@@ -3990,8 +4511,30 @@ impl DownloadManager {
             }
         }
 
-        let (response, _origin_permit, _global_permit) =
-            send_admitted(client, request, cancel).await?;
+        #[cfg(feature = "test-tools")]
+        if let Some(trace) = &task.trace {
+            trace.requests.fetch_add(1, Ordering::Relaxed);
+        }
+        let response = send_admitted(
+            client,
+            request,
+            cancel,
+            #[cfg(feature = "test-tools")]
+            task.trace.as_deref(),
+        )
+        .await;
+        segment.waiting.store(true, Ordering::Relaxed);
+        let (response, _origin_permit, _global_permit) = response?;
+        #[cfg(feature = "test-tools")]
+        if let Some(trace) = &task.trace {
+            trace.protocol(response.version());
+            if matches!(
+                response.status(),
+                StatusCode::TOO_MANY_REQUESTS | StatusCode::SERVICE_UNAVAILABLE
+            ) {
+                trace.refusals.fetch_add(1, Ordering::Relaxed);
+            }
+        }
         let origin = origin_budget(response.url());
 
         if !response.status().is_success() || response.status() == StatusCode::NO_CONTENT {
@@ -4058,7 +4601,6 @@ impl DownloadManager {
 
         let mut output = fs::OpenOptions::new()
             .create(!shared)
-            .append(!shared && existing > 0)
             .write(true)
             .truncate(!shared && existing == 0)
             .open(&part_path)
@@ -4067,6 +4609,9 @@ impl DownloadManager {
             output
                 .seek(std::io::SeekFrom::Start(range.start + existing))
                 .await?;
+        } else if existing > 0 {
+            output.set_len(existing).await?;
+            output.seek(std::io::SeekFrom::Start(existing)).await?;
         }
         // Batch small network chunks into disk writes; flush even on cancellation or failure.
         let mut output = BufWriter::with_capacity(
@@ -4090,11 +4635,11 @@ impl DownloadManager {
             loop {
                 task.check_stopped(cancel)?;
                 let waiting_at = Instant::now();
-                let item = tokio::select! {
+                let item = transfer_span!(task.trace.as_deref(),Body,tokio::select! {
                     item = stream.next() => Some(item),
                     _ = cancel.cancelled() => return Err(EngineError::Cancelled),
                     _ = tokio::time::sleep(Duration::from_secs(5).saturating_sub(response_wait)), if recover_peer => None,
-                };
+                });
                 response_wait += waiting_at.elapsed();
                 if recover_peer && response_wait >= Duration::from_secs(5) {
                     let peer = if limiter.quantum() == usize::MAX && task.limiter.quantum() == usize::MAX { live_peer_rate.load(Ordering::Relaxed) } else { 0 };
@@ -4105,6 +4650,8 @@ impl DownloadManager {
                 let Some(item) = item else { continue; };
                 let Some(chunk) = item else { break; };
                 let chunk = chunk?;
+                #[cfg(feature = "test-tools")]
+                if let Some(trace) = &task.trace {trace.network_bytes.fetch_add(chunk.len() as u64,Ordering::Relaxed);}
                 written = written.saturating_add(chunk.len() as u64);
                 if expected_len.is_some_and(|expected| written > expected) {
                     return Err(EngineError::Message(
@@ -4117,17 +4664,17 @@ impl DownloadManager {
                         .quantum()
                         .min(task.limiter.quantum())
                         .min(chunk.len() - offset);
-                    limiter
+                    transfer_span!(task.trace.as_deref(),Limiter,limiter
                         .acquire(size, cancel)
-                        .await
+                        .await)
                         .map_err(|_| EngineError::Cancelled)?;
-                    task.limiter
+                    transfer_span!(task.trace.as_deref(),Limiter,task.limiter
                         .acquire(size, cancel)
-                        .await
+                        .await)
                         .map_err(|_| EngineError::Cancelled)?;
                     task.check_stopped(cancel)?;
                     let writing_at=policy.as_ref().map(|_|Instant::now());
-                    output.write_all(&chunk[offset..offset + size]).await?;
+                    transfer_span!(task.trace.as_deref(),Write,output.write_all(&chunk[offset..offset + size]).await)?;
                     if let (Some(policy),Some(writing_at))=(&policy,writing_at) {policy.write_wait_ns.fetch_add(writing_at.elapsed().as_nanos().min(u64::MAX as u128) as u64,Ordering::Relaxed);}
                     if let Some(hash) = &mut part_hash {
                         hash.update(&chunk[offset..offset + size]);
@@ -4135,17 +4682,23 @@ impl DownloadManager {
                     segment.downloaded.fetch_add(size as u64, Ordering::Relaxed);
                     offset += size;
                 }
-                if shared && checkpoint_at.elapsed() >= Duration::from_secs(5) {
-                    output.flush().await?;
-                    output.get_ref().sync_data().await?;
-                    write_json_atomic(
+                if let Some(hash) = part_hash.as_ref().filter(|_| checkpoint_at.elapsed() >= Duration::from_secs(5)) {
+                    let durable_at = Instant::now();
+                    transfer_span!(task.trace.as_deref(),Flush,output.flush().await)?;
+                    transfer_span!(task.trace.as_deref(),Sync,output.get_ref().sync_data().await)?;
+                    transfer_span!(task.trace.as_deref(),Checkpoint,write_json_atomic(
                         &part_dir.join(format!("{index}.progress.json")),
                         &PartCheckpoint {
                             bytes: segment.downloaded.load(Ordering::Relaxed),
-                            sha256: format!("{:x}", part_hash.as_ref().unwrap().clone().finalize()),
+                            sha256: format!("{:x}", hash.clone().finalize()),
                         },
                     )
-                    .await?;
+                    .await)?;
+                    #[cfg(feature = "test-tools")]
+                    segment.durable.store(segment.downloaded.load(Ordering::Relaxed),Ordering::Relaxed);
+                    if let Some(policy) = &policy {
+                        policy.write_wait_ns.fetch_add(durable_at.elapsed().as_nanos().min(u64::MAX as u128) as u64, Ordering::Relaxed);
+                    }
                     checkpoint_at = Instant::now();
                 }
                 if progress_at.elapsed() >= Duration::from_secs(10) {
@@ -4159,9 +4712,14 @@ impl DownloadManager {
                             progress_at.elapsed(),
                             &mut best_rate,
                             &mut previous_rate,
-                            // One completed transport's capacity is shared by the parallel ranges.
+                            // A completed range cannot inflate the target as active peers drain.
                             if recover_peer {
-                                peer_rate.load(Ordering::Relaxed) / peer_count.max(1) as u64
+                                let share = peer_rate.load(Ordering::Relaxed) / worker_count.max(1) as u64;
+                                if peers.iter().filter(|p| p.active.load(Ordering::Relaxed)).count() >= 2 {
+                                    share.min(live_peer_rate.load(Ordering::Relaxed))
+                                } else {
+                                    share
+                                }
                             } else {
                                 0
                             },
@@ -4185,19 +4743,41 @@ impl DownloadManager {
         }
         .await;
         segment.active.store(false, Ordering::Relaxed);
-        output.flush().await?;
-        if transfer.is_err() || shared {
-            output.get_ref().sync_data().await?;
+        segment.waiting.store(true, Ordering::Relaxed);
+        let durable_at = Instant::now();
+        transfer_span!(task.trace.as_deref(), Flush, output.flush().await)?;
+        if transfer.is_err() || part_hash.is_some() {
+            transfer_span!(
+                task.trace.as_deref(),
+                Sync,
+                output.get_ref().sync_data().await
+            )?;
         }
-        if let Some(hash) = part_hash {
-            write_json_atomic(
-                &part_dir.join(format!("{index}.progress.json")),
-                &PartCheckpoint {
-                    bytes: segment.downloaded.load(Ordering::Relaxed),
-                    sha256: format!("{:x}", hash.finalize()),
-                },
-            )
-            .await?;
+        let received_digest = part_hash.map(|hash| format!("{:x}", hash.finalize()));
+        if let Some(hash) = received_digest.as_ref() {
+            transfer_span!(
+                task.trace.as_deref(),
+                Checkpoint,
+                write_json_atomic(
+                    &part_dir.join(format!("{index}.progress.json")),
+                    &PartCheckpoint {
+                        bytes: segment.downloaded.load(Ordering::Relaxed),
+                        sha256: hash.clone(),
+                    },
+                )
+                .await
+            )?;
+            #[cfg(feature = "test-tools")]
+            segment.durable.store(
+                segment.downloaded.load(Ordering::Relaxed),
+                Ordering::Relaxed,
+            );
+        }
+        if let Some(policy) = &policy {
+            policy.write_wait_ns.fetch_add(
+                durable_at.elapsed().as_nanos().min(u64::MAX as u128) as u64,
+                Ordering::Relaxed,
+            );
         }
         transfer?;
 
@@ -4229,6 +4809,9 @@ impl DownloadManager {
                 return Err(EngineError::Incomplete);
             }
         }
+        if !shared && peers.len() == 1 {
+            *task.received_sha256.lock().expect("received hash poisoned") = received_digest;
+        }
         Ok(())
     }
 
@@ -4250,6 +4833,8 @@ impl DownloadManager {
                     _ = stop.cancelled() => break,
                     _ = ticker.tick() => {
                         let current = current_segments(&segments);
+                        #[cfg(feature = "test-tools")]
+                        if let Some(trace) = &task.trace {trace.durable_bytes.store(current.iter().map(|s|s.durable.load(Ordering::Relaxed)).sum(),Ordering::Relaxed);}
                         let now = Instant::now();
                         let elapsed = now.duration_since(last_instant).as_secs_f64().max(0.001);
                         // A range fallback replaces the layout; its speeds start over.
@@ -4292,10 +4877,33 @@ impl DownloadManager {
             .map(|part| part.downloaded_bytes)
             .sum::<u64>();
         let speed = segments.iter().map(|part| part.speed_bps).sum::<u64>();
+        let receiving = segments.iter().filter(|part| part.active).count();
+        let connecting = segments
+            .iter()
+            .filter(|part| {
+                !part.waiting
+                    && !part.active
+                    && part
+                        .length
+                        .is_none_or(|length| part.downloaded_bytes < length)
+            })
+            .count();
+        let planned = segments.len();
+        #[cfg(feature = "test-tools")]
+        if let Some(trace) = &task.trace {
+            trace.sample(downloaded, receiving, connecting, planned);
+        }
         let snapshot = {
             let mut record = task.record.write().await;
             record.downloaded_bytes = downloaded;
-            record.segments = segments;
+            record
+                .extra
+                .insert("receivingConnections".into(), json!(receiving));
+            record
+                .extra
+                .insert("connectingConnections".into(), json!(connecting));
+            record.extra.insert("plannedRanges".into(), json!(planned));
+            record.segments = compact_segments(segments);
             record.speed_bps = if task.paused.load(Ordering::Acquire) {
                 0
             } else {
@@ -4420,12 +5028,14 @@ impl DownloadManager {
         _url: &Url,
     ) -> EngineResult<reqwest::Response> {
         for attempt in 0..3 {
-            let (response, _origin, _global) = send_admitted(
+            let (response, origin_permit, global_permit) = send_admitted(
                 &self.client,
                 request.try_clone().ok_or_else(|| {
                     EngineError::Message("Metadata request cannot be replayed.".into())
                 })?,
                 &CancellationToken::new(),
+                #[cfg(feature = "test-tools")]
+                None,
             )
             .await?;
             let origin = origin_budget(response.url());
@@ -4441,6 +5051,9 @@ impl DownloadManager {
             });
             origin.cool_down(delay).await;
             drop(response);
+            // A server cooldown must not occupy admission slots needed by unrelated jobs.
+            drop(origin_permit);
+            drop(global_permit);
             if attempt == 2 || delay > Duration::from_secs(3600) {
                 return Err(EngineError::RetryAfter { status, delay });
             }
@@ -4456,7 +5069,7 @@ impl DownloadManager {
         cancel: &CancellationToken,
         part_dir: &Path,
         ranges: &[ByteRange],
-    ) -> EngineResult<PathBuf> {
+    ) -> EngineResult<(PathBuf, std::fs::File)> {
         let record = task.record.read().await.clone();
         let requested = PathBuf::from(&record.destination);
         let parent = requested
@@ -4476,10 +5089,8 @@ impl DownloadManager {
         } else {
             ranges.to_vec()
         };
-        let fingerprint = format!(
-            "{:x}",
-            Sha256::digest(fs::read(part_dir.join("transfer.json")).await?)
-        );
+        let manifest_bytes = fs::read(part_dir.join("transfer.json")).await?;
+        let fingerprint = format!("{:x}", Sha256::digest(&manifest_bytes));
         let checkpoint_path = part_dir.join("merge.json");
         let prefix = format!(".{}.{}.", safe_file_name(desired_name), record.id);
         let checkpoint = fs::read(&checkpoint_path)
@@ -4499,11 +5110,18 @@ impl DownloadManager {
             .map(|c| c.file_name.clone())
             .unwrap_or_else(|| format!("{prefix}{}.fetchrail-part", Uuid::new_v4()));
         let mut temp_path = parent.join(temp_name);
-        let recovered = checkpoint.is_some()
-            && fs::symlink_metadata(&temp_path)
-                .await
-                .is_ok_and(|m| m.is_file() && m.len() == total);
-        if !recovered {
+        let recovered = checkpoint
+            .as_ref()
+            .and_then(|saved| saved.identity.as_ref())
+            .is_some_and(|saved| {
+                open_publication_file(&temp_path)
+                    .is_ok_and(|(identity, length, _)| identity == *saved && length == total)
+            });
+        let assembled_identity = if !recovered {
+            #[cfg(feature = "test-tools")]
+            if let Some(trace) = &task.trace {
+                trace.phase(trace::Phase::Assembly);
+            }
             // Never truncate a stale checkpoint or a file planted at its saved path.
             temp_path = parent.join(format!("{prefix}{}.fetchrail-part", Uuid::new_v4()));
             let merged = Arc::new(AtomicU64::new(0));
@@ -4528,7 +5146,9 @@ impl DownloadManager {
                         &merged,
                         expected.as_deref(),
                         &cancel,
-                    )
+                    )?;
+                    let (identity, length, _) = open_publication_file(&temp_path)?;
+                    Ok((identity, length))
                 }
             });
             let started = Instant::now();
@@ -4553,9 +5173,24 @@ impl DownloadManager {
                     }
                 }
             };
-            if let Err(error) = result {
-                let _ = fs::remove_file(&temp_path).await;
-                return Err(error);
+            let (identity, length) = match result {
+                Ok(assembled) => assembled,
+                Err(error) => {
+                    let _ = fs::remove_file(&temp_path).await;
+                    return Err(error);
+                }
+            };
+            #[cfg(feature = "test-tools")]
+            if let Some(trace) = &task.trace {
+                trace.span(trace::Phase::Assembly, started.elapsed());
+                if open_publication_file(&part_dir.join("0.part")).is_ok_and(|v| v.0 == identity) {
+                    trace.linked.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            if length != total {
+                return Err(EngineError::Message(
+                    "Assembled file changed size; staging preserved.".into(),
+                ));
             }
             write_json_atomic(
                 &checkpoint_path,
@@ -4564,9 +5199,49 @@ impl DownloadManager {
                     total,
                     fingerprint: fingerprint.clone(),
                     expected_sha256: record.expected_sha256.clone(),
+                    identity: Some(identity.clone()),
                 },
             )
             .await?;
+            Some(identity)
+        } else {
+            None
+        };
+        let scan_identity = match assembled_identity {
+            Some(identity) => identity,
+            None => {
+                let path = temp_path.clone();
+                tokio::task::spawn_blocking(move || open_publication_file(&path).map(|v| v.0))
+                    .await
+                    .map_err(|e| EngineError::Message(e.to_string()))??
+            }
+        };
+        let complete_hashes = if record.expected_sha256.is_none() {
+            completed_shared_hashes(part_dir, total).await?
+        } else {
+            None
+        };
+        let mut expected_sha256 = record.expected_sha256.clone().or_else(|| {
+            if complete_hashes.is_none() {
+                task.received_sha256
+                    .lock()
+                    .expect("received hash poisoned")
+                    .clone()
+            } else {
+                None
+            }
+        });
+        if complete_hashes.is_none() && expected_sha256.is_none() {
+            // Legacy assemblies have no receive-time proof; capture their content before scanning.
+            let path = temp_path.clone();
+            let token = cancel.clone();
+            let (_, _, hash) = transfer_span!(
+                task.trace.as_deref(),
+                Verify,
+                tokio::task::spawn_blocking(move || file_fingerprint(&path, &token)).await
+            )
+            .map_err(|e| EngineError::Message(e.to_string()))??;
+            expected_sha256 = Some(hash);
         }
         // Assembly is done; Windows attachment policy can still spend time scanning the file.
         let snapshot = {
@@ -4577,29 +5252,47 @@ impl DownloadManager {
             record.clone()
         };
         self.emit_record(&snapshot);
+        #[cfg(feature = "test-tools")]
+        if let Some(trace) = &task.trace {
+            trace.phase(trace::Phase::Attachment);
+        }
         #[cfg(windows)]
-        crate::platform::mark_download(&temp_path, &record.url, desired_name).await?;
+        transfer_span!(
+            task.trace.as_deref(),
+            Attachment,
+            crate::platform::mark_download(
+                &temp_path,
+                &record.url,
+                desired_name,
+                #[cfg(feature = "test-tools")]
+                task.trace.clone(),
+            )
+            .await
+        )?;
         task.check_stopped(cancel)?;
         let path = temp_path.clone();
         let hash_cancel = cancel.clone();
-        let (identity, bytes, sha256) =
-            tokio::task::spawn_blocking(move || file_fingerprint(&path, &hash_cancel))
-                .await
-                .map_err(|e| EngineError::Message(e.to_string()))??;
-        if bytes != total {
-            return Err(EngineError::Message(
-                "Publication size changed; staging preserved.".into(),
-            ));
+        #[cfg(feature = "test-tools")]
+        if let Some(trace) = &task.trace {
+            trace.phase(trace::Phase::Verify);
         }
-        if record
-            .expected_sha256
-            .as_ref()
-            .is_some_and(|expected| *expected != sha256)
-        {
-            return Err(EngineError::Message(
-                "SHA-256 checksum mismatch. File was not published.".into(),
-            ));
-        }
+        let verified = transfer_span!(
+            task.trace.as_deref(),
+            Verify,
+            tokio::task::spawn_blocking(move || {
+                verify_scanned_publication(
+                    &path,
+                    &scan_identity,
+                    total,
+                    &manifest_bytes,
+                    complete_hashes,
+                    expected_sha256.as_deref(),
+                    &hash_cancel,
+                )
+            })
+            .await
+        )
+        .map_err(|e| EngineError::Message(e.to_string()))??;
         let _dispatch = self.dispatch_lock.lock().await;
         let _lock = self.persist_lock.lock().await;
         task.check_stopped(cancel)?;
@@ -4609,28 +5302,58 @@ impl DownloadManager {
                 .await
                 .map_err(EngineError::Message)?;
             let mut journal = PublicationJournal {
-                version: 1,
+                version: if verified.range_sha256.is_empty() {
+                    1
+                } else {
+                    2
+                },
                 id: record.id,
                 destination: destination.clone(),
                 total,
                 manifest_sha256: fingerprint.clone(),
-                sha256: sha256.clone(),
-                identity: identity.clone(),
+                sha256: verified.sha256.clone(),
+                range_sha256: verified.range_sha256.clone(),
+                identity: verified.identity.clone(),
                 published: false,
             };
-            write_json_atomic(&part_dir.join("publication.json"), &journal).await?;
+            transfer_span!(
+                task.trace.as_deref(),
+                Journal,
+                write_json_atomic(&part_dir.join("publication.json"), &journal).await
+            )?;
             let from = temp_path.clone();
             let to = destination.clone();
-            match tokio::task::spawn_blocking(move || {
-                crate::platform::publish_noreplace(&from, &to)
-            })
-            .await
+            let publishing_file = verified.file.try_clone()?;
+            #[cfg(feature = "test-tools")]
+            let publish_trace = task.trace.clone();
+            #[cfg(feature = "test-tools")]
+            if let Some(trace) = &task.trace {
+                trace.phase(trace::Phase::Publish);
+            }
+            match transfer_span!(
+                task.trace.as_deref(),
+                Publish,
+                tokio::task::spawn_blocking(move || {
+                    crate::platform::publish_verified_noreplace(
+                        &publishing_file,
+                        &from,
+                        &to,
+                        #[cfg(feature = "test-tools")]
+                        publish_trace.as_deref(),
+                    )
+                })
+                .await
+            )
             .map_err(|e| EngineError::Message(e.to_string()))?
             {
                 Ok(()) => {
                     journal.published = true;
-                    write_json_atomic(&part_dir.join("publication.json"), &journal).await?;
-                    return Ok(destination);
+                    transfer_span!(
+                        task.trace.as_deref(),
+                        Journal,
+                        write_json_atomic(&part_dir.join("publication.json"), &journal).await
+                    )?;
+                    return Ok((destination, verified.file));
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
                 Err(error) => return Err(error.into()),
@@ -5363,6 +6086,36 @@ async fn shared_staging(part_dir: &Path) -> EngineResult<bool> {
     }
 }
 
+// A complete shared stage already has a durable SHA-256 for every disjoint range.
+// Reuse those commitments only when all bytes were checkpointed; otherwise the
+// existing full-file verification remains mandatory.
+async fn completed_shared_hashes(part_dir: &Path, total: u64) -> EngineResult<Option<Vec<String>>> {
+    let bytes = fs::read(part_dir.join("transfer.json")).await?;
+    let manifest: PartManifest = serde_json::from_slice(&bytes)
+        .map_err(|_| EngineError::Message("Transfer checkpoint is damaged.".into()))?;
+    if !manifest.shared_staging
+        || !manifest.accepts_ranges
+        || manifest.validator.is_none()
+        || !valid_manifest_ranges(&manifest, total)
+        || manifest.final_url_sha256.is_none()
+        || manifest.total_bytes != Some(total)
+        || manifest.ranges.len() < 2
+    {
+        return Ok(None);
+    }
+    let mut hashes = Vec::with_capacity(manifest.ranges.len());
+    for (index, range) in manifest.ranges.iter().enumerate() {
+        let Some(checkpoint) = part_checkpoint(part_dir, index, range.len()).await? else {
+            return Ok(None);
+        };
+        if checkpoint.bytes != range.len() {
+            return Ok(None);
+        }
+        hashes.push(checkpoint.sha256);
+    }
+    Ok(Some(hashes))
+}
+
 async fn part_checkpoint(
     part_dir: &Path,
     index: usize,
@@ -5403,7 +6156,11 @@ async fn prepare_parts(
         total_bytes: probe.total_bytes,
         ranges: ranges.to_vec(),
         validator: probe.validator.clone(),
-        version: 1,
+        version: if ranges.len() > 32 || stored.as_ref().is_some_and(|s| s.version == 2) {
+            2
+        } else {
+            1
+        },
         final_url_sha256: probe
             .final_url
             .as_ref()
@@ -5502,6 +6259,36 @@ pub(crate) fn parse_content_range(headers: &HeaderMap) -> Option<(u64, u64, Opti
     Some((start, end, total))
 }
 
+fn compact_segments(segments: Vec<SegmentProgress>) -> Vec<SegmentProgress> {
+    if segments.len() <= 32 {
+        return segments;
+    }
+    segments
+        .chunks(segments.len().div_ceil(32))
+        .map(|group| SegmentProgress {
+            start: group[0].start,
+            length: group
+                .iter()
+                .try_fold(0u64, |total, part| part.length.map(|length| total + length)),
+            downloaded_bytes: group.iter().map(|part| part.downloaded_bytes).sum(),
+            speed_bps: group.iter().map(|part| part.speed_bps).sum(),
+            active: group.iter().any(|part| part.active),
+            waiting: group.iter().any(|part| part.waiting),
+        })
+        .collect()
+}
+
+fn valid_manifest_ranges(manifest: &PartManifest, total: u64) -> bool {
+    let cap = match manifest.version {
+        1 => 32,
+        2 => 512,
+        _ => return false,
+    };
+    !manifest.ranges.is_empty()
+        && manifest.ranges.len() <= cap
+        && manifest.ranges == split_ranges(total, manifest.ranges.len())
+}
+
 fn suggested_connection_count(total: u64, configured: usize, min_segment: u64) -> usize {
     if total == 0 {
         return 1;
@@ -5544,7 +6331,9 @@ async fn segment_counters(part_dir: &Path, ranges: &[ByteRange]) -> EngineResult
             }
         }
         segments.push(SegmentCounter {
-            waiting: AtomicBool::new(false),
+            #[cfg(feature = "test-tools")]
+            durable: AtomicU64::new(downloaded),
+            waiting: AtomicBool::new(true),
             range: *range,
             downloaded: AtomicU64::new(downloaded),
             active: AtomicBool::new(false),

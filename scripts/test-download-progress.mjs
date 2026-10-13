@@ -98,6 +98,19 @@ try {
   });
   await page.waitForFunction(() => document.querySelector('[role="progressbar"]')?.getAttribute("aria-valuenow") === "25");
   await page.screenshot({ path: join(output, "download-status.png"), fullPage: true });
+  assert((await page.locator("body").innerText()).includes("78.6 MB/s"), "Download speeds use decimal MB/s");
+  await page.evaluate(() => {
+    Object.assign(window.testRecord, {requestedConnections:16, receivingConnections:16, connectingConnections:0, plannedRanges:128});
+    window.testEmit("fetchrail://download-updated", structuredClone(window.testRecord));
+  });
+  await page.getByText("16 receiving · 16 max · 128 sections", {exact:true}).waitFor();
+  await page.getByText("128 sections are shown in 4 groups. Requests can move between sections.", {exact:true}).waitFor();
+  assert.equal(await page.locator("tbody tr").count(), 4);
+  await page.evaluate(() => {
+    for(const key of ["receivingConnections", "connectingConnections", "plannedRanges"]) delete window.testRecord[key];
+    window.testRecord.requestedConnections=4;
+    window.testEmit("fetchrail://download-updated", structuredClone(window.testRecord));
+  });
   await page.getByRole("button", { name: "Hide details" }).click();
   assert.equal(await page.locator("tbody").count(), 0);
   await page.getByRole("button", { name: "Show details" }).click();
@@ -440,6 +453,11 @@ try {
   await page.getByRole("tab", {name:"General",exact:true}).click();await page.getByRole("tab", {name:"Performance",exact:true}).click();
   await page.getByRole("heading", {name:"Latest results",exact:true}).waitFor();
   assert.equal(await page.getByRole("button", {name:"Apply calibration",exact:true}).isDisabled(),true,"Short or failed tests must not be applied");
+  await page.evaluate(()=>{window.testPerformance.latest.profile.confidence="measured";window.testPerformance.latestIssue="This report is no longer applicable: the engine changed. Run a new calibration.";window.testPerformance.appliedActive=false;});
+  await page.getByRole("tab", {name:"General",exact:true}).click();await page.getByRole("tab", {name:"Performance",exact:true}).click();
+  await page.getByText("This report is no longer applicable: the engine changed. Run a new calibration.",{exact:true}).waitFor();
+  assert.equal(await page.getByRole("button", {name:"Apply calibration",exact:true}).isDisabled(),true,"Old measured results cannot be applied after invalidation");
+  assert.equal(await page.getByText("Insufficient samples",{exact:true}).count(),2,"Unproven fast disk samples must not be shown as zero hardware performance");
   console.log("PASS: opt-in calibration, selected budgets, cancellation, application, redacted report, reset, uncertainty and responsive results");
 
   // The setup program is the same page with `setup` in its address: three steps to install, one screen to remove.
