@@ -305,7 +305,7 @@ fn independent_parallel_range_handles_reject_truncation_and_mutation() {
         &ranges,
         &hashes,
         &cancel,
-        4
+        8
     )
     .unwrap());
     assert_eq!(
@@ -367,30 +367,67 @@ fn independent_parallel_range_handles_reject_truncation_and_mutation() {
 }
 
 #[test]
-#[ignore = "256 MiB local-only finalization benchmark; not part of routine tests"]
+fn protected_verification_worker_limit_scales_without_unbounded_buffers() {
+    const MIB: u64 = 1024 * 1024;
+    assert_eq!(postscan_verification_workers(127 * MIB, 16), 1);
+    assert_eq!(postscan_verification_workers(128 * MIB, 16), 4);
+    assert_eq!(postscan_verification_workers(1023 * MIB, 16), 4);
+    assert_eq!(postscan_verification_workers(1024 * MIB, 16), 8);
+    assert_eq!(postscan_verification_workers(20 * 1024 * MIB, 16), 8);
+    assert_eq!(postscan_verification_workers(20 * 1024 * MIB, 6), 6);
+    assert_eq!(postscan_verification_workers(20 * 1024 * MIB, 0), 1);
+}
+
+#[test]
+#[ignore = "local-only postscan hashing benchmark; not part of routine tests"]
 fn benchmark_protected_range_hashes_serial_and_parallel() {
-    let root = std::env::temp_dir().join(format!("fetchrail-sha-bench-{}", Uuid::new_v4()));
+    let scratch = std::env::var_os("FETCHRAIL_SHA_BENCH_ROOT")
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
+    assert!(scratch.is_dir(), "Benchmark scratch directory must exist");
+    let root = scratch.join(format!("fetchrail-sha-bench-{}", Uuid::new_v4()));
     std::fs::create_dir_all(&root).unwrap();
     let path = root.join("synthetic-staging.bin");
+    let repeats = std::env::var("FETCHRAIL_SHA_BENCH_REPEATS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|count| [32, 64, 128].contains(count))
+        .unwrap_or(32);
     let payload = (0..8 * 1024 * 1024)
         .map(|i| (i / 4096) as u8)
         .collect::<Vec<_>>();
     let mut output = std::fs::File::create(&path).unwrap();
-    for _ in 0..32 {
+    for _ in 0..repeats {
         output.write_all(&payload).unwrap();
     }
     output.sync_all().unwrap();
     drop(output);
     let mut hasher = Sha256::new();
-    hasher.update(&payload);
-    hasher.update(&payload);
+    for _ in 0..(repeats / 16) {
+        hasher.update(&payload);
+    }
     let expected = format!("{:x}", hasher.finalize());
     let (identity, total, protected) =
         open_publication_file_with_access(&path, PublicationAccess::Publish).unwrap();
     let ranges = split_ranges(total, 16);
     let hashes = vec![expected; 16];
     let mut times = Vec::new();
-    for workers in [1, 4, 4, 1] {
+    let worker_plan = std::env::var("FETCHRAIL_SHA_BENCH_WORKERS")
+        .ok()
+        .and_then(|value| {
+            value
+                .split(',')
+                .map(str::parse::<usize>)
+                .collect::<Result<Vec<_>, _>>()
+                .ok()
+        })
+        .filter(|workers| {
+            !workers.is_empty()
+                && workers.len() <= 12
+                && workers.iter().all(|&worker| (1..=16).contains(&worker))
+        })
+        .unwrap_or_else(|| vec![1, 4, 8, 6, 8, 4, 1]);
+    for workers in worker_plan {
         let started = Instant::now();
         assert!(range_hashes_match(
             protected.try_clone().unwrap(),
@@ -404,7 +441,10 @@ fn benchmark_protected_range_hashes_serial_and_parallel() {
         .unwrap());
         times.push((workers, started.elapsed().as_millis()));
     }
-    println!("Protected 256MiB range SHA-256 [workers, elapsed_ms] = {times:?}");
+    println!(
+        "Protected {}MiB range SHA-256 [workers, elapsed_ms] = {times:?}",
+        repeats * 8
+    );
     drop(protected);
     std::fs::remove_dir_all(root).unwrap();
 }

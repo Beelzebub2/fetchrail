@@ -599,6 +599,20 @@ fn range_hashes_match(
     Ok(matches)
 }
 
+fn postscan_verification_workers(total: u64, parallelism: usize) -> usize {
+    // Large publications justify more independent disk/CPU lanes. Keep the
+    // allocation bounded: each lane's SHA reader uses two 8 MiB buffers and
+    // a separate read thread. Small publications avoid thread overhead.
+    let cap = if total >= 1024 * 1024 * 1024 {
+        8
+    } else if total >= 128 * 1024 * 1024 {
+        4
+    } else {
+        1
+    };
+    parallelism.max(1).min(cap)
+}
+
 fn committed_ranges_match(
     file: std::fs::File,
     path: &Path,
@@ -625,14 +639,13 @@ fn committed_ranges_match(
     {
         return Ok(false);
     }
-    // Parallelize only large verified representations; tiny files avoid the thread overhead.
-    let workers = if total >= 128 * 1024 * 1024 {
+    // Tune bounded postscan parallelism with measured, optimized local hashing.
+    let workers = postscan_verification_workers(
+        total,
         std::thread::available_parallelism()
-            .map(|cores| cores.get().min(4))
-            .unwrap_or(1)
-    } else {
-        1
-    };
+            .map(|cores| cores.get())
+            .unwrap_or(1),
+    );
     range_hashes_match(
         file,
         path,
