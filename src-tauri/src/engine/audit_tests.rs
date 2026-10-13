@@ -112,7 +112,20 @@ async fn publication_crash_stages_reconcile_exactly_one_file_and_reject_foreign_
                 .await
                 .unwrap();
             if stage > 0 {
-                crate::platform::publish_noreplace(&temp, &output).unwrap();
+                let (_, _, file) =
+                    open_publication_file_with_access(&temp, PublicationAccess::Publish).unwrap();
+                let publication = crate::platform::publish_verified_noreplace(
+                    &file,
+                    &temp,
+                    &output,
+                    #[cfg(feature = "test-tools")]
+                    None,
+                )
+                .unwrap();
+                // Model process exit after publication, before its journal/catalog acknowledgment.
+                drop(file);
+                drop(publication);
+                assert!(!temp.exists());
             }
             if stage > 1 {
                 journal.published = true;
