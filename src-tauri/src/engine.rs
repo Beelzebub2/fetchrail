@@ -427,6 +427,11 @@ fn open_publication_file_with_access(
                 // The primary Publish handle already denies third-party writes/deletes.
                 // These read-only handles must still share its existing write/delete access.
                 options.share_mode(0x00000001 | 0x00000002 | 0x00000004);
+                // Each lane reads a full range before seeking to its next claimed range.
+                use windows::Win32::Storage::FileSystem::{
+                    FILE_FLAG_OPEN_REPARSE_POINT, FILE_FLAG_SEQUENTIAL_SCAN,
+                };
+                options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT.0 | FILE_FLAG_SEQUENTIAL_SCAN.0);
             }
             PublicationAccess::Publish => {
                 options
@@ -724,7 +729,7 @@ async fn recover_publication(part_dir: &Path, record: &mut DownloadRecord) -> En
 async fn recover_verified_publication(
     part_dir: &Path,
     record: &mut DownloadRecord,
-) -> EngineResult<Option<std::fs::File>> {
+) -> EngineResult<Option<crate::platform::PublicationGuard>> {
     let bytes = match fs::read(part_dir.join("publication.json")).await {
         Ok(bytes) => bytes,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -809,8 +814,7 @@ async fn recover_verified_publication(
                     &destination,
                     #[cfg(feature = "test-tools")]
                     None,
-                )?;
-                Ok::<_, std::io::Error>(file)
+                )
             })
             .await
             .map_err(|e| EngineError::Message(e.to_string()))??,
@@ -833,7 +837,8 @@ async fn recover_verified_publication(
             )
         })
         .await
-        .map_err(|e| EngineError::Message(e.to_string()))??;
+        .map_err(|e| EngineError::Message(e.to_string()))??
+        .map(Into::into);
     }
     if verified_file.is_none() {
         return Err(EngineError::Message("Published file changed or belongs to another owner; no file was replaced. Inspect the preserved staging before retrying.".into()));
@@ -5069,7 +5074,7 @@ impl DownloadManager {
         cancel: &CancellationToken,
         part_dir: &Path,
         ranges: &[ByteRange],
-    ) -> EngineResult<(PathBuf, std::fs::File)> {
+    ) -> EngineResult<(PathBuf, crate::platform::PublicationGuard)> {
         let record = task.record.read().await.clone();
         let requested = PathBuf::from(&record.destination);
         let parent = requested
@@ -5346,14 +5351,14 @@ impl DownloadManager {
             )
             .map_err(|e| EngineError::Message(e.to_string()))?
             {
-                Ok(()) => {
+                Ok(publication_guard) => {
                     journal.published = true;
                     transfer_span!(
                         task.trace.as_deref(),
                         Journal,
                         write_json_atomic(&part_dir.join("publication.json"), &journal).await
                     )?;
-                    return Ok((destination, verified.file));
+                    return Ok((destination, publication_guard));
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
                 Err(error) => return Err(error.into()),
