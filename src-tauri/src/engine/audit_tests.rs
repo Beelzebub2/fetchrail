@@ -7,6 +7,26 @@ fn record(destination: &Path) -> DownloadRecord {
 }
 
 #[test]
+fn finalizing_http_releases_only_its_transfer_slot() {
+    let mut item = record(Path::new("owned.bin"));
+    for status in [
+        DownloadStatus::Connecting,
+        DownloadStatus::Downloading,
+        DownloadStatus::Stalled,
+    ] {
+        item.status = status;
+        assert!(record_uses_transfer_slot(&item));
+    }
+    for status in [DownloadStatus::Merging, DownloadStatus::Completed] {
+        item.status = status;
+        assert!(!record_uses_transfer_slot(&item));
+        item.torrent = Some(crate::torrent::TorrentSummary::default());
+        assert!(record_uses_transfer_slot(&item));
+        item.torrent = None;
+    }
+}
+
+#[test]
 fn dates_weak_and_malformed_etags_never_authorize_resume() {
     let mut headers = HeaderMap::new();
     headers.insert(
