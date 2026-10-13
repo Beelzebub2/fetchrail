@@ -213,3 +213,51 @@ Benchmark experimental range plans are ignored by ordinary builds. A separately
 named `Fetchrail-Preview.exe` refuses to start without its isolated launcher.
 Any full WAN comparison requires a fresh link and an explicit traffic budget;
 do not reuse a small calibration budget for repeated full-file transfers.
+
+## Protected parallel verification and Windows timing (13 October)
+
+Verified shared-stage range commitments now use independently reopened read-only
+handles for bounded parallel postscan SHA-256. Files below 128 MiB retain one
+worker; larger files use up to four, and files at least 1 GiB use up to eight,
+bounded by host parallelism and the number of ranges. Each worker checks the
+original file identity and total length and hashes exact immutable byte ranges.
+The existing publication handle stays open throughout, denying external write
+and delete access on Windows. Recovery uses the same verifier. Whole-file
+expected checksums retain their full-file verification path.
+
+Cloned Windows handles share a file cursor, including synchronous positioned
+reads, so concurrent readers must open separate file objects. Their sharing
+flags accommodate the already open protected publication handle without
+granting write or delete access. Tests cover independent cursors, cancellation,
+same-size content modification, truncation, worker bounds and journal recovery.
+Memory remains bounded to two 8 MiB buffers per lane; small files avoid the
+extra threads. Cached synthetic benchmarks qualify the bounded implementation,
+but cannot establish storage or WAN performance for another machine.
+
+Developer traces now split attachment setup, COM Save, ADS open/write/sync,
+protected rename and final sync. Up to 64 UTC/monotonic phase transitions,
+64 fixed-label retry events and 64 flush/sync/checkpoint events over 200 ms
+help correlate waits without storing URLs, file names, headers or credentials.
+HTTP 429/503 Retry-After responses retain their actual status in these private
+diagnostics. The retention and isolated-build requirements above still apply;
+ordinary downloads do not produce this detailed trace.
+
+Same-volume assembly can take milliseconds while completion still waits on
+attachment policy, required postscan hashing or Windows rename filters.
+API timing identifies the boundary of a wait, not its provider. A faster rename
+API, deferred verification or file-identity-only check is not an established
+safe shortcut. [Microsoft's attachment contract](https://learn.microsoft.com/en-us/windows/win32/api/shobjidl_core/nf-shobjidl_core-iattachmentexecute-save)
+permits scanners to alter/delete bytes, and
+[minifilter diagnostics](https://learn.microsoft.com/en-us/windows-hardware/test/assessments/minifilter-diagnostics)
+provide provider/callback attribution. A future short, operator-authorized ETW
+capture must preserve other recordings, remain private and disclose its memory
+cost before use. No scan exclusions or security-policy changes are part of this
+optimization.
+
+The full-app fixture additionally accepts `cross-volume`, requiring an absolute
+`FETCHRAIL_APP_BENCH_OUTPUT_VOLUME` directory on another volume. It checks the
+copied output's independent SHA-256, both durable catalogs, zero hardlinks and
+persisted developer trace. Cleanup removes only its own resolved temporary
+directory after every check succeeds. Fault fixtures retain failed artifacts.
+The CI queue test gates its slow final response on a later queued claim, so it
+tests work conservation without assuming quiet disk/CPU timing.

@@ -58,8 +58,10 @@ const handler = (request, response) => {
   function pump() {
     if (mode === 'host-pause' && !paused && remaining < count - 1024 * 1024) { paused = true; setTimeout(pump, 12000); return; }
     while (!response.destroyed && remaining > 0) {
+      // Assert queue order without depending on disk/CPU timing under parallel CI load.
+      if (mode === 'queued-gated' && start === 0 && remaining <= body.length && !served.some(visit => visit.start >= total / 2) && performance.now()-began < 20000) { setTimeout(pump, 5); return; }
       const trickling = mode === 'trickle' && fail && remaining < count - 1024 * 1024;
-      const budget = mode === 'queued-skew' && start === 0 ? Math.max(0, body.length + Math.floor((performance.now()-began)/1000*2e6) - (count-remaining)) : body.length;
+      const budget = ['queued-skew', 'queued-gated'].includes(mode) && start === 0 ? Math.max(0, body.length + Math.floor((performance.now()-began)/1000*2e6) - (count-remaining)) : body.length;
       if (!budget) { setTimeout(pump, Math.max(1,(count-remaining)/2e6*1000-(performance.now()-began))); return; }
       const size = Math.min(remaining, budget, trickling ? 64 : mode === 'uneven-rates' && start > 0 ? 16 * 1024 : body.length);
       const blocked = !response.write(body.subarray(0, size));
@@ -350,7 +352,14 @@ async fn queued_ranges_fill_idle_workers_before_a_slow_range_finishes() {
     let total = 64 * 1024 * 1024;
     let mut timings = Vec::new();
     for planned in [4, 8, 8, 4] {
-        let server = TestServer::new(total, "queued-skew");
+        let server = TestServer::new(
+            total,
+            if planned == 8 {
+                "queued-gated"
+            } else {
+                "queued-skew"
+            },
+        );
         let (dir, _, mut probe) = parts(total, planned).await;
         probe.final_url = Some(server.url.clone());
         let ranges = split_ranges(total, planned);
