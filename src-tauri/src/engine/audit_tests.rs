@@ -1,5 +1,87 @@
 use super::*;
 
+#[cfg(all(windows, feature = "test-tools"))]
+#[test]
+fn scan_overlap_observes_provider_changes_without_blocking_remediation() {
+    use std::io::{Seek, SeekFrom, Write};
+    let root = std::env::temp_dir().join(format!("fetchrail-overlap-{}", Uuid::new_v4()));
+    std::fs::create_dir(&root).unwrap();
+    let path = root.join("owned.bin");
+    let bytes = vec![0x5a; 1024 * 1024];
+    let expected = format!("{:x}", Sha256::digest(&bytes));
+    for action in [
+        "unchanged",
+        "ads",
+        "mutate",
+        "restore",
+        "truncate",
+        "delete",
+        "reject",
+    ] {
+        std::fs::write(&path, &bytes).unwrap();
+        let (identity, total, inspected) = open_publication_file(&path).unwrap();
+        drop(inspected);
+        let trace = Arc::new(trace::Trace::default());
+        let result = verify_during_attachment(
+            &path,
+            &identity,
+            total,
+            b"",
+            None,
+            Some(&expected),
+            &CancellationToken::new(),
+            trace.clone(),
+            || {
+                match action {
+                    "ads" => std::fs::write(
+                        format!("{}:Zone.Identifier", path.display()),
+                        b"[ZoneTransfer]\r\nZoneId=3\r\n",
+                    )?,
+                    "mutate" | "restore" => {
+                        let mut file = std::fs::OpenOptions::new().write(true).open(&path)?;
+                        file.seek(SeekFrom::Start(123))?;
+                        file.write_all(b"changed")?;
+                        if action == "restore" {
+                            file.seek(SeekFrom::Start(123))?;
+                            file.write_all(&bytes[123..130])?;
+                        }
+                    }
+                    "truncate" => std::fs::OpenOptions::new()
+                        .write(true)
+                        .open(&path)?
+                        .set_len(4096)?,
+                    "delete" => std::fs::remove_file(&path)?,
+                    "reject" => {
+                        return Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+                    }
+                    _ => {}
+                }
+                Ok(())
+            },
+        );
+        if ["unchanged", "ads", "restore"].contains(&action) {
+            let proof = result
+                .unwrap()
+                .expect("Local NTFS test must grant observation");
+            assert_eq!(proof.sha256, expected);
+            assert!(std::fs::OpenOptions::new().write(true).open(&path).is_err());
+            if action == "restore" {
+                assert_eq!(trace.snapshot()["spans"]["verification"]["calls"], 2);
+            }
+            drop(proof);
+        } else {
+            assert!(
+                result.is_err(),
+                "Changed, deleted or rejected content must not publish"
+            );
+        }
+        if path.exists() {
+            std::fs::remove_file(&path).unwrap();
+        }
+    }
+    std::fs::remove_dir(&root).unwrap();
+}
+
 fn record(destination: &Path) -> DownloadRecord {
     serde_json::from_value(json!({"id": Uuid::new_v4(), "url":"https://example.test/file?signature=private-token", "fileName":"file.bin", "destination":destination,
         "status":"merging", "totalBytes":7, "downloadedBytes":7, "speedBps":0, "etaSeconds":null, "connections":1, "error":null,
@@ -132,7 +214,20 @@ async fn publication_crash_stages_reconcile_exactly_one_file_and_reject_foreign_
                 .await
                 .unwrap();
             if stage > 0 {
-                crate::platform::publish_noreplace(&temp, &output).unwrap();
+                let (_, _, file) =
+                    open_publication_file_with_access(&temp, PublicationAccess::Publish).unwrap();
+                let publication = crate::platform::publish_verified_noreplace(
+                    &file,
+                    &temp,
+                    &output,
+                    #[cfg(feature = "test-tools")]
+                    None,
+                )
+                .unwrap();
+                // Model process exit after publication, before its journal/catalog acknowledgment.
+                drop(file);
+                drop(publication);
+                assert!(!temp.exists());
             }
             if stage > 1 {
                 journal.published = true;
@@ -573,7 +668,7 @@ async fn benchmark_synthetic_windows_attachment_and_publish() {
         "Synthetic file was changed by attachment policy"
     );
     let publish_started = Instant::now();
-    crate::platform::publish_verified_noreplace(
+    let publication_guard = crate::platform::publish_verified_noreplace(
         &protected,
         &staging,
         &target,
@@ -583,18 +678,176 @@ async fn benchmark_synthetic_windows_attachment_and_publish() {
     let publish_ms = publish_started.elapsed().as_millis();
     let spans = trace.snapshot();
     assert_eq!(spans["spans"]["attachmentSave"]["calls"], 1);
-    assert_eq!(spans["spans"]["publishRename"]["calls"], 1);
+    assert_eq!(spans["spans"]["publishLink"]["calls"], 1);
+    assert!(spans["spans"]["publishRename"]["calls"].as_u64().unwrap() <= 1);
     let save_ms = spans["spans"]["attachmentSave"]["totalMs"]
         .as_f64()
         .unwrap();
     let rename_ms = spans["spans"]["publishRename"]["totalMs"].as_f64().unwrap();
     assert_eq!(std::fs::metadata(&target).unwrap().len(), length);
-    assert!(!staging.exists(), "Rename left its temporary file behind");
+    drop(protected);
+    drop(publication_guard);
+    assert!(
+        !staging.exists(),
+        "Publication left its temporary file behind"
+    );
     println!(
         "Synthetic {}GiB extension={} populated={} Internet-source={} create+sync={}ms, COM Save={:.3}ms (wrapper={}ms), no-clobber rename={:.3}ms (wrapper={}ms); no scanner attribution",
         gib, extension, populated, internet_source, populate_ms, save_ms, attachment_ms, rename_ms, publish_ms
     );
-    drop(protected);
+}
+
+#[cfg(all(windows, feature = "test-tools"))]
+#[test]
+fn handle_link_publication_pins_bytes_and_retires_only_the_temporary_name() {
+    let root =
+        std::env::temp_dir().join(format!("fetchrail-linked-publication-{}", Uuid::new_v4()));
+    std::fs::create_dir(&root).unwrap();
+    let source = root.join("temporary.fetchrail-part");
+    let destination = root.join("published-Ω.bin");
+    let bytes = b"verified publication with a surviving final name";
+    std::fs::write(&source, bytes).unwrap();
+    let mut ads = source.as_os_str().to_os_string();
+    ads.push(":Zone.Identifier");
+    std::fs::write(&ads, b"[ZoneTransfer]\r\nZoneId=3\r\n").unwrap();
+    let (identity, _, file) =
+        open_publication_file_with_access(&source, PublicationAccess::Publish).unwrap();
+    #[cfg(feature = "test-tools")]
+    let trace = trace::Trace::default();
+    let publication_guard = crate::platform::link_publication_for_test(
+        &file,
+        &source,
+        &destination,
+        #[cfg(feature = "test-tools")]
+        Some(&trace),
+    )
+    .unwrap()
+    .unwrap();
+    #[cfg(feature = "test-tools")]
+    {
+        let spans = trace.snapshot();
+        assert_eq!(spans["spans"]["publishLink"]["calls"], 1);
+        assert_eq!(spans["spans"]["publishRename"]["calls"], 0);
+        assert_eq!(spans["spans"]["publishRetire"]["calls"], 0);
+    }
+    assert_eq!(open_publication_file(&destination).unwrap().0, identity);
+    assert_eq!(std::fs::read(&destination).unwrap(), bytes);
+    assert!(std::fs::OpenOptions::new()
+        .write(true)
+        .open(&destination)
+        .is_err());
+    assert!(std::fs::rename(&destination, root.join("unexpected.bin")).is_err());
+    // The last duplicate holds the guard through both durable catalog writes.
+    let duplicate = file.try_clone().unwrap();
+    drop(file);
+    assert!(std::fs::OpenOptions::new()
+        .write(true)
+        .open(&destination)
+        .is_err());
+    drop(duplicate);
+    assert!(std::fs::rename(&destination, root.join("unexpected.bin")).is_err());
+    let cleanup = publication_guard.release().unwrap();
+    assert!(source.exists());
+    std::fs::rename(&destination, root.join("moved.bin")).unwrap();
+    std::fs::rename(root.join("moved.bin"), &destination).unwrap();
+    let private = root.join("parts");
+    std::fs::create_dir(&private).unwrap();
+    std::fs::hard_link(&source, private.join("0.part")).unwrap();
+    cleanup.clean(&private).unwrap();
+    assert!(!source.exists());
+    assert_eq!(std::fs::read(&destination).unwrap(), bytes);
+    let mut published_ads = destination.as_os_str().to_os_string();
+    published_ads.push(":Zone.Identifier");
+    assert_eq!(
+        std::fs::read(published_ads).unwrap(),
+        b"[ZoneTransfer]\r\nZoneId=3\r\n"
+    );
+    for action in [
+        "delete-output",
+        "replace-source",
+        "replace-resume",
+        "collision",
+        "bound",
+    ] {
+        let case = root.join(action);
+        let parts = case.join("parts");
+        std::fs::create_dir_all(&parts).unwrap();
+        let temporary = case.join("temporary.fetchrail-part");
+        let output = case.join("finished.bin");
+        std::fs::write(&temporary, bytes).unwrap();
+        std::fs::hard_link(&temporary, parts.join("0.part")).unwrap();
+        let (_, _, protected) =
+            open_publication_file_with_access(&temporary, PublicationAccess::Publish).unwrap();
+        if action == "collision" {
+            std::fs::write(&output, b"another owner's file").unwrap();
+            assert_eq!(
+                crate::platform::link_publication_for_test(&protected, &temporary, &output, None)
+                    .err()
+                    .unwrap()
+                    .kind(),
+                std::io::ErrorKind::AlreadyExists
+            );
+            assert_eq!(std::fs::read(&output).unwrap(), b"another owner's file");
+            continue;
+        }
+        let guard =
+            crate::platform::link_publication_for_test(&protected, &temporary, &output, None)
+                .unwrap()
+                .unwrap();
+        let second = if action == "bound" {
+            let second = crate::platform::link_publication_for_test(
+                &protected,
+                &temporary,
+                &case.join("second.bin"),
+                None,
+            )
+            .unwrap()
+            .unwrap();
+            assert!(crate::platform::link_publication_for_test(
+                &protected,
+                &temporary,
+                &case.join("third.bin"),
+                None
+            )
+            .unwrap()
+            .is_none());
+            assert!(!case.join("third.bin").exists());
+            Some(second)
+        } else {
+            None
+        };
+        drop(protected);
+        let cleanup = guard.release().unwrap();
+        drop(second.map(|guard| guard.release()));
+        let foreign = match action {
+            "replace-source" => Some(temporary.clone()),
+            "replace-resume" => Some(parts.join("0.part")),
+            _ => None,
+        };
+        if action == "delete-output" {
+            std::fs::remove_file(&output).unwrap();
+        }
+        if let Some(path) = &foreign {
+            std::fs::remove_file(path).unwrap();
+            std::fs::write(path, b"foreign replacement").unwrap();
+        }
+        let result = cleanup.clean(&parts);
+        if let Some(path) = foreign {
+            assert!(result.is_err());
+            assert_eq!(std::fs::read(path).unwrap(), b"foreign replacement");
+        } else {
+            result.unwrap();
+        }
+        if action == "delete-output" {
+            assert!(
+                !output.exists(),
+                "Cleanup must never resurrect a deleted output"
+            );
+        } else {
+            assert_eq!(std::fs::read(&output).unwrap(), bytes);
+        }
+    }
+    std::fs::remove_dir_all(root).unwrap();
 }
 
 #[tokio::test]
@@ -718,7 +971,7 @@ async fn post_attachment_verification_rejects_mutations_and_keeps_provenance() {
                     .is_err());
                     assert_eq!(fs::read(&output).await.unwrap(), b"foreign output");
                     fs::remove_file(&output).await.unwrap();
-                    crate::platform::publish_verified_noreplace(
+                    let publication_guard = crate::platform::publish_verified_noreplace(
                         &verified.file,
                         &temp,
                         &output,
@@ -726,6 +979,8 @@ async fn post_attachment_verification_rejects_mutations_and_keeps_provenance() {
                         None,
                     )
                     .unwrap();
+                    #[cfg(windows)]
+                    assert!(std::fs::rename(&output, root.join("unexpected.bin")).is_err());
                     assert_eq!(fs::read(&output).await.unwrap(), data);
                     #[cfg(windows)]
                     if outcome == "ads" {
@@ -737,6 +992,7 @@ async fn post_attachment_verification_rejects_mutations_and_keeps_provenance() {
                             .any(|v| v == b"ZoneId=3"));
                     }
                     drop(verified);
+                    drop(publication_guard);
                 } else {
                     assert!(result.is_err(), "{outcome}, copied={copied}");
                     assert!(

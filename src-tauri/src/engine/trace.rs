@@ -34,8 +34,11 @@ pub(crate) enum Phase {
     AttachmentAdsSync,
     PublishRename,
     PublishSync,
+    PublishLink,
+    PublishRetire,
+    ScanOverlap,
 }
-const NAMES: [&str; 24] = [
+const NAMES: [&str; 27] = [
     "probe",
     "originAdmission",
     "globalAdmission",
@@ -60,6 +63,9 @@ const NAMES: [&str; 24] = [
     "attachmentAdsSync",
     "publishRename",
     "publishSync",
+    "publishLink",
+    "publishRetire",
+    "scanHashOverlap",
 ];
 #[derive(Clone, Copy)]
 pub(crate) enum RetryCause {
@@ -163,7 +169,7 @@ struct Span {
 }
 #[derive(Default)]
 pub(crate) struct Trace {
-    spans: [Span; 24],
+    spans: [Span; NAMES.len()],
     pub network_bytes: AtomicU64,
     pub durable_bytes: AtomicU64,
     pub requests: AtomicU64,
@@ -395,7 +401,7 @@ impl Trace {
                 json!({"phase":NAMES[transition.phase_index],"elapsedMs":transition.elapsed_ms,"utc":transition.observed_at_utc.to_rfc3339()})
             })
             .collect::<Vec<_>>();
-        let phases: [(&str, Value); 24] = std::array::from_fn(|i| {
+        let phases: [(&str, Value); NAMES.len()] = std::array::from_fn(|i| {
             let span = &self.spans[i];
             let calls = span.calls.load(Ordering::Relaxed);
             let mut cumulative = 0;

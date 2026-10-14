@@ -9,6 +9,10 @@ use std::{
 mod linux;
 #[cfg(windows)]
 mod windows_attachment;
+#[cfg(all(windows, feature = "test-tools"))]
+mod windows_publication;
+#[cfg(all(windows, feature = "test-tools"))]
+mod windows_scan_watch;
 #[cfg(target_os = "linux")]
 pub(crate) use linux::torrent_argument_source;
 #[cfg(target_os = "linux")]
@@ -17,6 +21,8 @@ pub use linux::{
 };
 #[cfg(windows)]
 pub(crate) use windows_attachment::mark_download;
+#[cfg(all(windows, feature = "test-tools"))]
+pub(crate) use windows_scan_watch::ScanWatch;
 
 pub const APP_ID: &str = "com.rrmtools.braid";
 
@@ -222,13 +228,98 @@ pub fn reveal(path: &Path) -> Result<(), String> {
         .map_err(|e| format!("Could not open the destination folder: {e}"))
 }
 
-/// Publish a complete file without a check/rename race with another application.
+#[must_use = "Keep the data and final name protected through catalog acknowledgment"]
+pub(crate) struct PublicationGuard {
+    _data: fs::File,
+    _entry: Option<fs::File>,
+    #[cfg(all(windows, feature = "test-tools"))]
+    cleanup: Option<DeferredPublicationCleanup>,
+}
+impl From<fs::File> for PublicationGuard {
+    fn from(file: fs::File) -> Self {
+        Self {
+            _data: file,
+            _entry: None,
+            #[cfg(all(windows, feature = "test-tools"))]
+            cleanup: None,
+        }
+    }
+}
+
+#[cfg(all(windows, feature = "test-tools"))]
+impl PublicationGuard {
+    pub(crate) fn release(self) -> Option<DeferredPublicationCleanup> {
+        let Self {
+            _data,
+            _entry,
+            cleanup,
+        } = self;
+        // The finished file must be movable and writable before its completion event.
+        drop(_entry);
+        drop(_data);
+        cleanup
+    }
+}
+
+#[cfg(all(windows, feature = "test-tools"))]
+pub(crate) struct DeferredPublicationCleanup {
+    source: PathBuf,
+    identity: (u32, u64),
+    _permit: tokio::sync::OwnedSemaphorePermit,
+}
+
+#[cfg(all(windows, feature = "test-tools"))]
+static PUBLICATION_CLEANUP_SLOTS: std::sync::LazyLock<std::sync::Arc<tokio::sync::Semaphore>> =
+    std::sync::LazyLock::new(|| std::sync::Arc::new(tokio::sync::Semaphore::new(2)));
+
+#[cfg(all(windows, feature = "test-tools"))]
+impl DeferredPublicationCleanup {
+    pub(crate) fn clean(self, part_dir: &Path) -> std::io::Result<()> {
+        // Only the two aliases of the verified shared stage can release payload storage.
+        windows_publication::retire_named_entry(&part_dir.join("0.part"), self.identity)?;
+        windows_publication::retire_named_entry(&self.source, self.identity)?;
+        fs::remove_dir_all(part_dir)
+    }
+}
+
+#[cfg(all(windows, feature = "test-tools"))]
+pub(crate) fn link_publication_for_test(
+    file: &fs::File,
+    source: &Path,
+    destination: &Path,
+    trace: Option<&crate::engine::trace::Trace>,
+) -> std::io::Result<Option<PublicationGuard>> {
+    let Ok(permit) = PUBLICATION_CLEANUP_SLOTS.clone().try_acquire_owned() else {
+        return Ok(None);
+    };
+    let linked = {
+        let _span = trace.map(|trace| trace.guard(crate::engine::trace::Phase::PublishLink));
+        windows_publication::link_verified(file, destination)?
+    };
+    let Some(entry) = linked else { return Ok(None) };
+    {
+        let _span = trace.map(|trace| trace.guard(crate::engine::trace::Phase::PublishSync));
+        file.sync_all()?;
+    }
+    Ok(Some(PublicationGuard {
+        _data: file.try_clone()?,
+        _entry: Some(entry),
+        cleanup: Some(DeferredPublicationCleanup {
+            source: source.to_owned(),
+            identity: windows_publication::file_identity(file)?,
+            _permit: permit,
+        }),
+    }))
+}
+
+/// Publish a complete file without replacing another application's file.
 pub(crate) fn publish_verified_noreplace(
     file: &fs::File,
     source: &Path,
     destination: &Path,
     #[cfg(feature = "test-tools")] trace: Option<&crate::engine::trace::Trace>,
-) -> std::io::Result<()> {
+) -> std::io::Result<PublicationGuard> {
+    let data_guard = file.try_clone()?;
     #[cfg(windows)]
     {
         use std::os::windows::{ffi::OsStrExt, io::AsRawHandle};
@@ -240,6 +331,18 @@ pub(crate) fn publish_verified_noreplace(
             return Err(std::io::Error::other(
                 "Publication destination must be absolute",
             ));
+        }
+        #[cfg(feature = "test-tools")]
+        if trace.is_some()
+            && test_root()
+                .ok()
+                .flatten()
+                .is_some_and(|root| source.starts_with(root))
+            && std::env::var("FETCHRAIL_TEST_DEFER_PUBLICATION_CLEANUP").is_ok_and(|v| v == "1")
+        {
+            if let Some(guard) = link_publication_for_test(file, source, destination, trace)? {
+                return Ok(guard);
+            }
         }
         let name: Vec<u16> = destination
             .as_os_str()
@@ -273,14 +376,16 @@ pub(crate) fn publish_verified_noreplace(
         let _ = source;
         #[cfg(feature = "test-tools")]
         let _sync_span = trace.map(|trace| trace.guard(crate::engine::trace::Phase::PublishSync));
-        file.sync_all()
+        file.sync_all()?;
+        Ok(data_guard.into())
     }
     #[cfg(not(windows))]
     {
         let _ = file;
         #[cfg(feature = "test-tools")]
         let _ = trace;
-        publish_noreplace(source, destination)
+        publish_noreplace(source, destination)?;
+        Ok(data_guard.into())
     }
 }
 
