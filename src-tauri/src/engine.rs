@@ -61,6 +61,15 @@ const QUEUES_EVENT: &str = "fetchrail://queues-updated";
 const REMOVED_EVENT: &str = "fetchrail://download-removed";
 const MERGE_BUFFER_SIZE: usize = 4 * 1024 * 1024;
 const TRANSFER_BUFFER_SIZE: usize = 1024 * 1024;
+const CHECKPOINT_INTERVAL: Duration = Duration::from_secs(5);
+
+fn initial_checkpoint_interval(index: usize, workers: usize, range_bytes: u64) -> Duration {
+    if range_bytes < 64 * 1024 * 1024 {
+        return CHECKPOINT_INTERVAL;
+    }
+    let slots = workers.clamp(1, 32);
+    CHECKPOINT_INTERVAL / slots as u32 * (slots - index % slots) as u32
+}
 
 pub(crate) fn download_client_builder() -> reqwest::ClientBuilder {
     Client::builder()
@@ -4762,6 +4771,15 @@ impl DownloadManager {
         let (mut best_rate, mut previous_rate) = (0.0, 0.0);
         let mut slow_windows = 0;
         let mut checkpoint_at = Instant::now();
+        // Spread the initial durable writes without extending the recovery window.
+        let mut checkpoint_delay =
+            initial_checkpoint_interval(index, worker_count, expected_len.unwrap_or(0));
+        #[cfg(feature = "test-tools")]
+        if task.trace.is_some()
+            && std::env::var("FETCHRAIL_TEST_CHECKPOINT_PHASE").is_ok_and(|value| value == "0")
+        {
+            checkpoint_delay = CHECKPOINT_INTERVAL;
+        }
         let (mut response_wait, mut watched_bytes, mut weak_windows) =
             (Duration::ZERO, existing, 0usize);
         let transfer = async {
@@ -4816,7 +4834,7 @@ impl DownloadManager {
                     segment.downloaded.fetch_add(size as u64, Ordering::Relaxed);
                     offset += size;
                 }
-                if let Some(hash) = part_hash.as_ref().filter(|_| checkpoint_at.elapsed() >= Duration::from_secs(5)) {
+                if let Some(hash) = part_hash.as_ref().filter(|_| checkpoint_at.elapsed() >= checkpoint_delay) {
                     let durable_at = Instant::now();
                     transfer_span!(task.trace.as_deref(),Flush,output.flush().await)?;
                     transfer_span!(task.trace.as_deref(),Sync,output.get_ref().sync_data().await)?;
@@ -4834,6 +4852,7 @@ impl DownloadManager {
                         policy.write_wait_ns.fetch_add(durable_at.elapsed().as_nanos().min(u64::MAX as u128) as u64, Ordering::Relaxed);
                     }
                     checkpoint_at = Instant::now();
+                    checkpoint_delay = CHECKPOINT_INTERVAL;
                 }
                 if progress_at.elapsed() >= Duration::from_secs(10) {
                     if probe.accepts_ranges
