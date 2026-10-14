@@ -71,6 +71,61 @@ fn initial_checkpoint_interval(index: usize, workers: usize, range_bytes: u64) -
     CHECKPOINT_INTERVAL / slots as u32 * (slots - index % slots) as u32
 }
 
+enum TransferOutput {
+    Regular(fs::File),
+    #[cfg(all(windows, feature = "test-tools"))]
+    Guarded(crate::guarded_staging::GuardedWriter),
+}
+impl TransferOutput {
+    async fn metadata(&self) -> std::io::Result<std::fs::Metadata> {
+        match self {
+            Self::Regular(file) => file.metadata().await,
+            #[cfg(all(windows, feature = "test-tools"))]
+            Self::Guarded(file) => file.metadata().await,
+        }
+    }
+    async fn sync_data(&self) -> std::io::Result<()> {
+        match self {
+            Self::Regular(file) => file.sync_data().await,
+            #[cfg(all(windows, feature = "test-tools"))]
+            Self::Guarded(file) => file.sync_data().await,
+        }
+    }
+}
+impl tokio::io::AsyncWrite for TransferOutput {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        data: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        match self.get_mut() {
+            Self::Regular(file) => std::pin::Pin::new(file).poll_write(cx, data),
+            #[cfg(all(windows, feature = "test-tools"))]
+            Self::Guarded(file) => std::pin::Pin::new(file).poll_write(cx, data),
+        }
+    }
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            Self::Regular(file) => std::pin::Pin::new(file).poll_flush(cx),
+            #[cfg(all(windows, feature = "test-tools"))]
+            Self::Guarded(file) => std::pin::Pin::new(file).poll_flush(cx),
+        }
+    }
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            Self::Regular(file) => std::pin::Pin::new(file).poll_shutdown(cx),
+            #[cfg(all(windows, feature = "test-tools"))]
+            Self::Guarded(file) => std::pin::Pin::new(file).poll_shutdown(cx),
+        }
+    }
+}
+
 pub(crate) fn download_client_builder() -> reqwest::ClientBuilder {
     Client::builder()
         .user_agent(concat!("Fetchrail/", env!("CARGO_PKG_VERSION")))
@@ -849,6 +904,76 @@ fn verify_during_attachment(
     Ok(Some(proof))
 }
 
+#[cfg(all(windows, feature = "test-tools"))]
+fn accept_streamed_verification(
+    path: &Path,
+    identity: &FileIdentity,
+    total: u64,
+    manifest: &[u8],
+    hashes: Vec<String>,
+    guard: Arc<crate::guarded_staging::GuardedStage>,
+    cancel: &CancellationToken,
+    trace: Option<Arc<trace::Trace>>,
+    scan: impl FnOnce() -> std::io::Result<()>,
+) -> EngineResult<Option<VerifiedPublication>> {
+    let guard = Arc::try_unwrap(guard)
+        .map_err(|_| EngineError::Message("Guarded transfer readers remain active".into()))?;
+    let (writer, valid) = guard.finish(&hashes)?;
+    if !valid {
+        drop(writer);
+        return Ok(None);
+    }
+    let (observed_identity, observed_length, file) =
+        open_publication_file_with_access(path, PublicationAccess::Observe)?;
+    if &observed_identity != identity || observed_length != total {
+        return Err(EngineError::Message(
+            "Guarded assembly identity changed".into(),
+        ));
+    }
+    let Some(watch) = crate::platform::ScanWatch::new(file) else {
+        drop(writer);
+        return Ok(None);
+    };
+    drop(writer);
+    transfer_span!(trace.as_deref(), Attachment, scan())?;
+    if cancel.is_cancelled() {
+        return Err(EngineError::Cancelled);
+    }
+    let (protected_identity, length, protected) =
+        open_publication_file_with_access(path, PublicationAccess::Publish)?;
+    if &protected_identity != identity || length != total {
+        return Err(EngineError::Message(
+            "Streamed file changed during attachment processing".into(),
+        ));
+    }
+    if watch.unchanged() {
+        if let Some(trace) = &trace {
+            trace.stream_proof_accepted.store(true, Ordering::Relaxed);
+        }
+        Ok(Some(VerifiedPublication {
+            identity: protected_identity,
+            file: protected,
+            sha256: String::new(),
+            range_sha256: hashes,
+        }))
+    } else {
+        Ok(Some(transfer_span!(
+            trace.as_deref(),
+            Verify,
+            verify_publication_contents(
+                protected,
+                protected_identity,
+                path,
+                total,
+                manifest,
+                Some(hashes),
+                None,
+                cancel
+            )
+        )?))
+    }
+}
+
 #[cfg(test)]
 async fn recover_publication(part_dir: &Path, record: &mut DownloadRecord) -> EngineResult<bool> {
     Ok(recover_verified_publication(part_dir, record)
@@ -1032,6 +1157,8 @@ fn segment_progress(segments: &[SegmentCounter], speeds: &[f64]) -> Vec<SegmentP
 }
 
 struct DownloadTask {
+    #[cfg(all(windows, feature = "test-tools"))]
+    guarded_staging: Mutex<Option<(FileIdentity, Arc<crate::guarded_staging::GuardedStage>)>>,
     #[cfg(feature = "test-tools")]
     trace: Option<Arc<trace::Trace>>,
     analytics_sample: Mutex<Option<crate::analytics::Sample>>,
@@ -1070,6 +1197,8 @@ impl DownloadTask {
             limiter: RateLimiter::new(record.speed_limit_bps),
             performance: Mutex::new(None),
             received_sha256: Mutex::new(None),
+            #[cfg(all(windows, feature = "test-tools"))]
+            guarded_staging: Mutex::new(None),
             request_context,
             paused: AtomicBool::new(record.status == DownloadStatus::Paused),
             record: RwLock::new(record),
@@ -3604,9 +3733,23 @@ impl DownloadManager {
         }
         let manager = self.clone();
         let cancel = task.fresh_cancel_token();
+        #[cfg(all(windows, feature = "test-tools"))]
+        {
+            *task
+                .guarded_staging
+                .lock()
+                .expect("guarded staging poisoned") = None;
+        }
         tauri::async_runtime::spawn(async move {
             let result = manager.run(task.clone(), cancel).await;
             if let Err(error) = result {
+                #[cfg(all(windows, feature = "test-tools"))]
+                {
+                    *task
+                        .guarded_staging
+                        .lock()
+                        .expect("guarded staging poisoned") = None;
+                }
                 manager.handle_run_error(&task, error).await;
                 #[cfg(feature = "test-tools")]
                 manager.save_test_trace(&task).await;
@@ -4307,6 +4450,25 @@ impl DownloadManager {
         let peer_rate = AtomicU64::new(0);
         let live_peer_rate = AtomicU64::new(0);
         let shared = shared_staging(part_dir).await?;
+        #[cfg(all(windows, feature = "test-tools"))]
+        if shared
+            && probe.validator.is_some()
+            && task.trace.is_some()
+            && std::env::var("FETCHRAIL_TEST_STREAMING_VERIFY").is_ok_and(|value| value == "1")
+            && task.record.read().await.expected_sha256.is_none()
+        {
+            if let Ok((identity, length, file)) = open_publication_file_with_access(
+                &part_dir.join("0.part"),
+                PublicationAccess::Publish,
+            ) {
+                if let Ok(stage) = crate::guarded_staging::GuardedStage::new(file, length) {
+                    *task
+                        .guarded_staging
+                        .lock()
+                        .expect("guarded staging poisoned") = Some((identity, Arc::new(stage)));
+                }
+            }
+        }
         #[cfg(feature = "test-tools")]
         if let Some(trace) = &task.trace {
             trace.phase(trace::Phase::Body);
@@ -4742,20 +4904,73 @@ impl DownloadManager {
             }
         }
 
-        let mut output = fs::OpenOptions::new()
-            .create(!shared)
-            .write(true)
-            .truncate(!shared && existing == 0)
-            .open(&part_path)
-            .await?;
-        if shared {
-            output
-                .seek(std::io::SeekFrom::Start(range.start + existing))
+        #[cfg(all(windows, feature = "test-tools"))]
+        let guarded = task
+            .guarded_staging
+            .lock()
+            .expect("guarded staging poisoned")
+            .as_ref()
+            .map(|(_, stage)| stage.clone());
+        #[cfg(all(windows, feature = "test-tools"))]
+        let mut prefix_verifier = if let Some((guard_identity, _)) = task
+            .guarded_staging
+            .lock()
+            .expect("guarded staging poisoned")
+            .as_ref()
+        {
+            let (identity, length, reader) =
+                open_publication_file_with_access(&part_path, PublicationAccess::ConcurrentRead)?;
+            if &identity != guard_identity || Some(length) != probe.total_bytes {
+                return Err(EngineError::Message(
+                    "Guarded staging identity changed".into(),
+                ));
+            }
+            Some(crate::guarded_staging::PrefixVerifier::new(
+                reader,
+                range.start,
+                existing,
+                range.end + 1,
+                part_hash
+                    .as_ref()
+                    .ok_or_else(|| EngineError::Message("Guarded range hash unavailable".into()))?
+                    .clone(),
+            )?)
+        } else {
+            None
+        };
+        #[cfg(all(windows, feature = "test-tools"))]
+        let guarded_output = guarded
+            .as_ref()
+            .map(|stage| stage.writer(range.start + existing, range.end + 1))
+            .transpose()?;
+        #[cfg(not(all(windows, feature = "test-tools")))]
+        let guarded_output: Option<TransferOutput> = None;
+        let output = if let Some(guarded_output) = guarded_output {
+            #[cfg(all(windows, feature = "test-tools"))]
+            {
+                TransferOutput::Guarded(guarded_output)
+            }
+            #[cfg(not(all(windows, feature = "test-tools")))]
+            {
+                guarded_output
+            }
+        } else {
+            let mut output = fs::OpenOptions::new()
+                .create(!shared)
+                .write(true)
+                .truncate(!shared && existing == 0)
+                .open(&part_path)
                 .await?;
-        } else if existing > 0 {
-            output.set_len(existing).await?;
-            output.seek(std::io::SeekFrom::Start(existing)).await?;
-        }
+            if shared {
+                output
+                    .seek(std::io::SeekFrom::Start(range.start + existing))
+                    .await?;
+            } else if existing > 0 {
+                output.set_len(existing).await?;
+                output.seek(std::io::SeekFrom::Start(existing)).await?;
+            }
+            TransferOutput::Regular(output)
+        };
         // Batch small network chunks into disk writes; flush even on cancellation or failure.
         let mut output = BufWriter::with_capacity(
             policy
@@ -4838,6 +5053,11 @@ impl DownloadManager {
                     let durable_at = Instant::now();
                     transfer_span!(task.trace.as_deref(),Flush,output.flush().await)?;
                     transfer_span!(task.trace.as_deref(),Sync,output.get_ref().sync_data().await)?;
+                    #[cfg(all(windows, feature = "test-tools"))]
+                    if let Some(verifier)=prefix_verifier.as_mut() {
+                        let verified = transfer_span!(task.trace.as_deref(),Verify,verifier.verify_to(segment.downloaded.load(Ordering::Relaxed),format!("{:x}",hash.clone().finalize()),cancel.clone()).await)?;
+                        if let Some(trace) = &task.trace { trace.stream_verified_bytes.fetch_add(verified,Ordering::Relaxed); }
+                    }
                     transfer_span!(task.trace.as_deref(),Checkpoint,write_json_atomic(
                         &part_dir.join(format!("{index}.progress.json")),
                         &PartCheckpoint {
@@ -4907,6 +5127,25 @@ impl DownloadManager {
             )?;
         }
         let received_digest = part_hash.map(|hash| format!("{:x}", hash.finalize()));
+        #[cfg(all(windows, feature = "test-tools"))]
+        if let (Some(verifier), Some(hash)) = (prefix_verifier.as_mut(), received_digest.as_ref()) {
+            let bytes = segment.downloaded.load(Ordering::Relaxed);
+            let verified = transfer_span!(
+                task.trace.as_deref(),
+                Verify,
+                verifier
+                    .verify_to(bytes, hash.clone(), CancellationToken::new())
+                    .await
+            )?;
+            if let Some(trace) = &task.trace {
+                trace
+                    .stream_verified_bytes
+                    .fetch_add(verified, Ordering::Relaxed);
+            }
+            if transfer.is_ok() && expected_len == Some(bytes) {
+                guarded.as_ref().unwrap().certify(index, hash.clone())?;
+            }
+        }
         if let Some(hash) = received_digest.as_ref() {
             transfer_span!(
                 task.trace.as_deref(),
@@ -5305,7 +5544,25 @@ impl DownloadManager {
                     record.expected_sha256.clone()
                 };
                 let cancel = cancel.clone();
+                #[cfg(all(windows, feature = "test-tools"))]
+                let guard_alias = task
+                    .guarded_staging
+                    .lock()
+                    .expect("guarded staging poisoned")
+                    .clone();
                 move || {
+                    #[cfg(all(windows, feature = "test-tools"))]
+                    if let Some((identity, guard)) = guard_alias {
+                        guard.alias_to(&part_dir.join("0.part"), &temp_path)?;
+                        let (actual, length, _) = open_publication_file(&temp_path)?;
+                        if actual != identity || length != total {
+                            return Err(EngineError::Message(
+                                "Guarded alias changed identity".into(),
+                            ));
+                        }
+                        merged.store(total, Ordering::Relaxed);
+                        return Ok((actual, length));
+                    }
                     join_parts_cancellable(
                         &part_dir,
                         &temp_path,
@@ -5433,8 +5690,53 @@ impl DownloadManager {
         if let Some(trace) = &task.trace {
             trace.phase(trace::Phase::Attachment);
         }
+        #[cfg(all(windows, feature = "test-tools"))]
+        let stream_guard = task
+            .guarded_staging
+            .lock()
+            .expect("guarded staging poisoned")
+            .take();
+        #[cfg(all(windows, feature = "test-tools"))]
+        let streamed = if let (Some((guard_identity, guard)), Some(hashes)) =
+            (stream_guard, complete_hashes.clone())
+        {
+            if guard_identity != scan_identity {
+                return Err(EngineError::Message(
+                    "Guarded final identity changed".into(),
+                ));
+            }
+            let path = temp_path.clone();
+            let identity = scan_identity.clone();
+            let manifest = manifest_bytes.clone();
+            let token = cancel.clone();
+            let trace = task.trace.clone();
+            let url = record.url.clone();
+            let name = desired_name.to_owned();
+            let runtime = tokio::runtime::Handle::current();
+            tokio::task::spawn_blocking(move || {
+                accept_streamed_verification(
+                    &path,
+                    &identity,
+                    total,
+                    &manifest,
+                    hashes,
+                    guard,
+                    &token,
+                    trace.clone(),
+                    || runtime.block_on(crate::platform::mark_download(&path, &url, &name, trace)),
+                )
+            })
+            .await
+            .map_err(|e| EngineError::Message(e.to_string()))??
+        } else {
+            None
+        };
+        #[cfg(not(all(windows, feature = "test-tools")))]
+        let streamed: Option<VerifiedPublication> = None;
         #[cfg(windows)]
-        let overlapping = if total >= 64 * 1024 * 1024 && {
+        let overlapping = if streamed.is_some() {
+            streamed
+        } else if total >= 64 * 1024 * 1024 && {
             let enabled = true;
             #[cfg(feature = "test-tools")]
             let enabled = enabled

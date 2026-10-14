@@ -7,6 +7,8 @@ mod browser_extension;
 mod diagnostics;
 mod download_window;
 mod engine;
+#[cfg(all(windows, feature = "test-tools"))]
+mod guarded_staging;
 #[cfg(windows)]
 pub mod install;
 mod integrity;
