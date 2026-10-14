@@ -48,6 +48,15 @@ files](https://learn.microsoft.com/en-us/windows/win32/api/shobjidl_core/nf-shob
 Security processing and namespace waits need further investigation before enabling
 this path in production.
 
+A subsequent owner-approved 60-second Defender trace reproduced the delay:
+receiving ended after 184.87 seconds and the total was 210.15 seconds. `IOAVWeb`
+ran for 8.82 seconds during attachment processing; an `Internal (7)` scan then ran
+for 16.25 seconds, overlapping the 16.21-second rename wait and ending as rename
+returned. Nested `FileScan` rows describe overlapping work and must not be added
+again. All byte, origin, catalog and immediate access checks passed. The precise
+trigger of the second scan remains unproven; a diagnostic performance hint alone
+is not a malware verdict. Security policy and exclusions were unchanged.
+
 Validation: 127 native tests passed, 3 optional benchmarks ignored; normal library
 check, optimized test build, Rust formatting, frontend build, browser checks and
 version consistency passed. Tests cover cancelled and mismatched prefix checks,
