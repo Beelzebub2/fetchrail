@@ -389,6 +389,8 @@ enum PublicationAccess {
     Verify,
     Publish,
     ConcurrentRead,
+    #[cfg(all(windows, feature = "test-tools"))]
+    Observe,
 }
 fn open_publication_file_with_access(
     path: &Path,
@@ -419,6 +421,10 @@ fn open_publication_file_with_access(
         use std::os::windows::fs::OpenOptionsExt;
         options.custom_flags(0x00200000);
         match access {
+            #[cfg(feature = "test-tools")]
+            PublicationAccess::Observe => {
+                options.share_mode(7).custom_flags(0x40000000 | 0x00200000);
+            }
             PublicationAccess::Inspect => {}
             PublicationAccess::Verify => {
                 options.share_mode(0x00000001);
@@ -427,6 +433,11 @@ fn open_publication_file_with_access(
                 // The primary Publish handle already denies third-party writes/deletes.
                 // These read-only handles must still share its existing write/delete access.
                 options.share_mode(0x00000001 | 0x00000002 | 0x00000004);
+                // Each lane reads a full range before seeking to its next claimed range.
+                use windows::Win32::Storage::FileSystem::{
+                    FILE_FLAG_OPEN_REPARSE_POINT, FILE_FLAG_SEQUENTIAL_SCAN,
+                };
+                options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT.0 | FILE_FLAG_SEQUENTIAL_SCAN.0);
             }
             PublicationAccess::Publish => {
                 options
@@ -680,6 +691,29 @@ fn verify_scanned_publication(
             "File changed during attachment processing; no file was published.".into(),
         ));
     }
+    verify_publication_contents(
+        file,
+        identity,
+        path,
+        total,
+        manifest_bytes,
+        complete_hashes,
+        expected_sha256,
+        cancel,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn verify_publication_contents(
+    file: std::fs::File,
+    identity: FileIdentity,
+    path: &Path,
+    total: u64,
+    manifest_bytes: &[u8],
+    complete_hashes: Option<Vec<String>>,
+    expected_sha256: Option<&str>,
+    cancel: &CancellationToken,
+) -> EngineResult<VerifiedPublication> {
     let (sha256, range_sha256) = if let Some(hashes) = complete_hashes {
         if !committed_ranges_match(
             file.try_clone()?,
@@ -715,6 +749,96 @@ fn verify_scanned_publication(
     })
 }
 
+#[cfg(all(windows, feature = "test-tools"))]
+#[allow(clippy::too_many_arguments)]
+fn verify_during_attachment(
+    path: &Path,
+    expected_identity: &FileIdentity,
+    total: u64,
+    manifest_bytes: &[u8],
+    complete_hashes: Option<Vec<String>>,
+    expected_sha256: Option<&str>,
+    cancel: &CancellationToken,
+    trace: Arc<trace::Trace>,
+    scan: impl FnOnce() -> std::io::Result<()>,
+) -> EngineResult<Option<VerifiedPublication>> {
+    let Ok((identity, bytes, observed)) =
+        open_publication_file_with_access(path, PublicationAccess::Observe)
+    else {
+        return Ok(None);
+    };
+    if identity != *expected_identity || bytes != total {
+        return Ok(None);
+    }
+    let Some(watch) = crate::platform::ScanWatch::new(observed) else {
+        return Ok(None);
+    };
+    let (identity, bytes, input) =
+        open_publication_file_with_access(path, PublicationAccess::ConcurrentRead)?;
+    if identity != *expected_identity || bytes != total {
+        return Ok(None);
+    }
+    let hash_cancel = cancel.child_token();
+    let hashes = complete_hashes.clone();
+    let proof = std::thread::scope(|scope| -> EngineResult<VerifiedPublication> {
+        let hash = scope.spawn(|| {
+            transfer_span!(
+                Some(trace.as_ref()),
+                Verify,
+                verify_publication_contents(
+                    input,
+                    identity,
+                    path,
+                    total,
+                    manifest_bytes,
+                    hashes,
+                    expected_sha256,
+                    &hash_cancel
+                )
+            )
+        });
+        let scanned = transfer_span!(Some(trace.as_ref()), Attachment, scan());
+        if scanned.is_err() {
+            hash_cancel.cancel();
+        }
+        let result = hash
+            .join()
+            .map_err(|_| EngineError::Message("Integrity worker panicked.".into()))?;
+        scanned?;
+        let (identity, bytes, protected) =
+            open_publication_file_with_access(path, PublicationAccess::Publish)?;
+        if identity != *expected_identity || bytes != total {
+            return Err(EngineError::Message(
+                "File changed during attachment processing; no file was published.".into(),
+            ));
+        }
+        if cancel.is_cancelled() {
+            return Err(EngineError::Cancelled);
+        }
+        if watch.unchanged() {
+            let mut proof = result?;
+            proof.file = protected;
+            Ok(proof)
+        } else {
+            transfer_span!(
+                Some(trace.as_ref()),
+                Verify,
+                verify_publication_contents(
+                    protected,
+                    identity,
+                    path,
+                    total,
+                    manifest_bytes,
+                    complete_hashes,
+                    expected_sha256,
+                    cancel
+                )
+            )
+        }
+    })?;
+    Ok(Some(proof))
+}
+
 #[cfg(test)]
 async fn recover_publication(part_dir: &Path, record: &mut DownloadRecord) -> EngineResult<bool> {
     Ok(recover_verified_publication(part_dir, record)
@@ -724,7 +848,7 @@ async fn recover_publication(part_dir: &Path, record: &mut DownloadRecord) -> En
 async fn recover_verified_publication(
     part_dir: &Path,
     record: &mut DownloadRecord,
-) -> EngineResult<Option<std::fs::File>> {
+) -> EngineResult<Option<crate::platform::PublicationGuard>> {
     let bytes = match fs::read(part_dir.join("publication.json")).await {
         Ok(bytes) => bytes,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -809,8 +933,7 @@ async fn recover_verified_publication(
                     &destination,
                     #[cfg(feature = "test-tools")]
                     None,
-                )?;
-                Ok::<_, std::io::Error>(file)
+                )
             })
             .await
             .map_err(|e| EngineError::Message(e.to_string()))??,
@@ -833,7 +956,8 @@ async fn recover_verified_publication(
             )
         })
         .await
-        .map_err(|e| EngineError::Message(e.to_string()))??;
+        .map_err(|e| EngineError::Message(e.to_string()))??
+        .map(Into::into);
     }
     if verified_file.is_none() {
         return Err(EngineError::Message("Published file changed or belongs to another owner; no file was replaced. Inspect the preserved staging before retrying.".into()));
@@ -4126,6 +4250,9 @@ impl DownloadManager {
         if let Some(trace) = &task.trace {
             trace.catalog_acknowledged.store(true, Ordering::Release);
         }
+        #[cfg(all(windows, feature = "test-tools"))]
+        let pending_cleanup = verified_file.release();
+        #[cfg(not(all(windows, feature = "test-tools")))]
         drop(verified_file);
         if initial_downloaded == 0 {
             if let (Some(policy), Some(hardware)) = (policy, hardware) {
@@ -4145,6 +4272,18 @@ impl DownloadManager {
                 }
             }
         }
+        #[cfg(all(windows, feature = "test-tools"))]
+        if let Some(cleanup) = pending_cleanup {
+            let owned = part_dir.clone();
+            tokio::task::spawn_blocking(move || {
+                if let Err(error) = cleanup.clean(&owned) {
+                    eprintln!("Private publication cleanup deferred: {error}");
+                }
+            });
+        } else {
+            let _ = fs::remove_dir_all(&part_dir).await;
+        }
+        #[cfg(not(all(windows, feature = "test-tools")))]
         let _ = fs::remove_dir_all(&part_dir).await;
         #[cfg(feature = "test-tools")]
         self.save_test_trace(&task).await;
@@ -5075,7 +5214,7 @@ impl DownloadManager {
         cancel: &CancellationToken,
         part_dir: &Path,
         ranges: &[ByteRange],
-    ) -> EngineResult<(PathBuf, std::fs::File)> {
+    ) -> EngineResult<(PathBuf, crate::platform::PublicationGuard)> {
         let record = task.record.read().await.clone();
         let requested = PathBuf::from(&record.destination);
         let parent = requested
@@ -5271,43 +5410,91 @@ impl DownloadManager {
         if let Some(trace) = &task.trace {
             trace.phase(trace::Phase::Attachment);
         }
-        #[cfg(windows)]
-        transfer_span!(
-            task.trace.as_deref(),
-            Attachment,
-            crate::platform::mark_download(
-                &temp_path,
-                &record.url,
-                desired_name,
-                #[cfg(feature = "test-tools")]
-                task.trace.clone(),
+        #[cfg(all(windows, feature = "test-tools"))]
+        let overlapping = if let Some(trace) = task.trace.clone().filter(|_| {
+            std::env::var("FETCHRAIL_TEST_SCAN_OVERLAP").is_ok_and(|value| value == "1")
+        }) {
+            let path = temp_path.clone();
+            let identity = scan_identity.clone();
+            let manifest = manifest_bytes.clone();
+            let hashes = complete_hashes.clone();
+            let expected = expected_sha256.clone();
+            let token = cancel.clone();
+            let url = record.url.clone();
+            let name = desired_name.to_owned();
+            let runtime = tokio::runtime::Handle::current();
+            transfer_span!(
+                task.trace.as_deref(),
+                ScanOverlap,
+                tokio::task::spawn_blocking(move || {
+                    verify_during_attachment(
+                        &path,
+                        &identity,
+                        total,
+                        &manifest,
+                        hashes,
+                        expected.as_deref(),
+                        &token,
+                        trace.clone(),
+                        || {
+                            runtime.block_on(crate::platform::mark_download(
+                                &path,
+                                &url,
+                                &name,
+                                Some(trace),
+                            ))
+                        },
+                    )
+                })
+                .await
             )
-            .await
-        )?;
-        task.check_stopped(cancel)?;
-        let path = temp_path.clone();
-        let hash_cancel = cancel.clone();
-        #[cfg(feature = "test-tools")]
-        if let Some(trace) = &task.trace {
-            trace.phase(trace::Phase::Verify);
-        }
-        let verified = transfer_span!(
-            task.trace.as_deref(),
-            Verify,
-            tokio::task::spawn_blocking(move || {
-                verify_scanned_publication(
-                    &path,
-                    &scan_identity,
-                    total,
-                    &manifest_bytes,
-                    complete_hashes,
-                    expected_sha256.as_deref(),
-                    &hash_cancel,
+            .map_err(|error| EngineError::Message(error.to_string()))??
+        } else {
+            None
+        };
+        #[cfg(not(all(windows, feature = "test-tools")))]
+        let overlapping: Option<VerifiedPublication> = None;
+        let verified = if let Some(verified) = overlapping {
+            verified
+        } else {
+            #[cfg(windows)]
+            transfer_span!(
+                task.trace.as_deref(),
+                Attachment,
+                crate::platform::mark_download(
+                    &temp_path,
+                    &record.url,
+                    desired_name,
+                    #[cfg(feature = "test-tools")]
+                    task.trace.clone(),
                 )
-            })
-            .await
-        )
-        .map_err(|e| EngineError::Message(e.to_string()))??;
+                .await
+            )?;
+            task.check_stopped(cancel)?;
+            let path = temp_path.clone();
+            let hash_cancel = cancel.clone();
+            #[cfg(feature = "test-tools")]
+            if let Some(trace) = &task.trace {
+                trace.phase(trace::Phase::Verify);
+            }
+            transfer_span!(
+                task.trace.as_deref(),
+                Verify,
+                tokio::task::spawn_blocking(move || {
+                    verify_scanned_publication(
+                        &path,
+                        &scan_identity,
+                        total,
+                        &manifest_bytes,
+                        complete_hashes,
+                        expected_sha256.as_deref(),
+                        &hash_cancel,
+                    )
+                })
+                .await
+            )
+            .map_err(|e| EngineError::Message(e.to_string()))??
+        };
         let _dispatch = self.dispatch_lock.lock().await;
         let _lock = self.persist_lock.lock().await;
         task.check_stopped(cancel)?;
@@ -5361,14 +5548,14 @@ impl DownloadManager {
             )
             .map_err(|e| EngineError::Message(e.to_string()))?
             {
-                Ok(()) => {
+                Ok(publication_guard) => {
                     journal.published = true;
                     transfer_span!(
                         task.trace.as_deref(),
                         Journal,
                         write_json_atomic(&part_dir.join("publication.json"), &journal).await
                     )?;
-                    return Ok((destination, verified.file));
+                    return Ok((destination, publication_guard));
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
                 Err(error) => return Err(error.into()),
