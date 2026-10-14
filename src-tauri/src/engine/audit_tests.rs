@@ -1,6 +1,44 @@
 use super::*;
 
 #[test]
+fn initial_checkpoints_spread_without_extending_the_recovery_window() {
+    for workers in 1..=32 {
+        let mut seen = std::collections::HashSet::new();
+        for index in 0..workers {
+            let delay = initial_checkpoint_interval(index, workers, 64 * 1024 * 1024);
+            assert!(delay > Duration::ZERO && delay <= CHECKPOINT_INTERVAL);
+            assert!(seen.insert(delay));
+            assert_eq!(
+                delay,
+                initial_checkpoint_interval(index + workers, workers, 64 * 1024 * 1024)
+            );
+        }
+        assert_eq!(seen.len(), workers);
+    }
+    assert_eq!(
+        initial_checkpoint_interval(0, 0, 64 * 1024 * 1024),
+        CHECKPOINT_INTERVAL
+    );
+    assert_eq!(
+        initial_checkpoint_interval(usize::MAX, 1, 64 * 1024 * 1024),
+        CHECKPOINT_INTERVAL
+    );
+    assert!(initial_checkpoint_interval(usize::MAX, usize::MAX, u64::MAX) <= CHECKPOINT_INTERVAL);
+    for workers in [1, 8, 16, 32] {
+        for index in 0..workers {
+            assert_eq!(
+                initial_checkpoint_interval(index, workers, 0),
+                CHECKPOINT_INTERVAL
+            );
+            assert_eq!(
+                initial_checkpoint_interval(index, workers, 64 * 1024 * 1024 - 1),
+                CHECKPOINT_INTERVAL
+            );
+        }
+    }
+}
+
+#[test]
 fn private_assembly_suffix_preserves_type_and_keeps_extensionless_names() {
     for (name, suffix) in [
         ("archive.rar", ".fetchrail-part.rar"),
