@@ -249,6 +249,24 @@ try {
   const dockShown = () => page.locator(".save-dock").evaluate((bar) => bar.classList.contains("shown"));
   const glide = () => page.locator(".tab-glide").evaluate((bar) => ({ opacity: bar.style.opacity, transform: bar.style.transform }));
   await page.getByRole("button", { name: /^All downloads/ }).waitFor();
+  // Large files may queue 32 immutable byte ranges on 16 live connections.
+  // Neither the connection label nor the throughput header may confuse those units.
+  await page.evaluate(() => {
+    window.originalRecord = structuredClone(window.testRecord);
+    const size = 1024 ** 2;
+    const segments = Array.from({ length: 32 }, (_, index) => {
+      const done = index < 8, active = index >= 8 && index < 12;
+      return { start: index * size, length: size, downloadedBytes: done ? size : 0, speedBps: active ? 27_500_000 : 0, active, waiting: !active && !done };
+    });
+    Object.assign(window.testRecord, { status: "downloading", totalBytes: 32 * size, downloadedBytes: 8 * size, speedBps: 110_000_000, connections: 16, requestedConnections: 16, receivingConnections: 4, connectingConnections: 0, plannedRanges: 32, segments });
+    window.testEmit("fetchrail://download-updated", structuredClone(window.testRecord));
+  });
+  await page.locator(".download-row .col-speed small").getByText("4 of 16 connections").waitFor();
+  await page.locator(".throughput .speed").getByText("110.0", { exact: true }).waitFor();
+  await page.evaluate(() => {
+    window.testRecord = window.originalRecord;
+    window.testEmit("fetchrail://download-updated", structuredClone(window.testRecord));
+  });
   assert.equal(await gear.getAttribute("aria-pressed"), "false");
   assert.equal((await glide()).opacity, "1", "The current view tab carries the underline.");
   await page.getByRole("button", { name: /^Default/ }).click();
