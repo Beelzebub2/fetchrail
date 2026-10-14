@@ -14,6 +14,16 @@ pub(crate) async fn mark_download(
     file_name: &str,
     #[cfg(feature = "test-tools")] trace: Option<std::sync::Arc<crate::engine::trace::Trace>>,
 ) -> io::Result<()> {
+    #[cfg(feature = "test-tools")]
+    let benchmark_source = (trace.is_some()
+        && crate::platform::test_root()
+            .ok()
+            .flatten()
+            .is_some_and(|root| path.starts_with(root)))
+    .then(|| std::env::var("FETCHRAIL_TEST_ATTACHMENT_SOURCE").ok())
+    .flatten();
+    #[cfg(feature = "test-tools")]
+    let url = benchmark_source.as_deref().unwrap_or(url);
     #[cfg(windows)]
     {
         let scan_path = path.to_path_buf();
