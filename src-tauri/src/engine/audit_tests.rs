@@ -32,6 +32,12 @@ fn scan_overlap_observes_provider_changes_without_blocking_remediation() {
         "reject",
     ] {
         std::fs::write(&path, &bytes).unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .sync_all()
+            .unwrap();
         let (identity, total, inspected) = open_publication_file(&path).unwrap();
         drop(inspected);
         let trace = Arc::new(trace::Trace::default());
@@ -43,7 +49,7 @@ fn scan_overlap_observes_provider_changes_without_blocking_remediation() {
             None,
             Some(&expected),
             &CancellationToken::new(),
-            trace.clone(),
+            Some(trace.clone()),
             || {
                 match action {
                     "ads" => std::fs::write(
@@ -92,6 +98,80 @@ fn scan_overlap_observes_provider_changes_without_blocking_remediation() {
             std::fs::remove_file(&path).unwrap();
         }
     }
+    std::fs::write(&path, &bytes).unwrap();
+    let watches = (0..2)
+        .map(|_| {
+            let (_, _, file) =
+                open_publication_file_with_access(&path, PublicationAccess::Observe).unwrap();
+            crate::platform::ScanWatch::new(file)
+                .expect("Local NTFS must support shared read observation")
+        })
+        .collect::<Vec<_>>();
+    let (_, _, third) =
+        open_publication_file_with_access(&path, PublicationAccess::Observe).unwrap();
+    assert!(
+        crate::platform::ScanWatch::new(third).is_none(),
+        "At most two scans can add concurrent hash readers"
+    );
+    drop(watches);
+    for mapping_before_watch in [true, false] {
+        use std::os::windows::io::AsRawHandle;
+        use windows::{
+            core::PCWSTR,
+            Win32::{
+                Foundation::{CloseHandle, HANDLE},
+                System::Memory::{
+                    CreateFileMappingW, MapViewOfFile, UnmapViewOfFile, FILE_MAP_WRITE,
+                    PAGE_READWRITE,
+                },
+            },
+        };
+        std::fs::write(&path, &bytes).unwrap();
+        let writable = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        let mut watch = if mapping_before_watch {
+            None
+        } else {
+            let (_, _, file) =
+                open_publication_file_with_access(&path, PublicationAccess::Observe).unwrap();
+            Some(crate::platform::ScanWatch::new(file).unwrap())
+        };
+        let mapping = unsafe {
+            CreateFileMappingW(
+                HANDLE(writable.as_raw_handle()),
+                None,
+                PAGE_READWRITE,
+                0,
+                0,
+                PCWSTR::null(),
+            )
+        }
+        .unwrap();
+        let view = unsafe { MapViewOfFile(mapping, FILE_MAP_WRITE, 0, 0, 0) };
+        assert!(!view.Value.is_null());
+        drop(writable);
+        if mapping_before_watch {
+            let (_, _, file) =
+                open_publication_file_with_access(&path, PublicationAccess::Observe).unwrap();
+            watch = crate::platform::ScanWatch::new(file);
+        }
+        unsafe {
+            *(view.Value as *mut u8) = 0x33;
+        }
+        assert!(
+            watch.as_ref().is_none_or(|watch| !watch.unchanged()),
+            "Writable mappings must refuse or break the notification"
+        );
+        unsafe {
+            UnmapViewOfFile(view).unwrap();
+            CloseHandle(mapping).unwrap();
+        }
+        drop(watch);
+    }
+    std::fs::remove_file(path).unwrap();
     std::fs::remove_dir(&root).unwrap();
 }
 

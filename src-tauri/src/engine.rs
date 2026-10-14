@@ -397,7 +397,7 @@ enum PublicationAccess {
     Verify,
     Publish,
     ConcurrentRead,
-    #[cfg(all(windows, feature = "test-tools"))]
+    #[cfg(windows)]
     Observe,
 }
 fn open_publication_file_with_access(
@@ -429,7 +429,6 @@ fn open_publication_file_with_access(
         use std::os::windows::fs::OpenOptionsExt;
         options.custom_flags(0x00200000);
         match access {
-            #[cfg(feature = "test-tools")]
             PublicationAccess::Observe => {
                 options.share_mode(7).custom_flags(0x40000000 | 0x00200000);
             }
@@ -438,8 +437,7 @@ fn open_publication_file_with_access(
                 options.share_mode(0x00000001);
             }
             PublicationAccess::ConcurrentRead => {
-                // The primary Publish handle already denies third-party writes/deletes.
-                // These read-only handles must still share its existing write/delete access.
+                // Share scanner access during observation and the protected handle during publication.
                 options.share_mode(0x00000001 | 0x00000002 | 0x00000004);
             }
             PublicationAccess::Publish => {
@@ -566,7 +564,7 @@ fn range_hashes_match(
     }
     // Windows cloned handles share their seek cursor, including seek_read. Instead
     // reopen one independent, identity-checked read handle per worker while the
-    // protected Publish handle remains open and denies writes and replacement.
+    // publication handle or scan notification covers the independent read lanes.
     // Bound CPU, disk pressure and the integrity reader's two 8 MiB buffers.
     let _protected_file = file;
     let next = AtomicUsize::new(0);
@@ -752,7 +750,7 @@ fn verify_publication_contents(
     })
 }
 
-#[cfg(all(windows, feature = "test-tools"))]
+#[cfg(windows)]
 #[allow(clippy::too_many_arguments)]
 fn verify_during_attachment(
     path: &Path,
@@ -762,7 +760,7 @@ fn verify_during_attachment(
     complete_hashes: Option<Vec<String>>,
     expected_sha256: Option<&str>,
     cancel: &CancellationToken,
-    trace: Arc<trace::Trace>,
+    #[cfg(feature = "test-tools")] trace: Option<Arc<trace::Trace>>,
     scan: impl FnOnce() -> std::io::Result<()>,
 ) -> EngineResult<Option<VerifiedPublication>> {
     let Ok((identity, bytes, observed)) =
@@ -786,7 +784,7 @@ fn verify_during_attachment(
     let proof = std::thread::scope(|scope| -> EngineResult<VerifiedPublication> {
         let hash = scope.spawn(|| {
             transfer_span!(
-                Some(trace.as_ref()),
+                trace.as_deref(),
                 Verify,
                 verify_publication_contents(
                     input,
@@ -800,7 +798,7 @@ fn verify_during_attachment(
                 )
             )
         });
-        let scanned = transfer_span!(Some(trace.as_ref()), Attachment, scan());
+        let scanned = transfer_span!(trace.as_deref(), Attachment, scan());
         if scanned.is_err() {
             hash_cancel.cancel();
         }
@@ -824,7 +822,7 @@ fn verify_during_attachment(
             Ok(proof)
         } else {
             transfer_span!(
-                Some(trace.as_ref()),
+                trace.as_deref(),
                 Verify,
                 verify_publication_contents(
                     protected,
@@ -5229,12 +5227,15 @@ impl DownloadManager {
         let fingerprint = format!("{:x}", Sha256::digest(&manifest_bytes));
         let checkpoint_path = part_dir.join("merge.json");
         let prefix = format!(".{}.{}.", safe_file_name(desired_name), record.id);
+        #[cfg(windows)]
+        let suffix = private_assembly_suffix(desired_name);
+        #[cfg(not(windows))]
         let suffix = ".fetchrail-part".to_owned();
         #[cfg(feature = "test-tools")]
         let suffix = if task.trace.is_some()
-            && std::env::var("FETCHRAIL_TEST_PRESERVE_EXTENSION").is_ok_and(|value| value == "1")
+            && std::env::var("FETCHRAIL_TEST_PRESERVE_EXTENSION").is_ok_and(|value| value == "0")
         {
-            private_assembly_suffix(desired_name)
+            ".fetchrail-part".to_owned()
         } else {
             suffix
         };
@@ -5413,10 +5414,16 @@ impl DownloadManager {
         if let Some(trace) = &task.trace {
             trace.phase(trace::Phase::Attachment);
         }
-        #[cfg(all(windows, feature = "test-tools"))]
-        let overlapping = if let Some(trace) = task.trace.clone().filter(|_| {
-            std::env::var("FETCHRAIL_TEST_SCAN_OVERLAP").is_ok_and(|value| value == "1")
-        }) {
+        #[cfg(windows)]
+        let overlapping = if total >= 64 * 1024 * 1024 && {
+            let enabled = true;
+            #[cfg(feature = "test-tools")]
+            let enabled = enabled
+                && !(task.trace.is_some()
+                    && std::env::var("FETCHRAIL_TEST_SCAN_OVERLAP")
+                        .is_ok_and(|value| value == "0"));
+            enabled
+        } {
             let path = temp_path.clone();
             let identity = scan_identity.clone();
             let manifest = manifest_bytes.clone();
@@ -5426,6 +5433,8 @@ impl DownloadManager {
             let url = record.url.clone();
             let name = desired_name.to_owned();
             let runtime = tokio::runtime::Handle::current();
+            #[cfg(feature = "test-tools")]
+            let scan_trace = task.trace.clone();
             transfer_span!(
                 task.trace.as_deref(),
                 ScanOverlap,
@@ -5438,13 +5447,15 @@ impl DownloadManager {
                         hashes,
                         expected.as_deref(),
                         &token,
-                        trace.clone(),
+                        #[cfg(feature = "test-tools")]
+                        scan_trace.clone(),
                         || {
                             runtime.block_on(crate::platform::mark_download(
                                 &path,
                                 &url,
                                 &name,
-                                Some(trace),
+                                #[cfg(feature = "test-tools")]
+                                scan_trace,
                             ))
                         },
                     )
@@ -5455,7 +5466,7 @@ impl DownloadManager {
         } else {
             None
         };
-        #[cfg(not(all(windows, feature = "test-tools")))]
+        #[cfg(not(windows))]
         let overlapping: Option<VerifiedPublication> = None;
         let verified = if let Some(verified) = overlapping {
             verified
