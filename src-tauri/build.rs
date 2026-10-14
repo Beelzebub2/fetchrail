@@ -10,6 +10,7 @@ fn main() {
             "src/performance.rs",
             "src/performance_platform.rs",
             "src/staging.rs",
+            "src/guarded_staging.rs",
             "src/model.rs",
             "src/integrity.rs",
             "src/platform/mod.rs",

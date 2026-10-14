@@ -1,5 +1,169 @@
 use super::*;
 
+#[cfg(all(windows, feature = "test-tools"))]
+#[tokio::test]
+async fn streamed_integrity_handoff_allows_scanner_changes_and_rechecks_them() {
+    use std::io::{Seek, SeekFrom, Write};
+    let root = std::env::temp_dir().join(format!("fetchrail-streamed-scan-{}", Uuid::new_v4()));
+    std::fs::create_dir(&root).unwrap();
+    let source = root.join("0.part");
+    let target = root.join("checked.bin");
+    let total = 2 * 1024 * 1024u64;
+    let ranges = split_ranges(total, 2);
+    let manifest = serde_json::to_vec(&PartManifest {
+        total_bytes: Some(total),
+        ranges: ranges.clone(),
+        validator: Some("\"streamed\"".into()),
+        version: 2,
+        final_url_sha256: Some("0".repeat(64)),
+        accepts_ranges: true,
+        shared_staging: true,
+    })
+    .unwrap();
+    for action in [
+        "unchanged",
+        "ads",
+        "mutate",
+        "restore",
+        "truncate",
+        "delete",
+        "reject",
+    ] {
+        std::fs::write(&source, vec![0u8; total as usize]).unwrap();
+        let (identity, _, file) =
+            open_publication_file_with_access(&source, PublicationAccess::Publish).unwrap();
+        let stage = Arc::new(crate::guarded_staging::GuardedStage::new(file, total).unwrap());
+        let mut hashes = Vec::new();
+        for (index, range) in ranges.iter().enumerate() {
+            let mut writer = stage.writer(range.start, range.end + 1).unwrap();
+            let (_, _, reader) =
+                open_publication_file_with_access(&source, PublicationAccess::ConcurrentRead)
+                    .unwrap();
+            let mut verifier = crate::guarded_staging::PrefixVerifier::new(
+                reader,
+                range.start,
+                0,
+                range.end + 1,
+                Sha256::new(),
+            )
+            .unwrap();
+            let mut hash = Sha256::new();
+            for step in 0..4 {
+                let bytes = vec![index as u8; 256 * 1024];
+                writer.write_all(&bytes).await.unwrap();
+                writer.flush().await.unwrap();
+                writer.sync_data().await.unwrap();
+                hash.update(&bytes);
+                if step == 0 {
+                    let cancelled = CancellationToken::new();
+                    cancelled.cancel();
+                    assert!(verifier
+                        .verify_to(
+                            256 * 1024,
+                            format!("{:x}", hash.clone().finalize()),
+                            cancelled
+                        )
+                        .await
+                        .is_err());
+                    assert!(verifier
+                        .verify_to(256 * 1024, "0".repeat(64), CancellationToken::new())
+                        .await
+                        .is_err());
+                }
+                let verified = verifier
+                    .verify_to(
+                        (step + 1) * 256 * 1024,
+                        format!("{:x}", hash.clone().finalize()),
+                        CancellationToken::new(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(verified, 256 * 1024);
+            }
+            assert!(verifier
+                .verify_to(0, "0".repeat(64), CancellationToken::new())
+                .await
+                .is_err());
+            assert!(verifier
+                .verify_to(total + 1, "0".repeat(64), CancellationToken::new())
+                .await
+                .is_err());
+            assert!(writer.write_all(&[1]).await.is_err());
+            let digest = format!("{:x}", hash.finalize());
+            stage.certify(index, digest.clone()).unwrap();
+            hashes.push(digest);
+        }
+        assert!(std::fs::OpenOptions::new()
+            .write(true)
+            .open(&source)
+            .is_err());
+        stage.alias_to(&source, &target).unwrap();
+        let trace = Arc::new(trace::Trace::default());
+        let outcome = accept_streamed_verification(
+            &target,
+            &identity,
+            total,
+            &manifest,
+            hashes,
+            stage,
+            &CancellationToken::new(),
+            Some(trace.clone()),
+            || {
+                match action {
+                    "ads" => std::fs::write(
+                        format!("{}:Zone.Identifier", target.display()),
+                        b"[ZoneTransfer]\r\nZoneId=3\r\n",
+                    )?,
+                    "mutate" | "restore" => {
+                        let mut writer = std::fs::OpenOptions::new().write(true).open(&target)?;
+                        writer.seek(SeekFrom::Start(17))?;
+                        writer.write_all(&[0x55])?;
+                        if action == "restore" {
+                            writer.seek(SeekFrom::Start(17))?;
+                            writer.write_all(&[0])?;
+                        }
+                        writer.sync_all()?;
+                    }
+                    "truncate" => std::fs::OpenOptions::new()
+                        .write(true)
+                        .open(&target)?
+                        .set_len(total - 1)?,
+                    "delete" => std::fs::remove_file(&target)?,
+                    "reject" => {
+                        return Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+                    }
+                    _ => {}
+                };
+                Ok(())
+            },
+        );
+        if ["unchanged", "ads", "restore"].contains(&action) {
+            let proof = outcome
+                .unwrap()
+                .expect("Local NTFS must support the handoff");
+            assert!(std::fs::OpenOptions::new()
+                .write(true)
+                .open(&target)
+                .is_err());
+            assert_eq!(
+                trace.snapshot()["spans"]["verification"]["calls"],
+                if action == "restore" { 1 } else { 0 }
+            );
+            drop(proof);
+        } else {
+            assert!(
+                outcome.is_err(),
+                "Scanner changes/rejection must prevent publication: {action}"
+            );
+        }
+        if target.exists() {
+            std::fs::remove_file(&target).unwrap();
+        }
+        std::fs::remove_file(&source).unwrap();
+    }
+    std::fs::remove_dir(&root).unwrap();
+}
+
 #[test]
 fn initial_checkpoints_spread_without_extending_the_recovery_window() {
     for workers in 1..=32 {
