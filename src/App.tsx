@@ -1421,7 +1421,7 @@ function sparkPoints(samples: number[], peak: number, height: number) {
 function Throughput({ overview, connections, samples }: { overview: EngineOverview; connections: number; samples: number[] }) {
   const points = sparkPoints(samples, Math.max(...samples, 1) * 1.2, 44);
   const [amount, unit] =
-    overview.currentSpeedBps > 0 ? formatBytes(overview.currentSpeedBps).split(" ") : ["0", "MB"];
+    overview.currentSpeedBps > 0 ? formatSpeed(overview.currentSpeedBps).split(" ") : ["0", "MB/s"];
 
   return (
     <section
@@ -1435,7 +1435,7 @@ function Throughput({ overview, connections, samples }: { overview: EngineOvervi
       </svg>
       <div className="speed mono">
         <strong>{amount}</strong>
-        <span>{unit}/s</span>
+        <span>{unit}</span>
       </div>
     </section>
   );
@@ -1615,8 +1615,8 @@ function DownloadRow({
           onClick={() => setExpanded(!expanded)}
           aria-expanded={expanded}
           aria-controls={panelId}
-          title={expanded ? "Hide connections" : "Show connections"}
-          aria-label={`${expanded ? "Hide" : "Show"} connections for ${item.fileName}`}
+          title={expanded ? "Hide download details" : "Show download details"}
+          aria-label={`${expanded ? "Hide" : "Show"} download details for ${item.fileName}`}
         >
           <ChevronRight size={16} className="chevron" />
         </button>
@@ -1685,8 +1685,8 @@ function DownloadRow({
         <div className="col-speed">
           <span className="mono">{formatSpeed(item.speedBps)}</span>
           {item.status === "downloading" && (
-            <small title={`Requested up to ${requested}; adapted to file size and server support`}>
-              {parts.length - count("done")} of {parts.length} connections
+            <small title={`${item.plannedRanges ?? parts.length} byte sections queued; requested up to ${requested} connections`}>
+              {live.receiving + live.connecting} of {item.connections} connections
             </small>
           )}
           {item.status === "merging" && <small>Disk write</small>}
