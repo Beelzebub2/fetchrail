@@ -43,7 +43,8 @@ function fixtureServer(mode,workers) {
     response.writeHead(mode==="ignored"?200:range?206:200,headers);response.flushHeaders();
     const first=performance.now();let sent=0,timer;
     const persistentSlow=mode==="tail-region"&&start<total/32;
-    const speed=persistentSlow||(start===0&&mode==="tail-matrix")?1e6:mode==="skew"&&start===0?8e6:120e6/workers;
+    const slowTail=mode==="tail-recover"&&start===0||mode==="tail-stays-slow"&&start<total/workers;
+    const speed=slowTail?4e6:persistentSlow||(start===0&&mode==="tail-matrix")?1e6:mode==="skew"&&start===0?8e6:120e6/workers;
     const limit=mode==="ignored"?total:end-start+1;
     function pump() {
       if(response.destroyed)return;
@@ -157,6 +158,8 @@ async function run(label,exe,plan,mode="uniform",workers=8,tracing=true) {
       if(mode==="cross-volume")assert.equal(result.trace?.hardLinks,0,"Cross-volume finalization must exercise the checked copy");
       if(record.testTrace?.elapsedMs!=null){const persisted=JSON.parse(await readFile(join(fixture.stateDir,"dev-transfer-traces.json")));assert(persisted.captures.some(capture=>capture.downloadId===job.id&&capture.status==="completed"&&capture.metrics.catalogAcknowledged));result.traceSaved=true;}
       if(mode==="disconnect")assert(result.trace?.retries>=1&&state.requests.length>workers,"Disconnect must actually trigger a suffix retry");
+      if(mode==="tail-recover"&&label.includes("-B"))assert.equal(result.trace?.retries,1,"A drained slow tail must recover once from its durable suffix");
+      if(mode==="tail-stays-slow")assert((result.trace?.retries??0)<=1,"A persistently slow source must finish without repeated tail restarts");
       if(mode==="refusal")assert.equal(state.refusals,1,"Refusal fixture must exercise server backoff");
       if(mode==="uniform")assert(duration>=total/120e6-state.requests.length*block.length/120e6-.1,"Fixture rate budget was bypassed");
       if(plan.startsWith("ranges=")){
@@ -182,6 +185,10 @@ const cases=process.env.FETCHRAIL_APP_BENCH_CASES??"uniform,skew,faults";
 if(cases.includes("matrix"))for(const mode of(cases.includes("tail-region")?["tail-region"]:["uniform","tail-matrix"]))for(const workers of[1,4,8,16,32])for(const count of[32,64,128,512])await run(`${mode}-${workers}w-${count}r`,candidate,`ranges=${count}`,mode,workers);
 if(cases.includes("resume"))assert(total>2*1024**3,"Use more than 2 GiB to exercise version-2 micro-range recovery");
 if(cases.includes("fixed"))for(const [label,exe]of [["fixed-A1",baseline],["fixed-B1",candidate],["fixed-B2",candidate],["fixed-A2",baseline]])await run(label,exe,"fixed");
+if(cases.includes("tail-recovery")) {
+  for(const [label,exe]of [["tail-A1",baseline],["tail-B1",candidate],["tail-B2",candidate],["tail-A2",baseline]])await run(label,exe,"fixed","tail-recover",8);
+  await run("tail-stays-slow-B",candidate,"fixed","tail-stays-slow",8);
+}
 if(cases.includes("uniform"))for(const [label,exe,plan]of [["uniform-A1",baseline,"fixed"],["uniform-B1",candidate,"64m"],["uniform-B2",candidate,"128m"],["uniform-A2",baseline,"fixed"]])await run(label,exe,plan);
 if(cases.includes("skew"))for(const [label,exe,plan]of [["skew-A1",baseline,"fixed"],["skew-B1",candidate,"double"],["skew-B2",candidate,"64m"],["skew-A2",baseline,"fixed"]])await run(label,exe,plan,"skew");
 if(cases.includes("faults"))for(const mode of["disconnect","refusal","invalid","changed","ignored"])await run(`fault-${mode}`,candidate,"64m",mode,4);

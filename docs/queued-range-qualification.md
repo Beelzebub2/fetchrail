@@ -31,3 +31,13 @@ A subsequent same-executable comparison used the retained 21.6 GB reference with
 Use an optimized build with test-tools and the existing scripts/benchmark-http-app.mjs harness. Set FETCHRAIL_APP_BENCH_CASES=matrix for uniform and first-response trials, or matrix-tail-region for persistent-region trials. Set a fresh FETCHRAIL_APP_BENCH_OUTPUT directory, an optional existing FETCHRAIL_APP_BENCH_VOLUME for owned fixtures, and FETCHRAIL_APP_BENCH_BYTES=2147483648. The isolated range hook accepts ranges=32, ranges=64, ranges=128 and ranges=512, bounded to 512. It has no effect in ordinary builds. Raw results and local content stay outside version control.
 
 Queueing addresses receiving tails. Windows attachment processing and content verification remain required before publication; these measurements do not establish near-instant finalization. See Microsoft's [attachment Save contract](https://learn.microsoft.com/en-us/windows/win32/api/shobjidl_core/nf-shobjidl_core-iattachmentexecute-save) and [HTTP range and validator semantics](https://www.rfc-editor.org/rfc/rfc9110.html).
+
+## Recovering a drained slow tail
+
+A bounded queue cannot make idle workers assist a range already receiving. The slow-range comparison previously divided an already per-range rate by the worker count a second time. The comparison now uses consistent units.
+
+When at most a quarter of the workers have unfinished ranges, a range's first attempt may renew its validated suffix after two five-second response-wait windows below half a previously sustained per-range rate. Renewal requires an estimated remaining transfer time over twenty seconds, byte-range support, an unchanged strong validator and no explicit bandwidth limit. Disk-write and limiter waits do not enter these response-wait windows. The resumed attempt retains ordinary timeout and error handling without repeating this tail heuristic.
+
+The existing writer flushes and checkpoints its prefix before the suffix request begins. The resumed writer verifies that prefix and the response's representation and range; it does not overlap another writer or change the immutable partition. Unknown-length streams keep their existing recovery path.
+
+`FETCHRAIL_APP_BENCH_CASES=tail-recovery` exercises an initially slow response that becomes faster after renewal, plus a source that remains slow. The ordinary fixed-layout and failure scenarios remain available. These checks verify complete-file digests, durable catalog generations, request ceilings and suffix geometry. They do not promise a minimum internet speed or instantaneous Windows security processing.

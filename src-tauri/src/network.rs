@@ -36,6 +36,23 @@ pub fn weak_peer(bytes: u64, elapsed: Duration, peer: u64, windows: &mut usize) 
     *windows >= 2
 }
 
+pub fn slow_tail(
+    bytes: u64,
+    elapsed: Duration,
+    peer: u64,
+    remaining: u64,
+    windows: &mut usize,
+) -> bool {
+    let rate = bytes as f64 / elapsed.as_secs_f64().max(0.001);
+    // Retry a long, drained tail once; short tails finish sooner than reopening a request.
+    *windows = if peer > 0 && rate < peer as f64 * 0.5 && remaining as f64 > rate * 20.0 {
+        *windows + 1
+    } else {
+        0
+    };
+    *windows >= 2
+}
+
 pub struct OriginGate {
     active: AtomicUsize,
     waits: AtomicUsize,
@@ -137,6 +154,43 @@ impl OriginGate {
 mod tests {
     use super::*;
     use futures_util::FutureExt;
+
+    #[test]
+    fn tail_recovery_requires_sustained_collapse_and_time_left() {
+        let mut windows = 0;
+        let sample = Duration::from_secs(5);
+        assert!(!slow_tail(
+            15_000_000,
+            sample,
+            8_000_000,
+            200_000_000,
+            &mut windows
+        ));
+        assert!(slow_tail(
+            15_000_000,
+            sample,
+            8_000_000,
+            180_000_000,
+            &mut windows
+        ));
+        assert!(!slow_tail(
+            15_000_000,
+            sample,
+            8_000_000,
+            3_000_000,
+            &mut windows
+        ));
+        for _ in 0..4 {
+            assert!(!slow_tail(
+                15_000_000,
+                sample,
+                3_000_000,
+                200_000_000,
+                &mut windows
+            ));
+            assert!(!slow_tail(15_000_000, sample, 0, 200_000_000, &mut windows));
+        }
+    }
 
     #[test]
     fn weak_peer_requires_two_live_windows_and_resets_on_host_pause() {
