@@ -9,7 +9,7 @@ use std::{
 mod linux;
 #[cfg(windows)]
 mod windows_attachment;
-#[cfg(all(windows, feature = "test-tools"))]
+#[cfg(windows)]
 mod windows_scan_watch;
 #[cfg(target_os = "linux")]
 pub(crate) use linux::torrent_argument_source;
@@ -19,7 +19,7 @@ pub use linux::{
 };
 #[cfg(windows)]
 pub(crate) use windows_attachment::mark_download;
-#[cfg(all(windows, feature = "test-tools"))]
+#[cfg(windows)]
 pub(crate) use windows_scan_watch::ScanWatch;
 
 pub const APP_ID: &str = "com.rrmtools.braid";
@@ -231,6 +231,7 @@ pub(crate) fn publish_verified_noreplace(
     file: &fs::File,
     source: &Path,
     destination: &Path,
+    #[cfg(all(windows, feature = "test-tools"))] rename_write_through: bool,
     #[cfg(feature = "test-tools")] trace: Option<&crate::engine::trace::Trace>,
 ) -> std::io::Result<()> {
     #[cfg(windows)]
@@ -277,6 +278,11 @@ pub(crate) fn publish_verified_noreplace(
         let _ = source;
         #[cfg(feature = "test-tools")]
         let _sync_span = trace.map(|trace| trace.guard(crate::engine::trace::Phase::PublishSync));
+        #[cfg(feature = "test-tools")]
+        if rename_write_through {
+            // Only unchanged, already-synced data on local NTFS may use metadata write-through.
+            return Ok(());
+        }
         file.sync_all()
     }
     #[cfg(not(windows))]
@@ -286,6 +292,46 @@ pub(crate) fn publish_verified_noreplace(
         let _ = trace;
         publish_noreplace(source, destination)
     }
+}
+
+#[cfg(all(windows, feature = "test-tools"))]
+pub(crate) fn local_ntfs_file(file: &fs::File) -> bool {
+    use std::os::windows::io::AsRawHandle;
+    use windows::{
+        core::PCWSTR,
+        Win32::{
+            Foundation::HANDLE,
+            Storage::FileSystem::{
+                GetDriveTypeW, GetFinalPathNameByHandleW, GetVolumeInformationByHandleW,
+                GETFINALPATHNAMEBYHANDLE_FLAGS,
+            },
+        },
+    };
+    let handle = HANDLE(file.as_raw_handle());
+    let mut kind = [0u16; 32];
+    if unsafe { GetVolumeInformationByHandleW(handle, None, None, None, None, Some(&mut kind)) }
+        .is_err()
+    {
+        return false;
+    }
+    if String::from_utf16_lossy(&kind).trim_end_matches('\0') != "NTFS" {
+        return false;
+    }
+    let mut path = [0u16; 1024];
+    let length =
+        unsafe { GetFinalPathNameByHandleW(handle, &mut path, GETFINALPATHNAMEBYHANDLE_FLAGS(0)) }
+            as usize;
+    if length < 7
+        || length >= path.len()
+        || path[..4] != [92, 92, 63, 92]
+        || path[5] != 58
+        || path[6] != 92
+    {
+        return false;
+    }
+    let mut root = path[..7].to_vec();
+    root.push(0);
+    unsafe { GetDriveTypeW(PCWSTR(root.as_ptr())) == 3 }
 }
 
 /// Publish a complete file without replacing an existing destination.

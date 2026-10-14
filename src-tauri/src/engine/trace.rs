@@ -35,8 +35,9 @@ pub(crate) enum Phase {
     PublishRename,
     PublishSync,
     ScanOverlap,
+    MetadataPublication,
 }
-const NAMES: [&str; 25] = [
+const NAMES: [&str; 26] = [
     "probe",
     "originAdmission",
     "globalAdmission",
@@ -62,6 +63,7 @@ const NAMES: [&str; 25] = [
     "publishRename",
     "publishSync",
     "scanHashOverlap",
+    "metadataPublication",
 ];
 #[derive(Clone, Copy)]
 pub(crate) enum RetryCause {
@@ -165,7 +167,7 @@ struct Span {
 }
 #[derive(Default)]
 pub(crate) struct Trace {
-    spans: [Span; 25],
+    spans: [Span; NAMES.len()],
     pub network_bytes: AtomicU64,
     pub durable_bytes: AtomicU64,
     pub requests: AtomicU64,
@@ -397,7 +399,7 @@ impl Trace {
                 json!({"phase":NAMES[transition.phase_index],"elapsedMs":transition.elapsed_ms,"utc":transition.observed_at_utc.to_rfc3339()})
             })
             .collect::<Vec<_>>();
-        let phases: [(&str, Value); 25] = std::array::from_fn(|i| {
+        let phases: [(&str, Value); NAMES.len()] = std::array::from_fn(|i| {
             let span = &self.spans[i];
             let calls = span.calls.load(Ordering::Relaxed);
             let mut cumulative = 0;
@@ -431,6 +433,12 @@ impl Drop for SpanGuard<'_> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn last_counter_accepts_zero_duration_without_panicking() {
+        let trace = super::Trace::default();
+        trace.span(super::Phase::MetadataPublication, std::time::Duration::ZERO);
+        assert_eq!(trace.snapshot()["spans"]["metadataPublication"]["calls"], 1);
+    }
     use super::*;
     #[test]
     fn saved_traces_are_bounded_private_and_preserve_unrecognized_files() {

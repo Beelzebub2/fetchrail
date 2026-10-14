@@ -15,6 +15,63 @@ fn private_assembly_suffix_preserves_type_and_keeps_extensionless_names() {
 
 #[cfg(all(windows, feature = "test-tools"))]
 #[test]
+fn metadata_only_publication_keeps_content_name_and_origin_protected() {
+    use std::io::Write;
+    let root = std::env::temp_dir().join(format!("fetchrail-metadata-publish-{}", Uuid::new_v4()));
+    std::fs::create_dir(&root).unwrap();
+    let path = root.join("private.rar");
+    let output = root.join("published.rar");
+    let mut writer = std::fs::File::create(&path).unwrap();
+    writer.write_all(b"durable verified bytes").unwrap();
+    writer.sync_all().unwrap();
+    drop(writer);
+    let mut origin = std::fs::File::create(format!("{}:Zone.Identifier", path.display())).unwrap();
+    origin.write_all(b"[ZoneTransfer]\r\nZoneId=3\r\n").unwrap();
+    origin.sync_all().unwrap();
+    drop(origin);
+    let input = std::fs::File::open(&path).unwrap();
+    if !crate::platform::local_ntfs_file(&input) {
+        drop(input);
+        std::fs::remove_dir_all(root).unwrap();
+        return;
+    }
+    drop(input);
+    let (_, _, file) =
+        open_publication_file_with_access(&path, PublicationAccess::PublishReadOnlyThrough)
+            .unwrap();
+    assert!(
+        file.sync_all().is_err(),
+        "Metadata publication must not quietly rely on GENERIC_WRITE"
+    );
+    assert!(std::fs::OpenOptions::new().write(true).open(&path).is_err());
+    std::fs::write(&output, b"foreign").unwrap();
+    assert_eq!(
+        crate::platform::publish_verified_noreplace(&file, &path, &output, true, None)
+            .unwrap_err()
+            .kind(),
+        std::io::ErrorKind::AlreadyExists
+    );
+    assert_eq!(std::fs::read(&output).unwrap(), b"foreign");
+    std::fs::remove_file(&output).unwrap();
+    crate::platform::publish_verified_noreplace(&file, &path, &output, true, None).unwrap();
+    assert_eq!(
+        std::fs::read(format!("{}:Zone.Identifier", output.display())).unwrap(),
+        b"[ZoneTransfer]\r\nZoneId=3\r\n"
+    );
+    assert_eq!(std::fs::read(&output).unwrap(), b"durable verified bytes");
+    assert!(std::fs::OpenOptions::new()
+        .write(true)
+        .open(&output)
+        .is_err());
+    assert!(std::fs::rename(&output, root.join("unexpected.rar")).is_err());
+    drop(file);
+    std::fs::rename(&output, root.join("moved.rar")).unwrap();
+    assert!(!path.exists());
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(all(windows, feature = "test-tools"))]
+#[test]
 fn scan_overlap_observes_provider_changes_without_blocking_remediation() {
     use std::io::{Seek, SeekFrom, Write};
     let root = std::env::temp_dir().join(format!("fetchrail-overlap-{}", Uuid::new_v4()));
@@ -32,6 +89,12 @@ fn scan_overlap_observes_provider_changes_without_blocking_remediation() {
         "reject",
     ] {
         std::fs::write(&path, &bytes).unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .sync_all()
+            .unwrap();
         let (identity, total, inspected) = open_publication_file(&path).unwrap();
         drop(inspected);
         let trace = Arc::new(trace::Trace::default());
@@ -43,7 +106,7 @@ fn scan_overlap_observes_provider_changes_without_blocking_remediation() {
             None,
             Some(&expected),
             &CancellationToken::new(),
-            trace.clone(),
+            Some(trace.clone()),
             || {
                 match action {
                     "ads" => std::fs::write(
@@ -77,6 +140,17 @@ fn scan_overlap_observes_provider_changes_without_blocking_remediation() {
                 .unwrap()
                 .expect("Local NTFS test must grant observation");
             assert_eq!(proof.sha256, expected);
+            let metadata_requested = std::env::var("FETCHRAIL_TEST_READ_ONLY_PUBLICATION")
+                .is_ok_and(|value| value == "1");
+            assert_eq!(
+                proof.rename_write_through,
+                metadata_requested
+                    && action != "restore"
+                    && crate::platform::local_ntfs_file(&proof.file)
+            );
+            if proof.rename_write_through {
+                assert!(proof.file.sync_all().is_err());
+            }
             assert!(std::fs::OpenOptions::new().write(true).open(&path).is_err());
             if action == "restore" {
                 assert_eq!(trace.snapshot()["spans"]["verification"]["calls"], 2);
@@ -92,7 +166,92 @@ fn scan_overlap_observes_provider_changes_without_blocking_remediation() {
             std::fs::remove_file(&path).unwrap();
         }
     }
+    std::fs::write(&path, &bytes).unwrap();
+    let watches = (0..2)
+        .map(|_| {
+            let (_, _, file) =
+                open_publication_file_with_access(&path, PublicationAccess::Observe).unwrap();
+            crate::platform::ScanWatch::new(file)
+                .expect("Local NTFS must support shared read observation")
+        })
+        .collect::<Vec<_>>();
+    let (_, _, third) =
+        open_publication_file_with_access(&path, PublicationAccess::Observe).unwrap();
+    assert!(
+        crate::platform::ScanWatch::new(third).is_none(),
+        "At most two scans can add concurrent hash readers"
+    );
+    drop(watches);
+    for mapping_before_watch in [true, false] {
+        use std::os::windows::io::AsRawHandle;
+        use windows::{
+            core::PCWSTR,
+            Win32::{
+                Foundation::{CloseHandle, HANDLE},
+                System::Memory::{
+                    CreateFileMappingW, MapViewOfFile, UnmapViewOfFile, FILE_MAP_WRITE,
+                    PAGE_READWRITE,
+                },
+            },
+        };
+        std::fs::write(&path, &bytes).unwrap();
+        let writable = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        let mut watch = if mapping_before_watch {
+            None
+        } else {
+            let (_, _, file) =
+                open_publication_file_with_access(&path, PublicationAccess::Observe).unwrap();
+            Some(crate::platform::ScanWatch::new(file).unwrap())
+        };
+        let mapping = unsafe {
+            CreateFileMappingW(
+                HANDLE(writable.as_raw_handle()),
+                None,
+                PAGE_READWRITE,
+                0,
+                0,
+                PCWSTR::null(),
+            )
+        }
+        .unwrap();
+        let view = unsafe { MapViewOfFile(mapping, FILE_MAP_WRITE, 0, 0, 0) };
+        assert!(!view.Value.is_null());
+        drop(writable);
+        if mapping_before_watch {
+            let (_, _, file) =
+                open_publication_file_with_access(&path, PublicationAccess::Observe).unwrap();
+            watch = crate::platform::ScanWatch::new(file);
+        }
+        unsafe {
+            *(view.Value as *mut u8) = 0x33;
+        }
+        assert!(
+            watch.as_ref().is_none_or(|watch| !watch.unchanged()),
+            "Writable mappings must refuse or break the notification"
+        );
+        unsafe {
+            UnmapViewOfFile(view).unwrap();
+            CloseHandle(mapping).unwrap();
+        }
+        drop(watch);
+    }
+    std::fs::remove_file(path).unwrap();
     std::fs::remove_dir(&root).unwrap();
+    if std::env::var("FETCHRAIL_METADATA_TEST_CHILD").as_deref() != Ok("1") {
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "engine::audit_tests::scan_overlap_observes_provider_changes_without_blocking_remediation"])
+            .env("FETCHRAIL_TEST_READ_ONLY_PUBLICATION", "1")
+            .env("FETCHRAIL_METADATA_TEST_CHILD", "1")
+            .status().unwrap();
+        assert!(
+            status.success(),
+            "Metadata-only mode must retain provider-change fallbacks"
+        );
+    }
 }
 
 fn record(destination: &Path) -> DownloadRecord {
@@ -677,6 +836,7 @@ async fn benchmark_synthetic_windows_attachment_and_publish() {
         &protected,
         &staging,
         &target,
+        false,
         Some(trace.as_ref()),
     )
     .unwrap();
@@ -812,6 +972,8 @@ async fn post_attachment_verification_rejects_mutations_and_keeps_provenance() {
                         &verified.file,
                         &temp,
                         &output,
+                        #[cfg(all(windows, feature = "test-tools"))]
+                        false,
                         #[cfg(feature = "test-tools")]
                         None,
                     )
@@ -822,6 +984,8 @@ async fn post_attachment_verification_rejects_mutations_and_keeps_provenance() {
                         &verified.file,
                         &temp,
                         &output,
+                        #[cfg(all(windows, feature = "test-tools"))]
+                        false,
                         #[cfg(feature = "test-tools")]
                         None,
                     )
