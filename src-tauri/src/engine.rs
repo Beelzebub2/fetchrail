@@ -350,6 +350,14 @@ struct MergeCheckpoint {
     identity: Option<FileIdentity>,
 }
 
+fn private_assembly_suffix(name: &str) -> String {
+    Path::new(name)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(|extension| format!(".fetchrail-part.{extension}"))
+        .unwrap_or_else(|| ".fetchrail-part".into())
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 struct FileIdentity {
     volume: u64,
@@ -389,6 +397,8 @@ enum PublicationAccess {
     Verify,
     Publish,
     ConcurrentRead,
+    #[cfg(windows)]
+    Observe,
 }
 fn open_publication_file_with_access(
     path: &Path,
@@ -419,13 +429,15 @@ fn open_publication_file_with_access(
         use std::os::windows::fs::OpenOptionsExt;
         options.custom_flags(0x00200000);
         match access {
+            PublicationAccess::Observe => {
+                options.share_mode(7).custom_flags(0x40000000 | 0x00200000);
+            }
             PublicationAccess::Inspect => {}
             PublicationAccess::Verify => {
                 options.share_mode(0x00000001);
             }
             PublicationAccess::ConcurrentRead => {
-                // The primary Publish handle already denies third-party writes/deletes.
-                // These read-only handles must still share its existing write/delete access.
+                // Share scanner access during observation and the protected handle during publication.
                 options.share_mode(0x00000001 | 0x00000002 | 0x00000004);
             }
             PublicationAccess::Publish => {
@@ -552,7 +564,7 @@ fn range_hashes_match(
     }
     // Windows cloned handles share their seek cursor, including seek_read. Instead
     // reopen one independent, identity-checked read handle per worker while the
-    // protected Publish handle remains open and denies writes and replacement.
+    // publication handle or scan notification covers the independent read lanes.
     // Bound CPU, disk pressure and the integrity reader's two 8 MiB buffers.
     let _protected_file = file;
     let next = AtomicUsize::new(0);
@@ -680,6 +692,29 @@ fn verify_scanned_publication(
             "File changed during attachment processing; no file was published.".into(),
         ));
     }
+    verify_publication_contents(
+        file,
+        identity,
+        path,
+        total,
+        manifest_bytes,
+        complete_hashes,
+        expected_sha256,
+        cancel,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn verify_publication_contents(
+    file: std::fs::File,
+    identity: FileIdentity,
+    path: &Path,
+    total: u64,
+    manifest_bytes: &[u8],
+    complete_hashes: Option<Vec<String>>,
+    expected_sha256: Option<&str>,
+    cancel: &CancellationToken,
+) -> EngineResult<VerifiedPublication> {
     let (sha256, range_sha256) = if let Some(hashes) = complete_hashes {
         if !committed_ranges_match(
             file.try_clone()?,
@@ -713,6 +748,96 @@ fn verify_scanned_publication(
         sha256,
         range_sha256,
     })
+}
+
+#[cfg(windows)]
+#[allow(clippy::too_many_arguments)]
+fn verify_during_attachment(
+    path: &Path,
+    expected_identity: &FileIdentity,
+    total: u64,
+    manifest_bytes: &[u8],
+    complete_hashes: Option<Vec<String>>,
+    expected_sha256: Option<&str>,
+    cancel: &CancellationToken,
+    #[cfg(feature = "test-tools")] trace: Option<Arc<trace::Trace>>,
+    scan: impl FnOnce() -> std::io::Result<()>,
+) -> EngineResult<Option<VerifiedPublication>> {
+    let Ok((identity, bytes, observed)) =
+        open_publication_file_with_access(path, PublicationAccess::Observe)
+    else {
+        return Ok(None);
+    };
+    if identity != *expected_identity || bytes != total {
+        return Ok(None);
+    }
+    let Some(watch) = crate::platform::ScanWatch::new(observed) else {
+        return Ok(None);
+    };
+    let (identity, bytes, input) =
+        open_publication_file_with_access(path, PublicationAccess::ConcurrentRead)?;
+    if identity != *expected_identity || bytes != total {
+        return Ok(None);
+    }
+    let hash_cancel = cancel.child_token();
+    let hashes = complete_hashes.clone();
+    let proof = std::thread::scope(|scope| -> EngineResult<VerifiedPublication> {
+        let hash = scope.spawn(|| {
+            transfer_span!(
+                trace.as_deref(),
+                Verify,
+                verify_publication_contents(
+                    input,
+                    identity,
+                    path,
+                    total,
+                    manifest_bytes,
+                    hashes,
+                    expected_sha256,
+                    &hash_cancel
+                )
+            )
+        });
+        let scanned = transfer_span!(trace.as_deref(), Attachment, scan());
+        if scanned.is_err() {
+            hash_cancel.cancel();
+        }
+        let result = hash
+            .join()
+            .map_err(|_| EngineError::Message("Integrity worker panicked.".into()))?;
+        scanned?;
+        let (identity, bytes, protected) =
+            open_publication_file_with_access(path, PublicationAccess::Publish)?;
+        if identity != *expected_identity || bytes != total {
+            return Err(EngineError::Message(
+                "File changed during attachment processing; no file was published.".into(),
+            ));
+        }
+        if cancel.is_cancelled() {
+            return Err(EngineError::Cancelled);
+        }
+        if watch.unchanged() {
+            let mut proof = result?;
+            proof.file = protected;
+            Ok(proof)
+        } else {
+            transfer_span!(
+                trace.as_deref(),
+                Verify,
+                verify_publication_contents(
+                    protected,
+                    identity,
+                    path,
+                    total,
+                    manifest_bytes,
+                    complete_hashes,
+                    expected_sha256,
+                    cancel
+                )
+            )
+        }
+    })?;
+    Ok(Some(proof))
 }
 
 #[cfg(test)]
@@ -761,7 +886,10 @@ async fn recover_verified_publication(
         })?;
         let prefix = format!(".{}.{}.", safe_file_name(&record.file_name), record.id);
         if !checkpoint.file_name.starts_with(&prefix)
-            || !checkpoint.file_name.ends_with(".fetchrail-part")
+            || !(checkpoint.file_name.ends_with(".fetchrail-part")
+                || checkpoint
+                    .file_name
+                    .ends_with(&private_assembly_suffix(&record.file_name)))
             || Path::new(&checkpoint.file_name).components().count() != 1
             || checkpoint.total != journal.total
             || checkpoint.fingerprint != journal.manifest_sha256
@@ -5099,6 +5227,18 @@ impl DownloadManager {
         let fingerprint = format!("{:x}", Sha256::digest(&manifest_bytes));
         let checkpoint_path = part_dir.join("merge.json");
         let prefix = format!(".{}.{}.", safe_file_name(desired_name), record.id);
+        #[cfg(windows)]
+        let suffix = private_assembly_suffix(desired_name);
+        #[cfg(not(windows))]
+        let suffix = ".fetchrail-part".to_owned();
+        #[cfg(feature = "test-tools")]
+        let suffix = if task.trace.is_some()
+            && std::env::var("FETCHRAIL_TEST_PRESERVE_EXTENSION").is_ok_and(|value| value == "0")
+        {
+            ".fetchrail-part".to_owned()
+        } else {
+            suffix
+        };
         let checkpoint = fs::read(&checkpoint_path)
             .await
             .ok()
@@ -5108,13 +5248,16 @@ impl DownloadManager {
                     && saved.fingerprint == fingerprint
                     && saved.expected_sha256 == record.expected_sha256
                     && saved.file_name.starts_with(&prefix)
-                    && saved.file_name.ends_with(".fetchrail-part")
+                    && (saved.file_name.ends_with(".fetchrail-part")
+                        || saved
+                            .file_name
+                            .ends_with(&private_assembly_suffix(desired_name)))
                     && Path::new(&saved.file_name).components().count() == 1
             });
         let temp_name = checkpoint
             .as_ref()
             .map(|c| c.file_name.clone())
-            .unwrap_or_else(|| format!("{prefix}{}.fetchrail-part", Uuid::new_v4()));
+            .unwrap_or_else(|| format!("{prefix}{}{suffix}", Uuid::new_v4()));
         let mut temp_path = parent.join(temp_name);
         let recovered = checkpoint
             .as_ref()
@@ -5129,7 +5272,7 @@ impl DownloadManager {
                 trace.phase(trace::Phase::Assembly);
             }
             // Never truncate a stale checkpoint or a file planted at its saved path.
-            temp_path = parent.join(format!("{prefix}{}.fetchrail-part", Uuid::new_v4()));
+            temp_path = parent.join(format!("{prefix}{}{suffix}", Uuid::new_v4()));
             let merged = Arc::new(AtomicU64::new(0));
             // Batch disk I/O on one worker instead of scheduling every small read and write.
             let mut worker = tokio::task::spawn_blocking({
@@ -5272,42 +5415,100 @@ impl DownloadManager {
             trace.phase(trace::Phase::Attachment);
         }
         #[cfg(windows)]
-        transfer_span!(
-            task.trace.as_deref(),
-            Attachment,
-            crate::platform::mark_download(
-                &temp_path,
-                &record.url,
-                desired_name,
-                #[cfg(feature = "test-tools")]
-                task.trace.clone(),
+        let overlapping = if total >= 64 * 1024 * 1024 && {
+            let enabled = true;
+            #[cfg(feature = "test-tools")]
+            let enabled = enabled
+                && !(task.trace.is_some()
+                    && std::env::var("FETCHRAIL_TEST_SCAN_OVERLAP")
+                        .is_ok_and(|value| value == "0"));
+            enabled
+        } {
+            let path = temp_path.clone();
+            let identity = scan_identity.clone();
+            let manifest = manifest_bytes.clone();
+            let hashes = complete_hashes.clone();
+            let expected = expected_sha256.clone();
+            let token = cancel.clone();
+            let url = record.url.clone();
+            let name = desired_name.to_owned();
+            let runtime = tokio::runtime::Handle::current();
+            #[cfg(feature = "test-tools")]
+            let scan_trace = task.trace.clone();
+            transfer_span!(
+                task.trace.as_deref(),
+                ScanOverlap,
+                tokio::task::spawn_blocking(move || {
+                    verify_during_attachment(
+                        &path,
+                        &identity,
+                        total,
+                        &manifest,
+                        hashes,
+                        expected.as_deref(),
+                        &token,
+                        #[cfg(feature = "test-tools")]
+                        scan_trace.clone(),
+                        || {
+                            runtime.block_on(crate::platform::mark_download(
+                                &path,
+                                &url,
+                                &name,
+                                #[cfg(feature = "test-tools")]
+                                scan_trace,
+                            ))
+                        },
+                    )
+                })
+                .await
             )
-            .await
-        )?;
-        task.check_stopped(cancel)?;
-        let path = temp_path.clone();
-        let hash_cancel = cancel.clone();
-        #[cfg(feature = "test-tools")]
-        if let Some(trace) = &task.trace {
-            trace.phase(trace::Phase::Verify);
-        }
-        let verified = transfer_span!(
-            task.trace.as_deref(),
-            Verify,
-            tokio::task::spawn_blocking(move || {
-                verify_scanned_publication(
-                    &path,
-                    &scan_identity,
-                    total,
-                    &manifest_bytes,
-                    complete_hashes,
-                    expected_sha256.as_deref(),
-                    &hash_cancel,
+            .map_err(|error| EngineError::Message(error.to_string()))??
+        } else {
+            None
+        };
+        #[cfg(not(windows))]
+        let overlapping: Option<VerifiedPublication> = None;
+        let verified = if let Some(verified) = overlapping {
+            verified
+        } else {
+            #[cfg(windows)]
+            transfer_span!(
+                task.trace.as_deref(),
+                Attachment,
+                crate::platform::mark_download(
+                    &temp_path,
+                    &record.url,
+                    desired_name,
+                    #[cfg(feature = "test-tools")]
+                    task.trace.clone(),
                 )
-            })
-            .await
-        )
-        .map_err(|e| EngineError::Message(e.to_string()))??;
+                .await
+            )?;
+            task.check_stopped(cancel)?;
+            let path = temp_path.clone();
+            let hash_cancel = cancel.clone();
+            #[cfg(feature = "test-tools")]
+            if let Some(trace) = &task.trace {
+                trace.phase(trace::Phase::Verify);
+            }
+            transfer_span!(
+                task.trace.as_deref(),
+                Verify,
+                tokio::task::spawn_blocking(move || {
+                    verify_scanned_publication(
+                        &path,
+                        &scan_identity,
+                        total,
+                        &manifest_bytes,
+                        complete_hashes,
+                        expected_sha256.as_deref(),
+                        &hash_cancel,
+                    )
+                })
+                .await
+            )
+            .map_err(|e| EngineError::Message(e.to_string()))??
+        };
         let _dispatch = self.dispatch_lock.lock().await;
         let _lock = self.persist_lock.lock().await;
         task.check_stopped(cancel)?;
