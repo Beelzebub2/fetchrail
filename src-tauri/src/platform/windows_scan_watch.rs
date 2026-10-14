@@ -1,4 +1,4 @@
-// Isolated experiment: observe writes without preventing scanner remediation.
+// Observe writes without preventing scanner remediation.
 use std::{fs::File, os::windows::io::AsRawHandle};
 use windows::{
     core::{HRESULT, PCWSTR},
@@ -22,9 +22,14 @@ pub(crate) struct ScanWatch {
     overlapped: Box<OVERLAPPED>,
     output: Box<REQUEST_OPLOCK_OUTPUT_BUFFER>,
     pending: bool,
+    _permit: tokio::sync::OwnedSemaphorePermit,
 }
+static HASH_SLOTS: std::sync::LazyLock<std::sync::Arc<tokio::sync::Semaphore>> =
+    std::sync::LazyLock::new(|| std::sync::Arc::new(tokio::sync::Semaphore::new(2)));
 impl ScanWatch {
     pub(crate) fn new(file: File) -> Option<Self> {
+        // Avoid adding an unbounded set of integrity readers to simultaneous scans.
+        let permit = HASH_SLOTS.clone().try_acquire_owned().ok()?;
         let event = unsafe { CreateEventW(None, true, false, PCWSTR::null()) }.ok()?;
         let mut watch = Self {
             file,
@@ -35,6 +40,7 @@ impl ScanWatch {
             }),
             output: Box::default(),
             pending: false,
+            _permit: permit,
         };
         let input = REQUEST_OPLOCK_INPUT_BUFFER {
             StructureVersion: REQUEST_OPLOCK_CURRENT_VERSION as u16,
