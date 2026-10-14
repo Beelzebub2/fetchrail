@@ -4798,6 +4798,7 @@ impl DownloadManager {
         }
         let (mut response_wait, mut watched_bytes, mut weak_windows) =
             (Duration::ZERO, existing, 0usize);
+        let mut tail_windows = 0;
         let transfer = async {
             let mut written = existing;
             loop {
@@ -4812,6 +4813,9 @@ impl DownloadManager {
                 if recover_peer && response_wait >= Duration::from_secs(5) {
                     let peer = if limiter.quantum() == usize::MAX && task.limiter.quantum() == usize::MAX { live_peer_rate.load(Ordering::Relaxed) } else { 0 };
                     if crate::network::weak_peer(written.saturating_sub(watched_bytes), response_wait, peer, &mut weak_windows) { return Err(EngineError::Slow); }
+                    let draining = expected_len.is_some() && peers.iter().filter(|p| p.downloaded.load(Ordering::Relaxed) < p.range.len()).count() <= worker_count.div_ceil(4);
+                    let tail_peer = if draining && limiter.quantum() == usize::MAX && task.limiter.quantum() == usize::MAX { peer_rate.load(Ordering::Relaxed) } else { 0 };
+                    if crate::network::slow_tail(written.saturating_sub(watched_bytes), response_wait, tail_peer, expected_len.unwrap_or(0).saturating_sub(written), &mut tail_windows) { return Err(EngineError::Slow); }
                     watched_bytes = written;
                     response_wait = Duration::ZERO;
                 }
@@ -4883,7 +4887,7 @@ impl DownloadManager {
                             &mut previous_rate,
                             // A completed range cannot inflate the target as active peers drain.
                             if recover_peer {
-                                let share = peer_rate.load(Ordering::Relaxed) / worker_count.max(1) as u64;
+                                let share = peer_rate.load(Ordering::Relaxed);
                                 if peers.iter().filter(|p| p.active.load(Ordering::Relaxed)).count() >= 2 {
                                     share.min(live_peer_rate.load(Ordering::Relaxed))
                                 } else {
