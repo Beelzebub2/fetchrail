@@ -4032,14 +4032,24 @@ impl DownloadManager {
         let total = probe.total_bytes;
         self.emit_record(&*task.record.read().await);
         let part_dir = self.part_dir(task.record.read().await.id);
+        let planned_count = if probe.accepts_ranges && probe.validator.is_some() {
+            queued_range_count(
+                total.unwrap_or(0),
+                connection_count,
+                settings.min_segment_size_mb * 1024 * 1024,
+            )
+        } else {
+            connection_count
+        };
         #[cfg(feature = "test-tools")]
-        let connection_count = if crate::platform::test_root()
+        let planned_count = if crate::platform::test_root()
             .map_err(EngineError::Message)?
             .is_some()
             && probe.accepts_ranges
             && probe.validator.is_some()
         {
             match std::env::var("FETCHRAIL_TEST_RANGE_PLAN").as_deref() {
+                Ok("fixed") => connection_count,
                 Ok("double") => suggested_connection_count(
                     total.unwrap_or(0),
                     (connection_count * 2).min(32),
@@ -4049,13 +4059,19 @@ impl DownloadManager {
                     .max(connection_count),
                 Ok("128m") => (total.unwrap_or(0).div_ceil(128 * 1024 * 1024).min(512) as usize)
                     .max(connection_count),
-                _ => connection_count,
+                Ok(plan) => plan
+                    .strip_prefix("ranges=")
+                    .and_then(|value| value.parse::<usize>().ok())
+                    .filter(|count| (1..=512).contains(count))
+                    .unwrap_or(planned_count)
+                    .max(connection_count),
+                Err(_) => planned_count,
             }
         } else {
-            connection_count
+            planned_count
         };
         let mut ranges = match total {
-            Some(total) => split_ranges(total, connection_count),
+            Some(total) => split_ranges(total, planned_count),
             None => vec![ByteRange {
                 start: 0,
                 end: u64::MAX,
@@ -6533,6 +6549,16 @@ fn valid_manifest_ranges(manifest: &PartManifest, total: u64) -> bool {
         && manifest.ranges == split_ranges(total, manifest.ranges.len())
 }
 
+fn queued_range_count(total: u64, workers: usize, min_segment: u64) -> usize {
+    let workers = workers.clamp(1, 32);
+    // Keep request/checkpoint overhead out of small and single-connection transfers.
+    if workers == 1 || total < 8 * 1024 * 1024 * 1024 {
+        return workers;
+    }
+    ((total / min_segment.max(128 * 1024 * 1024)).clamp(workers as u64, 512) as usize)
+        .min(workers * 2)
+}
+
 fn suggested_connection_count(total: u64, configured: usize, min_segment: u64) -> usize {
     if total == 0 {
         return 1;
@@ -7038,6 +7064,28 @@ mod tests {
             ..Default::default()
         }))
         .is_err());
+    }
+
+    #[test]
+    fn queued_ranges_preserve_small_transfers_limits_and_geometry() {
+        let gib = 1024u64.pow(3);
+        for (total, workers, minimum, expected) in [
+            (2 * gib, 16, 4 * 1024 * 1024, 16),
+            (8 * gib - 1, 32, 0, 32),
+            (8 * gib, 16, 0, 32),
+            (21_618_816_672, 16, 0, 32),
+            (21_618_816_672, 1, 0, 1),
+            (21_618_816_672, 16, 512 * 1024 * 1024, 32),
+            (1024 * gib, 32, 0, 64),
+        ] {
+            let count = super::queued_range_count(total, workers, minimum);
+            assert_eq!(count, expected);
+            let ranges = split_ranges(total, count);
+            assert_eq!(ranges.iter().map(|range| range.len()).sum::<u64>(), total);
+            assert!(ranges
+                .windows(2)
+                .all(|pair| pair[0].end + 1 == pair[1].start));
+        }
     }
 
     #[test]
