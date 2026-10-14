@@ -9,6 +9,8 @@ use std::{
 mod linux;
 #[cfg(windows)]
 mod windows_attachment;
+#[cfg(all(windows, feature = "test-tools"))]
+mod windows_scan_watch;
 #[cfg(target_os = "linux")]
 pub(crate) use linux::torrent_argument_source;
 #[cfg(target_os = "linux")]
@@ -17,6 +19,8 @@ pub use linux::{
 };
 #[cfg(windows)]
 pub(crate) use windows_attachment::mark_download;
+#[cfg(all(windows, feature = "test-tools"))]
+pub(crate) use windows_scan_watch::ScanWatch;
 
 pub const APP_ID: &str = "com.rrmtools.braid";
 

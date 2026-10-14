@@ -11,6 +11,10 @@ fn main() {
             "src/performance_platform.rs",
             "src/staging.rs",
             "src/model.rs",
+            "src/integrity.rs",
+            "src/platform/mod.rs",
+            "src/platform/windows_attachment.rs",
+            "src/platform/windows_scan_watch.rs",
             "Cargo.toml",
             "Cargo.lock",
         ] {

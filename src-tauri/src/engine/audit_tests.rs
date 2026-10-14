@@ -1,5 +1,100 @@
 use super::*;
 
+#[test]
+fn private_assembly_suffix_preserves_type_and_keeps_extensionless_names() {
+    for (name, suffix) in [
+        ("archive.rar", ".fetchrail-part.rar"),
+        ("archive.tar.GZ", ".fetchrail-part.GZ"),
+        ("report-Ω.pdf", ".fetchrail-part.pdf"),
+        ("README", ".fetchrail-part"),
+        (".hidden", ".fetchrail-part"),
+    ] {
+        assert_eq!(private_assembly_suffix(name), suffix);
+    }
+}
+
+#[cfg(all(windows, feature = "test-tools"))]
+#[test]
+fn scan_overlap_observes_provider_changes_without_blocking_remediation() {
+    use std::io::{Seek, SeekFrom, Write};
+    let root = std::env::temp_dir().join(format!("fetchrail-overlap-{}", Uuid::new_v4()));
+    std::fs::create_dir(&root).unwrap();
+    let path = root.join("owned.bin");
+    let bytes = vec![0x5a; 1024 * 1024];
+    let expected = format!("{:x}", Sha256::digest(&bytes));
+    for action in [
+        "unchanged",
+        "ads",
+        "mutate",
+        "restore",
+        "truncate",
+        "delete",
+        "reject",
+    ] {
+        std::fs::write(&path, &bytes).unwrap();
+        let (identity, total, inspected) = open_publication_file(&path).unwrap();
+        drop(inspected);
+        let trace = Arc::new(trace::Trace::default());
+        let result = verify_during_attachment(
+            &path,
+            &identity,
+            total,
+            b"",
+            None,
+            Some(&expected),
+            &CancellationToken::new(),
+            trace.clone(),
+            || {
+                match action {
+                    "ads" => std::fs::write(
+                        format!("{}:Zone.Identifier", path.display()),
+                        b"[ZoneTransfer]\r\nZoneId=3\r\n",
+                    )?,
+                    "mutate" | "restore" => {
+                        let mut file = std::fs::OpenOptions::new().write(true).open(&path)?;
+                        file.seek(SeekFrom::Start(123))?;
+                        file.write_all(b"changed")?;
+                        if action == "restore" {
+                            file.seek(SeekFrom::Start(123))?;
+                            file.write_all(&bytes[123..130])?;
+                        }
+                    }
+                    "truncate" => std::fs::OpenOptions::new()
+                        .write(true)
+                        .open(&path)?
+                        .set_len(4096)?,
+                    "delete" => std::fs::remove_file(&path)?,
+                    "reject" => {
+                        return Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+                    }
+                    _ => {}
+                }
+                Ok(())
+            },
+        );
+        if ["unchanged", "ads", "restore"].contains(&action) {
+            let proof = result
+                .unwrap()
+                .expect("Local NTFS test must grant observation");
+            assert_eq!(proof.sha256, expected);
+            assert!(std::fs::OpenOptions::new().write(true).open(&path).is_err());
+            if action == "restore" {
+                assert_eq!(trace.snapshot()["spans"]["verification"]["calls"], 2);
+            }
+            drop(proof);
+        } else {
+            assert!(
+                result.is_err(),
+                "Changed, deleted or rejected content must not publish"
+            );
+        }
+        if path.exists() {
+            std::fs::remove_file(&path).unwrap();
+        }
+    }
+    std::fs::remove_dir(&root).unwrap();
+}
+
 fn record(destination: &Path) -> DownloadRecord {
     serde_json::from_value(json!({"id": Uuid::new_v4(), "url":"https://example.test/file?signature=private-token", "fileName":"file.bin", "destination":destination,
         "status":"merging", "totalBytes":7, "downloadedBytes":7, "speedBps":0, "etaSeconds":null, "connections":1, "error":null,
@@ -90,13 +185,18 @@ fn integrity_and_authentication_failures_never_retry() {
 
 #[tokio::test]
 async fn publication_crash_stages_reconcile_exactly_one_file_and_reject_foreign_occupants() {
-    // Five repetitions across four boundaries = 20 deterministic crash-state fixtures.
-    for _ in 0..5 {
+    // Twenty crash fixtures cover legacy names and names retaining the file type.
+    for repetition in 0..5 {
         for stage in 0..4 {
             let root = std::env::temp_dir().join(format!("fetchrail-publish-{}", Uuid::new_v4()));
             let output = root.join("file.bin");
             let mut saved = record(&output);
-            let temp = root.join(format!(".file.bin.{}.fixture.fetchrail-part", saved.id));
+            let suffix = if repetition % 2 == 0 {
+                ".fetchrail-part".to_owned()
+            } else {
+                private_assembly_suffix(&saved.file_name)
+            };
+            let temp = root.join(format!(".file.bin.{}.fixture{suffix}", saved.id));
             let part_dir = root.join("parts").join(saved.id.to_string());
             fs::create_dir_all(&part_dir).await.unwrap();
             fs::write(part_dir.join("transfer.json"), b"manifest")
