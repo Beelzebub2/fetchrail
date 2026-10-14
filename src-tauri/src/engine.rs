@@ -4772,7 +4772,8 @@ impl DownloadManager {
         let mut slow_windows = 0;
         let mut checkpoint_at = Instant::now();
         // Spread the initial durable writes without extending the recovery window.
-        let mut checkpoint_delay = initial_checkpoint_interval(index, worker_count, expected_len.unwrap_or(0));
+        let mut checkpoint_delay =
+            initial_checkpoint_interval(index, worker_count, expected_len.unwrap_or(0));
         #[cfg(feature = "test-tools")]
         if task.trace.is_some()
             && std::env::var("FETCHRAIL_TEST_CHECKPOINT_PHASE").is_ok_and(|value| value == "0")
