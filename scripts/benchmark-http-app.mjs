@@ -16,7 +16,7 @@ assert(process.argv[2] && process.argv[3], "Pass baseline and candidate executab
 const baseline = resolve(process.argv[2]), candidate = resolve(process.argv[3]);
 const total = Number(process.env.FETCHRAIL_APP_BENCH_BYTES ?? 2 * 1024 ** 3);
 assert(Number.isSafeInteger(total) && total >= 64 * 1024 ** 2 && total <= 4 * 1024 ** 3);
-const output = resolve("artifacts/http-app-benchmark"); await mkdir(output, {recursive:true});
+const output = resolve(process.env.FETCHRAIL_APP_BENCH_OUTPUT ?? "artifacts/http-app-benchmark"); await mkdir(output, {recursive:true});
 const block = Buffer.from(Array.from({length:64*1024}, (_,i)=>(i*17+(i>>>5))&255));
 const expected = createHash("sha256");
 for(let remaining=total;remaining>0;remaining-=block.length) expected.update(block.subarray(0,Math.min(block.length,remaining)));
@@ -42,7 +42,8 @@ function fixtureServer(mode,workers) {
     let ended=false;const finish=()=>{if(!ended){ended=true;state.active--;visit.done=performance.now();}};response.once("close",finish);response.once("finish",finish);
     response.writeHead(mode==="ignored"?200:range?206:200,headers);response.flushHeaders();
     const first=performance.now();let sent=0,timer;
-    const speed=mode==="skew"&&start===0?8e6:120e6/workers;
+    const persistentSlow=mode==="tail-region"&&start<total/32;
+    const speed=persistentSlow||(start===0&&mode==="tail-matrix")?1e6:mode==="skew"&&start===0?8e6:120e6/workers;
     const limit=mode==="ignored"?total:end-start+1;
     function pump() {
       if(response.destroyed)return;
@@ -76,7 +77,7 @@ function summarize(samples,start,done,total) {
   return {seconds:(done-start)/1000,endToEndMBps:total/((done-start)/1000)/1e6,completeTenSecondWindows:windows.length,p10MBps:quantile(.1),p50MBps:quantile(.5),p90MBps:quantile(.9),minReceivingIntervalMBps:receivingIntervals.length?Math.min(...receivingIntervals):null,maxReceivingIntervalMBps:receivingIntervals.length?Math.max(...receivingIntervals):null,progressRollbackBytes:rollbackBytes,dipSecondsBelow90MBps:dipSeconds,worstDropSeconds:worstDrop};
 }
 async function run(label,exe,plan,mode="uniform",workers=8,tracing=true) {
-  const fixture=await createFixture("http-app-benchmark"),{server,state}=fixtureServer(mode,workers);
+  const fixture=await createFixture("http-app-benchmark",process.env.FETCHRAIL_APP_BENCH_VOLUME),{server,state}=fixtureServer(mode,workers);
   let app,browser,closed,verified=false,crossOutput;const samples=[];
   try {
     if(mode==="cross-volume") {
@@ -109,9 +110,13 @@ async function run(label,exe,plan,mode="uniform",workers=8,tracing=true) {
     const settings=await invoke("get_settings");await invoke("update_settings",{settings:{...settings,autoUpdate:false,launchOnStart:false,performanceAuto:false,adaptiveConnections:false,connectionsPerDownload:workers,sortIntoCategoryFolders:false}});
     const start=performance.now(),startedAt=new Date().toISOString();
     const job=await page.evaluate(async request=>{window.benchStarted=performance.now();return window.__TAURI_INTERNALS__.invoke("add_download",{request});},{url:`http://127.0.0.1:${server.address().port}/fixture.bin`,fileName:"fixture.bin",directory:crossOutput??join(fixture.root,"output"),connections:workers});
-    let record,lastSample=-1,recovered=false,savedManifest;const traceEpochs=[];
+    let record,lastSample=-1,recovered=false,savedManifest,initialManifest;const traceEpochs=[];
     await until(async()=>{
       record=await invoke("get_download",{id:job.id});const now=performance.now(),seconds=(now-start)/1000;
+      if(!initialManifest){
+        const bytes=await readFile(join(fixture.stateDir,"parts",job.id,"transfer.json")).catch(error=>{if(error.code==="ENOENT")return null;throw error;});
+        if(bytes)initialManifest=JSON.parse(bytes);
+      }
       if(seconds-lastSample>=1||["completed","failed"].includes(record.status)){
         samples.push({seconds,time:new Date().toISOString(),status:record.status,bytes:record.downloadedBytes,speedBps:record.speedBps,receiving:record.receivingConnections??record.segments.filter(s=>s.active).length,connecting:record.connectingConnections??0,groups:record.segments.length,planned:record.plannedRanges??record.connections,trace:record.testTrace??null});lastSample=seconds;
       }
@@ -154,6 +159,11 @@ async function run(label,exe,plan,mode="uniform",workers=8,tracing=true) {
       if(mode==="disconnect")assert(result.trace?.retries>=1&&state.requests.length>workers,"Disconnect must actually trigger a suffix retry");
       if(mode==="refusal")assert.equal(state.refusals,1,"Refusal fixture must exercise server backoff");
       if(mode==="uniform")assert(duration>=total/120e6-state.requests.length*block.length/120e6-.1,"Fixture rate budget was bypassed");
+      if(plan.startsWith("ranges=")){
+        assert.equal(initialManifest?.ranges.length,Number(plan.slice(7)),"Requested immutable range geometry must be exercised");
+        assert(state.requests.every(request=>initialManifest.ranges.some(range=>request.start>=range.start&&request.start<=range.end&&request.end===range.end)),"Suffix retries must remain within their original range");
+        result.plannedRangeCount=initialManifest.ranges.length;
+      }
       verified=true;
     }
     results.push(result);await writeFile(join(output,`${label}.json`),JSON.stringify(result,null,2));
@@ -169,6 +179,7 @@ async function run(label,exe,plan,mode="uniform",workers=8,tracing=true) {
 }
 
 const cases=process.env.FETCHRAIL_APP_BENCH_CASES??"uniform,skew,faults";
+if(cases.includes("matrix"))for(const mode of(cases.includes("tail-region")?["tail-region"]:["uniform","tail-matrix"]))for(const workers of[1,4,8,16,32])for(const count of[32,64,128,512])await run(`${mode}-${workers}w-${count}r`,candidate,`ranges=${count}`,mode,workers);
 if(cases.includes("resume"))assert(total>2*1024**3,"Use more than 2 GiB to exercise version-2 micro-range recovery");
 if(cases.includes("fixed"))for(const [label,exe]of [["fixed-A1",baseline],["fixed-B1",candidate],["fixed-B2",candidate],["fixed-A2",baseline]])await run(label,exe,"fixed");
 if(cases.includes("uniform"))for(const [label,exe,plan]of [["uniform-A1",baseline,"fixed"],["uniform-B1",candidate,"64m"],["uniform-B2",candidate,"128m"],["uniform-A2",baseline,"fixed"]])await run(label,exe,plan);
