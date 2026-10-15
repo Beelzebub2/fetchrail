@@ -33,5 +33,5 @@ for (const browser of ["chromium", "firefox"]) {
 }
 
 console.log("Built browser extensions:");
-console.log("  Chromium/Edge:", join(out, "chromium"));
+console.log("  Chromium:", join(out, "chromium"));
 console.log("  Firefox:", join(out, "firefox"));

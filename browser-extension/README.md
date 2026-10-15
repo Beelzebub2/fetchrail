@@ -17,15 +17,15 @@ If you already loaded the unpacked companion, disable or remove it before enabli
 
 For Linux browser packages, custom profiles and sandbox limits, see the [Linux companion guide](../docs/linux.md#browser-companion).
 
-The Opera Add-ons v0.7.1 listing was submitted on 12 October 2026 and is awaiting review. Until it is published, Opera GX users can install the Chrome Web Store build according to [Opera's guidance](https://help.opera.com/en/latest/customization/). The [Opera submission guide](../docs/edge-opera-addons.md) covers store updates and native-host setup after approval.
+The Opera Add-ons v0.7.1 listing was submitted on 12 October 2026 and is awaiting review. Until it is published, Opera GX users can install the Chrome Web Store build according to [Opera's guidance](https://help.opera.com/en/latest/customization/). The [Opera submission guide](../docs/opera-addons.md) covers store updates and native-host setup after approval.
 
-### Manual installation: Chrome, Edge, Chromium, Vivaldi, and Brave
+### Manual installation: Chrome, Chromium, Vivaldi, and Brave
 
 1. In Fetchrail, open **Settings → Browser companion → Manual installation and Firefox → Open extension folder**. The tray's **Get browser companion** action opens the official store listing.
-2. Open your browser's extensions page, such as `chrome://extensions`, `edge://extensions`, or `vivaldi://extensions`.
+2. Open your browser's extensions page, such as `chrome://extensions` or `vivaldi://extensions`.
 3. Enable **Developer mode**, choose **Load unpacked**, and select the opened folder.
 
-Chrome/Edge 116 or newer is required for automatic panel-aware companion reloads. Other Chromium browsers that use Chrome's native-host registration can also use the Chromium build.
+Chrome 116 or newer is required for automatic panel-aware companion reloads. Other Chromium browsers that use Chrome's native-host registration can also use the Chromium build.
 
 ### Firefox
 
@@ -102,7 +102,7 @@ Development unpacked extension: fkmedfamaoejlhddajndhjemiedmnldh
 Chrome Web Store extension: ccmbmcgihlemlheldpkgnidgohlkaipb
 ```
 
-The registration script allow-lists both Chromium IDs for Chrome, Edge, Chromium, Vivaldi, and Brave. Firefox uses `browser@braid.rrmtools.uk`.
+The registration script allow-lists both Chromium IDs for Chrome, Chromium, Vivaldi, and Brave. Firefox uses `browser@braid.rrmtools.uk`.
 
 ## Companion updates
 

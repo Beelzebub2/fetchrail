@@ -401,7 +401,7 @@ pub async fn capabilities(tray: bool) -> Capabilities {
         update_owner: "setup".into(),
         browser_integration: Feature::new(
             true,
-            "Native Chrome, Edge, Chromium, Brave, Vivaldi and Firefox.",
+            "Native Chrome, Chromium, Brave, Vivaldi and Firefox.",
         ),
     }
 }
