@@ -26,7 +26,7 @@ const provenance={baselineSha256:await digest(baseline),candidateSha256:await di
 async function until(work,label,timeout=60000) {const end=performance.now()+timeout;while(performance.now()<end){const value=await work();if(value)return value;await delay(100);}throw Error(`Timed out: ${label}`);}
 async function freePort() {const socket=tcpServer();await new Promise(done=>socket.listen(0,"127.0.0.1",done));const port=socket.address().port;await new Promise(done=>socket.close(done));return port;}
 function fixtureServer(mode,workers) {
-  const state={active:0,peak:0,requests:[],bytes:0,refusals:0};let refused=false,broken=false;
+  const state={active:0,peak:0,requests:[],bytes:0,refusals:0};let refused=false,broken=false,tailVisits=0;
   const server=createServer((request,response)=>{
     const range=/^bytes=(\d+)-(\d*)$/.exec(request.headers.range??"");
     const start=range?Number(range[1]):0,end=range?.[2]?Number(range[2]):total-1;
@@ -43,7 +43,9 @@ function fixtureServer(mode,workers) {
     response.writeHead(mode==="ignored"?200:range?206:200,headers);response.flushHeaders();
     const first=performance.now();let sent=0,timer;
     const persistentSlow=mode==="tail-region"&&start<total/32;
-    const slowTail=mode==="tail-recover"&&start===0||mode==="tail-stays-slow"&&start<total/workers;
+    const retryTail=mode==="disconnect-tail"&&start<total/workers;
+    if(retryTail)tailVisits++;
+    const slowTail=mode==="tail-recover"&&start===0||mode==="tail-stays-slow"&&start<total/workers||retryTail&&tailVisits===2;
     const speed=slowTail?4e6:persistentSlow||(start===0&&mode==="tail-matrix")?1e6:mode==="skew"&&start===0?8e6:120e6/workers;
     const limit=mode==="ignored"?total:end-start+1;
     function pump() {
@@ -54,7 +56,7 @@ function fixtureServer(mode,workers) {
         const size=Math.min(block.length-offset,limit-sent,budget);
         sent+=size;budget-=size;visit.bytes+=size;state.bytes+=size;
         const writable=response.write(block.subarray(offset,offset+size));
-        if(mode==="disconnect"&&!broken&&sent>=1024*1024){broken=true;response.destroy();return;}
+        if((mode==="disconnect"||retryTail)&&!broken&&sent>=1024*1024){broken=true;response.destroy();return;}
         if(!writable){response.once("drain",pump);return;}
       }
       if(sent>=limit){response.end();return;}
@@ -160,6 +162,12 @@ async function run(label,exe,plan,mode="uniform",workers=8,tracing=true) {
       if(mode==="disconnect")assert(result.trace?.retries>=1&&state.requests.length>workers,"Disconnect must actually trigger a suffix retry");
       if(mode==="tail-recover"&&label.includes("-B"))assert.equal(result.trace?.retries,1,"A drained slow tail must recover once from its durable suffix");
       if(mode==="tail-stays-slow")assert((result.trace?.retries??0)<=1,"A persistently slow source must finish without repeated tail restarts");
+      if(mode==="disconnect-tail"){
+        assert(state.requests.length>workers&&result.trace?.retryEvents.some(event=>["body","decode","incomplete"].includes(event.reason)),"A connection error must precede the slow suffix");
+        const renewals=result.trace?.retryEvents.filter(event=>event.reason==="slowPeer")??[];
+        assert.equal(renewals.length,label.includes("-B")?1:0,"A transport retry must preserve one slow-peer renewal");
+        assert.equal(result.trace?.retries,label.includes("-B")?2:1);
+      }
       if(mode==="refusal")assert.equal(state.refusals,1,"Refusal fixture must exercise server backoff");
       if(mode==="uniform")assert(duration>=total/120e6-state.requests.length*block.length/120e6-.1,"Fixture rate budget was bypassed");
       if(plan.startsWith("ranges=")){
@@ -189,6 +197,7 @@ if(cases.includes("tail-recovery")) {
   for(const [label,exe]of [["tail-A1",baseline],["tail-B1",candidate],["tail-B2",candidate],["tail-A2",baseline]])await run(label,exe,"fixed","tail-recover",8);
   await run("tail-stays-slow-B",candidate,"fixed","tail-stays-slow",8);
 }
+if(cases.includes("disconnect-tail"))for(const [label,exe]of [["disconnect-tail-A1",baseline],["disconnect-tail-B1",candidate],["disconnect-tail-B2",candidate],["disconnect-tail-A2",baseline]])await run(label,exe,"fixed","disconnect-tail",8);
 if(cases.includes("uniform"))for(const [label,exe,plan]of [["uniform-A1",baseline,"fixed"],["uniform-B1",candidate,"64m"],["uniform-B2",candidate,"128m"],["uniform-A2",baseline,"fixed"]])await run(label,exe,plan);
 if(cases.includes("skew"))for(const [label,exe,plan]of [["skew-A1",baseline,"fixed"],["skew-B1",candidate,"double"],["skew-B2",candidate,"64m"],["skew-A2",baseline,"fixed"]])await run(label,exe,plan,"skew");
 if(cases.includes("faults"))for(const mode of["disconnect","refusal","invalid","changed","ignored"])await run(`fault-${mode}`,candidate,"64m",mode,4);

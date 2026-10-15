@@ -4358,6 +4358,8 @@ impl DownloadManager {
                     let result = async {
                         #[cfg(feature = "test-tools")]
                         let mut previous_retry_cause = None;
+                        // A transport failure must not consume the one slow-peer renewal.
+                        let mut recovered_slow_peer = false;
                         for attempt in 0..3 {
                             #[cfg(feature = "test-tools")]
                             if attempt > 0 {
@@ -4404,7 +4406,9 @@ impl DownloadManager {
                                 workers,
                                 shared,
                                 live_peer_rate,
-                                attempt == 0 && probe.accepts_ranges && probe.validator.is_some(),
+                                !recovered_slow_peer
+                                    && probe.accepts_ranges
+                                    && probe.validator.is_some(),
                             )
                             .await;
                             let Err(error) = result else {
@@ -4439,6 +4443,7 @@ impl DownloadManager {
                                 previous_retry_cause = Some(trace::RetryCause::from_error(&error));
                             }
                             if matches!(error, EngineError::Slow) {
+                                recovered_slow_peer = true;
                                 client = download_client_builder().build()?;
                                 // Re-establish available throughput on the new transport. A link
                                 // capacity change must not repeatedly reject a steady slower source.
