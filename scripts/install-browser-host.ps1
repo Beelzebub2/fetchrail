@@ -51,6 +51,6 @@ foreach ($registration in $registrations) {
     Set-Item -Path $registration.Path -Value $registration.Manifest
 }
 
-Write-Host "Fetchrail native host registered for Chrome, Edge, Chromium, Vivaldi, Brave and Firefox."
+Write-Host "Fetchrail native host registered for Chrome, Chromium, Vivaldi, Brave and Firefox."
 Write-Host "Chromium extension ids: $ChromiumExtensionId, $ChromiumStoreExtensionId"
 Write-Host "Open Fetchrail Settings > Browser companion > Open extension folder, then load that folder in your browser."
