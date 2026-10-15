@@ -43,30 +43,32 @@ If you previously loaded `browser-extension/dist` from the checkout, switch to t
 
 Click the toolbar icon to see live transfers and pause, resume, retry, or cancel them. The companion shows the latest 100 transfers, overall speed, and counts; **Open app** opens the desktop manager with the full history and settings.
 
-- Paste one or several HTTP(S) URLs.
+- Paste one or several HTTP(S) URLs and press **Download** or Enter. Shift+Enter starts a new line.
 - Choose **This page** to scan links and media on demand, then search, filter, and select downloads.
-- Use **Transfer options** to choose up to 32 connections, an existing queue, a paused start, or a future start time. Fetchrail adapts ranges to file size and server support.
-- Set a per-file speed limit in KiB/s in **Transfer options**; zero means unlimited. The desktop app's total limit also applies.
+- Open **Options** under the paste field to choose up to 32 connections, an existing queue, a paused start, or a future start time. Fetchrail adapts ranges to file size and server support.
+- Set a per-file speed limit in KiB/s in **Options**; leaving it empty means unlimited. The desktop app's total limit also applies.
 - Right-click a link and choose **Download with Fetchrail**, or right-click a page and choose **Choose downloads with Fetchrail**.
 - Choose **Open in a tab** to keep the companion available while browsing.
 
-Connection and queue preferences are saved locally in the browser. The companion follows the desktop app's theme and accent and shows each transfer's individual connections when expanded.
+Connection and queue preferences are saved locally in the browser. The companion follows the desktop app's theme and accent and shows each transfer's individual connections when you click its row.
+
+The companion's version is at the bottom right. Click it to see the desktop app's version as well and whether the two work together. The extension and the app are released separately, so their version numbers can differ.
 
 ## Multi-step download pages
 
-Choose **Browse download pages**, paste page URLs and click **Browse pages**. You can also select page links in **This page** and click **Browse selected download pages**. Grant the optional HTTP(S) browser access when prompted so the companion can associate the final file request with the batch's tab, including popups and redirects.
+In **Options**, set **Links point to** to **Download pages**, then paste page URLs and click **Browse pages**. You can also select page links in **This page** and click **Browse pages**. Grant the optional HTTP(S) browser access when prompted so the companion can associate the final file request with the batch's tab, including popups and redirects.
 
-The batch opens one page at a time. **Follow a single clear download button automatically** follows visible controls such as Download, Free download and Generate download link, waiting for disabled countdown buttons to become available. It pauses automation when there are several candidates or a CAPTCHA and stops after 20 automatic steps per item. Continue those steps manually; the companion captures the final file regardless of how many pages you visited.
+The batch opens one page at a time. **Press a single clear download button for me** follows visible controls such as Download, Free download and Generate download link, waiting for disabled countdown buttons to become available. It pauses automation when there are several candidates or a CAPTCHA and stops after 20 automatic steps per item. Continue those steps manually; the companion captures the final file regardless of how many pages you visited.
 
 Captured batch files inherit the queue, connections, speed cap and start time chosen before the batch started. Successful verification advances the batch without opening a separate confirmation window. A failed handoff resumes the browser transfer and keeps the current item available for retry or skipping. **Reopen page**, **Skip item** and **Stop batch** are in the companion. A stopped batch leaves its accepted transfers in Fetchrail.
 
-Enable **Use browser session for captured files** for cookie-dependent downloads. This forwards only the observed final GET's Cookie, Referer, User-Agent and Authorization headers when the browser exposes them. Headers are stored in the desktop app's local `downloads.json` for unfinished transfers so resume and schedules can survive restarts; they are omitted from UI events and bridge responses and removed from disk on completion or removal. Treat unfinished download history as private. Temporary request observations remain in browser session storage and expire after two minutes.
+Enable **Use my browser session** in **Options** for cookie-dependent downloads. This forwards only the observed final GET's Cookie, Referer, User-Agent and Authorization headers when the browser exposes them. Headers are stored in the desktop app's local `downloads.json` for unfinished transfers so resume and schedules can survive restarts; they are omitted from UI events and bridge responses and removed from disk on completion or removal. Treat unfinished download history as private. Temporary request observations remain in browser session storage and expire after two minutes.
 
 The companion needs one reload to pick up its new `webRequest` permission. Optional website access is requested by the Browse pages action or session switch. Regular page scanning continues to use `activeTab`.
 
 ## Automatic download routing
 
-**Send browser downloads to Fetchrail** is enabled by default. Turn it off in the companion when you want downloads to remain in the browser.
+**Catch browser downloads** is enabled by default. Turn it off at the bottom of the companion when you want downloads to remain in the browser.
 
 For an eligible browser download, the companion:
 

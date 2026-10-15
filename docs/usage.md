@@ -46,9 +46,9 @@ Fetchrail includes companions for **Chrome, Edge, Chromium, Vivaldi, Brave, and 
 
 Open the companion to paste URL batches, choose links from **This page**, or control live transfers. You can also right-click a link and choose **Download with Fetchrail**.
 
-**Send browser downloads to Fetchrail** is enabled by default. The companion verifies a transfer before cancelling the browser's copy; a failed handoff continues in the browser. For a caught download, **Download file info** lets you confirm its name, category, and folder before starting or keeping it for later.
+**Catch browser downloads** is enabled by default. The companion verifies a transfer before cancelling the browser's copy; a failed handoff continues in the browser. For a caught download, **Download file info** lets you confirm its name, category, and folder before starting or keeping it for later.
 
-For sites with several buttons or countdowns, use **Browse download pages**. See the guide for [page batches and session support](../browser-extension/README.md#multi-step-download-pages) and [routing limits](../browser-extension/README.md#routing-limits).
+For sites with several buttons or countdowns, open the companion's **Options** and set **Links point to** to **Download pages**. See the guide for [page batches and session support](../browser-extension/README.md#multi-step-download-pages) and [routing limits](../browser-extension/README.md#routing-limits).
 
 ## Progress windows
 
