@@ -451,6 +451,14 @@ h1, h2, p { margin: 0; }
 .form input[readonly] { color: var(--text-2); }
 .form .check { display: flex; align-items: center; gap: 10px; font-size: 13px; font-weight: 400; cursor: pointer; }
 .check input { width: 16px; height: 16px; flex: none; margin: 0; accent-color: var(--accent); }
+.windows-check { display: grid; gap: 8px; padding-top: 14px; border-top: 1px solid var(--line-soft); }
+.windows-check-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.windows-check-info { position: relative; flex: none; }
+.windows-check-info summary { width: 28px; height: 28px; display: grid; place-items: center; border-radius: 50%; color: var(--text-2); cursor: pointer; list-style: none; }
+.windows-check-info summary::-webkit-details-marker { display: none; }
+.windows-check-info summary:hover,.windows-check-info[open] summary { color: var(--accent-text); background: var(--accent-soft); }
+.windows-check-info p { position: absolute; z-index: 4; bottom: 32px; right: 0; width: min(340px, 75vw); padding: 14px; border: 1px solid var(--line); border-radius: 12px; color: var(--text-2); background: var(--raised); box-shadow: 0 12px 32px var(--shade); font-size: 12.5px; line-height: 1.5; }
+.windows-check-warning { color: var(--danger); font-size: 12.5px; line-height: 1.5; }
 
 /* Unsaved settings wait here; it slides away once they are saved or discarded. */
 .save-dock { position: fixed; bottom: 22px; left: 50%; z-index: 5; display: flex; align-items: center; gap: 14px; padding: 8px 8px 8px 18px; border: 1px solid var(--line); border-radius: 16px; background: var(--raised); box-shadow: 0 18px 44px var(--shade); opacity: 0; pointer-events: none; transform: translate(-50%, 96px); transition: transform 460ms var(--spring), opacity 220ms, background 300ms; }
