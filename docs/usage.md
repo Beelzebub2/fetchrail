@@ -42,7 +42,7 @@ Switch off **Automatically sort new downloads into folders** to keep new files d
 
 ## Browser downloads
 
-Fetchrail includes companions for **Chrome, Edge, Chromium, Vivaldi, Brave, and Firefox**. Follow the [browser companion guide](../browser-extension/README.md#install-the-companion) to load the extension.
+Fetchrail includes companions for **Chrome, Chromium, Vivaldi, Brave, and Firefox**. Follow the [browser companion guide](../browser-extension/README.md#install-the-companion) to load the extension.
 
 Open the companion to paste URL batches, choose links from **This page**, or control live transfers. You can also right-click a link and choose **Download with Fetchrail**.
 
