@@ -331,6 +331,7 @@ mod tests {
             connections_per_download: 8,
             performance_auto: false,
             min_segment_size_mb: 4,
+            windows_attachment_check: true,
             launch_on_start: false,
             minimize_to_tray: true,
             theme: Default::default(),
