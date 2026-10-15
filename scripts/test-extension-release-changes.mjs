@@ -78,6 +78,7 @@ try {
   scenario("Chrome package preparation", () => write("scripts/prepare-chrome-web-store.mjs", "// Modified package\n"), { ...none, chromium: true, opera: true });
   scenario("Mozilla listing metadata", () => write("browser-extension/amo-metadata.json", { categories: ["other"] }), { ...none, firefox: true });
   scenario("Privacy policy only", () => write("browser-extension/privacy-policy.txt", "Changed policy.\n"), { ...none, firefox_policy: true });
+  scenario("Listing icon sync only", () => write("scripts/firefox-add-ons-icon.mjs", "// Updated icon sync\n"), { ...none, firefox_policy: true });
   scenario("Extension font update", () => updateJson("package-lock.json", (data) => { data.packages["node_modules/@fontsource-variable/geist"].integrity = "sha512-changed"; }), { ...none, chromium: true, opera: true, firefox: true });
   scenario("Unrelated npm dependency update", () => updateJson("package-lock.json", (data) => { data.packages["node_modules/react"].version = "19.0.1"; }), none);
 

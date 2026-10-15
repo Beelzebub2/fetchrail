@@ -24,13 +24,13 @@
 
 <p align="center">
   <a href="https://chromewebstore.google.com/detail/fetchrail-browser-integra/ccmbmcgihlemlheldpkgnidgohlkaipb"><img src="https://developer.chrome.com/static/docs/webstore/branding/image/iNEddTyWiMfLSwFD6qGq.png" alt="Install Fetchrail from the Chrome Web Store" height="60"></a>
-  <a href="https://addons.mozilla.org/en-US/firefox/addon/fetchrail-browser-integration/"><img src="https://extensionworkshop.com/assets/img/documentation/publish/get-the-addon-178x60px.dad84b42.png" alt="Firefox Add-ons listing, awaiting approval" height="60"></a>
+  <a href="https://addons.mozilla.org/en-US/firefox/addon/fetchrail-browser-integration/"><img src="https://extensionworkshop.com/assets/img/documentation/publish/get-the-addon-178x60px.dad84b42.png" alt="Install Fetchrail from Firefox Add-ons" height="60"></a>
 </p>
 
 <p align="center">
   <a href="https://chromewebstore.google.com/detail/ccmbmcgihlemlheldpkgnidgohlkaipb"><img src="https://img.shields.io/chrome-web-store/v/ccmbmcgihlemlheldpkgnidgohlkaipb?label=Chrome%20public&amp;style=flat-square&amp;color=238636" alt="Chrome Web Store: public version"></a>
-  <a href="https://github.com/Beelzebub2/fetchrail/actions/runs/38172309596"><img src="https://img.shields.io/badge/Firefox-v0.7.1%20in%20review-d29922?style=flat-square" alt="Firefox v0.7.1 awaiting approval"></a>
-  <a href="browser-extension/README.md"><img src="https://img.shields.io/badge/Opera%20GX-v0.7.1%20in%20review-d29922?style=flat-square" alt="Opera GX v0.7.1 awaiting Opera review"></a>
+  <a href="https://addons.mozilla.org/en-US/firefox/addon/fetchrail-browser-integration/"><img src="https://img.shields.io/amo/v/fetchrail-browser-integration?label=Firefox%20public&amp;style=flat-square&amp;color=238636&amp;cacheSeconds=300" alt="Firefox Add-ons: public version"></a>
+  <a href="https://addons.opera.com/en/search/?query=Fetchrail"><img src="https://img.shields.io/endpoint?url=https%3A%2F%2Ffetchrail.rrmtools.uk%2Fapi%2Fstores%2Fopera&amp;style=flat-square&amp;cacheSeconds=300" alt="Opera GX: current public store availability"></a>
 </p>
 
 > Most downloads travel down a single connection. Fetchrail opens up to thirty-two, and lets you watch every one.
