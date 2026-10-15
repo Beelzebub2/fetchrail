@@ -2513,7 +2513,7 @@ function SettingsPage({
               <section className="card minor rise d2" aria-labelledby="companion-manual-title">
                 <div className="card-head">
                   <h2 id="companion-manual-title">Manual installation and Firefox</h2>
-                  <p>For Chrome or Edge without the store, and for Firefox.</p>
+                  <p>For Chrome or another Chromium browser without the store, and for Firefox.</p>
                 </div>
                 <ol className="steps">
                   <li>
@@ -2525,7 +2525,7 @@ function SettingsPage({
                   </li>
                   <li>
                     <span className="mono" aria-hidden="true">2</span>
-                    <strong>In Chrome or Edge, enable Developer mode</strong>
+                    <strong>In Chrome or another Chromium browser, enable Developer mode</strong>
                   </li>
                   <li>
                     <span className="mono" aria-hidden="true">3</span>

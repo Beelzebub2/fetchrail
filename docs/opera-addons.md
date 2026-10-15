@@ -1,12 +1,12 @@
-# Publishing Fetchrail for Edge and Opera GX
+# Publishing Fetchrail for Opera GX
 
-The Chromium Manifest V3 companion is shared by Chrome, Microsoft Edge and Opera (including Opera GX). Opera Add-ons **v0.7.1 was submitted for moderation on 12 October 2026**, and is not public yet. The Edge store listing has not been submitted. Only mark a store as approved after its public listing is accessible.
+The Chromium Manifest V3 companion is shared by Chrome and Opera (including Opera GX). Opera Add-ons **v0.7.1 was submitted for moderation on 12 October 2026**, and is not public yet. Only mark the store as approved after its public listing is accessible.
 
 ## Build the production ZIP
 
-The manually triggered [Edge and Opera Add-ons package workflow](../.github/workflows/edge-opera-addons-package.yml) builds and tests the current source, then uploads an Actions artifact named `edge-opera-addons-upload`. Inside is `fetchrail-browser-vVERSION-edge-opera.zip`, which can be uploaded unchanged to both stores, and `SHA256SUMS.txt`. The archive places `manifest.json` at its root, removes the development `key` and `update_url`, and excludes local `build-info.json`. The manifest currently declares **v0.7.1**.
+The manually triggered [Opera Add-ons package workflow](../.github/workflows/opera-addons-package.yml) builds and tests the current source, then uploads an Actions artifact named `opera-addons-upload`. Inside is `fetchrail-browser-vVERSION-opera.zip`, which can be uploaded to Opera, and `SHA256SUMS.txt`. The archive places `manifest.json` at its root, removes the development `key` and `update_url`, and excludes local `build-info.json`.
 
-To generate the same production directory locally, run `npm ci`, `npm run browser:build`, `npm run browser:check`, and `node scripts/prepare-chrome-web-store.mjs v0.7.1`. ZIP the *contents* of `release-artifacts/chrome-web-store-0.7.1` (not the folder itself). For any later release, substitute the matching version everywhere.
+To generate the same production directory locally, run `npm ci`, `npm run browser:build`, `npm run browser:check`, and `node scripts/prepare-chrome-web-store.mjs vVERSION`. ZIP the *contents* of `release-artifacts/chrome-web-store-VERSION` (not the folder itself), substituting the current package version.
 
 The browser extension requires the separate [Fetchrail desktop application](https://github.com/Beelzebub2/fetchrail/releases/latest). Start Fetchrail once to register its native messaging host. Browsers and desktop releases update independently.
 
@@ -28,7 +28,7 @@ The browser extension requires the separate [Fetchrail desktop application](http
 
 **Single purpose:** Route and manage downloads using the locally installed Fetchrail download manager.
 
-**Category:** Productivity (Opera). In Edge, choose the closest available download management/productivity category.
+**Category:** Productivity.
 
 **Website:** https://fetchrail.rrmtools.uk/
 
@@ -36,7 +36,7 @@ The browser extension requires the separate [Fetchrail desktop application](http
 
 **Support:** https://github.com/Beelzebub2/fetchrail/issues
 
-**Permissions for Edge review:**
+**Permissions for review:**
 
 | Permission | Reason |
 | :-- | :-- |
@@ -51,23 +51,14 @@ The browser extension requires the separate [Fetchrail desktop application](http
 
 **Reviewer notes:** Install the Fetchrail desktop app, start it once to register the native host `com.rrmtools.braid`, then test the toolbar, an HTTP(S) download handoff and link context menu. Download handoffs verify the request before cancelling the browser copy; they revert if the app cannot accept it. Session-header forwarding is disabled by default. Use an ordinary public test download; no account is required.
 
-**Media:** Use the current 128×128 extension icon from `browser-extension/dist/chromium/icons/128.png` and capture current screenshots of the real companion UI. For Opera, [612×408 px is preferred and 800×600 px is the maximum](https://help.opera.com/en/extensions/publishing-guidelines/); show the toolbar popup and a real feature. Avoid older MDI-branded images under local `artifacts/`. Microsoft also documents its [listing image sizes](https://learn.microsoft.com/en-us/microsoft-edge/extensions/publish/publish-extension#step-7-enter-store-listing-details-for-each-language).
-
-## First Microsoft Edge Add-ons submission
-
-1. [Register or sign in to Microsoft Partner Center](https://partner.microsoft.com/dashboard) and enable the Microsoft Edge developer program. [Registration is free](https://learn.microsoft.com/en-us/microsoft-edge/extensions/publish/create-dev-account); verification may require account-owner action.
-2. Under **Edge → Create new extension**, upload the ZIP produced above. Choose **Public** and intended markets, complete properties, privacy/permission disclosures, assets, English listing text and reviewer notes, then submit for certification.
-3. Copy the resulting **Microsoft Edge catalog extension ID** and the product listing URL from the dashboard. A store submission or upload being accepted does *not* mean approved.
-4. After the first listing exists, [Edge's v1.1 Update REST API](https://learn.microsoft.com/en-us/microsoft-edge/extensions/update/api/using-addons-api) can automate subsequent releases using the product ID and Partner Center Publish API credentials. That API cannot create a first listing.
-
-The [Microsoft Edge Add-ons badge](https://learn.microsoft.com/en-us/microsoft-edge/extensions/publish/add-ons-badge) must link to an actual Edge listing and should be used only after it becomes public. Until then the README shows a preparation badge.
+**Media:** Use the current 128×128 extension icon from `browser-extension/dist/chromium/icons/128.png` and capture current screenshots of the real companion UI. [612×408 px is preferred and 800×600 px is the maximum](https://help.opera.com/en/extensions/publishing-guidelines/); show the toolbar popup and a real feature. Avoid older MDI-branded images under local `artifacts/`.
 
 ## First Opera Add-ons submission (including Opera GX)
 
 1. Sign in with an Opera account at [Upload Extensions](https://addons.opera.com/developer/upload/) and upload the production ZIP.
 2. Complete the package/version form, **Productivity** category, summary, description, relevant current screenshots and license information. Review the [publishing guidelines](https://help.opera.com/en/extensions/publishing-guidelines/) and [acceptance criteria](https://help.opera.com/en/extensions/acceptance-criteria/). Opera's terms may apply a default CC BY-NC-ND 4.0 license if no separate EULA is provided; the publisher must choose the intended distribution terms before submitting.
 3. Submit the extension from the developer dashboard, then check the **Submitted extensions** page for moderation and feedback. The upload and moderation are separate steps; there is no documented official API for first-time Opera publication.
-4. Fetchrail v0.7.1 completed these steps on 12 October 2026. The [Opera developer listing](https://addons.opera.com/developer/package/307435/) is awaiting moderation. Once approved, confirm the extension ID and public URL and replace the review badge.
+4. Fetchrail v0.7.1 completed these steps on 12 October 2026. The [Opera developer listing](https://addons.opera.com/developer/package/307435/) is awaiting moderation. Once approved, confirm the extension ID and public URL; the README badge discovers the public listing automatically.
 
 ## Automatic Opera update submissions
 
@@ -86,12 +77,12 @@ Opera GX can also use [Chrome Web Store extensions](https://help.opera.com/en/la
 
 ## Required native-host follow-up
 
-Each store can assign an extension ID different from the development and Chrome Web Store IDs. Fetchrail currently permits only those two Chromium origins. Before advertising a native Edge/Opera listing as working, add each **confirmed store extension ID** to:
+The Opera store can assign an extension ID different from the development and Chrome Web Store IDs. Fetchrail currently permits only those two Chromium origins. Before advertising the native Opera listing as working, add its **confirmed store extension ID** to:
 
 - `src-tauri/src/native_host.rs` — native launcher invocation origin validation.
 - `src-tauri/src/browser_extension.rs` — Chromium `allowed_origins` for packaged Windows and Linux installations.
 - `scripts/install-browser-host.ps1` — development/standalone host registration.
 
-Update the accompanying tests, release an updated desktop installer, and verify the extension can connect from **each real store-installed browser**. Wildcard extension origins should not be used. Chrome's existing ID cannot be assumed to match the Edge or Opera listing.
+Update the accompanying tests, release an updated desktop installer, and verify the extension can connect from the real Opera store-installed browser. Wildcard extension origins should not be used. Chrome's existing ID cannot be assumed to match the Opera listing.
 
-For native messaging documentation, see [Microsoft Edge](https://learn.microsoft.com/en-us/microsoft-edge/extensions/developer-guide/native-messaging) and [Opera](https://help.opera.com/en/extensions/message-passing/). No extension upload can complete these checks until the publisher dashboard has assigned its store ID.
+For native messaging documentation, see [Opera](https://help.opera.com/en/extensions/message-passing/). No extension upload can complete these checks until the publisher dashboard has assigned its store ID.
