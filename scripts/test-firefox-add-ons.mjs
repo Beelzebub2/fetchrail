@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { readFile, stat } from "node:fs/promises";
 import { createHmac } from "node:crypto";
 import { authorization, syncPrivacyPolicy, verifyCredentials } from "./firefox-add-ons-policy.mjs";
+import { syncIcon } from "./firefox-add-ons-icon.mjs";
 
 const json = async (path) => JSON.parse(await readFile(new URL(`../${path}`, import.meta.url), "utf8"));
 const source = await json("browser-extension/manifests/firefox.json");
@@ -69,4 +70,30 @@ assert.equal(await syncPrivacyPolicy({ ...args, fetcher: async () => new Respons
   "Mozilla's display-only links must not force repeat privacy policy updates");
 await assert.rejects(syncPrivacyPolicy({ ...args, fetcher: async (_url, req) => new Response(JSON.stringify({ privacy_policy: { "en-US": req.method === "GET" ? "a different policy" : policy } }), { status: 200 }) }), /did not return the submitted privacy policy/);
 await assert.rejects(syncPrivacyPolicy({ ...args, fetcher: async () => new Response("{}", { status: 403 }) }), /HTTP 403/);
+const icon = await readFile(new URL("../browser-extension/src/icons/128.png", import.meta.url));
+let uploads = 0, checks = 0;
+const iconArgs = { issuer: args.issuer, secret: args.secret, guid: args.guid, icon, pause: async () => {}, fetcher: async (url, request) => {
+  if (url === "https://addons.mozilla.org/user-media/addon_icons/123/123456-128.png") {
+    assert.equal(request.headers?.Authorization, undefined, "JWT must never be forwarded to image hosts");
+    return new Response(icon, { headers: { "Content-Type": "image/png" } });
+  }
+  assert.equal(url, "https://addons.mozilla.org/api/v5/addons/addon/browser%40braid.rrmtools.uk/");
+  assert.match(request.headers.Authorization, /^JWT /);
+  if (request.method === "PATCH") {
+    uploads++;
+    assert.equal(request.headers["Content-Type"], undefined, "Fetch must create the multipart boundary");
+    assert.deepEqual([...request.body.keys()], ["icon"], "Metadata repair must not upload a new extension version");
+    assert.deepEqual(Buffer.from(await request.body.get("icon").arrayBuffer()), icon);
+    assert.equal(request.body.get("icon").type, "image/png");
+    return Response.json({});
+  }
+  checks++;
+  return Response.json({ icons: { 128: checks === 1 ? "https://addons.mozilla.org/static-server/img/addon-icons/default-128.png" : "https://addons.mozilla.org/user-media/addon_icons/123/123456-128.png" } });
+} };
+await syncIcon(iconArgs);
+await syncIcon(iconArgs);
+assert.equal(uploads, 2, "Repeated metadata repair safely reuses the same listing icon without a version submission");
+assert.equal(checks, 3, "Default icons must wait for asynchronous resizing");
+await assert.rejects(syncIcon({ ...iconArgs, fetcher: async () => new Response("{}", { status: 403 }) }), /icon upload failed.*403/);
+await assert.rejects(syncIcon({ ...iconArgs, fetcher: async () => Response.json({ icons: { 128: "https://addons.mozilla.org/static-server/img/addon-icons/default-128.png" } }) }), /public image is not ready/);
 console.log(`Firefox AMO ${built.version}: identity, manifest, disclosure, metadata, and package checks passed.`);

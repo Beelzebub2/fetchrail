@@ -64,7 +64,8 @@ export function compareExtensionChanges(base, head) {
     chromium: chromiumChanged,
     opera: chromiumChanged,
     firefox: shared || fontsChanged || paths.has("browser-extension/amo-metadata.json") || manifestChanged(base, head, "firefox"),
-    firefox_policy: paths.has("browser-extension/privacy-policy.txt"),
+    // Keep the existing workflow output: policy_only now synchronizes both listing fields.
+    firefox_policy: ["browser-extension/privacy-policy.txt", "scripts/firefox-add-ons-policy.mjs", "scripts/firefox-add-ons-icon.mjs"].some(path => paths.has(path)),
   };
 }
 

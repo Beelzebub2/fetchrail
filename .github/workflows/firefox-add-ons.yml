@@ -9,7 +9,7 @@ on:
   workflow_dispatch:
     inputs:
       policy_only:
-        description: Repair or update the AMO privacy policy without resubmitting the version
+        description: Repair or update the AMO icon and privacy policy without resubmitting the version
         type: boolean
         default: false
 
@@ -84,6 +84,11 @@ jobs:
             --approval-timeout 0 \
             --artifacts-dir artifacts/firefox-add-ons \
             --no-input
+      - name: Publish and verify Firefox listing icon
+        env:
+          AMO_JWT_ISSUER: ${{ secrets.AMO_JWT_ISSUER }}
+          AMO_JWT_SECRET: ${{ secrets.AMO_JWT_SECRET }}
+        run: node scripts/firefox-add-ons-icon.mjs
       - name: Publish and verify Firefox privacy policy
         env:
           AMO_JWT_ISSUER: ${{ secrets.AMO_JWT_ISSUER }}
