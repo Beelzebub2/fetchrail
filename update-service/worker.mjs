@@ -2,6 +2,7 @@ import { DurableObject } from "cloudflare:workers";
 import { AUDIENCE, FeedError, authorize, compareTags, loadRelease, publicationDecision, readJson, sha256 } from "./policy.mjs";
 import bootstrap from "./bootstrap.mjs";
 import { analyticsApi } from "./analytics.mjs";
+import { operaBadgeResponse } from "./store-badges.mjs";
 export { AnalyticsStore } from "./analytics.mjs";
 
 export class ReleaseFeed extends DurableObject {
@@ -47,6 +48,7 @@ async function website(request, env) {
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
+    if (url.pathname === "/api/stores/opera") return operaBadgeResponse(request, ctx);
     if (["/api/analytics", "/api/analytics/report"].includes(url.pathname)) return analyticsApi(request, env);
     if (!url.pathname.startsWith("/api/")) return website(request, env);
     try {
