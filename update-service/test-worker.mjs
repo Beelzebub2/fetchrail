@@ -22,12 +22,13 @@ const options = {
       testAlarm() { return this.ctx.storage.getAlarm(); }
       testRunAlarm() { return this.alarm(); }
     }
-  ` }, ...["worker.mjs", "policy.mjs", "bootstrap.mjs", "analytics.mjs"].map(name => ({ type: "ESModule", path: fileURLToPath(new URL(name, import.meta.url)) }))],
+  ` }, ...["worker.mjs", "policy.mjs", "bootstrap.mjs", "analytics.mjs", "store-badges.mjs"].map(name => ({ type: "ESModule", path: fileURLToPath(new URL(name, import.meta.url)) }))],
   compatibilityDate: "2026-10-09",
   durableObjects: { RELEASE_FEED: { className: "ReleaseFeed", useSQLite: true }, ANALYTICS: { className: "AnalyticsStore", useSQLite: true } },
   bindings: { ANALYTICS_READ_TOKEN: "test-read-secret-with-at-least-32-characters" },
   serviceBindings: { ASSETS: "assets-test" },
   outboundService: async request => {
+    if (request.url === "https://addons.opera.com/en/search/?query=Fetchrail") return new Response("No search results for &#x27;Fetchrail&#x27;", { headers: { "Content-Type": "text/html" } });
     if (request.url === "https://token.actions.githubusercontent.com/.well-known/jwks") return Response.json({ keys: [jwt.jwk] });
     for (const [tag, fixture] of fixtures) {
       if (request.url === `https://api.github.com/repos/${REPOSITORY}/releases/tags/${tag}`) return Response.json(fixture.release);
@@ -48,6 +49,9 @@ async function publish(tag, changes = {}) {
     body: JSON.stringify({ tag, manifestSha256: await sha256(fixtures.get(tag).bytes), ...changes }) });
 }
 try {
+  assert.equal((await (await get("/api/stores/opera")).json()).message, "not public");
+  assert.equal((await worker.dispatchFetch("https://fetchrail.rrmtools.uk/api/stores/opera", { method: "POST" })).status, 405);
+  assert.equal(await (await worker.dispatchFetch("https://fetchrail.rrmtools.uk/api/stores/opera", { method: "HEAD" })).text(), "");
   const reportFixture = { schema: 1, version: "0.6.1", os: "windows", arch: "x64", counters: { launch: 1, http_added: 3, http_completed: 2, size_under_10mb: 2 } };
   const collect = (data, headers = {}, path = "/api/analytics") => worker.dispatchFetch(`https://fetchrail.rrmtools.uk${path}`, { method: "POST", headers: { "Content-Type": "application/json", ...headers }, body: typeof data === "string" ? data : JSON.stringify(data) });
   const readAnalytics = () => worker.dispatchFetch("https://fetchrail.rrmtools.uk/api/analytics/report", { headers: { Authorization: `Bearer ${options.bindings.ANALYTICS_READ_TOKEN}` } });
