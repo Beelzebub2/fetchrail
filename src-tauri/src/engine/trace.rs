@@ -140,7 +140,7 @@ struct SlowIoEvent {
     duration_ms: f64,
     observed_at_utc: chrono::DateTime<chrono::Utc>,
 }
-#[derive(serde::Serialize)]
+#[derive(Default, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 struct Sample {
     elapsed_ms: u64,
@@ -149,6 +149,10 @@ struct Sample {
     receiving: usize,
     connecting: usize,
     planned: usize,
+    network: u64,
+    target: usize,
+    unfinished: usize,
+    queued: usize,
 }
 struct PhaseTransition {
     phase_index: usize,
@@ -180,6 +184,11 @@ pub(crate) struct Trace {
     retry_events: Mutex<Vec<RetryEvent>>,
     slow_io_events: Mutex<Vec<SlowIoEvent>>,
     samples: Mutex<Vec<Sample>>,
+    receiving_started: OnceLock<Instant>,
+    receiving_elapsed: OnceLock<Duration>,
+    receiving_epochs: AtomicUsize,
+    // shortcut: one hour from the first receiving epoch; qualify resumed or longer captures before analysis.
+    network_windows: OnceLock<[AtomicU64; 360]>,
 }
 impl Trace {
     pub fn guard(&self, phase: Phase) -> SpanGuard<'_> {
@@ -196,6 +205,16 @@ impl Trace {
         .then(|| Arc::new(Self::default()))
     }
     pub fn phase(&self, phase: Phase) {
+        if matches!(phase, Phase::Body) {
+            self.receiving_epochs.fetch_add(1, Ordering::Relaxed);
+            self.receiving_started.get_or_init(Instant::now);
+            self.network_windows
+                .get_or_init(|| std::array::from_fn(|_| AtomicU64::new(0)));
+        } else if matches!(phase, Phase::Assembly) {
+            if let Some(started) = self.receiving_started.get() {
+                self.receiving_elapsed.get_or_init(|| started.elapsed());
+            }
+        }
         let mut transitions = self
             .phase_transitions
             .lock()
@@ -224,7 +243,12 @@ impl Trace {
         }
         self.phase.store(phase as usize, Ordering::Relaxed);
     }
-    pub fn sample(&self, downloaded: u64, receiving: usize, connecting: usize, planned: usize) {
+    pub fn sample(
+        &self,
+        downloaded: u64,
+        segments: &[crate::model::SegmentProgress],
+        target: usize,
+    ) {
         let elapsed_ms = self
             .started
             .get_or_init(Instant::now)
@@ -241,10 +265,41 @@ impl Trace {
                 elapsed_ms,
                 downloaded,
                 durable: self.durable_bytes.load(Ordering::Relaxed),
-                receiving,
-                connecting,
-                planned,
+                receiving: segments.iter().filter(|s| s.active).count(),
+                connecting: segments
+                    .iter()
+                    .filter(|s| {
+                        !s.active
+                            && !s.waiting
+                            && s.length.is_none_or(|length| s.downloaded_bytes < length)
+                    })
+                    .count(),
+                planned: segments.len(),
+                network: self.network_bytes.load(Ordering::Relaxed),
+                target,
+                unfinished: segments
+                    .iter()
+                    .filter(|s| s.length.is_none_or(|length| s.downloaded_bytes < length))
+                    .count(),
+                queued: segments
+                    .iter()
+                    .filter(|s| {
+                        !s.active
+                            && s.waiting
+                            && s.length.is_none_or(|length| s.downloaded_bytes < length)
+                    })
+                    .count(),
             });
+        }
+    }
+    pub fn received(&self, bytes: u64) {
+        self.network_bytes.fetch_add(bytes, Ordering::Relaxed);
+        if let (Some(started), Some(windows)) =
+            (self.receiving_started.get(), self.network_windows.get())
+        {
+            if let Some(window) = windows.get((started.elapsed().as_secs() / 10) as usize) {
+                window.fetch_add(bytes, Ordering::Relaxed);
+            }
         }
     }
     pub fn save(
@@ -253,6 +308,16 @@ impl Trace {
         id: uuid::Uuid,
         status: crate::model::DownloadStatus,
     ) -> std::io::Result<()> {
+        if matches!(
+            status,
+            crate::model::DownloadStatus::Paused
+                | crate::model::DownloadStatus::Failed
+                | crate::model::DownloadStatus::Cancelled
+        ) {
+            if let Some(started) = self.receiving_started.get() {
+                self.receiving_elapsed.get_or_init(|| started.elapsed());
+            }
+        }
         let _lock = SAVE_LOCK
             .lock()
             .map_err(|_| std::io::Error::other("trace save poisoned"))?;
@@ -414,7 +479,24 @@ impl Trace {
                 json!({"calls":calls,"totalMs":span.nanos.load(Ordering::Relaxed) as f64/1e6,"maxMs":span.max.load(Ordering::Relaxed) as f64/1e6,"p95UpperMs":p95}),
             )
         });
-        json!({"engineBuild":env!("FETCHRAIL_ENGINE_BUILD"),"elapsedMs":self.started.get().map(|started|started.elapsed().as_millis().min(u64::MAX as u128) as u64),"phase":NAMES[self.phase.load(Ordering::Relaxed)],"phaseTransitions":transitions,"retryEvents":retry_events,"slowIoEvents":slow_io_events,"networkBytes":self.network_bytes.load(Ordering::Relaxed),"durableBytes":self.durable_bytes.load(Ordering::Relaxed),"catalogAcknowledged":self.catalog_acknowledged.load(Ordering::Acquire),"requests":self.requests.load(Ordering::Relaxed),"retries":self.retries.load(Ordering::Relaxed),"refusals":self.refusals.load(Ordering::Relaxed),"hardLinks":self.linked.load(Ordering::Relaxed),"protocols":self.protocols.iter().map(|v|v.load(Ordering::Relaxed)).collect::<Vec<_>>(),"spans":phases.into_iter().map(|(name,value)|(name.to_string(),value)).collect::<serde_json::Map<_,_>>()})
+        let receiving_elapsed = self
+            .receiving_elapsed
+            .get()
+            .copied()
+            .or_else(|| self.receiving_started.get().map(Instant::elapsed))
+            .unwrap_or_default();
+        let network_windows = self
+            .network_windows
+            .get()
+            .map(|windows| {
+                windows
+                    .iter()
+                    .take((receiving_elapsed.as_secs() / 10 + 1) as usize)
+                    .map(|bytes| bytes.load(Ordering::Relaxed))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        json!({"engineBuild":env!("FETCHRAIL_ENGINE_BUILD"),"elapsedMs":self.started.get().map(|started|started.elapsed().as_millis().min(u64::MAX as u128) as u64),"phase":NAMES[self.phase.load(Ordering::Relaxed)],"phaseTransitions":transitions,"retryEvents":retry_events,"slowIoEvents":slow_io_events,"networkBytes":self.network_bytes.load(Ordering::Relaxed),"durableBytes":self.durable_bytes.load(Ordering::Relaxed),"receivingElapsedMs":receiving_elapsed.as_millis(),"networkWindowBytes":network_windows,"receivingEpochs":self.receiving_epochs.load(Ordering::Relaxed),"networkWindowsTruncated":receiving_elapsed>=Duration::from_secs(3600),"catalogAcknowledged":self.catalog_acknowledged.load(Ordering::Acquire),"requests":self.requests.load(Ordering::Relaxed),"retries":self.retries.load(Ordering::Relaxed),"refusals":self.refusals.load(Ordering::Relaxed),"hardLinks":self.linked.load(Ordering::Relaxed),"protocols":self.protocols.iter().map(|v|v.load(Ordering::Relaxed)).collect::<Vec<_>>(),"spans":phases.into_iter().map(|(name,value)|(name.to_string(),value)).collect::<serde_json::Map<_,_>>()})
     }
 }
 
@@ -451,9 +533,10 @@ mod tests {
                 receiving: 1,
                 connecting: 0,
                 planned: 40,
+                ..Sample::default()
             });
         }
-        trace.sample(2, 1, 0, 40);
+        trace.sample(2, &[], 1);
         trace.phase(Phase::Body);
         trace.retry(12, 1, RetryCause::Incomplete, Some(1024));
         trace.span(Phase::Sync, Duration::from_millis(252));
@@ -623,5 +706,95 @@ mod tests {
             pair[0]["elapsedMs"].as_u64().unwrap() <= pair[1]["elapsedMs"].as_u64().unwrap()
         }));
         assert!(!snapshot.to_string().contains("http://"));
+    }
+
+    #[test]
+    fn samples_distinguish_queued_work_from_connections_and_received_from_durable_bytes() {
+        let segment = crate::model::SegmentProgress {
+            start: 0,
+            length: Some(100),
+            downloaded_bytes: 0,
+            speed_bps: 0,
+            active: false,
+            waiting: false,
+        };
+        let trace = Trace::default();
+        trace.network_bytes.store(90, Ordering::Relaxed);
+        trace.durable_bytes.store(20, Ordering::Relaxed);
+        trace.sample(
+            70,
+            &[
+                crate::model::SegmentProgress {
+                    active: true,
+                    waiting: true,
+                    downloaded_bytes: 70,
+                    ..segment.clone()
+                },
+                segment.clone(),
+                crate::model::SegmentProgress {
+                    waiting: true,
+                    ..segment.clone()
+                },
+                crate::model::SegmentProgress {
+                    waiting: true,
+                    downloaded_bytes: 100,
+                    ..segment
+                },
+            ],
+            2,
+        );
+        let samples = trace.samples.lock().unwrap();
+        let sample = &samples[0];
+        assert_eq!(
+            (sample.network, sample.downloaded, sample.durable),
+            (90, 70, 20)
+        );
+        assert_eq!(
+            (sample.target, sample.receiving, sample.connecting),
+            (2, 1, 1)
+        );
+        assert_eq!(
+            (sample.planned, sample.unfinished, sample.queued),
+            (4, 3, 1)
+        );
+    }
+
+    #[test]
+    fn network_windows_count_received_bytes_in_exact_ten_second_buckets() {
+        let trace = Trace::default();
+        trace
+            .receiving_started
+            .set(Instant::now() - Duration::from_secs(15))
+            .unwrap();
+        trace.phase(Phase::Body);
+        trace.received(123);
+        trace.received(456);
+        trace.phase(Phase::Assembly);
+        let snapshot = trace.snapshot();
+        assert_eq!(snapshot["networkBytes"], 579);
+        assert_eq!(snapshot["networkWindowBytes"], json!([0, 579]));
+        let elapsed = trace.receiving_elapsed.get().copied();
+        trace.phase(Phase::Assembly);
+        assert_eq!(elapsed, trace.receiving_elapsed.get().copied());
+    }
+
+    #[test]
+    fn network_window_limits_are_explicit_for_long_and_resumed_captures() {
+        let trace = Trace::default();
+        trace
+            .receiving_started
+            .set(Instant::now() - Duration::from_secs(3601))
+            .unwrap();
+        trace.phase(Phase::Body);
+        trace.received(123);
+        let snapshot = trace.snapshot();
+        assert_eq!(snapshot["networkBytes"], 123);
+        assert_eq!(
+            snapshot["networkWindowBytes"].as_array().unwrap().len(),
+            360
+        );
+        assert_eq!(snapshot["networkWindowsTruncated"], true);
+        trace.phase(Phase::Body);
+        assert_eq!(trace.snapshot()["receivingEpochs"], 2);
     }
 }
