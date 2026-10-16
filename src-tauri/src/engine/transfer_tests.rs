@@ -1322,6 +1322,34 @@ async fn ignored_and_invalid_ranges_stop_all_connections() {
     }
 }
 
+#[cfg(feature = "test-tools")]
+#[tokio::test]
+async fn transport_only_diagnostics_cannot_complete_or_record_durable_bytes() {
+    let total = 1024 * 1024;
+    let server = TestServer::new(total, "normal");
+    let client = Client::builder().no_proxy().build().unwrap();
+    for cancelled in [false, true] {
+        let response = client.get(server.url.clone())
+            .header(RANGE, format!("bytes=0-{}", total - 1))
+            .send().await.unwrap();
+        assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+        let trace = trace::Trace::default();
+        let cancel = CancellationToken::new();
+        if cancelled { cancel.cancel(); }
+        let result = DownloadManager::receive_transport_only(response, total, &trace, &cancel).await;
+        if cancelled {
+            assert!(matches!(result, Err(EngineError::Cancelled)));
+        } else {
+            assert!(matches!(result, Err(EngineError::Message(message)) if message.contains("cannot publish")));
+        }
+        let snapshot = trace.snapshot();
+        assert_eq!(snapshot["networkBytes"], if cancelled { 0 } else { total });
+        assert_eq!(snapshot["durableBytes"], 0);
+        assert_eq!(snapshot["catalogAcknowledged"], false);
+        assert_eq!(snapshot["transportOnly"], true);
+    }
+}
+
 #[tokio::test]
 async fn buffered_connections_still_share_live_speed_limits() {
     let total = 512 * 1024;
