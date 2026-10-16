@@ -7,6 +7,8 @@ mod browser_extension;
 mod diagnostics;
 mod download_window;
 mod engine;
+mod health;
+mod health_history;
 #[cfg(windows)]
 pub mod install;
 mod integrity;
@@ -22,6 +24,7 @@ mod performance_platform;
 pub mod platform;
 #[cfg(target_os = "linux")]
 mod power_events;
+mod quality;
 mod rate_limit;
 mod staging;
 mod state_store;
@@ -440,6 +443,63 @@ async fn set_analytics_consent(
     enabled: bool,
 ) -> Result<DownloadSettings, String> {
     manager.set_analytics_consent(enabled).await
+}
+
+#[tauri::command]
+async fn set_quality_consent(
+    manager: State<'_, Arc<DownloadManager>>,
+    enabled: bool,
+) -> Result<DownloadSettings, String> {
+    manager.set_quality_consent(enabled).await
+}
+#[tauri::command]
+fn quality_preview(manager: State<'_, Arc<DownloadManager>>) -> Option<quality::Report> {
+    manager.quality_preview()
+}
+#[tauri::command]
+async fn download_health(
+    manager: State<'_, Arc<DownloadManager>>,
+    id: Uuid,
+) -> Result<health::Report, String> {
+    manager.download_health(id).await
+}
+#[tauri::command]
+async fn clear_download_health(
+    manager: State<'_, Arc<DownloadManager>>,
+    id: Uuid,
+) -> Result<(), String> {
+    manager.clear_download_health(id).await
+}
+#[tauri::command]
+async fn export_health_report(
+    path: String,
+    report: health::Report,
+    permission: bool,
+) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        health::export(std::path::Path::new(&path), &report, permission)
+    })
+    .await
+    .map_err(|_| "Safe report export did not finish.".to_string())?
+}
+#[tauri::command]
+async fn set_local_crash_history(
+    manager: State<'_, Arc<DownloadManager>>,
+    enabled: bool,
+) -> Result<DownloadSettings, String> {
+    manager.set_local_crash_history(enabled).await
+}
+#[tauri::command]
+async fn local_health_history(
+    manager: State<'_, Arc<DownloadManager>>,
+) -> Result<Vec<health::Report>, String> {
+    manager.local_health_history().await
+}
+#[tauri::command]
+async fn clear_local_health_history(
+    manager: State<'_, Arc<DownloadManager>>,
+) -> Result<(), String> {
+    manager.clear_local_health_history().await
 }
 
 #[tauri::command]
@@ -1056,6 +1116,14 @@ pub fn run() {
             open_browser_extension_folder,
             update_settings,
             set_analytics_consent,
+            set_quality_consent,
+            quality_preview,
+            download_health,
+            clear_download_health,
+            export_health_report,
+            set_local_crash_history,
+            local_health_history,
+            clear_local_health_history,
             start_diagnostics,
             diagnostics_state,
             cancel_diagnostics,

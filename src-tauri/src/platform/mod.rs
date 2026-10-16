@@ -231,6 +231,7 @@ pub(crate) fn publish_verified_noreplace(
     file: &fs::File,
     source: &Path,
     destination: &Path,
+    health: Option<&crate::health::Health>,
     #[cfg(feature = "test-tools")] trace: Option<&crate::engine::trace::Trace>,
 ) -> std::io::Result<()> {
     #[cfg(windows)]
@@ -256,6 +257,8 @@ pub(crate) fn publish_verified_noreplace(
         // Word storage supplies the native structure's alignment and its variable-length name.
         let mut storage = vec![0usize; bytes.div_ceil(std::mem::size_of::<usize>())];
         unsafe {
+            let _rename_health_span =
+                health.map(|health| health.guard(crate::health::Phase::PublishRename));
             #[cfg(feature = "test-tools")]
             let _rename_span =
                 trace.map(|trace| trace.guard(crate::engine::trace::Phase::PublishRename));
@@ -275,6 +278,8 @@ pub(crate) fn publish_verified_noreplace(
             }
         }
         let _ = source;
+        let _sync_health_span =
+            health.map(|health| health.guard(crate::health::Phase::PublishSync));
         #[cfg(feature = "test-tools")]
         let _sync_span = trace.map(|trace| trace.guard(crate::engine::trace::Phase::PublishSync));
         file.sync_all()
@@ -282,6 +287,8 @@ pub(crate) fn publish_verified_noreplace(
     #[cfg(not(windows))]
     {
         let _ = file;
+        let _publish_health_span =
+            health.map(|health| health.guard(crate::health::Phase::PublishRename));
         #[cfg(feature = "test-tools")]
         let _ = trace;
         publish_noreplace(source, destination)

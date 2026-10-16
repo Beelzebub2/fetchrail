@@ -33,6 +33,27 @@ use uuid::Uuid;
 pub(crate) mod trace;
 
 macro_rules! transfer_span {
+    ($task:ident.trace.as_deref(), $phase:ident, $work:expr) => {{
+        let health_span = $task.health.guard(crate::health::Phase::$phase);
+        #[cfg(feature = "test-tools")]
+        let _trace_span = $task
+            .trace
+            .as_deref()
+            .map(|trace| trace.guard(trace::Phase::$phase));
+        let result = $work;
+        health_span.observe(&result);
+        result
+    }};
+    (health = $health:expr, $trace:expr, $phase:ident, $work:expr) => {{
+        let health_span = $health.map(|health| health.guard(crate::health::Phase::$phase));
+        #[cfg(feature = "test-tools")]
+        let _trace_span = $trace.map(|trace| trace.guard(trace::Phase::$phase));
+        let result = $work;
+        if let Some(span) = health_span.as_ref() {
+            span.observe(&result);
+        }
+        result
+    }};
     ($trace:expr, $phase:ident, $work:expr) => {{
         #[cfg(feature = "test-tools")]
         let _trace_span = $trace.map(|trace| trace.guard(trace::Phase::$phase));
@@ -136,6 +157,7 @@ async fn send_admitted(
     client: &Client,
     request: reqwest::RequestBuilder,
     cancel: &CancellationToken,
+    health: Option<&crate::health::Health>,
     #[cfg(feature = "test-tools")] trace: Option<&trace::Trace>,
 ) -> EngineResult<(
     reqwest::Response,
@@ -152,9 +174,15 @@ async fn send_admitted(
             ));
         }
         let origin = origin_budget(&url);
-        let permit = transfer_span!(trace, Origin, origin.acquire(32, cancel).await)
-            .ok_or(EngineError::Cancelled)?;
+        let permit = transfer_span!(
+            health = health,
+            trace,
+            Origin,
+            origin.acquire(32, cancel).await
+        )
+        .ok_or(EngineError::Cancelled)?;
         let global = transfer_span!(
+            health = health,
             trace,
             Global,
             tokio::select! {
@@ -166,6 +194,7 @@ async fn send_admitted(
             .try_clone()
             .ok_or_else(|| EngineError::Message("HTTP request cannot be replayed.".into()))?;
         let response = transfer_span!(
+            health = health,
             trace,
             Headers,
             tokio::select! {
@@ -173,6 +202,9 @@ async fn send_admitted(
                 _ = cancel.cancelled() => Err(EngineError::Cancelled),
             }
         )?;
+        if let Some(health) = health {
+            health.protocol(response.version());
+        }
         if !matches!(
             response.status(),
             StatusCode::MOVED_PERMANENTLY
@@ -270,8 +302,56 @@ enum EngineError {
     Slow(u64),
     #[error("Server ended a range before all requested bytes arrived.")]
     Incomplete,
+    #[error("{1}")]
+    Observed(crate::health::Cause, &'static str),
     #[error("{0}")]
     Message(String),
+}
+
+impl EngineError {
+    fn health_cause(&self, phase: Option<crate::health::Phase>) -> crate::health::Cause {
+        use crate::health::{Cause as C, Phase as P};
+        match self {
+            Self::Observed(cause, _) => *cause,
+            Self::Cancelled => C::Cancelled,
+            Self::Slow(_) => C::SlowPeer,
+            Self::Incomplete => C::BodyIncomplete,
+            Self::RangeUnsupported => C::RangeIgnored,
+            Self::Request(e) if e.is_timeout() => C::Timeout,
+            Self::Request(e) if e.is_connect() => C::DnsOrConnect,
+            Self::Request(e) if e.is_body() || e.is_decode() => C::BodyIncomplete,
+            Self::Request(_) => C::Request,
+            Self::Http(s) | Self::RetryAfter { status: s, .. }
+                if *s == StatusCode::TOO_MANY_REQUESTS =>
+            {
+                C::Http429
+            }
+            Self::Http(s) | Self::RetryAfter { status: s, .. }
+                if *s == StatusCode::SERVICE_UNAVAILABLE =>
+            {
+                C::Http503
+            }
+            Self::Http(s) if s.is_client_error() => C::Http4xx,
+            Self::Http(s) if s.is_server_error() => C::Http5xx,
+            _ if phase == Some(P::Catalog) => C::Catalog,
+            _ if matches!(
+                phase,
+                Some(
+                    P::Attachment
+                        | P::AttachmentSetup
+                        | P::AttachmentSave
+                        | P::AttachmentAdsOpen
+                        | P::AttachmentAdsWrite
+                        | P::AttachmentAdsSync
+                )
+            ) =>
+            {
+                C::Attachment
+            }
+            Self::Io(_) => C::Disk,
+            _ => C::Unknown,
+        }
+    }
 }
 
 type EngineResult<T> = Result<T, EngineError>;
@@ -305,6 +385,11 @@ fn failure_category(error: &EngineError) -> (&'static str, bool) {
         EngineError::Io(e) if matches!(e.raw_os_error(), Some(28 | 112)) => ("disk_full", false),
         EngineError::Slow(_) | EngineError::Incomplete => ("transient_network", true),
         EngineError::RangeUnsupported => ("range_unsupported", false),
+        EngineError::Observed(crate::health::Cause::Integrity, _) => ("checksum_failed", false),
+        EngineError::Observed(
+            crate::health::Cause::SourceChanged | crate::health::Cause::RangeInvalid,
+            _,
+        ) => ("resource_changed", false),
         EngineError::Message(e) if e.contains("checksum") || e.contains("SHA-256") => {
             ("checksum_failed", false)
         }
@@ -766,9 +851,9 @@ fn verify_publication_contents(
             &hashes,
             cancel,
         )? {
-            return Err(EngineError::Message(
-                "SHA-256 checksum mismatch after attachment processing. File was not published."
-                    .into(),
+            return Err(EngineError::Observed(
+                crate::health::Cause::Integrity,
+                "SHA-256 checksum mismatch after attachment processing. File was not published.",
             ));
         }
         (String::new(), hashes)
@@ -779,8 +864,9 @@ fn verify_publication_contents(
         )
     };
     if expected_sha256.is_some_and(|expected| expected != sha256) {
-        return Err(EngineError::Message(
-            "SHA-256 checksum mismatch after attachment processing. File was not published.".into(),
+        return Err(EngineError::Observed(
+            crate::health::Cause::Integrity,
+            "SHA-256 checksum mismatch after attachment processing. File was not published.",
         ));
     }
     Ok(VerifiedPublication {
@@ -801,6 +887,7 @@ fn verify_during_attachment(
     complete_hashes: Option<Vec<String>>,
     expected_sha256: Option<&str>,
     cancel: &CancellationToken,
+    health: Option<&crate::health::Health>,
     #[cfg(feature = "test-tools")] trace: Option<Arc<trace::Trace>>,
     scan: impl FnOnce() -> std::io::Result<()>,
 ) -> EngineResult<Option<VerifiedPublication>> {
@@ -825,6 +912,7 @@ fn verify_during_attachment(
     let proof = std::thread::scope(|scope| -> EngineResult<VerifiedPublication> {
         let hash = scope.spawn(|| {
             transfer_span!(
+                health = health,
                 trace.as_deref(),
                 Verify,
                 verify_publication_contents(
@@ -839,7 +927,7 @@ fn verify_during_attachment(
                 )
             )
         });
-        let scanned = transfer_span!(trace.as_deref(), Attachment, scan());
+        let scanned = transfer_span!(health = health, trace.as_deref(), Attachment, scan());
         if scanned.is_err() {
             hash_cancel.cancel();
         }
@@ -863,6 +951,7 @@ fn verify_during_attachment(
             Ok(proof)
         } else {
             transfer_span!(
+                health = health,
                 trace.as_deref(),
                 Verify,
                 verify_publication_contents(
@@ -976,6 +1065,7 @@ async fn recover_verified_publication(
                     &file,
                     &temporary,
                     &destination,
+                    None,
                     #[cfg(feature = "test-tools")]
                     None,
                 )?;
@@ -1038,7 +1128,6 @@ struct SegmentCounter {
     downloaded: AtomicU64,
     active: AtomicBool,
     waiting: AtomicBool,
-    #[cfg(feature = "test-tools")]
     durable: AtomicU64,
 }
 
@@ -1067,6 +1156,8 @@ struct DownloadTask {
     #[cfg(feature = "test-tools")]
     trace: Option<Arc<trace::Trace>>,
     analytics_sample: Mutex<Option<crate::analytics::Sample>>,
+    quality_sample: Mutex<Option<crate::quality::Sample>>,
+    health: Arc<crate::health::Health>,
     record: RwLock<DownloadRecord>,
     paused: AtomicBool,
     cancelled: AtomicBool,
@@ -1094,11 +1185,14 @@ impl DownloadTask {
         record: DownloadRecord,
         request_context: Option<BrowserRequestContext>,
         analytics_sample: Option<crate::analytics::Sample>,
+        quality_sample: Option<crate::quality::Sample>,
     ) -> Self {
         Self {
             #[cfg(feature = "test-tools")]
             trace: trace::Trace::enabled(),
             analytics_sample: Mutex::new(analytics_sample),
+            quality_sample: Mutex::new(quality_sample),
+            health: Arc::new(Default::default()),
             limiter: RateLimiter::new(record.speed_limit_bps),
             performance: Mutex::new(None),
             received_sha256: Mutex::new(None),
@@ -1304,11 +1398,10 @@ impl DownloadManager {
         record.extra.remove("nextRetryAt");
         self.tasks.write().await.insert(
             id,
-            Arc::new(DownloadTask::new(
-                record.clone(),
-                None,
-                self.analytics.prepare(),
-            )),
+            Arc::new(DownloadTask {
+                health: task.health.clone(),
+                ..DownloadTask::new(record.clone(), None, self.analytics.prepare(), None)
+            }),
         );
         if let Err(error) = self.persist_records().await {
             self.tasks.write().await.insert(id, task);
@@ -1317,7 +1410,20 @@ impl DownloadManager {
             }
             return Err(error.to_string());
         }
+        let had_coverage = task.health.observed_from_accept();
+        if let Ok(replacement) = self.task(id).await {
+            *replacement.quality_sample.lock().unwrap() =
+                task.quality_sample.lock().unwrap().take();
+        }
         self.register_analytics(&record).await;
+        if let Ok(replacement) = self.task(id).await {
+            if !had_coverage {
+                replacement.health.clear();
+            }
+            replacement
+                .health
+                .cause(crate::health::Cause::SourceChanged);
+        }
         self.emit_record(&record);
         Ok(record)
     }
@@ -1363,11 +1469,15 @@ impl DownloadManager {
             .map_err(|error| format!("Could not create default download directory: {error}"))?;
 
         let settings_path = data_dir.join(SETTINGS_FILE);
-        let settings = read_saved_json::<DownloadSettings>(&settings_path)
+        let mut settings = read_saved_json::<DownloadSettings>(&settings_path)
             .await
             .map_err(|e| e.to_string())?
             .unwrap_or_else(|| default_settings(&default_download_dir))
             .normalized();
+        apply_privacy_receipts(&mut settings, &data_dir);
+        if !settings.local_crash_history {
+            let _ = crate::health_history::clear(&data_dir);
+        }
 
         let mut queues = read_saved_json::<Vec<QueueRecord>>(&data_dir.join(QUEUES_FILE))
             .await
@@ -1437,7 +1547,12 @@ impl DownloadManager {
                 }
                 task_map.insert(
                     record.id,
-                    Arc::new(DownloadTask::new(record, stored.request_context, None)),
+                    Arc::new(DownloadTask::new(
+                        record,
+                        stored.request_context,
+                        None,
+                        None,
+                    )),
                 );
             }
         }
@@ -1449,9 +1564,13 @@ impl DownloadManager {
                 app.clone(),
                 data_dir.clone(),
             )),
-            analytics: Arc::new(crate::analytics::Analytics::new(
-                &settings.analytics_consent,
-            )),
+            analytics: {
+                let analytics = Arc::new(crate::analytics::Analytics::new(
+                    &settings.analytics_consent,
+                ));
+                analytics.quality.configure(&settings.quality_consent);
+                analytics
+            },
             settings_update_lock: tokio::sync::Mutex::new(()),
             torrent_engine: TorrentEngine::new(&data_dir.join("torrents"))?,
             torrent_imports: RwLock::new(HashMap::new()),
@@ -1811,6 +1930,7 @@ impl DownloadManager {
                     &self.client,
                     self.client.get(source),
                     &CancellationToken::new(),
+                    None,
                     #[cfg(feature = "test-tools")]
                     None,
                 )
@@ -2048,6 +2168,7 @@ impl DownloadManager {
                 record.clone(),
                 None,
                 self.analytics.prepare(),
+                self.analytics.quality.prepare(),
             )),
         );
         if let Err(error) = self.persist_records().await {
@@ -2412,6 +2533,9 @@ impl DownloadManager {
                 continue;
             };
             let mut record = task.record.write().await;
+            task.health.torrent(
+                serde_json::from_value::<crate::health::TorrentHealth>(s["health"].clone()).ok(),
+            );
             let old = record.status.clone();
             let before = record.clone();
             let number = |key: &str| s[key].as_u64().unwrap_or(0);
@@ -2484,6 +2608,7 @@ impl DownloadManager {
                 structural = true;
             }
             structural |= record.status != old;
+            task.health.activity(activity(&record));
             self.observe_analytics(&task, &record);
             if *record != before {
                 updates.push(record.clone());
@@ -2512,6 +2637,12 @@ impl DownloadManager {
         }
         if structural || checkpoint {
             self.persist_records().await.map_err(|e| e.to_string())?;
+            for task in self.tasks.read().await.values() {
+                let record = task.record.read().await;
+                if record.torrent.is_some() {
+                    self.observe_quality(task, &record);
+                }
+            }
         }
         let expired = self
             .torrent_imports
@@ -2747,6 +2878,7 @@ impl DownloadManager {
             record.clone(),
             request.request_context,
             self.analytics.prepare(),
+            self.analytics.quality.prepare(),
         ));
         self.tasks.write().await.insert(id, task.clone());
         if persist {
@@ -3467,6 +3599,67 @@ impl DownloadManager {
         result
     }
 
+    pub async fn set_quality_consent(&self, enabled: bool) -> Result<DownloadSettings, String> {
+        if !enabled {
+            self.analytics
+                .quality
+                .configure(&crate::quality::Consent::choice(false));
+        }
+        let _update = self.settings_update_lock.lock().await;
+        let _persist = self.persist_lock.lock().await;
+        let result = persist_quality_choice(
+            &self.settings,
+            &self.analytics.quality,
+            &self.data_dir.join(SETTINGS_FILE),
+            enabled,
+        )
+        .await;
+        let _ = self.app.emit(SETTINGS_EVENT, &*self.settings.read().await);
+        result
+    }
+    pub async fn set_local_crash_history(&self, enabled: bool) -> Result<DownloadSettings, String> {
+        let _update = self.settings_update_lock.lock().await;
+        let mut settings = self.settings.read().await.clone();
+        settings.local_crash_history = enabled;
+        if !enabled {
+            *self.settings.write().await = settings.clone();
+        }
+        let _persist = self.persist_lock.lock().await;
+        let result = async {
+            write_json_atomic(&self.data_dir.join("local-history-choice.json"), &enabled).await.map_err(|_| "Cannot save local history choice. Local recording is off for this run; retry before restarting.")?;
+            write_json_atomic(&self.data_dir.join(SETTINGS_FILE), &settings).await.map_err(|_| "Cannot save local history choice.")?;
+            if !enabled { crate::health_history::clear(&self.data_dir)?; }
+            Ok::<(), String>(())
+        }.await;
+        if result.is_ok() {
+            *self.settings.write().await = settings.clone();
+        }
+        let _ = self.app.emit(SETTINGS_EVENT, &*self.settings.read().await);
+        result?;
+        Ok(settings)
+    }
+    pub async fn local_health_history(&self) -> Result<Vec<crate::health::Report>, String> {
+        let _update = self.settings_update_lock.lock().await;
+        let root = self.data_dir.clone();
+        tokio::task::spawn_blocking(move || {
+            let cases = crate::health_history::load(&root, Utc::now().timestamp())?;
+            if root.join("diagnostic-history.json").exists() {
+                crate::health_history::save(&root, &cases)?;
+            }
+            Ok(cases.into_iter().map(|c| c.report).collect())
+        })
+        .await
+        .map_err(|_| "Cannot read local history.")?
+    }
+    pub async fn clear_local_health_history(&self) -> Result<(), String> {
+        let _update = self.settings_update_lock.lock().await;
+        crate::health_history::clear(&self.data_dir)?;
+        for task in self.tasks.read().await.values() {
+            task.health.clear();
+        }
+        Ok(())
+    }
+
     pub async fn update_settings(
         &self,
         mut settings: DownloadSettings,
@@ -3644,7 +3837,10 @@ impl DownloadManager {
                 manager.save_test_trace(&task).await;
             }
             task.running.store(false, Ordering::Release);
-            let _ = manager.persist_records().await;
+            if manager.persist_records().await.is_ok() {
+                let record = task.record.read().await;
+                manager.observe_quality(&task, &record);
+            }
         });
     }
 
@@ -3655,7 +3851,17 @@ impl DownloadManager {
             let root = self.data_dir.clone();
             let record = task.record.read().await;
             let (id, status) = (record.id, record.status.clone());
+            let health = task.health.snapshot(record.torrent.is_some());
+            let health_root = root.clone();
             drop(record);
+            let _ = tokio::task::spawn_blocking(move || {
+                let bytes = serde_json::to_vec(&health).map_err(std::io::Error::other)?;
+                crate::platform::write_private_atomic(
+                    &health_root.join(format!("dev-health-{id}.json")),
+                    &bytes,
+                )
+            })
+            .await;
             if !matches!(
                 tokio::task::spawn_blocking(move || trace.save(&root, id, status)).await,
                 Ok(Ok(()))
@@ -3666,6 +3872,63 @@ impl DownloadManager {
     }
 
     fn start_scheduler(self: &Arc<Self>) {
+        let breadcrumbs = self.clone();
+        tauri::async_runtime::spawn(async move {
+            let mut timer = interval(Duration::from_secs(30));
+            timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                timer.tick().await;
+                let _update = breadcrumbs.settings_update_lock.lock().await;
+                if !breadcrumbs.settings.read().await.local_crash_history {
+                    continue;
+                }
+                let now = Utc::now().timestamp();
+                let mut selected = Vec::new();
+                let tasks = breadcrumbs
+                    .tasks
+                    .read()
+                    .await
+                    .values()
+                    .filter(|task| task.health.observed_from_accept())
+                    .cloned()
+                    .collect::<Vec<_>>();
+                for task in tasks {
+                    let record = task.record.read().await;
+                    let running = task.running.load(Ordering::Acquire);
+                    let saved_at = if running {
+                        now
+                    } else {
+                        record.finished_at.map(|t| t.timestamp()).unwrap_or(0)
+                    };
+                    if saved_at > now - 7 * 86400 {
+                        selected.push((
+                            record.created_at,
+                            record.id,
+                            task.health.snapshot(record.torrent.is_some()),
+                            saved_at,
+                        ));
+                    }
+                }
+                selected.sort_by_key(|c| std::cmp::Reverse(c.0));
+                selected.truncate(20);
+                let root = breadcrumbs.data_dir.clone();
+                let _ = tokio::task::spawn_blocking(move || -> Result<(), String> {
+                    let mut cases = crate::health_history::load(&root, now)?;
+                    for (_, id, report, saved_at) in selected {
+                        cases.retain(|case| case.id != id);
+                        cases.push(crate::health_history::Case {
+                            id,
+                            saved_at,
+                            report,
+                        });
+                    }
+                    cases.sort_by_key(|c| std::cmp::Reverse(c.saved_at));
+                    cases.truncate(20);
+                    crate::health_history::save(&root, &cases)
+                })
+                .await;
+            }
+        });
         let progress = self.clone();
         tauri::async_runtime::spawn(async move {
             let mut ticker = interval(Duration::from_millis(200));
@@ -3963,6 +4226,8 @@ impl DownloadManager {
                 *task.record.write().await = record;
                 self.persist_records().await?;
                 self.acknowledge_catalog().await?;
+                task.health.completed(completed.downloaded_bytes);
+                self.observe_quality(&task, &completed);
                 drop(verified_file);
                 let _ = fs::remove_dir_all(&part_dir).await;
                 self.emit_record(&completed);
@@ -3984,10 +4249,10 @@ impl DownloadManager {
             task.trace.as_deref(),
             Probe,
             tokio::select! {
-                result = self.probe(&url, task.request_context.as_ref()) => result?,
-                _ = cancel.cancelled() => return Err(EngineError::Cancelled),
+                result = self.probe(&url, task.request_context.as_ref(), Some(&task.health)) => result,
+                _ = cancel.cancelled() => Err(EngineError::Cancelled),
             }
-        );
+        )?;
 
         let settings = self.settings.read().await.clone();
         let snapshot = task.record.read().await.clone();
@@ -4209,6 +4474,7 @@ impl DownloadManager {
             .await;
 
             if matches!(first_result, Err(EngineError::RangeUnsupported)) {
+                task.health.cause(crate::health::Cause::RangeIgnored);
                 {
                     let mut record = task.record.write().await;
                     record.connections = 1;
@@ -4249,6 +4515,7 @@ impl DownloadManager {
 
         progress_stop.cancel();
         let _ = progress_handle.await;
+        task.health.sample(false);
         // The reporter's last tick can trail the final bytes; settle the record before leaving.
         let settled = segment_progress(&current_segments(&segments), &[]);
         #[cfg(feature = "test-tools")]
@@ -4311,6 +4578,8 @@ impl DownloadManager {
         if let Some(trace) = &task.trace {
             trace.catalog_acknowledged.store(true, Ordering::Release);
         }
+        task.health.completed(final_bytes);
+        self.observe_quality(&task, &snapshot);
         drop(verified_file);
         if initial_downloaded == 0 {
             if let (Some(policy), Some(hardware)) = (policy, hardware) {
@@ -4442,6 +4711,8 @@ impl DownloadManager {
                                     segment.waiting.store(false, Ordering::Relaxed);
                                 }
                             }
+                            let attempt_at = Instant::now();
+                            let before_attempt = segment.downloaded.load(Ordering::Relaxed);
                             let result = Self::download_segment(
                                 &client,
                                 limiter,
@@ -4464,6 +4735,9 @@ impl DownloadManager {
                                 },
                             )
                             .await;
+                            task.health.attempt(index, attempt, attempt_at,
+                                segment.downloaded.load(Ordering::Relaxed).saturating_sub(before_attempt),
+                                result.as_ref().err().map(|error| error.health_cause(task.health.failed_phase())));
                             let Err(error) = result else {
                                 return Ok(());
                             };
@@ -4491,6 +4765,7 @@ impl DownloadManager {
                             if !transient || attempt == 2 {
                                 return Err(error);
                             }
+                            task.health.cause(error.health_cause(task.health.failed_phase()));
                             #[cfg(feature = "test-tools")]
                             {
                                 previous_retry_cause = Some(trace::RetryCause::from_error(&error));
@@ -4774,6 +5049,7 @@ impl DownloadManager {
             client,
             request,
             cancel,
+            Some(&task.health),
             #[cfg(feature = "test-tools")]
             task.trace.as_deref(),
         )
@@ -4821,8 +5097,9 @@ impl DownloadManager {
         }
         if let Some(expected) = &probe.validator {
             if representation_validator(response.headers()).as_ref() != Some(expected) {
-                return Err(EngineError::Message(
-                    "File changed while downloading. Refresh the link and restart safely.".into(),
+                return Err(EngineError::Observed(
+                    crate::health::Cause::SourceChanged,
+                    "File changed while downloading. Refresh the link and restart safely.",
                 ));
             }
         }
@@ -4837,7 +5114,10 @@ impl DownloadManager {
             }
             let (actual_start, actual_end, actual_total) = parse_content_range(response.headers())
                 .ok_or_else(|| {
-                    EngineError::Message("Server returned an invalid Content-Range.".into())
+                    EngineError::Observed(
+                        crate::health::Cause::RangeInvalid,
+                        "Server returned an invalid Content-Range.",
+                    )
                 })?;
             let expected_end = if range.end == u64::MAX {
                 actual_end
@@ -4848,8 +5128,9 @@ impl DownloadManager {
                 || actual_end != expected_end
                 || actual_total != probe.total_bytes
             {
-                return Err(EngineError::Message(
-                    "Server returned bytes outside the requested range.".into(),
+                return Err(EngineError::Observed(
+                    crate::health::Cause::RangeInvalid,
+                    "Server returned bytes outside the requested range.",
                 ));
             }
         }
@@ -4951,6 +5232,7 @@ impl DownloadManager {
                 let _processing = task.trace.as_deref().map(|trace| trace.guard(trace::Phase::BodyProcessing));
                 #[cfg(feature = "test-tools")]
                 if let Some(trace) = &task.trace {trace.received(chunk.len() as u64);}
+                task.health.received.fetch_add(chunk.len() as u64, Ordering::Relaxed);
                 written = written.saturating_add(chunk.len() as u64);
                 if expected_len.is_some_and(|expected| written > expected) {
                     return Err(EngineError::Message(
@@ -4993,8 +5275,9 @@ impl DownloadManager {
                         },
                     )
                     .await)?;
-                    #[cfg(feature = "test-tools")]
-                    segment.durable.store(segment.downloaded.load(Ordering::Relaxed),Ordering::Relaxed);
+                    let durable = segment.downloaded.load(Ordering::Relaxed);
+                    let previous = segment.durable.swap(durable, Ordering::Relaxed);
+                    task.health.checkpoint_written.fetch_add(durable.saturating_sub(previous), Ordering::Relaxed);
                     if let Some(policy) = &policy {
                         policy.write_wait_ns.fetch_add(durable_at.elapsed().as_nanos().min(u64::MAX as u128) as u64, Ordering::Relaxed);
                     }
@@ -5067,11 +5350,11 @@ impl DownloadManager {
                 )
                 .await
             )?;
-            #[cfg(feature = "test-tools")]
-            segment.durable.store(
-                segment.downloaded.load(Ordering::Relaxed),
-                Ordering::Relaxed,
-            );
+            let durable = segment.downloaded.load(Ordering::Relaxed);
+            let previous = segment.durable.swap(durable, Ordering::Relaxed);
+            task.health
+                .checkpoint_written
+                .fetch_add(durable.saturating_sub(previous), Ordering::Relaxed);
         }
         if let Some(policy) = &policy {
             policy.write_wait_ns.fetch_add(
@@ -5133,6 +5416,7 @@ impl DownloadManager {
                     _ = stop.cancelled() => break,
                     _ = ticker.tick() => {
                         let current = current_segments(&segments);
+                        task.health.sample(manager.limiter.quantum() == usize::MAX && task.limiter.quantum() == usize::MAX);
                         #[cfg(feature = "test-tools")]
                         if let Some(trace) = &task.trace {trace.durable_bytes.store(current.iter().map(|s|s.durable.load(Ordering::Relaxed)).sum(),Ordering::Relaxed);}
                         let now = Instant::now();
@@ -5238,6 +5522,7 @@ impl DownloadManager {
         &self,
         url: &Url,
         context: Option<&BrowserRequestContext>,
+        health: Option<&crate::health::Health>,
     ) -> EngineResult<ProbeResult> {
         let mut total_bytes = None;
         let mut accepts_ranges = false;
@@ -5252,6 +5537,7 @@ impl DownloadManager {
                     .headers(context_headers(context)?)
                     .header(ACCEPT_ENCODING, "identity"),
                 url,
+                health,
             )
             .await;
         if matches!(&head, Err(EngineError::RetryAfter { .. })) {
@@ -5278,7 +5564,7 @@ impl DownloadManager {
             if total_bytes != Some(0) {
                 request = request.header(RANGE, "bytes=0-0");
             }
-            let response = self.metadata_request(request, url).await?;
+            let response = self.metadata_request(request, url, health).await?;
             if response.status() == StatusCode::PARTIAL_CONTENT {
                 let (start, end, total) =
                     parse_content_range(response.headers()).ok_or_else(|| {
@@ -5316,6 +5602,7 @@ impl DownloadManager {
                         .header(RANGE, "bytes=0-0")
                         .header(ACCEPT_ENCODING, "identity"),
                     url,
+                    health,
                 )
                 .await
             {
@@ -5339,6 +5626,7 @@ impl DownloadManager {
         &self,
         request: reqwest::RequestBuilder,
         _url: &Url,
+        health: Option<&crate::health::Health>,
     ) -> EngineResult<reqwest::Response> {
         for attempt in 0..3 {
             let (response, origin_permit, global_permit) = send_admitted(
@@ -5347,6 +5635,7 @@ impl DownloadManager {
                     EngineError::Message("Metadata request cannot be replayed.".into())
                 })?,
                 &CancellationToken::new(),
+                health,
                 #[cfg(feature = "test-tools")]
                 None,
             )
@@ -5362,6 +5651,15 @@ impl DownloadManager {
             let delay = retry_after(response.headers(), Utc::now()).unwrap_or_else(|| {
                 Duration::from_millis((500u64 << attempt) + u64::from(Uuid::new_v4().as_bytes()[0]))
             });
+            if attempt < 2 && delay <= Duration::from_secs(3600) {
+                if let Some(health) = health {
+                    health.cause(if status == StatusCode::TOO_MANY_REQUESTS {
+                        crate::health::Cause::Http429
+                    } else {
+                        crate::health::Cause::Http503
+                    });
+                }
+            }
             origin.cool_down(delay).await;
             drop(response);
             // A server cooldown must not occupy admission slots needed by unrelated jobs.
@@ -5371,7 +5669,12 @@ impl DownloadManager {
                 return Err(EngineError::RetryAfter { status, delay });
             }
             // The caller selects against cancellation, including this server cooldown.
-            tokio::time::sleep(delay).await;
+            transfer_span!(
+                health = health,
+                None::<&trace::Trace>,
+                Retry,
+                tokio::time::sleep(delay).await
+            );
         }
         unreachable!()
     }
@@ -5446,6 +5749,7 @@ impl DownloadManager {
                     .is_ok_and(|(identity, length, _)| identity == *saved && length == total)
             });
         let assembled_identity = if !recovered {
+            let _assembly_health_span = task.health.guard(crate::health::Phase::Assembly);
             #[cfg(feature = "test-tools")]
             if let Some(trace) = &task.trace {
                 trace.phase(trace::Phase::Assembly);
@@ -5614,6 +5918,7 @@ impl DownloadManager {
             let url = record.url.clone();
             let name = desired_name.to_owned();
             let runtime = tokio::runtime::Handle::current();
+            let scan_health = task.health.clone();
             #[cfg(feature = "test-tools")]
             let scan_trace = task.trace.clone();
             transfer_span!(
@@ -5628,6 +5933,7 @@ impl DownloadManager {
                         hashes,
                         expected.as_deref(),
                         &token,
+                        Some(scan_health.as_ref()),
                         #[cfg(feature = "test-tools")]
                         scan_trace.clone(),
                         || {
@@ -5636,6 +5942,7 @@ impl DownloadManager {
                                 &url,
                                 &name,
                                 true,
+                                Some(scan_health.clone()),
                                 #[cfg(feature = "test-tools")]
                                 scan_trace,
                             ))
@@ -5662,6 +5969,7 @@ impl DownloadManager {
                     &record.url,
                     desired_name,
                     windows_attachment_check,
+                    Some(task.health.clone()),
                     #[cfg(feature = "test-tools")]
                     task.trace.clone(),
                 )
@@ -5723,6 +6031,7 @@ impl DownloadManager {
             let from = temp_path.clone();
             let to = destination.clone();
             let publishing_file = verified.file.try_clone()?;
+            let publish_health = task.health.clone();
             #[cfg(feature = "test-tools")]
             let publish_trace = task.trace.clone();
             #[cfg(feature = "test-tools")]
@@ -5737,6 +6046,7 @@ impl DownloadManager {
                         &publishing_file,
                         &from,
                         &to,
+                        Some(publish_health.as_ref()),
                         #[cfg(feature = "test-tools")]
                         publish_trace.as_deref(),
                     )
@@ -5754,7 +6064,10 @@ impl DownloadManager {
                     )?;
                     return Ok((destination, verified.file));
                 }
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    task.health.cause(crate::health::Cause::PublishConflict);
+                    continue;
+                }
                 Err(error) => return Err(error.into()),
             }
         }
@@ -5764,6 +6077,8 @@ impl DownloadManager {
     }
 
     async fn handle_run_error(&self, task: &Arc<DownloadTask>, error: EngineError) {
+        task.health
+            .cause(error.health_cause(task.health.failed_phase()));
         let snapshot = {
             let mut record = task.record.write().await;
             if record.status == DownloadStatus::Queued && matches!(error, EngineError::Cancelled) {
@@ -5886,6 +6201,7 @@ impl DownloadManager {
             .cloned()
             .collect::<Vec<_>>();
         let mut records = Vec::with_capacity(tasks.len());
+        let mut observations = Vec::new();
         for task in tasks {
             let record = task.record.read().await.clone();
             let request_context = if record.status == DownloadStatus::Completed || !cfg!(windows) {
@@ -5893,6 +6209,9 @@ impl DownloadManager {
             } else {
                 task.request_context.clone()
             };
+            if task.quality_sample.lock().unwrap().is_some() {
+                observations.push((task.clone(), record.clone()));
+            }
             records.push(StoredDownload {
                 torrent_priorities: record.torrent.as_ref().map(|t| t.priorities.clone()),
                 record,
@@ -5900,7 +6219,11 @@ impl DownloadManager {
             });
         }
         records.sort_by_key(|task| task.record.created_at);
-        write_catalog_atomic(&self.data_dir.join(STATE_FILE), records).await
+        write_catalog_atomic(&self.data_dir.join(STATE_FILE), records).await?;
+        for (task, record) in observations {
+            self.observe_quality(&task, &record);
+        }
+        Ok(())
     }
 
     async fn persist_settings(&self) -> EngineResult<()> {
@@ -5920,6 +6243,13 @@ impl DownloadManager {
 
     async fn register_analytics(&self, record: &DownloadRecord) {
         if let Ok(task) = self.task(record.id).await {
+            task.health.accepted();
+            task.health.activity(activity(record));
+            if let Some(sample) = task.quality_sample.lock().unwrap().as_mut() {
+                self.analytics
+                    .quality
+                    .added(sample, record.torrent.is_some());
+            }
             if let Some(sample) = task.analytics_sample.lock().unwrap().as_mut() {
                 self.analytics.added(
                     sample,
@@ -5930,6 +6260,50 @@ impl DownloadManager {
                 );
             }
         }
+    }
+
+    fn observe_quality(&self, task: &DownloadTask, record: &DownloadRecord) {
+        use crate::quality::Outcome;
+        let outcome = match record.status {
+            DownloadStatus::Completed | DownloadStatus::Seeding
+                if record.torrent.as_ref().is_some_and(|t| t.selected_ready) =>
+            {
+                Outcome::TorrentSelectedReady
+            }
+            DownloadStatus::Completed | DownloadStatus::Seeding if record.torrent.is_some() => {
+                return
+            }
+            DownloadStatus::Completed => Outcome::HttpDurable,
+            DownloadStatus::Failed => Outcome::Failed,
+            DownloadStatus::Cancelled => Outcome::Cancelled,
+            _ => return,
+        };
+        let mut sample = task.quality_sample.lock().unwrap();
+        if let Some(sample) = sample.as_mut() {
+            self.analytics.quality.outcome(
+                sample,
+                record.torrent.is_some(),
+                outcome,
+                record.total_bytes,
+                &task.health.snapshot(record.torrent.is_some()),
+            );
+        }
+    }
+
+    pub async fn download_health(&self, id: Uuid) -> Result<crate::health::Report, String> {
+        let task = self.task(id).await?;
+        let torrent = task.record.read().await.torrent.is_some();
+        let mut report = task.health.snapshot(torrent);
+        report.file_limit_bps = Some(task.record.read().await.speed_limit_bps);
+        report.global_limit_bps = Some(self.settings.read().await.speed_limit_bps);
+        Ok(report)
+    }
+    pub async fn clear_download_health(&self, id: Uuid) -> Result<(), String> {
+        self.task(id).await?.health.clear();
+        Ok(())
+    }
+    pub fn quality_preview(&self) -> Option<crate::quality::Report> {
+        self.analytics.quality.preview()
     }
 
     fn observe_analytics(&self, task: &DownloadTask, record: &DownloadRecord) {
@@ -5952,6 +6326,7 @@ impl DownloadManager {
     fn emit_record(&self, record: &DownloadRecord) {
         if let Ok(tasks) = self.tasks.try_read() {
             if let Some(task) = tasks.get(&record.id) {
+                task.health.activity(activity(record));
                 self.observe_analytics(task, record);
             }
         }
@@ -6041,6 +6416,59 @@ pub(crate) fn saved_settings() -> Option<DownloadSettings> {
     Some(saved.normalized())
 }
 
+fn apply_privacy_receipts(settings: &mut DownloadSettings, data_dir: &Path) {
+    // v1 keeps legacy grants; new scopes require matching authoritative local receipts.
+    let receipt =
+        crate::state_store::read::<crate::quality::Consent>(&data_dir.join("quality-consent.json"))
+            .unwrap_or_default();
+    if !receipt.active() || receipt.decided_at != settings.quality_consent.decided_at {
+        settings.quality_consent.enabled = false;
+    }
+    if data_dir.join("analytics-consent.json").exists() {
+        let receipt = crate::state_store::read::<crate::analytics::Consent>(
+            &data_dir.join("analytics-consent.json"),
+        )
+        .unwrap_or_default();
+        if !receipt.active() {
+            settings.analytics_consent = receipt;
+        }
+        // A receipt cannot turn a failed main-settings grant into a silent opt-in.
+        // Existing valid v1 settings are retained only when the receipt also permits them.
+    }
+    settings.local_crash_history &=
+        crate::state_store::read::<bool>(&data_dir.join("local-history-choice.json"))
+            .unwrap_or(false);
+}
+
+async fn persist_quality_choice(
+    settings_lock: &RwLock<DownloadSettings>,
+    quality: &crate::quality::Quality,
+    path: &Path,
+    enabled: bool,
+) -> Result<DownloadSettings, String> {
+    let mut settings = settings_lock.read().await.clone();
+    let choice = crate::quality::Consent::choice(enabled);
+    if !enabled {
+        quality.configure(&choice);
+    }
+    settings.quality_consent = choice.clone();
+    let receipt = path.with_file_name("quality-consent.json");
+    let saved = async {
+        write_json_atomic(&receipt, &choice).await?;
+        write_json_atomic(path, &settings).await
+    }
+    .await;
+    if saved.is_err() {
+        settings.quality_consent.enabled = false;
+        quality.configure(&settings.quality_consent);
+        *settings_lock.write().await = settings.clone();
+        return Err("Could not save reliability privacy choice. Reliability analytics is off for this run. Retry withdrawal before restart if storage was inaccessible.".into());
+    }
+    *settings_lock.write().await = settings.clone();
+    quality.configure(&choice);
+    Ok(settings)
+}
+
 async fn persist_analytics_choice(
     settings_lock: &RwLock<DownloadSettings>,
     analytics: &crate::analytics::Analytics,
@@ -6054,7 +6482,16 @@ async fn persist_analytics_choice(
     if !enabled {
         analytics.configure(&settings.analytics_consent);
     }
-    if let Err(error) = write_json_atomic(path, &settings).await {
+    let result = async {
+        write_json_atomic(
+            &path.with_file_name("analytics-consent.json"),
+            &settings.analytics_consent,
+        )
+        .await?;
+        write_json_atomic(path, &settings).await
+    }
+    .await;
+    if let Err(error) = result {
         settings.analytics_consent = previous_consent;
         settings.analytics_consent.enabled = false;
         analytics.configure(&settings.analytics_consent);
@@ -6066,9 +6503,29 @@ async fn persist_analytics_choice(
     Ok(settings)
 }
 
+fn activity(record: &DownloadRecord) -> crate::health::Activity {
+    use crate::health::Activity as A;
+    match record.status {
+        DownloadStatus::Queued => A::Queued,
+        DownloadStatus::Scheduled if record.extra.contains_key("nextRetryAt") => A::Backoff,
+        DownloadStatus::Scheduled => A::Scheduled,
+        DownloadStatus::Paused => A::Paused,
+        DownloadStatus::Merging => A::Finalizing,
+        DownloadStatus::Completed => A::Complete,
+        DownloadStatus::Failed => A::Failed,
+        DownloadStatus::Cancelled => A::Cancelled,
+        DownloadStatus::Metadata => A::TorrentMetadata,
+        DownloadStatus::Checking => A::TorrentChecking,
+        DownloadStatus::Seeding => A::TorrentSeeding,
+        _ => A::Transferring,
+    }
+}
+
 fn default_settings(download_dir: &Path) -> DownloadSettings {
     DownloadSettings {
         analytics_consent: Default::default(),
+        quality_consent: Default::default(),
+        local_crash_history: false,
         extra: Default::default(),
         torrent: Default::default(),
         speed_limit_bps: 0,
@@ -6760,7 +7217,6 @@ async fn segment_counters(part_dir: &Path, ranges: &[ByteRange]) -> EngineResult
             }
         }
         segments.push(SegmentCounter {
-            #[cfg(feature = "test-tools")]
             durable: AtomicU64::new(downloaded),
             waiting: AtomicBool::new(true),
             range: *range,
@@ -6940,7 +7396,7 @@ fn join_parts_cancellable(
     }
     if let (Some(hash), Some(expected)) = (hash, expected_sha256) {
         if format!("{:x}", hash.finalize()) != expected {
-            return Err(EngineError::Message("SHA-256 verification failed. The file was not published; check the source and expected checksum.".into()));
+            return Err(EngineError::Observed(crate::health::Cause::Integrity, "SHA-256 verification failed. The file was not published; check the source and expected checksum."));
         }
     }
     output.sync_all()?;
@@ -6963,8 +7419,9 @@ fn verify_file_hash(path: &Path, expected: &str, cancel: &CancellationToken) -> 
         }
     })?;
     if actual != expected {
-        return Err(EngineError::Message(
-            "Output failed SHA-256 verification. The file was not published.".into(),
+        return Err(EngineError::Observed(
+            crate::health::Cause::Integrity,
+            "Output failed SHA-256 verification. The file was not published.",
         ));
     }
     Ok(())
@@ -6992,6 +7449,79 @@ mod tests {
         record_is_dispatch_ready, safe_file_name, split_ranges, suggested_connection_count,
     };
     use crate::model::{DownloadRecord, DownloadStatus};
+
+    #[tokio::test]
+    async fn reliability_receipts_preserve_independent_choices_and_refuse_stale_restores() {
+        let root =
+            std::env::temp_dir().join(format!("fetchrail-quality-consent-{}", Uuid::new_v4()));
+        tokio::fs::create_dir_all(&root).await.unwrap();
+        let path = root.join("settings.json");
+        let mut initial = default_settings(Path::new("Downloads"));
+        initial.analytics_consent = crate::analytics::Consent::choice(true);
+        let settings = tokio::sync::RwLock::new(initial);
+        let quality = crate::quality::Quality::default();
+        super::persist_quality_choice(&settings, &quality, &path, true)
+            .await
+            .unwrap();
+        let saved: DownloadSettings = crate::state_store::read(&path).unwrap();
+        assert!(saved.analytics_consent.active() && saved.quality_consent.active());
+        let mut restored = saved.clone();
+        super::apply_privacy_receipts(&mut restored, &root);
+        assert!(restored.quality_consent.active());
+        let mut stale_draft = saved.clone();
+        super::persist_quality_choice(&settings, &quality, &path, false)
+            .await
+            .unwrap();
+        stale_draft.preserve_analytics_consent(&*settings.read().await);
+        assert!(!stale_draft.quality_consent.active());
+        let mut restored = saved.clone();
+        super::apply_privacy_receipts(&mut restored, &root);
+        assert!(
+            !restored.quality_consent.active(),
+            "Restoring an old settings backup does not undo withdrawal"
+        );
+        assert!(
+            restored.analytics_consent.active(),
+            "v2 withdrawal does not revoke v1"
+        );
+        tokio::fs::write(root.join("quality-consent.json"), b"corrupt")
+            .await
+            .unwrap();
+        let mut restored = saved.clone();
+        super::apply_privacy_receipts(&mut restored, &root);
+        assert!(!restored.quality_consent.active());
+        let blocked = root.join("blocked");
+        tokio::fs::write(&blocked, b"file").await.unwrap();
+        assert!(super::persist_quality_choice(
+            &settings,
+            &quality,
+            &blocked.join("settings.json"),
+            true
+        )
+        .await
+        .is_err());
+        assert!(!settings.read().await.quality_consent.active());
+        assert!(
+            quality.prepare().is_none(),
+            "Failed storage cannot enable collection"
+        );
+        let failed_grant_path = root.join("main-settings-is-directory");
+        tokio::fs::create_dir_all(&failed_grant_path).await.unwrap();
+        let v1 = crate::analytics::Analytics::new(&crate::analytics::Consent::choice(false));
+        let off = tokio::sync::RwLock::new(default_settings(Path::new("Downloads")));
+        assert!(
+            super::persist_analytics_choice(&off, &v1, &failed_grant_path, true)
+                .await
+                .is_err()
+        );
+        let mut restarted = default_settings(Path::new("Downloads"));
+        super::apply_privacy_receipts(&mut restarted, &root);
+        assert!(
+            !restarted.analytics_consent.active(),
+            "A partial grant receipt never enables declined main settings"
+        );
+        tokio::fs::remove_dir_all(root).await.unwrap();
+    }
 
     #[tokio::test]
     async fn analytics_choice_persists_and_failure_does_not_enable_or_hide_an_undecided_choice() {

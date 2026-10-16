@@ -1,0 +1,1 @@
+{"schema":2,"purpose":"product-quality-v2","version":"0.7.4","os":"windows","arch":"x64","counters":{"http_accepted":1,"http_verified_durable":1,"size_small":1},"histograms":{"http_e2e_small_ms_v1":[0,0,1,0,0,0,0,0],"catalog_worker_ms_v1":[1,0,0,0,0,0,0,0]}}

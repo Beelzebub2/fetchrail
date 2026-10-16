@@ -323,6 +323,8 @@ mod tests {
         fs::create_dir_all(&root).unwrap();
         let settings = DownloadSettings {
             analytics_consent: Default::default(),
+            quality_consent: Default::default(),
+            local_crash_history: false,
             extra: Default::default(),
             torrent: Default::default(),
             speed_limit_bps: 0,

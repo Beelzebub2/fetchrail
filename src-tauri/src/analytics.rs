@@ -7,6 +7,33 @@ pub const SCHEMA: u32 = 1;
 pub const PURPOSE: &str = "product-improvement-v1";
 const ENDPOINT: &str = "https://fetchrail.rrmtools.uk/api/analytics";
 const MAX_COUNT: u32 = 1000;
+pub(crate) fn valid_version(version: &str) -> bool {
+    version.split('.').count() == 3
+        && version.split('.').all(|part| {
+            !part.is_empty()
+                && part.len() <= 3
+                && part.bytes().all(|b| b.is_ascii_digit())
+                && (part.len() == 1 || !part.starts_with('0'))
+        })
+}
+fn report_client() -> Result<reqwest::Client, reqwest::Error> {
+    reqwest::Client::builder()
+        .retry(reqwest::retry::never())
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(std::time::Duration::from_secs(8))
+        .build()
+}
+async fn post_once(
+    client: &reqwest::Client,
+    endpoint: &str,
+    body: Vec<u8>,
+    cancel: CancellationToken,
+) -> bool {
+    tokio::select! { biased;
+        _ = cancel.cancelled() => false,
+        result = client.post(endpoint).header(reqwest::header::CONTENT_TYPE, "application/json").body(body).send() => result.is_ok_and(|response| response.status().is_success()),
+    }
+}
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase", deny_unknown_fields)]
@@ -37,7 +64,10 @@ struct State {
     counters: BTreeMap<&'static str, u32>,
     cancel: CancellationToken,
 }
-pub struct Analytics(Mutex<State>);
+pub struct Analytics {
+    state: Mutex<State>,
+    pub quality: crate::quality::Quality,
+}
 pub struct Sample {
     epoch: u64,
     registered: bool,
@@ -55,14 +85,17 @@ pub struct Report {
 
 impl Analytics {
     pub fn new(consent: &Consent) -> Self {
-        let analytics = Self(Mutex::new(State::default()));
+        let analytics = Self {
+            state: Mutex::new(State::default()),
+            quality: Default::default(),
+        };
         analytics.configure(consent);
         // An app launch is counted only when consent already exists. Never unique users.
         analytics.feature("launch");
         analytics
     }
     pub fn configure(&self, consent: &Consent) {
-        let mut state = self.0.lock().unwrap();
+        let mut state = self.state.lock().unwrap();
         let enabled = consent.active();
         if state.enabled != enabled {
             state.cancel.cancel();
@@ -91,13 +124,13 @@ impl Analytics {
         ) {
             return;
         }
-        let mut state = self.0.lock().unwrap();
+        let mut state = self.state.lock().unwrap();
         if state.enabled {
             Self::increment(&mut state, metric);
         }
     }
     pub fn prepare(&self) -> Option<Sample> {
-        let state = self.0.lock().unwrap();
+        let state = self.state.lock().unwrap();
         state.enabled.then_some(Sample {
             epoch: state.epoch,
             registered: false,
@@ -112,7 +145,7 @@ impl Analytics {
         custom_queue: bool,
         browser: bool,
     ) {
-        let mut state = self.0.lock().unwrap();
+        let mut state = self.state.lock().unwrap();
         if !state.enabled || state.epoch != sample.epoch || sample.registered {
             return;
         }
@@ -145,7 +178,7 @@ impl Analytics {
             (true, "cancelled") => "torrent_cancelled",
             _ => return,
         };
-        let mut state = self.0.lock().unwrap();
+        let mut state = self.state.lock().unwrap();
         if !state.enabled || state.epoch != sample.epoch || !sample.registered || sample.terminal {
             return;
         }
@@ -165,7 +198,7 @@ impl Analytics {
         }
     }
     fn take_report(&self) -> Option<(Report, CancellationToken)> {
-        let mut state = self.0.lock().unwrap();
+        let mut state = self.state.lock().unwrap();
         if !state.enabled || state.counters.is_empty() {
             return None;
         }
@@ -189,12 +222,7 @@ impl Analytics {
         ))
     }
     pub async fn run(self: std::sync::Arc<Self>) {
-        let Ok(client) = reqwest::Client::builder()
-            .retry(reqwest::retry::never())
-            .redirect(reqwest::redirect::Policy::none())
-            .timeout(std::time::Duration::from_secs(8))
-            .build()
-        else {
+        let Ok(client) = report_client() else {
             return;
         };
         // RAM-only best effort: loss on exit/failure is preferable to a tracking queue.
@@ -204,9 +232,19 @@ impl Analytics {
         loop {
             timer.tick().await;
             if let Some((report, cancel)) = self.take_report() {
-                tokio::select! { biased;
-                    _ = cancel.cancelled() => {},
-                    _ = client.post(ENDPOINT).json(&report).send() => {},
+                if let Ok(body) = serde_json::to_vec(&report) {
+                    let _ = post_once(&client, ENDPOINT, body, cancel).await;
+                }
+            }
+            if let Some((report, cancel)) = self
+                .quality
+                .take_report()
+                .filter(|_| crate::quality::REMOTE_RELEASE_APPROVED)
+            {
+                if let Ok(body) = serde_json::to_vec(&report) {
+                    if body.len() <= 4096 {
+                        let _ = post_once(&client, ENDPOINT, body, cancel).await;
+                    }
                 }
             }
         }
@@ -216,6 +254,90 @@ impl Analytics {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn actual_transport_has_no_source_credentials_and_cancelled_batches_open_no_socket() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}/api/analytics", listener.local_addr().unwrap());
+        let client = report_client().unwrap();
+        let cancelled = CancellationToken::new();
+        cancelled.cancel();
+        assert!(!post_once(&client, &endpoint, b"{}".to_vec(), cancelled).await);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), listener.accept())
+                .await
+                .is_err()
+        );
+        let analytics = Analytics::new(&Consent::default());
+        assert!(analytics.take_report().is_none() && analytics.quality.take_report().is_none());
+        analytics
+            .quality
+            .configure(&crate::quality::Consent::choice(true));
+        let mut sample = analytics.quality.prepare().unwrap();
+        analytics.quality.added(&mut sample, false);
+        let (report, cancel) = analytics.quality.take_report().unwrap();
+        let body = serde_json::to_vec(&report).unwrap();
+        let receive = async {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut bytes = Vec::new();
+            loop {
+                let mut buffer = [0; 4096];
+                let n = stream.read(&mut buffer).await.unwrap();
+                assert!(n > 0);
+                bytes.extend_from_slice(&buffer[..n]);
+                assert!(bytes.len() < 8192);
+                if bytes
+                    .windows(4)
+                    .position(|v| v == b"\r\n\r\n")
+                    .is_some_and(|end| bytes.len() >= end + 4 + body.len())
+                {
+                    break;
+                }
+            }
+            let request = String::from_utf8(bytes).unwrap();
+            let headers = request
+                .split("\r\n\r\n")
+                .next()
+                .unwrap()
+                .to_ascii_lowercase();
+            for sensitive in ["cookie:", "authorization:", "referer:", "origin:"] {
+                assert!(!headers.contains(sensitive));
+            }
+            assert!(request.contains("product-quality-v2"));
+            assert!(!request.contains("decidedAt"));
+            stream
+                .write_all(b"HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n")
+                .await
+                .unwrap();
+        };
+        let (sent, _) = tokio::join!(post_once(&client, &endpoint, body.clone(), cancel), receive);
+        assert!(sent);
+        assert!(analytics.take_report().is_none(), "v2 cannot enable v1");
+        // An already received request cannot be recalled; withdrawal still aborts the waiting client.
+        let mut sample = analytics.quality.prepare().unwrap();
+        analytics.quality.added(&mut sample, false);
+        let (report, cancel) = analytics.quality.take_report().unwrap();
+        let receive = async {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buffer = [0; 4096];
+            assert!(stream.read(&mut buffer).await.unwrap() > 0);
+            analytics
+                .quality
+                .configure(&crate::quality::Consent::choice(false));
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        };
+        let (sent, _) = tokio::join!(
+            post_once(
+                &client,
+                &endpoint,
+                serde_json::to_vec(&report).unwrap(),
+                cancel
+            ),
+            receive
+        );
+        assert!(!sent);
+        assert!(analytics.quality.take_report().is_none());
+    }
     #[test]
     fn consent_is_explicit_and_versioned() {
         assert!(!Consent::default().active());
@@ -287,13 +409,7 @@ pub async fn share_diagnostics(
 ) -> Result<(), String> {
     if !["windows", "linux", "other"].contains(&os)
         || !["x64", "arm64", "other"].contains(&arch)
-        || version.split('.').count() != 3
-        || version.split('.').any(|part| {
-            part.is_empty()
-                || part.len() > 3
-                || !part.bytes().all(|b| b.is_ascii_digit())
-                || (part.len() > 1 && part.starts_with('0'))
-        })
+        || !valid_version(version)
     {
         return Err("Invalid diagnostic report metadata.".into());
     }
