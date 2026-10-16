@@ -103,6 +103,26 @@ try {
   await page.waitForFunction(() => document.querySelector('[role="progressbar"]')?.getAttribute("aria-valuenow") === "25");
   await page.screenshot({ path: join(output, "download-status.png"), fullPage: true });
   assert((await page.locator("body").innerText()).includes("78.6 MB/s"), "Download speeds use decimal MB/s");
+  // The window shrinks to the transfer and its controls, and grows again for the details.
+  const fits = () => page.evaluate(() => document.documentElement.scrollHeight <= innerHeight);
+  await page.getByRole("button", { name: "Hide details" }).click();
+  await page.setViewportSize({ width: 500, height: 520 });
+  assert.equal(await page.locator("tbody tr").count(), 0);
+  for (const name of ["Speed limiter", "Options on completion", "Download status"]) {
+    await page.getByRole("tab", { name }).click();
+    assert.ok(await fits(), `${name} fits the window without its details.`);
+  }
+  await page.screenshot({ path: join(output, "download-status-small.png") });
+  await page.getByRole("button", { name: "Show details" }).click();
+  await page.setViewportSize({ width: 500, height: 756 });
+  assert.equal(await page.locator("tbody tr").count(), 4);
+  assert.ok(await fits(), "The details fit the window grown for them.");
+  await page.setViewportSize({ width: 640, height: 800 });
+  assert.deepEqual(
+    await page.evaluate(() => window.testCalls.filter((call) => call.name === "set_progress_details").map((call) => call.args.details)),
+    [false, true],
+    "Each switch resizes the window and is remembered for the next one.",
+  );
   await page.evaluate(() => {
     Object.assign(window.testRecord, {requestedConnections:16, receivingConnections:16, connectingConnections:0, plannedRanges:128});
     window.testEmit("fetchrail://download-updated", structuredClone(window.testRecord));

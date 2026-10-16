@@ -29,10 +29,20 @@ pub async fn show_download_progress(
     id: Uuid,
 ) -> Result<(), String> {
     let record = manager.watch_progress(id).await?;
-    show_progress(&app, &record)
+    show_progress(&app, &record).await
 }
 
-fn show_progress(app: &AppHandle, record: &DownloadRecord) -> Result<(), String> {
+/// The progress window's width and height, then its smallest width and height. It fits the
+/// transfer and its controls, and is taller while it shows connection details.
+fn progress_size(details: bool) -> [f64; 4] {
+    if details {
+        [500.0, 756.0, 440.0, 420.0]
+    } else {
+        [500.0, 520.0, 440.0, 420.0]
+    }
+}
+
+async fn show_progress(app: &AppHandle, record: &DownloadRecord) -> Result<(), String> {
     let id = record.id;
     let label = format!("{PROGRESS_WINDOW}{id}");
     if let Some(window) = app.get_webview_window(&label) {
@@ -40,18 +50,48 @@ fn show_progress(app: &AppHandle, record: &DownloadRecord) -> Result<(), String>
         window.unminimize().map_err(|error| error.to_string())?;
         return window.set_focus().map_err(|error| error.to_string());
     }
+    // A torrent's file list and peers need more room.
+    let [width, height, min_width, min_height] = if record.torrent.is_some() {
+        [640.0, 800.0, 540.0, 470.0]
+    } else {
+        progress_size(
+            app.state::<Arc<DownloadManager>>()
+                .settings()
+                .await
+                .progress_details,
+        )
+    };
     tauri::WebviewWindowBuilder::new(
         app,
         label,
         tauri::WebviewUrl::App(format!("index.html?progress={id}").into()),
     )
     .title(&record.file_name)
-    .inner_size(640.0, 800.0)
-    .min_inner_size(540.0, 470.0)
+    .inner_size(width, height)
+    .min_inner_size(min_width, min_height)
     .center()
     .build()
     .map(|_| ())
     .map_err(|error| error.to_string())
+}
+
+/// Grows or shrinks the calling progress window for its details, and opens later ones the same way.
+#[tauri::command]
+pub async fn set_progress_details(
+    window: tauri::WebviewWindow,
+    manager: State<'_, Arc<DownloadManager>>,
+    details: bool,
+) -> Result<(), String> {
+    let [width, height, min_width, min_height] = progress_size(details);
+    window
+        .set_min_size(Some(tauri::LogicalSize::new(min_width, min_height)))
+        .map_err(|error| error.to_string())?;
+    window
+        .set_size(tauri::LogicalSize::new(width, height))
+        .map_err(|error| error.to_string())?;
+    let mut settings = manager.settings().await;
+    settings.progress_details = details;
+    manager.update_settings(settings).await.map(|_| ())
 }
 
 #[tauri::command]
@@ -108,7 +148,7 @@ pub async fn on_completion(app: &AppHandle, record: &DownloadRecord) {
         );
     }
     if record.completion_options.show_complete_dialog && record.progress_requested {
-        if let Err(message) = show_progress(app, record) {
+        if let Err(message) = show_progress(app, record).await {
             let _ = app.emit(
                 "fetchrail://completion-error",
                 serde_json::json!({ "id": record.id, "message": message }),
