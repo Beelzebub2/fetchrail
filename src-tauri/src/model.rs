@@ -166,14 +166,30 @@ pub enum Theme {
     Light,
 }
 
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
-pub enum Accent {
-    #[default]
-    Ember,
-    Azure,
-    Jade,
-    Iris,
+/// A `#rrggbb` color, or a preset name (ember, azure, jade, iris) saved before any color could be picked.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct Accent(pub String);
+
+impl Default for Accent {
+    fn default() -> Self {
+        Self("ember".into())
+    }
+}
+
+impl<'de> Deserialize<'de> for Accent {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = String::deserialize(deserializer)?.to_ascii_lowercase();
+        let hex = value.len() == 7
+            && value.starts_with('#')
+            && value[1..].bytes().all(|byte| byte.is_ascii_hexdigit());
+        if hex || ["ember", "azure", "jade", "iris"].contains(&value.as_str()) {
+            Ok(Self(value))
+        } else {
+            Err(serde::de::Error::custom(
+                "an accent is a #rrggbb color or a preset name",
+            ))
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -217,6 +233,9 @@ pub struct DownloadSettings {
     /// Whether removing a download from the list also deletes its file; unset asks each time.
     #[serde(default)]
     pub delete_files_on_remove: Option<bool>,
+    /// The progress window opens showing its connection details, as it was last left.
+    #[serde(default)]
+    pub progress_details: bool,
 }
 
 impl DownloadSettings {
@@ -231,7 +250,7 @@ impl DownloadSettings {
         let chosen = |settings: &Self| {
             (
                 settings.theme,
-                settings.accent,
+                settings.accent.clone(),
                 settings.launch_on_start,
                 settings.default_download_dir.clone(),
             )
@@ -245,7 +264,9 @@ impl DownloadSettings {
             } else if let Some(theme) = argument.strip_prefix("--theme=") {
                 self.theme = serde_json::from_value(theme.into()).unwrap_or(self.theme);
             } else if let Some(accent) = argument.strip_prefix("--accent=") {
-                self.accent = serde_json::from_value(accent.into()).unwrap_or(self.accent);
+                if let Ok(accent) = serde_json::from_value(accent.into()) {
+                    self.accent = accent;
+                }
             } else if let Some(folder) = argument.strip_prefix("--download-dir=") {
                 if !folder.trim().is_empty() {
                     self.default_download_dir = folder.trim().into();
@@ -478,7 +499,13 @@ mod tests {
             "--launch-on-start",
         ])));
         assert_eq!(settings.theme, Theme::Light);
-        assert_eq!(settings.accent, Accent::Jade);
+        assert_eq!(settings.accent, Accent("jade".into()));
+        assert!(settings.apply_setup_arguments(&args(&["--accent=#3FD6A0"])));
+        assert_eq!(
+            settings.accent,
+            Accent("#3fd6a0".into()),
+            "a picked color, spelled as the settings file spells it"
+        );
         assert_eq!(settings.default_download_dir, r"E:\My Files");
         assert!(settings.launch_on_start);
         assert!(
@@ -489,11 +516,14 @@ mod tests {
             !settings.apply_setup_arguments(&args(&[
                 "--theme=neon",
                 "--accent=",
+                "--accent=#12345g",
+                "--accent=red; background: url(x)",
                 "--download-dir= "
             ])),
             "values setup cannot have sent are ignored"
         );
         assert_eq!(settings.theme, Theme::Light);
+        assert_eq!(settings.accent, Accent("#3fd6a0".into()));
         assert_eq!(settings.default_download_dir, r"E:\My Files");
     }
 
@@ -540,6 +570,7 @@ mod tests {
             accent: Accent::default(),
             auto_update: true,
             delete_files_on_remove: None,
+            progress_details: false,
             sort_into_category_folders: true,
             categories: vec![
                 Category {
