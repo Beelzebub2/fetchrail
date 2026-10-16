@@ -89,6 +89,8 @@ pub(crate) fn download_client_builder() -> reqwest::ClientBuilder {
                 .http2_adaptive_window(false)
                 .http2_initial_connection_window_size(16 * 1024 * 1024)
                 .http2_initial_stream_window_size(16 * 1024 * 1024);
+        } else if std::env::var("FETCHRAIL_TEST_HTTP2_WINDOW").is_ok_and(|v| v == "default") {
+            builder = builder.http2_adaptive_window(false);
         }
         if let Ok(value) = std::env::var("FETCHRAIL_TEST_RESOLVE") {
             let (host, address) = value.split_once('=').expect("Diagnostic host=IP required");

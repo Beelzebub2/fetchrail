@@ -61,6 +61,9 @@ impl State {
                 json!({"elapsedMs":ms,"kind":"bandwidth","bytesPerSecond":bytes})
             }
             Control::Target(bytes) => json!({"elapsedMs":ms,"kind":"target","bytes":bytes}),
+            Control::StreamWindow(bytes) => {
+                json!({"elapsedMs":ms,"kind":"streamWindow","bytes":bytes})
+            }
             Control::Ping => json!({"elapsedMs":ms,"kind":"ping"}),
             Control::Pong => json!({"elapsedMs":ms,"kind":"pong"}),
             Control::Window { .. } => unreachable!(),
@@ -74,6 +77,7 @@ enum Control {
     Ack { bytes: u64, rtt_ns: u64 },
     Bandwidth(u64),
     Target(u64),
+    StreamWindow(u32),
     Ping,
     Pong,
 }
@@ -93,7 +97,7 @@ fn parse_message(message: &str) -> Option<Control> {
     if message == "sent ping" {
         return Some(Control::Ping);
     }
-    if message == "recv pong" {
+    if message == "recv pong" || message == "recv PING USER ack" {
         return Some(Control::Pong);
     }
     if let Some(value) = message.strip_prefix("BDP increased to ") {
@@ -125,6 +129,14 @@ fn parse_message(message: &str) -> Option<Control> {
 }
 
 fn parse_frame(frame: &str) -> Option<Control> {
+    if frame.starts_with("Ping { ack: false, payload: [") && frame.ends_with("] }") {
+        return Some(Control::Ping);
+    }
+    if frame.starts_with("Settings { ") && frame.ends_with(" }") {
+        let (_, value) = frame.split_once(", initial_window_size: ")?;
+        let value = value.split([',', ' ']).next()?.parse::<u32>().ok()?;
+        return (value <= 0x7fff_ffff).then_some(Control::StreamWindow(value));
+    }
     let (stream, increment) = frame
         .strip_prefix("WindowUpdate { stream_id: StreamId(")?
         .split_once("), size_increment: ")?;
@@ -152,7 +164,7 @@ impl Subscriber for Controls {
         metadata.is_event()
             && matches!(
                 metadata.target(),
-                "hyper::proto::h2::ping" | "h2::codec::framed_write"
+                "hyper::proto::h2::ping" | "h2::codec::framed_write" | "h2::proto::ping_pong"
             )
     }
     fn new_span(&self, _: &Attributes<'_>) -> Id {
@@ -187,7 +199,8 @@ pub(super) fn snapshot() -> Value {
     let Some(state) = STATE.get().and_then(|state| state.lock().ok()) else {
         return Value::Null;
     };
-    json!({"enabled":INSTALLED.get().copied().unwrap_or(false),"startedAtUtc":state.utc,"bdpEvents":state.bdp,"windowBuckets":state.windows,"truncated":state.truncated})
+    // Hyper's BDP messages require its unstable tracing feature; h2 controls do not.
+    json!({"enabled":INSTALLED.get().copied().unwrap_or(false),"startedAtUtc":state.utc,"bdpEvents":state.bdp,"hyperBdpEventsSupported":false,"windowBuckets":state.windows,"truncated":state.truncated})
 }
 
 #[cfg(test)]
@@ -200,6 +213,8 @@ mod tests {
         tracing::dispatcher::with_default(&dispatch, || {
             tracing::trace!(target: "hyper::proto::h2::ping", "BDP increased to {}", 65535);
             tracing::debug!(target: "h2::codec::framed_write", frame = ?format_args!("WindowUpdate {{ stream_id: StreamId(0), size_increment: 32768 }}"), "send");
+            tracing::debug!(target: "h2::codec::framed_write", frame = ?format_args!("Settings {{ flags: (0x0), initial_window_size: 1048576 }}"), "send");
+            tracing::trace!(target: "h2::proto::ping_pong", "recv PING USER ack");
             tracing::debug!(target: "h2::codec::framed_write", frame = ?format_args!("Headers {{ authorization: secret, url: https://private.invalid }}"), "send");
         });
         let state = STATE.get().unwrap().lock().unwrap();
@@ -208,6 +223,11 @@ mod tests {
             .iter()
             .any(|event| event["kind"] == "target" && event["bytes"] == 65535));
         assert_eq!(state.windows.iter().map(|row| row[2]).sum::<u64>(), 32768);
+        assert!(state
+            .bdp
+            .iter()
+            .any(|event| event["kind"] == "streamWindow" && event["bytes"] == 1048576));
+        assert!(state.bdp.iter().any(|event| event["kind"] == "pong"));
         let saved = json!({"bdp":state.bdp,"windows":state.windows}).to_string();
         assert!(!saved.contains("private.invalid"));
         assert!(!saved.contains("secret"));
@@ -224,6 +244,19 @@ mod tests {
         assert_eq!(
             parse_message("BDP increased to 1048576"),
             Some(Control::Target(1048576))
+        );
+        assert_eq!(
+            parse_frame("Ping { ack: false, payload: [59, 124, 219, 122, 11, 135, 22, 180] }"),
+            Some(Control::Ping)
+        );
+        assert_eq!(
+            parse_frame(
+                "Settings { flags: (0x0), initial_window_size: 16777216, max_frame_size: 16384 }"
+            ),
+            Some(Control::StreamWindow(16777216))
+        );
+        assert!(
+            parse_frame("Settings { flags: (0x0), initial_window_size: 2147483648 }").is_none()
         );
         assert_eq!(
             parse_message("current bandwidth = 12345.6B/s"),
