@@ -62,6 +62,7 @@ const REMOVED_EVENT: &str = "fetchrail://download-removed";
 const MERGE_BUFFER_SIZE: usize = 4 * 1024 * 1024;
 const TRANSFER_BUFFER_SIZE: usize = 1024 * 1024;
 const CHECKPOINT_INTERVAL: Duration = Duration::from_secs(5);
+const LARGE_TRANSFER_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 
 fn initial_checkpoint_interval(index: usize, workers: usize, range_bytes: u64) -> Duration {
     if range_bytes < 64 * 1024 * 1024 {
@@ -4366,26 +4367,27 @@ impl DownloadManager {
             .clamp(1, 32)
             .min(segments.len());
         drop(record);
-        #[cfg(feature = "test-tools")]
-        let test_clients = if crate::platform::test_root().is_ok_and(|root| root.is_some())
-            && std::env::var("FETCHRAIL_TEST_HTTP_POOLS").is_ok_and(|value| value == "4")
-        {
-            let mut clients = vec![client.clone()];
-            for _ in 1..workers.min(4) {
-                clients.push(download_client_builder().build()?);
-            }
-            clients
+        let pool_count = if probe.accepts_ranges && probe.validator.is_some() {
+            transfer_pool_count(probe.total_bytes.unwrap_or(0), workers)
         } else {
-            Vec::new()
+            1
         };
-        let futures = (0..workers).map(|_worker_index| {
-            #[cfg(feature = "test-tools")]
-            let worker_client = test_clients
-                .get(_worker_index % test_clients.len().max(1))
-                .unwrap_or(client)
-                .clone();
-            #[cfg(not(feature = "test-tools"))]
-            let worker_client = client.clone();
+        #[cfg(feature = "test-tools")]
+        let pool_count = if crate::platform::test_root().is_ok_and(|root| root.is_some()) {
+            match std::env::var("FETCHRAIL_TEST_HTTP_POOLS").as_deref() {
+                Ok("1") => 1,
+                Ok("4") => workers.min(4),
+                _ => pool_count,
+            }
+        } else {
+            pool_count
+        };
+        let mut clients = vec![client.clone()];
+        for _ in 1..pool_count {
+            clients.push(download_client_builder().build()?);
+        }
+        let futures = (0..workers).map(|worker_index| {
+            let worker_client = clients[worker_index % clients.len()].clone();
             let batch_cancel = &batch_cancel;
             let peer_rate = &peer_rate;
             let live_peer_rate = &live_peer_rate;
@@ -6697,14 +6699,23 @@ fn valid_manifest_ranges(manifest: &PartManifest, total: u64) -> bool {
         && manifest.ranges == split_ranges(total, manifest.ranges.len())
 }
 
+fn transfer_pool_count(total: u64, workers: usize) -> usize {
+    // A paced shared flow must not hold all of a large transfer's workers back.
+    if total < LARGE_TRANSFER_BYTES {
+        1
+    } else {
+        workers.clamp(1, 4)
+    }
+}
+
 fn queued_range_count(total: u64, workers: usize, min_segment: u64) -> usize {
     let workers = workers.clamp(1, 32);
     // Keep request/checkpoint overhead out of small and single-connection transfers.
-    if workers == 1 || total < 8 * 1024 * 1024 * 1024 {
+    if workers == 1 || total < LARGE_TRANSFER_BYTES {
         return workers;
     }
-    ((total / min_segment.max(128 * 1024 * 1024)).clamp(workers as u64, 512) as usize)
-        .min(workers * 2)
+    // Leave less work trapped on a slow receiver as other slots drain.
+    (total / min_segment.max(128 * 1024 * 1024)).clamp(workers as u64, 512) as usize
 }
 
 fn suggested_connection_count(total: u64, configured: usize, min_segment: u64) -> usize {
@@ -7217,17 +7228,21 @@ mod tests {
     #[test]
     fn queued_ranges_preserve_small_transfers_limits_and_geometry() {
         let gib = 1024u64.pow(3);
-        for (total, workers, minimum, expected) in [
-            (2 * gib, 16, 4 * 1024 * 1024, 16),
-            (8 * gib - 1, 32, 0, 32),
-            (8 * gib, 16, 0, 32),
-            (21_618_816_672, 16, 0, 32),
-            (21_618_816_672, 1, 0, 1),
-            (21_618_816_672, 16, 512 * 1024 * 1024, 32),
-            (1024 * gib, 32, 0, 64),
+        for (total, workers, minimum, expected, pools) in [
+            (2 * gib, 16, 4 * 1024 * 1024, 16, 1),
+            (8 * gib - 1, 32, 0, 32, 1),
+            (8 * gib, 2, 0, 64, 2),
+            (8 * gib, 3, 0, 64, 3),
+            (8 * gib, 16, 0, 64, 4),
+            (21_618_816_672, 16, 0, 161, 4),
+            (21_618_816_672, 1, 0, 1, 1),
+            (21_618_816_672, 16, 512 * 1024 * 1024, 40, 4),
+            (1024 * gib, 32, 0, 512, 4),
         ] {
             let count = super::queued_range_count(total, workers, minimum);
             assert_eq!(count, expected);
+            assert_eq!(super::transfer_pool_count(total, workers), pools);
+            assert!(pools <= workers && pools <= 4);
             let ranges = split_ranges(total, count);
             assert_eq!(ranges.iter().map(|range| range.len()).sum::<u64>(), total);
             assert!(ranges
