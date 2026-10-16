@@ -382,8 +382,20 @@ async fn reset_calibration(
 }
 
 #[tauri::command]
-fn open_browser_extension_store(app: AppHandle) -> Result<(), String> {
-    browser_extension::open_store(&app)
+fn open_browser_extension_store(
+    app: AppHandle,
+    browser: Option<browser_extension::Browser>,
+) -> Result<(), String> {
+    browser_extension::open_store(
+        &app,
+        browser.unwrap_or(browser_extension::Browser::Chromium),
+    )
+}
+
+/// Lets the Browser settings lead with the companion for the browser people actually use.
+#[tauri::command]
+fn default_browser() -> Option<browser_extension::Browser> {
+    browser_extension::default_browser()
 }
 
 #[tauri::command]
@@ -1040,6 +1052,7 @@ pub fn run() {
             reveal_download,
             get_settings,
             open_browser_extension_store,
+            default_browser,
             open_browser_extension_folder,
             update_settings,
             set_analytics_consent,
@@ -1090,7 +1103,9 @@ fn handle_tray_menu_event(app: &AppHandle, event: tauri::menu::MenuEvent) {
     match event.id().as_ref() {
         "show" => show_main_window(app),
         "extension" => {
-            if let Err(error) = browser_extension::open_store(app) {
+            if let Err(error) =
+                browser_extension::open_store(app, browser_extension::Browser::Chromium)
+            {
                 eprintln!("Fetchrail browser extension: {error}");
             }
         }

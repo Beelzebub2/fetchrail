@@ -1,19 +1,36 @@
-.performance-view-switch { display:grid; gap:10px; margin-bottom:20px; }
-.performance-view-switch .segmented { max-width:100%; width:fit-content; flex-wrap:wrap; }
-.performance-view-switch > .ghost-button { justify-self:start; }
-.performance-layout { display:grid; grid-template-columns:minmax(0,1.5fr) minmax(0,1fr); gap:16px; align-items:start; }
-.performance-layout .card, .performance-results { display:grid; gap:18px; min-width:0; }
+.performance-note { display:flex; flex-wrap:wrap; align-items:center; justify-content:space-between; gap:8px 16px; margin-bottom:16px; }
+.performance-note .hint { flex:1 1 360px; }
+.performance-layout { display:grid; grid-template-columns:minmax(0,1.5fr) minmax(0,1fr); gap:14px; align-items:start; }
+.performance-layout .card, .performance-results { display:grid; gap:16px; min-width:0; }
+/* The easy path: one button, and what the test will use in plain words beside it. */
+.performance-start { display:flex; flex-wrap:wrap; align-items:center; gap:12px 20px; padding:16px; border:1px solid var(--line-soft); border-radius:12px; background:var(--bg); transition:background 300ms, border-color 300ms; }
+.performance-start .primary-button { height:44px; padding:0 20px; border-radius:12px; }
+.performance-budget { display:flex; flex-wrap:wrap; gap:6px 16px; margin:0; padding:0; list-style:none; color:var(--text-2); font-size:12.5px; }
+.performance-budget li { display:flex; align-items:center; gap:6px; }
+.performance-budget li::before { content:""; width:5px; height:5px; border-radius:50%; background:var(--accent); }
+.performance-advanced,.performance-more { border-top:1px solid var(--line-soft); padding-top:12px; }
+.performance-advanced > summary,.performance-more > summary { width:fit-content; color:var(--text-2); font-size:13px; font-weight:600; cursor:pointer; }
+.performance-advanced > summary:hover,.performance-more > summary:hover { color:var(--text); }
+.performance-advanced-body { display:grid; gap:16px; padding-top:16px; }
+.performance-more p { margin-top:10px; }
+.performance-learned { color:var(--text-2); font-size:13px; }
+.performance-learned b { color:var(--text); font-weight:500; }
+.performance-confirm { display:grid; gap:10px; }
+/* Lines the borderless button's text up with the card's text. */
+.performance-reset { margin-left:-16px; }
+.performance-traces { display:grid; gap:12px; padding-top:12px; }
 .performance-controls { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:16px; }
 .performance-controls label { display:grid; gap:8px; }
 .performance-controls select { width:100%; min-width:0; }
 .performance-toggles { display:grid; gap:12px; }
 .performance-toggles label { display:flex; align-items:center; gap:10px; }
-.performance-toggle { display:flex; justify-content:space-between; gap:20px; align-items:center; }
-.performance-toggle small { display:block; color:var(--text-3); margin-top:5px; }
+/* Beats the stacked .form label layout, so the switch sits beside its text like every other switch. */
+.form .performance-toggle { display:flex; justify-content:space-between; gap:20px; align-items:center; color:var(--text); font-size:14px; font-weight:600; }
+.performance-toggle small { display:block; color:var(--text-3); margin-top:3px; font-size:12.5px; font-weight:400; }
 .performance-progress { display:grid; gap:12px; }
 .performance-progress progress { width:100%; accent-color:var(--accent); }
 .performance-progress button { justify-self:start; }
-.performance-results { margin-top:20px; }
+.performance-results { margin-top:14px; }
 .performance-facts { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); border-block:1px solid var(--line); }
 .performance-facts>div { display:grid; gap:10px; padding:18px 12px; }
 .performance-facts span { color:var(--text-3); font-size:12px; }

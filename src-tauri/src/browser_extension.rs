@@ -1,6 +1,6 @@
 use std::{fs, path::Path, sync::Mutex};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tauri::AppHandle;
 
 use serde_json::json;
@@ -182,11 +182,48 @@ pub fn remove_native_host() -> Result<(), String> {
     }
 }
 
-#[derive(Clone, Copy, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Browser {
     Chromium,
     Firefox,
+}
+
+/// Which companion suits a browser, from its Windows ProgId or Linux desktop file name:
+/// Firefox and its forks take the Firefox one; Chrome, Edge, Brave, Vivaldi and the rest take the Chromium one.
+fn browser_family(id: &str) -> Browser {
+    let id = id.to_ascii_lowercase();
+    if ["firefox", "librewolf", "waterfox", "floorp"]
+        .iter()
+        .any(|name| id.contains(name))
+    {
+        Browser::Firefox
+    } else {
+        Browser::Chromium
+    }
+}
+
+/// The default web browser's family, or None when the system does not say.
+pub fn default_browser() -> Option<Browser> {
+    #[cfg(windows)]
+    let id = ["https", "http"].iter().find_map(|scheme| {
+        RegKey::predef(HKEY_CURRENT_USER)
+            .open_subkey(format!(
+                r"Software\Microsoft\Windows\Shell\Associations\UrlAssociations\{scheme}\UserChoice"
+            ))
+            .and_then(|key| key.get_value::<String, _>("ProgId"))
+            .ok()
+    });
+    #[cfg(target_os = "linux")]
+    let id = std::process::Command::new("xdg-settings")
+        .args(["get", "default-web-browser"])
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string());
+    #[cfg(not(any(windows, target_os = "linux")))]
+    let id: Option<String> = None;
+    id.filter(|id| !id.is_empty()).map(|id| browser_family(&id))
 }
 
 impl Browser {
@@ -333,18 +370,49 @@ pub fn open_folder(app: &AppHandle, browser: Browser) -> Result<(), String> {
         .map_err(|error| format!("Could not open the extension folder: {error}"))
 }
 
-pub fn open_store(app: &AppHandle) -> Result<(), String> {
+pub const FIREFOX_STORE_URL: &str =
+    "https://addons.mozilla.org/firefox/addon/fetchrail-browser-integration/";
+
+/// Opens the store listing for a browser; the native host is registered first so the store copy can connect.
+pub fn open_store(app: &AppHandle, browser: Browser) -> Result<(), String> {
     install(app)?;
-    tauri_plugin_opener::open_url(
-        format!("https://chromewebstore.google.com/detail/{CHROMIUM_STORE_EXTENSION_ID}"),
-        None::<&str>,
-    )
-    .map_err(|error| format!("Could not open the Chrome Web Store: {error}"))
+    let (url, store) = match browser {
+        Browser::Chromium => (
+            format!("https://chromewebstore.google.com/detail/{CHROMIUM_STORE_EXTENSION_ID}"),
+            "the Chrome Web Store",
+        ),
+        Browser::Firefox => (FIREFOX_STORE_URL.to_string(), "Firefox Add-ons"),
+    };
+    tauri_plugin_opener::open_url(url, None::<&str>)
+        .map_err(|error| format!("Could not open {store}: {error}"))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_browsers_map_to_their_companion() {
+        for id in [
+            "FirefoxURL-308046B0AF4A39CB",
+            "firefox.desktop",
+            "org.mozilla.firefox.desktop",
+            "LibreWolfHTM",
+        ] {
+            assert_eq!(browser_family(id), Browser::Firefox, "{id}");
+        }
+        for id in [
+            "ChromeHTML",
+            "MSEdgeHTM",
+            "BraveHTML",
+            "VivaldiHTM",
+            "google-chrome.desktop",
+            "chromium.desktop",
+            "OperaStable",
+        ] {
+            assert_eq!(browser_family(id), Browser::Chromium, "{id}");
+        }
+    }
 
     #[test]
     fn embedded_panel_assets_are_complete() {

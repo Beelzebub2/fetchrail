@@ -1,8 +1,9 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
-import { Activity, Check, FolderOpen, Pause, Play, Upload, X } from "lucide-react";
-import { DownloadRecord, formatBytes, formatSpeed, progressOf, statusLabel } from "./App";
+import { Activity, Check, Ellipsis, FolderOpen, Pause, Play, Share2, Upload, X } from "lucide-react";
+import { PageHead } from "./PageHead";
+import { DownloadRecord, formatBytes, formatEta, formatSpeed, progressOf, statusLabel } from "./App";
 import "./Torrents.css";
 
 export type TorrentFile = { index: number; path: string; size: number; priority: number; downloaded: number };
@@ -97,9 +98,10 @@ export function TorrentRow({ item, selected, onSelect, command }: { item: Downlo
       <button className="icon-button" aria-label={`Inspect ${item.fileName}`} aria-pressed={selected} onClick={onSelect}><Activity size={16} /></button>
       <div className="file-badge">P2P</div><div className="col-name"><button className="torrent-name" onClick={onSelect} title={item.fileName}>{item.fileName}</button><span>{item.error || `${t.peers} peers · ${t.seeds} seeds · ${item.queue}`}</span></div>
       <div className="col-progress"><div className="progress-line"><span>{statusLabel(item.status)}</span><span className="mono">{progressOf(item).toFixed(0)}%</span></div><div className="merge-progress" role="progressbar" aria-label={`${item.fileName} progress`} aria-valuemin={0} aria-valuemax={100} aria-valuenow={Math.floor(progressOf(item))}><i className="merge-fill" style={{ width: `${progressOf(item)}%` }} /></div></div>
-      <div className="col-speed mono"><span>↓ {formatSpeed(item.speedBps)}</span><small>↑ {formatSpeed(t.uploadSpeedBps)}</small></div>
-      <div className="col-eta mono"><span>{t.selectedReady ? `${(t.uploadedBytes / Math.max(t.allDownloadedBytes, item.totalBytes ?? 0, 1)).toFixed(2)} ratio` : item.etaSeconds ? `${Math.ceil(item.etaSeconds / 60)} min` : "—"}</span></div>
-      <div className="row-actions"><button className="icon-button" title={pause ? "Pause downloading and sharing" : "Resume"} aria-label={`${pause ? "Pause" : "Resume"} ${item.fileName}`} onClick={() => void command(pause ? "pause_download" : "resume_download", item.id)}>{pause ? <Pause size={16} /> : <Play size={16} />}</button><button className="icon-button" title="Show folder" aria-label={`Show folder for ${item.fileName}`} onClick={() => void command("reveal_download", item.id)}><FolderOpen size={16} /></button></div>
+      {/* Download speed leads while the payload arrives, upload once it is only shared. */}
+      <div className="col-speed mono">{t.selectedReady ? <><span>↑ {formatSpeed(t.uploadSpeedBps)}</span>{item.speedBps > 0 && <small>↓ {formatSpeed(item.speedBps)}</small>}</> : <><span>↓ {formatSpeed(item.speedBps)}</span>{t.uploadSpeedBps > 0 && <small>↑ {formatSpeed(t.uploadSpeedBps)}</small>}</>}</div>
+      <div className="col-eta">{t.selectedReady ? <><span className="mono">{(t.uploadedBytes / Math.max(t.allDownloadedBytes, item.totalBytes ?? 0, 1)).toFixed(2)}</span><small>ratio</small></> : <><span className="mono">{formatEta(item.etaSeconds)}</span>{!!item.etaSeconds && <small>left</small>}</>}</div>
+      <div className="row-actions"><button className="icon-button" title={pause ? "Pause downloading and sharing" : "Resume"} aria-label={`${pause ? "Pause" : "Resume"} ${item.fileName}`} onClick={() => void command(pause ? "pause_download" : "resume_download", item.id)}>{pause ? <Pause size={16} /> : <Play size={16} />}</button><button className="icon-button" title="Show folder" aria-label={`Show folder for ${item.fileName}`} onClick={() => void command("reveal_download", item.id)}><FolderOpen size={16} /></button><button className="icon-button" title="Torrent details" aria-label={`Details for ${item.fileName}`} aria-pressed={selected} onClick={onSelect}><Ellipsis size={16} /></button></div>
     </div>
   </article>;
 }
@@ -146,10 +148,11 @@ export function TorrentSettingsFields({ value, onChange }: { value: TorrentSetti
   const [licenses, setLicenses] = useState("");
   const set = (field: keyof TorrentSettings, next: string | number | boolean) => onChange({ ...value, [field]: next });
   const choices = (name: string, field: "protocol" | "encryption", labels: string[]) => <fieldset className="choice-field"><legend>{name}</legend><div className="choices">{labels.map((label, index) => <label className="choice" key={label}><input type="radio" name={field} checked={(value[field] ?? 0) === index} onChange={() => set(field, index)} />{label}</label>)}</div></fieldset>;
-  return <section aria-labelledby="torrent-settings-title"><div className="page-head rise"><div><h1 id="torrent-settings-title">Torrents</h1><p>Native storage, TCP/uTP peers, v1/v2 torrents, DHT and peer exchange.</p></div><span className="fact">libtorrent <b>2.1.2</b></span></div>
+  return <section aria-labelledby="torrent-settings-title"><PageHead id="torrent-settings-title" icon={Share2} title="Torrents">Native storage, TCP/uTP peers, v1/v2 torrents, DHT and peer exchange. Built on libtorrent <span className="mono">2.1.2</span>.</PageHead>
     <div className="board">
     <section className="card major rise d1" aria-labelledby="torrent-sharing-title"><div className="card-head"><h2 id="torrent-sharing-title">Sharing limits</h2><p>How much Fetchrail gives back, and for how long, once a torrent finishes.</p></div>
-    <div className="setting-grid wide">{([["uploadLimitBps", "Upload limit (bytes/s)", 0], ["maxSeeds", "Concurrent sharing jobs", 1], ["connections", "Session connection limit", 20], ["ratioLimit", "Default share ratio (0 = unlimited)", 0], ["seedTimeLimit", "Default share seconds (0 = unlimited)", 0]] as const).map(([key, label, min]) => <label key={key}>{label}<input type="number" min={min} value={value[key]} onChange={e => set(key, Number(e.target.value))} /></label>)}</div>
+    {/* Limits read in the same units as the rest of the app: KiB/s for speed, hours for time; they are stored in bytes and seconds. */}
+    <div className="setting-grid wide">{([["uploadLimitBps", "Upload limit (KiB/s, 0 = unlimited)", 0, 1024, 1], ["maxSeeds", "Torrents sharing at once", 1, 1, 1], ["connections", "Peer connection limit", 20, 1, 1], ["ratioLimit", "Default share ratio (0 = unlimited)", 0, 1, 0.1], ["seedTimeLimit", "Default share time (hours, 0 = unlimited)", 0, 3600, 0.5]] as const).map(([key, label, min, scale, step]) => <label key={key}>{label}<input type="number" min={min} step={step} value={scale === 1 ? value[key] : Math.round(value[key] / scale * 100) / 100} onChange={e => set(key, scale === 1 ? Number(e.target.value) : Math.round(Number(e.target.value) * scale))} /></label>)}</div>
     </section>
     <section className="card minor rise d2" aria-labelledby="torrent-peers-title"><div className="card-head"><h2 id="torrent-peers-title">Peers</h2><p>How Fetchrail finds other peers and talks to them.</p></div>
     <div className="looks">

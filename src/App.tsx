@@ -10,6 +10,7 @@ import {
   ArrowRight,
   CalendarClock,
   Check,
+  ChevronDown,
   ChevronRight,
   CircleX,
   Download,
@@ -28,6 +29,7 @@ import {
   Play,
   Plus,
   Power,
+  Puzzle,
   RotateCw,
   Search,
   Settings,
@@ -39,6 +41,8 @@ import {
 } from "lucide-react";
 import "./App.css";
 import { PRESETS, accentColors, accentField, accentHex, accentSpot, distance, spotOf, type AccentSpot } from "./accent";
+import { INTERFACE_SCALES, useInterfaceScale } from "./interfaceScale";
+import { PageHead } from "./PageHead";
 import { PerformanceInvitation, PerformancePage, type PerformanceView } from "./Performance";
 import { AnalyticsPrompt, PrivacySettings } from "./Privacy";
 import type { AnalyticsConsent } from "./Privacy";
@@ -554,6 +558,7 @@ function App() {
     return totals;
   }, { active: 0, queued: 0, completed: 0, failed: 0, currentSpeedBps: 0, uploadSpeedBps: 0, seeding: 0 }), [downloads]);
   const samples = useSpeedSamples(overview.currentSpeedBps);
+  const interfaceScale = useInterfaceScale(isTauri());
   const [query, setQuery] = useState("");
   const [filter, setFilter] = useState("all");
   const [groupBy, setGroupBy] = useState<"status" | "queue">(() => (localStorage.getItem("groupBy") === "queue" ? "queue" : "status"));
@@ -726,12 +731,9 @@ function App() {
           })
         : statusSections.map(([title, statuses]) => {
             const items = filtered.filter((item) => statuses.includes(item.status));
-            const speed = items.reduce(
-              (sum, item) => sum + (title === "Seeding" ? item.torrent?.uploadSpeedBps ?? 0 : item.status === "downloading" ? item.speedBps : 0),
-              0,
-            );
             const tone = title === "Downloading" ? "live" as const : title === "Failed" ? "failed" as const : "idle" as const;
-            return { id: "status:" + title, title, queue: undefined, items, note: speed ? (title === "Seeding" ? "↑ " : "") + formatSpeed(speed) : "", tone };
+            // The combined speed lives in the top rail alone; a section heading repeating it was noise.
+            return { id: "status:" + title, title, queue: undefined, items, note: "", tone };
           });
     return groups
       .filter((group) => group.items.length)
@@ -954,6 +956,25 @@ function App() {
   // Without a chosen folder, the engine files the download under its category.
   const dialogCategory = settings?.sortIntoCategoryFolders ? categoryFor(nameFromUrl(url), settings) : null;
 
+  // Each settings section opens at its top, not wherever the last one was scrolled to.
+  const content = useRef<HTMLElement>(null);
+  useLayoutEffect(() => {
+    if (inSettings) content.current?.scrollTo({ top: 0 });
+  }, [inSettings, settingsSection]);
+
+  // Ctrl+S saves the settings while they are open; the form's own submit keeps the usual checks.
+  useEffect(() => {
+    if (!inSettings) return;
+    const save = (event: KeyboardEvent) => {
+      if ((event.ctrlKey || event.metaKey) && !event.altKey && event.key.toLowerCase() === "s") {
+        event.preventDefault();
+        document.querySelector<HTMLFormElement>("#settings-form")?.requestSubmit();
+      }
+    };
+    window.addEventListener("keydown", save);
+    return () => window.removeEventListener("keydown", save);
+  }, [inSettings]);
+
   async function chooseAnalytics(enabled: boolean) {
     setSettings(await invoke<DownloadSettings>("set_analytics_consent", { enabled }));
   }
@@ -1038,7 +1059,22 @@ function App() {
                 <ArrowLeft size={16} /> Downloads
               </button>
               <span className="rail-divider" aria-hidden="true" />
-              <div className="view-tabs" role="tablist" aria-label="Settings sections">
+              <div
+                className="view-tabs"
+                role="tablist"
+                aria-label="Settings sections"
+                onKeyDown={(event) => {
+                  // Arrow keys, Home and End move between sections, as in any tab strip.
+                  const ids = settingsSections.map(([id]) => id);
+                  const at = ids.indexOf(settingsSection);
+                  const step = { ArrowRight: at + 1, ArrowLeft: at - 1, Home: 0, End: ids.length - 1 }[event.key];
+                  if (step === undefined) return;
+                  event.preventDefault();
+                  const next = ids[(step + ids.length) % ids.length];
+                  setSettingsSection(next);
+                  document.getElementById("settings-tab-" + next)?.focus();
+                }}
+              >
                 {settingsSections.map(([id, label, Icon]) => (
                   <button
                     key={id}
@@ -1047,6 +1083,7 @@ function App() {
                     id={"settings-tab-" + id}
                     aria-selected={settingsSection === id}
                     aria-controls="settings-panel"
+                    tabIndex={settingsSection === id ? 0 : -1}
                     onClick={() => setSettingsSection(id)}
                   >
                     <Icon size={16} />
@@ -1122,7 +1159,7 @@ function App() {
         </div>
       </header>
 
-      <main className={inSettings ? "content" : "content transfers"}>
+      <main className={inSettings ? "content" : "content transfers"} ref={content}>
         {inSettings ? (
           <SettingsPage
             settings={settings}
@@ -1132,6 +1169,7 @@ function App() {
             version={version}
             update={update}
             samples={samples}
+            interfaceScale={interfaceScale}
             section={settingsSection}
             performanceView={performanceView}
             onPerformanceView={setPerformanceView}
@@ -1221,7 +1259,7 @@ function App() {
             <button type="button" className="ghost-button" disabled={busy || organizing !== null} onClick={() => setEdits({})}>
               Discard
             </button>
-            <button className="primary-button" form="settings-form" disabled={busy || organizing !== null}>
+            <button className="primary-button" form="settings-form" disabled={busy || organizing !== null} title="Save settings (Ctrl+S)" aria-keyshortcuts="Control+S">
               {saveState === "saving" ? "Saving…" : "Save settings"}
             </button>
           </>
@@ -1279,7 +1317,7 @@ function App() {
                 value={url}
                 onChange={(event) => setUrl(event.target.value)}
                 placeholder="https://example.com/archive.zip"
-                rows={4}
+                rows={3}
                 spellCheck={false}
                 required
               />
@@ -1425,26 +1463,66 @@ function sparkPoints(samples: number[], peak: number, height: number) {
   );
 }
 
+// The one place the combined speed is shown: download with its recent graph, upload under it while torrents share,
+// and the counts behind them one click away. Rows show only their own speeds.
 function Throughput({ overview, connections, samples }: { overview: EngineOverview; connections: number; samples: number[] }) {
   const points = sparkPoints(samples, Math.max(...samples, 1) * 1.2, 44);
   const [amount, unit] =
     overview.currentSpeedBps > 0 ? formatSpeed(overview.currentSpeedBps).split(" ") : ["0", "MB/s"];
-
+  const uploading = overview.uploadSpeedBps > 0;
+  const down = overview.currentSpeedBps > 0 ? formatSpeed(overview.currentSpeedBps) : "idle";
   return (
-    <section
-      className="throughput"
-      aria-label="Current throughput"
-      title={`${overview.active} active · ${overview.queued} waiting · ${connections} connections`}
-    >
-      <svg className="spark" viewBox="0 0 200 44" preserveAspectRatio="none" aria-hidden="true">
-        <path d={"M0,44 L" + points.join(" L") + " L200,44 Z"} />
-        <polyline points={points.join(" ")} />
-      </svg>
-      <div className="speed mono">
-        <strong>{amount}</strong>
-        <span>{unit}</span>
+    <>
+      <button
+        type="button"
+        className={overview.currentSpeedBps > 0 || uploading ? "throughput" : "throughput idle"}
+        popoverTarget="throughput-details"
+        style={{ anchorName: "--throughput" } as CSSProperties}
+        aria-label={`Download speed ${down}${uploading ? `, upload ${formatSpeed(overview.uploadSpeedBps)}` : ""}. Show transfer details`}
+      >
+        <svg className="spark" viewBox="0 0 200 44" preserveAspectRatio="none" aria-hidden="true">
+          <path d={"M0,44 L" + points.join(" L") + " L200,44 Z"} />
+          <polyline points={points.join(" ")} />
+        </svg>
+        <span className="rates">
+          <span className="speed mono">
+            <strong>{amount}</strong>
+            <span>{unit}</span>
+          </span>
+          {uploading && <span className="upload mono">↑ {formatSpeed(overview.uploadSpeedBps)}</span>}
+        </span>
+      </button>
+      <div className="menu throughput-details" popover="auto" id="throughput-details" style={{ positionAnchor: "--throughput" } as CSSProperties}>
+        <span className="overline">All transfers</span>
+        <dl>
+          <div>
+            <dt>Download</dt>
+            <dd className="mono">↓ {formatSpeed(overview.currentSpeedBps)}</dd>
+          </div>
+          <div>
+            <dt>Upload</dt>
+            <dd className="mono">↑ {formatSpeed(overview.uploadSpeedBps)}</dd>
+          </div>
+          <div>
+            <dt>Downloads</dt>
+            <dd>
+              {overview.active} active{overview.queued ? ` · ${overview.queued} waiting` : ""}
+            </dd>
+          </div>
+          <div>
+            <dt>Connections</dt>
+            <dd>{connections} open</dd>
+          </div>
+          {overview.seeding > 0 && (
+            <div>
+              <dt>Sharing</dt>
+              <dd>{overview.seeding} {overview.seeding === 1 ? "torrent" : "torrents"}</dd>
+            </div>
+          )}
+        </dl>
+        <small>The graph shows the last 40 seconds of download speed.</small>
       </div>
-    </section>
+    </>
   );
 }
 
@@ -1689,8 +1767,9 @@ function DownloadRow({
             </>
           )}
         </div>
+        {/* Waiting, paused and finished rows leave speed and time blank rather than repeating dashes. */}
         <div className="col-speed">
-          <span className="mono">{formatSpeed(item.speedBps)}</span>
+          {running && <span className="mono">{formatSpeed(item.speedBps)}</span>}
           {item.status === "downloading" && (
             <small title={`${item.plannedRanges ?? parts.length} byte sections queued; requested up to ${requested} connections`}>
               {live.receiving + live.connecting} of {item.connections} connections
@@ -1699,7 +1778,7 @@ function DownloadRow({
           {item.status === "merging" && <small>Disk write</small>}
         </div>
         <div className="col-eta">
-          <span className="mono">{running ? formatEta(item.etaSeconds) : "—"}</span>
+          {running && <span className="mono">{formatEta(item.etaSeconds)}</span>}
           {running && item.etaSeconds != null && item.etaSeconds > 0 && <small>left</small>}
         </div>
         <div className="row-actions">
@@ -2130,6 +2209,7 @@ function SettingsPage({
   version,
   update,
   samples,
+  interfaceScale,
   section,
   performanceView,
   onPerformanceView,
@@ -2153,6 +2233,7 @@ function SettingsPage({
   version: string;
   update: UpdateStatus;
   samples: number[];
+  interfaceScale: ReturnType<typeof useInterfaceScale>;
   section: SettingsSection;
   performanceView: PerformanceView;
   onPerformanceView: (view: PerformanceView) => void;
@@ -2182,6 +2263,18 @@ function SettingsPage({
   const files = Math.min(12, Math.max(1, draft.maxConcurrentDownloads || 1));
   // The queue timeline starts at the moment the settings were opened.
   const [now] = useState(() => Date.now());
+  // One category's endings are open for editing at a time.
+  const [openCategory, setOpenCategory] = useState<number | null>(null);
+  const endingOwners = useMemo(() => {
+    const owners = new Map<string, number[]>();
+    draft.categories.forEach((category, index) =>
+      category.extensions.forEach((ending) => {
+        const list = owners.get(ending) ?? [];
+        if (!list.includes(index)) owners.set(ending, [...list, index]);
+      }),
+    );
+    return owners;
+  }, [draft.categories]);
 
   async function organizeExisting(mode: "sort" | "flatten") {
     if (folderSettingsChanged) {
@@ -2205,12 +2298,26 @@ function SettingsPage({
     }
   }
 
-  async function openExtension(browser: "store" | "chromium" | "firefox") {
+  // The Browser page leads with the companion for the default browser; the other stays one click away.
+  const [defaultBrowser, setDefaultBrowser] = useState<"chromium" | "firefox" | null | undefined>(undefined);
+  const [otherBrowsers, setOtherBrowsers] = useState(false);
+  useEffect(() => {
+    if (section !== "browser" || defaultBrowser !== undefined) return;
+    invoke<string | null>("default_browser")
+      .then((browser) => setDefaultBrowser(browser === "firefox" || browser === "chromium" ? browser : null))
+      .catch(() => setDefaultBrowser(null));
+  }, [section, defaultBrowser]);
+  // Any browser that is not Firefox can use the Chromium companion.
+  const family = defaultBrowser ?? "chromium";
+  const companions: ("chromium" | "firefox")[] = otherBrowsers ? ["chromium", "firefox"] : [family];
+
+  async function openExtension(where: "chrome-store" | "firefox-store" | "chromium" | "firefox") {
     setOpeningExtension(true);
     setExtensionError(null);
     try {
-      if (browser === "store") await invoke("open_browser_extension_store");
-      else await invoke("open_browser_extension_folder", { browser });
+      if (where === "chrome-store") await invoke("open_browser_extension_store", { browser: "chromium" });
+      else if (where === "firefox-store") await invoke("open_browser_extension_store", { browser: "firefox" });
+      else await invoke("open_browser_extension_folder", { browser: where });
     } catch (error) {
       setExtensionError(String(error));
     } finally {
@@ -2238,12 +2345,9 @@ function SettingsPage({
         {section === "privacy" && <PrivacySettings settings={settings} onChoice={onAnalytics} />}
         {section === "general" && (
           <section aria-labelledby="general-settings-title">
-            <div className="page-head rise">
-              <div>
-                <h1 id="general-settings-title">General</h1>
-                <p>How Fetchrail looks, starts and keeps itself up to date.</p>
-              </div>
-            </div>
+            <PageHead id="general-settings-title" icon={Settings2} title="General">
+              How Fetchrail looks, starts and keeps itself up to date.
+            </PageHead>
             <div className="board">
               <section className="card major rise d1" aria-labelledby="appearance-settings-title">
                 <div className="card-head">
@@ -2252,6 +2356,30 @@ function SettingsPage({
                 </div>
                 {/* The look applies at once, so it is never one of the unsaved changes. */}
                 <LookFields look={draft} onChange={(look) => void onAppearance(look)} />
+                {/* Kept on this computer only: the right size depends on the screen. */}
+                <fieldset className="choice-field">
+                  <legend>
+                    Interface size
+                    <small>
+                      {interfaceScale.choice
+                        ? "Ctrl+0 returns to automatic"
+                        : `Automatic: ${Math.round(interfaceScale.automatic * 100)}% for this screen`}
+                    </small>
+                  </legend>
+                  <div className="choices">
+                    {INTERFACE_SCALES.map((size) => (
+                      <label key={size} className="choice">
+                        <input
+                          type="radio"
+                          name="interface-scale"
+                          checked={interfaceScale.choice === size}
+                          onChange={() => interfaceScale.choose(size)}
+                        />
+                        {size ? `${Math.round(size * 100)}%` : "Automatic"}
+                      </label>
+                    ))}
+                  </div>
+                </fieldset>
               </section>
 
               <div className="card-stack minor">
@@ -2335,13 +2463,9 @@ function SettingsPage({
 
         {section === "downloads" && (
           <section aria-labelledby="download-settings-title">
-            <div className="page-head rise">
-              <div>
-                <h1 id="download-settings-title">Downloads</h1>
-                <p>Where files land and how many connections Fetchrail opens.</p>
-              </div>
-              <span className="fact">Up to <b>{files * parts}</b> open connections</span>
-            </div>
+            <PageHead id="download-settings-title" icon={Download} title="Downloads">
+              Where files land and how many connections Fetchrail opens.
+            </PageHead>
             <div className="board">
               <div className="card-stack major">
                 <section className="card rise d1" aria-labelledby="connection-settings-title">
@@ -2385,10 +2509,7 @@ function SettingsPage({
                       <b className="mono">{files}</b> at once, <b className="mono">{parts}</b> {parts === 1 ? "connection" : "connections"} each:
                       up to <b className="mono">{files * parts}</b> open connections.
                     </p>
-                    <p className="hint">
-                      Each file is split into up to {parts} {parts === 1 ? "part" : "parts"}. Fetchrail falls back to one connection
-                      when a server does not support byte ranges.
-                    </p>
+                    <p className="hint">A server that cannot send parts of a file gets a single connection.</p>
                   </div>
                 </section>
 
@@ -2459,11 +2580,13 @@ function SettingsPage({
               </div>
 
               <section className="card minor rise d2" aria-labelledby="limit-settings-title">
-                <div className="card-head">
-                  <h2 id="limit-settings-title">Speed limit</h2>
-                  <p>Shared across every file and connection; changes apply when saved.</p>
+                <div className="card-head split tight">
+                  <div>
+                    <h2 id="limit-settings-title">Speed limit</h2>
+                    <p>Shared by every file and connection; applies when saved.</p>
+                  </div>
+                  <strong className="limit-readout mono">{draft.speedLimitBps > 0 ? formatSpeed(draft.speedLimitBps) : "Unlimited"}</strong>
                 </div>
-                <strong className="limit-readout mono">{draft.speedLimitBps > 0 ? formatSpeed(draft.speedLimitBps) : "Unlimited"}</strong>
                 <LimitGraph samples={samples} limit={draft.speedLimitBps} />
                 <div className="choices" role="group" aria-label="Speed limit presets">
                   {[0, 1, 5, 10].map((megabytes) => (
@@ -2490,31 +2613,34 @@ function SettingsPage({
 
         {section === "queues" && (
           <section aria-labelledby="queue-settings-title">
-            <div className="page-head rise">
-              <div>
-                <h1 id="queue-settings-title">Queues</h1>
-                <p>Queue schedules start and stop transfers automatically. Keep Fetchrail running; times use your local timezone.</p>
-              </div>
-              <div className="queue-create">
-                <input
-                  value={queueName}
-                  onChange={(event) => setQueueName(event.target.value)}
-                  placeholder="New queue name"
-                  aria-label="New queue name"
-                  maxLength={48}
-                />
-                <button
-                  type="button"
-                  className="secondary-button"
-                  disabled={busy || !queueName.trim()}
-                  onClick={async () => {
-                    if (await onCreateQueue(queueName.trim())) setQueueName("");
-                  }}
-                >
-                  <Plus size={16} /> Add queue
-                </button>
-              </div>
-            </div>
+            <PageHead
+              id="queue-settings-title"
+              icon={CalendarClock}
+              title="Queues"
+              actions={
+                <div className="queue-create">
+                  <input
+                    value={queueName}
+                    onChange={(event) => setQueueName(event.target.value)}
+                    placeholder="New queue name"
+                    aria-label="New queue name"
+                    maxLength={48}
+                  />
+                  <button
+                    type="button"
+                    className="secondary-button"
+                    disabled={busy || !queueName.trim()}
+                    onClick={async () => {
+                      if (await onCreateQueue(queueName.trim())) setQueueName("");
+                    }}
+                  >
+                    <Plus size={16} /> Add queue
+                  </button>
+                </div>
+              }
+            >
+              Schedules start and stop a queue's transfers automatically, in your local time, while Fetchrail runs.
+            </PageHead>
             <section className="card rise d1" aria-label="Queue schedules">
               <div>
                 <div className="queue-settings-item axis" aria-hidden="true">
@@ -2574,24 +2700,23 @@ function SettingsPage({
 
         {section === "categories" && (
           <section aria-labelledby="category-settings-title">
-            <div className="page-head rise">
-              <div>
-                <h1 id="category-settings-title">File categories</h1>
-                <p>
-                  Use these file endings for automatic sorting or to organize files you already have. A folder name
-                  means a folder inside the default Downloads directory; an absolute path uses that exact folder.
-                </p>
-              </div>
-            </div>
+            <PageHead id="category-settings-title" icon={FolderOpen} title="File categories">
+              Sort downloads into folders by their file ending, and tidy up files you already have.
+            </PageHead>
             <div className="card-stack">
-              <section className="card slim rise d1" aria-label="Automatic sorting">
-                <div className="rows">
-                  <label>
-                    <span className="tile" aria-hidden="true"><ListChecks size={18} /></span>
-                    <span className="grow">
-                      <strong>Automatically sort new downloads into folders</strong>
-                      <small>Turn this off to save every new download directly into your default Downloads folder. Manually chosen destinations still apply.</small>
-                    </span>
+              <section className="card rise d1" aria-labelledby="category-rules-title">
+                {/* The switch sits on the rules it turns on and off, instead of in a card of its own. */}
+                <div className="card-head split">
+                  <div>
+                    <h2 id="category-rules-title">Rules</h2>
+                    <p>
+                      A file goes to the first category that lists its ending. A folder name is a folder inside your default
+                      download folder; a full path is used as it is.
+                    </p>
+                  </div>
+                  <label className="switch-label sort-switch">
+                    <ListChecks size={16} aria-hidden="true" />
+                    Automatically sort new downloads
                     <input
                       className="switch"
                       type="checkbox"
@@ -2600,9 +2725,12 @@ function SettingsPage({
                     />
                   </label>
                 </div>
-              </section>
-
-              <section className="card rise d2" aria-label="Category rules">
+                {!draft.sortIntoCategoryFolders && (
+                  <p className="hint sort-off">
+                    Sorting is off: new downloads go straight to your default download folder. Folders you choose for a
+                    download still apply, and the rules below are still used to organize existing files.
+                  </p>
+                )}
                 <div className="categories">
                   <div className="category overline" aria-hidden="true">
                     <span>Category</span>
@@ -2610,56 +2738,24 @@ function SettingsPage({
                     <span />
                     <span>Folder</span>
                   </div>
-                  {draft.categories.map((category, index) => {
-                    const change = (patch: Partial<Category>) =>
-                      onChange({ categories: draft.categories.map((entry, at) => (at === index ? { ...entry, ...patch } : entry)) });
-                    return (
-                      <div key={index} className="category">
-                        <input
-                          value={category.name}
-                          onChange={(event) => change({ name: event.target.value })}
-                          placeholder="Name"
-                          aria-label="Category name"
-                          maxLength={32}
-                        />
-                        <EndingsField
-                          label={`File endings for ${category.name || "this category"}`}
-                          value={category.extensions}
-                          onChange={(extensions) => change({ extensions })}
-                        />
-                        <ArrowRight size={16} className="route" aria-hidden="true" />
-                        <input
-                          className="mono"
-                          value={category.folder}
-                          onChange={(event) => change({ folder: event.target.value })}
-                          placeholder="Folder"
-                          aria-label={`Folder for ${category.name || "this category"}`}
-                          spellCheck={false}
-                        />
-                        <button
-                          type="button"
-                          className="icon-button"
-                          onClick={async () => {
-                            const selected = await open({ directory: true, multiple: false });
-                            if (typeof selected === "string") change({ folder: selected });
-                          }}
-                          title="Choose folder"
-                          aria-label={`Choose folder for ${category.name || "this category"}`}
-                        >
-                          <FolderOpen size={16} />
-                        </button>
-                        <button
-                          type="button"
-                          className="icon-button"
-                          onClick={() => onChange({ categories: draft.categories.filter((_, at) => at !== index) })}
-                          title="Remove category"
-                          aria-label={`Remove ${category.name || "this category"}`}
-                        >
-                          <Trash2 size={16} />
-                        </button>
-                      </div>
-                    );
-                  })}
+                  {draft.categories.map((category, index) => (
+                    <CategoryRule
+                      key={index}
+                      category={category}
+                      index={index}
+                      expanded={openCategory === index}
+                      owners={endingOwners}
+                      names={draft.categories.map((entry) => entry.name)}
+                      onToggle={() => setOpenCategory(openCategory === index ? null : index)}
+                      onChange={(patch) =>
+                        onChange({ categories: draft.categories.map((entry, at) => (at === index ? { ...entry, ...patch } : entry)) })
+                      }
+                      onRemove={() => {
+                        onChange({ categories: draft.categories.filter((_, at) => at !== index) });
+                        setOpenCategory((current) => (current === null || current === index ? null : current > index ? current - 1 : current));
+                      }}
+                    />
+                  ))}
                   <div className="category rest">
                     <strong>General</strong>
                     <span>Every other file</span>
@@ -2671,7 +2767,12 @@ function SettingsPage({
                   <button
                     type="button"
                     className="secondary-button"
-                    onClick={() => onChange({ categories: [...draft.categories, { name: "", extensions: [], folder: "" }] })}
+                    onClick={() => {
+                      const at = draft.categories.length;
+                      onChange({ categories: [...draft.categories, { name: "", extensions: [], folder: "" }] });
+                      setOpenCategory(at);
+                      requestAnimationFrame(() => document.querySelector<HTMLInputElement>(`[data-category-name="${at}"]`)?.focus());
+                    }}
                   >
                     <Plus size={16} /> Add category
                   </button>
@@ -2682,7 +2783,7 @@ function SettingsPage({
                     <RotateCw size={16} /> {organizing === "flatten" ? "Moving files back…" : "Move files back to Downloads"}
                   </button>
                 </div>
-                <p className="hint">Organize checks loose files in your default Downloads folder using the saved rules. Moving files back also removes empty category folders inside Downloads. Files in use, unfinished downloads, and unrelated subfolders are left alone; existing filenames are never overwritten.</p>
+                <p className="hint">Organize sorts loose files in your default download folder by the saved rules. Moving files back also removes empty category folders. Files in use, unfinished downloads and other subfolders are left alone, and no existing file is overwritten.</p>
                 {folderSettingsChanged && <p className="hint">Save your category settings before organizing existing files.</p>}
                 {organizeNote && <p className="hint" role="status">{organizeNote}</p>}
                 {organizeError && <p className="extension-error" role="alert">{organizeError}</p>}
@@ -2695,55 +2796,77 @@ function SettingsPage({
 
         {section === "browser" && (
           <section aria-labelledby="extension-settings-title">
-            <div className="page-head rise">
-              <div>
-                <h1 id="extension-settings-title">Browser companion</h1>
-                <p>Sends downloads from your browser to Fetchrail.</p>
-              </div>
-            </div>
+            <PageHead id="extension-settings-title" icon={Globe} title="Browser companion">
+              Sends downloads from your browser to Fetchrail.
+            </PageHead>
             <div className="board">
               <section className="card major rise d1" aria-labelledby="companion-store-title">
                 <span className="overline">Recommended</span>
                 <div className="card-head">
-                  <h2 id="companion-store-title">Chrome Web Store</h2>
-                  <p>Get the official companion. Chrome updates it automatically when approved updates are published.</p>
+                  <h2 id="companion-store-title">
+                    {companions.length > 1 ? "Install from your browser's store" : family === "firefox" ? "Install from Firefox Add-ons" : "Install from the Chrome Web Store"}
+                  </h2>
+                  <p>
+                    {defaultBrowser && companions.length === 1 ? "Chosen for your default browser. " : ""}Get the official companion; your browser installs
+                    approved updates by itself.
+                  </p>
                 </div>
-                <div>
-                  <button type="button" className="primary-button" disabled={openingExtension} onClick={() => void openExtension("store")}>
-                    <Globe size={16} /> Get from Chrome Web Store
+                {defaultBrowser !== undefined && (
+                  <div className="store-choices">
+                    {companions.map((browser) => (
+                      <div key={browser} className="store-choice">
+                        <strong>
+                          {browser === "firefox" ? "Firefox" : "Chrome and Chromium browsers"}
+                          {defaultBrowser === browser && <span className="store-default">Default browser</span>}
+                        </strong>
+                        <small>{browser === "firefox" ? "Signed and listed by Mozilla" : "Chrome, Edge, Brave, Vivaldi and other Chromium-based browsers"}</small>
+                        <button type="button" className="primary-button" disabled={openingExtension} onClick={() => void openExtension(browser === "firefox" ? "firefox-store" : "chrome-store")}>
+                          <Puzzle size={16} /> {browser === "firefox" ? "Get from Firefox Add-ons" : "Get from Chrome Web Store"}
+                        </button>
+                      </div>
+                    ))}
+                  </div>
+                )}
+                <div className="store-foot">
+                  <p className="hint">If you loaded the unpacked companion before, disable it when installing the store version to avoid duplicate download capture.</p>
+                  <button type="button" className="ghost-button" aria-expanded={otherBrowsers} onClick={() => setOtherBrowsers(!otherBrowsers)}>
+                    {otherBrowsers ? "Show only my browser" : "Using another browser?"}
                   </button>
                 </div>
-                <p className="hint">If you loaded the unpacked companion before, disable it when installing the store version to avoid duplicate download capture.</p>
               </section>
 
               <section className="card minor rise d2" aria-labelledby="companion-manual-title">
                 <div className="card-head">
-                  <h2 id="companion-manual-title">Manual installation and Firefox</h2>
-                  <p>For Chrome or another Chromium browser without the store, and for Firefox.</p>
+                  <h2 id="companion-manual-title">Manual installation</h2>
+                  <p>Load the copy bundled with Fetchrail yourself, for a browser without store access.</p>
                 </div>
-                <ol className="steps">
-                  <li>
-                    <span className="mono" aria-hidden="true">1</span>
-                    <strong>Open the extension folder</strong>
-                    <button type="button" className="secondary-button" disabled={openingExtension} onClick={() => void openExtension("chromium")}>
-                      <FolderOpen size={16} /> Open extension folder
-                    </button>
-                  </li>
-                  <li>
-                    <span className="mono" aria-hidden="true">2</span>
-                    <strong>In Chrome or another Chromium browser, enable Developer mode</strong>
-                  </li>
-                  <li>
-                    <span className="mono" aria-hidden="true">3</span>
-                    <strong>Choose Load unpacked and select this folder</strong>
-                  </li>
-                </ol>
-                <div>
-                  <button type="button" className="ghost-button" disabled={openingExtension} onClick={() => void openExtension("firefox")}>
-                    Firefox folder
-                  </button>
-                </div>
-                <p className="hint">Unpacked companions follow the version bundled with Fetchrail after their panels close. Firefox temporary add-ons use Load Temporary Add-on in about:debugging and must be loaded again after a browser restart.</p>
+                {defaultBrowser !== undefined &&
+                  companions.map((browser) => (
+                    <div key={browser} className="manual-browser">
+                      {companions.length > 1 && <strong className="manual-title">{browser === "firefox" ? "Firefox" : "Chrome and Chromium browsers"}</strong>}
+                      <ol className="steps">
+                        <li>
+                          <span className="mono" aria-hidden="true">1</span>
+                          <strong>{browser === "firefox" ? "Open the Firefox folder" : "Open the extension folder"}</strong>
+                          <button type="button" className="secondary-button" disabled={openingExtension} onClick={() => void openExtension(browser)}>
+                            <FolderOpen size={16} /> {browser === "firefox" ? "Firefox folder" : "Open extension folder"}
+                          </button>
+                        </li>
+                        <li>
+                          <span className="mono" aria-hidden="true">2</span>
+                          <strong>{browser === "firefox" ? "In Firefox, open about:debugging and choose This Firefox" : "In Chrome or another Chromium browser, enable Developer mode"}</strong>
+                        </li>
+                        <li>
+                          <span className="mono" aria-hidden="true">3</span>
+                          <strong>{browser === "firefox" ? "Choose Load Temporary Add-on and select manifest.json in this folder" : "Choose Load unpacked and select this folder"}</strong>
+                        </li>
+                      </ol>
+                    </div>
+                  ))}
+                <p className="hint">
+                  Unpacked companions follow the version bundled with Fetchrail after their panels close.
+                  {companions.includes("firefox") ? " Firefox removes a temporary add-on when it restarts; the store version stays installed." : ""}
+                </p>
               </section>
 
               <section className="card rise d3" aria-labelledby="companion-repair-title">
@@ -2799,46 +2922,274 @@ function Stepper({
   );
 }
 
-// File endings as chips: a space, comma or Enter turns what was typed into one, clicking a chip removes it.
-function EndingsField({ label, value, onChange }: { label: string; value: string[]; onChange: (value: string[]) => void }) {
-  const [text, setText] = useState("");
-  const endings = value.filter(Boolean);
-  const add = (typed: string) => {
-    const next = typed.toLowerCase().split(/[\s,]+/).map((ending) => ending.replace(/^\.+/, "")).filter(Boolean);
-    if (next.length) onChange([...new Set([...endings, ...next])]);
-    setText("");
-  };
+// What was typed or pasted as endings: spaces, commas, semicolons and new lines separate them, and a leading dot or "*." is dropped.
+export function parseEndings(typed: string) {
+  return typed.toLowerCase().split(/[\s,;]+/).map((ending) => ending.replace(/^\*?\.+/, "").replace(/^\*$/, "")).filter(Boolean);
+}
+
+const endingCount = (count: number) => `${count} ${count === 1 ? "ending" : "endings"}`;
+
+// One category on a single line, however many endings it has; its endings open below it for editing.
+function CategoryRule({
+  category,
+  index,
+  expanded,
+  owners,
+  names,
+  onToggle,
+  onChange,
+  onRemove,
+}: {
+  category: Category;
+  index: number;
+  expanded: boolean;
+  // Which categories list each ending, in list order.
+  owners: Map<string, number[]>;
+  names: string[];
+  onToggle: () => void;
+  onChange: (patch: Partial<Category>) => void;
+  onRemove: () => void;
+}) {
+  const id = "endings-" + index;
+  const name = category.name || "this category";
+  const endings = category.extensions.filter(Boolean);
+  const count = endingCount(endings.length);
   return (
-    <div className="endings">
-      {endings.map((ending) => (
+    <div className={expanded ? "category-rule open" : "category-rule"}>
+      <div className="category">
+        <input
+          value={category.name}
+          onChange={(event) => onChange({ name: event.target.value })}
+          placeholder="Name"
+          aria-label="Category name"
+          maxLength={32}
+          data-category-name={index}
+        />
         <button
-          key={ending}
           type="button"
-          className="mono"
-          onClick={() => onChange(endings.filter((entry) => entry !== ending))}
-          title="Remove"
-          aria-label={`Remove ${ending}`}
+          className="endings-summary"
+          id={id + "-toggle"}
+          aria-expanded={expanded}
+          aria-controls={id}
+          aria-label={`${expanded ? "Close" : "Edit"} file endings for ${name}, ${count}`}
+          onClick={onToggle}
         >
-          {ending}
+          <span className="endings-preview mono" aria-hidden="true">
+            {endings.length ? endings.slice(0, 24).map((ending) => <span key={ending}>{ending}</span>) : <em>Add file endings</em>}
+          </span>
+          <span className="endings-count">{count}</span>
+          <ChevronDown size={16} className="chevron" />
         </button>
-      ))}
-      <input
-        className="mono"
-        value={text}
-        onChange={(event) => (/[\s,]/.test(event.target.value) ? add(event.target.value) : setText(event.target.value))}
-        onKeyDown={(event) => {
-          if (event.key === "Enter") {
-            event.preventDefault();
-            add(text);
-          } else if (event.key === "Backspace" && !text && endings.length) {
-            onChange(endings.slice(0, -1));
-          }
-        }}
-        onBlur={() => add(text)}
-        placeholder={endings.length ? "" : "zip rar 7z"}
-        aria-label={label}
-        spellCheck={false}
-      />
+        <ArrowRight size={16} className="route" aria-hidden="true" />
+        <input
+          className="mono"
+          value={category.folder}
+          onChange={(event) => onChange({ folder: event.target.value })}
+          placeholder="Folder"
+          aria-label={`Folder for ${name}`}
+          spellCheck={false}
+        />
+        <button
+          type="button"
+          className="icon-button"
+          onClick={async () => {
+            const selected = await open({ directory: true, multiple: false });
+            if (typeof selected === "string") onChange({ folder: selected });
+          }}
+          title="Choose folder"
+          aria-label={`Choose folder for ${name}`}
+        >
+          <FolderOpen size={16} />
+        </button>
+        <button type="button" className="icon-button" onClick={onRemove} title="Remove category" aria-label={`Remove ${name}`}>
+          <Trash2 size={16} />
+        </button>
+      </div>
+      {expanded && (
+        <EndingsEditor
+          id={id}
+          name={name}
+          endings={endings}
+          index={index}
+          owners={owners}
+          names={names}
+          onChange={(extensions) => onChange({ extensions })}
+          onDone={() => {
+            onToggle();
+            document.getElementById(id + "-toggle")?.focus();
+          }}
+        />
+      )}
+    </div>
+  );
+}
+
+// Adds several endings at once, filters a long list and removes single ones; the list scrolls inside a fixed height.
+function EndingsEditor({
+  id,
+  name,
+  endings,
+  index,
+  owners,
+  names,
+  onChange,
+  onDone,
+}: {
+  id: string;
+  name: string;
+  endings: string[];
+  index: number;
+  owners: Map<string, number[]>;
+  names: string[];
+  onChange: (endings: string[]) => void;
+  onDone: () => void;
+}) {
+  const [text, setText] = useState("");
+  const [filter, setFilter] = useState("");
+  const [note, setNote] = useState("");
+  const [fresh, setFresh] = useState<string[]>([]);
+  const [undo, setUndo] = useState<{ ending: string; at: number } | null>(null);
+  const list = useRef<HTMLUListElement>(null);
+  const term = parseEndings(filter)[0] ?? "";
+  const shown = term ? endings.filter((ending) => ending.includes(term)) : endings;
+  // An ending an earlier category also lists never reaches this one.
+  const firstOwner = (ending: string) => (owners.get(ending) ?? []).find((at) => at !== index);
+  const shadowed = (ending: string) => (owners.get(ending)?.[0] ?? index) < index;
+  const hidden = endings.filter(shadowed).length;
+
+  function add(typed: string) {
+    const parsed = parseEndings(typed);
+    setText("");
+    if (!parsed.length) return;
+    const added = [...new Set(parsed)].filter((ending) => !endings.includes(ending));
+    const repeated = parsed.length - added.length;
+    const shared = added.filter((ending) => firstOwner(ending) !== undefined);
+    if (added.length) {
+      onChange([...endings, ...added]);
+      // New endings join the end of the list, so it scrolls to show them.
+      requestAnimationFrame(() => list.current?.scrollTo({ top: list.current.scrollHeight }));
+    }
+    setFresh(added);
+    setUndo(null);
+    setFilter("");
+    setNote(
+      [
+        added.length ? (added.length <= 4 ? `Added ${added.join(", ")}` : `Added ${added.length} endings`) : "",
+        repeated ? `${repeated} already listed` : "",
+        shared.length ? `${shared.slice(0, 3).join(", ")}${shared.length > 3 ? "…" : ""} also in ${names[firstOwner(shared[0])!] || "another category"}` : "",
+      ].filter(Boolean).join(" · ") || "Nothing to add",
+    );
+  }
+
+  function remove(ending: string) {
+    const at = endings.indexOf(ending);
+    const position = shown.indexOf(ending);
+    onChange(endings.filter((entry) => entry !== ending));
+    setUndo({ ending, at });
+    setFresh([]);
+    setNote(`Removed ${ending}`);
+    // Keyboard focus moves on to the neighbouring ending instead of falling back to the page.
+    requestAnimationFrame(() => {
+      const buttons = list.current?.querySelectorAll("button");
+      const next = buttons?.[Math.min(position, buttons.length - 1)];
+      if (next) next.focus();
+      else document.getElementById(id + "-add")?.focus();
+    });
+  }
+
+  return (
+    <div
+      className="endings-editor"
+      id={id}
+      role="group"
+      aria-label={`File endings for ${name}`}
+      onKeyDown={(event) => {
+        if (event.key === "Escape") {
+          event.stopPropagation();
+          onDone();
+        }
+      }}
+    >
+      <div className="endings-tools">
+        <label className="endings-field add">
+          <Plus size={15} aria-hidden="true" />
+          <input
+            id={id + "-add"}
+            className="mono"
+            value={text}
+            onChange={(event) => (/[\s,;]/.test(event.target.value) ? add(event.target.value) : setText(event.target.value))}
+            onKeyDown={(event) => {
+              if (event.key === "Enter") {
+                event.preventDefault();
+                add(text);
+              }
+            }}
+            onBlur={() => text.trim() && add(text)}
+            placeholder="Add endings: mkv, mp4 webm"
+            aria-label={`Add file endings to ${name}`}
+            spellCheck={false}
+            autoComplete="off"
+          />
+          <button type="button" className="primary-button" disabled={!text.trim()} onMouseDown={(event) => event.preventDefault()} onClick={() => add(text)}>
+            Add
+          </button>
+        </label>
+        {endings.length > 12 && (
+          <label className="endings-field">
+            <Search size={15} aria-hidden="true" />
+            <input
+              type="search"
+              value={filter}
+              onChange={(event) => setFilter(event.target.value)}
+              onKeyDown={(event) => event.key === "Enter" && event.preventDefault()}
+              placeholder={`Filter ${endingCount(endings.length)}`}
+              aria-label={`Filter file endings for ${name}`}
+              spellCheck={false}
+              autoComplete="off"
+            />
+          </label>
+        )}
+      </div>
+      <ul className="endings-list" ref={list} aria-label={`${endingCount(shown.length)}${term ? ` matching ${term}` : ""}`}>
+        {shown.map((ending) => (
+          <li
+            key={ending}
+            className={(fresh.includes(ending) ? "fresh " : "") + (shadowed(ending) ? "shadowed" : "")}
+            title={shadowed(ending) ? `${names[owners.get(ending)![0]] || "An earlier category"} is higher in the list, so it gets .${ending} files` : undefined}
+          >
+            <span className="mono">{ending}</span>
+            <button type="button" onClick={() => remove(ending)} aria-label={`Remove ${ending}`}>
+              <X size={12} />
+            </button>
+          </li>
+        ))}
+        {!shown.length && <li className="endings-empty">{term ? `No ending matches “${term}”.` : "No endings yet. Files that match no category go to General."}</li>}
+      </ul>
+      <div className="endings-foot">
+        <span role="status">
+          {note ||
+            (hidden
+              ? `${endingCount(hidden)} dimmed: a category higher in the list already takes ${hidden === 1 ? "it" : "them"}.`
+              : "Separate several endings with spaces, commas or Enter.")}
+        </span>
+        {undo && (
+          <button
+            type="button"
+            className="ghost-button"
+            onClick={() => {
+              if (!endings.includes(undo.ending)) onChange([...endings.slice(0, undo.at), undo.ending, ...endings.slice(undo.at)]);
+              setFresh([undo.ending]);
+              setNote(`Restored ${undo.ending}`);
+              setUndo(null);
+            }}
+          >
+            Undo
+          </button>
+        )}
+        <button type="button" className="secondary-button" onClick={onDone}>
+          Done
+        </button>
+      </div>
     </div>
   );
 }
