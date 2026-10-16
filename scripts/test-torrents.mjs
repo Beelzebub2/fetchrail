@@ -138,7 +138,8 @@ try {
     const magnet = `magnet:?xt=urn:${h.length === 40 ? "btih:" + h : "btmh:1220" + h}`;
     await receive.call({ op: "add", id: importId, source: magnet, destination: importDir, config, importing: true });
     await receive.call({ op: "peer", id: importId, address: "127.0.0.1", port });
-    await until(async () => { await receive.call({ op: "poll" }); return (await receive.call({ op: "details", id: importId })).metadata; }, format + " magnet metadata");
+    // Match the app's persisted event; in-memory metadata can precede its cache.
+    await until(async () => (await receive.call({ op: "poll" })).events.some(event => event.id === importId && event.type === "metadata"), format + " persisted magnet metadata");
     assert.deepEqual(await readdir(importDir), [], "Metadata import must not write payload before confirmation");
     await receive.call({ op: "remove", id: importId });
     if (format === "hybrid") {
