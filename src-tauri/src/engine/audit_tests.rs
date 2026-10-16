@@ -780,7 +780,7 @@ async fn benchmark_synthetic_windows_attachment_and_publish() {
     } else {
         format!("http://127.0.0.1/{filename}")
     };
-    crate::platform::mark_download(&staging, &source, &filename, Some(trace.clone()))
+    crate::platform::mark_download(&staging, &source, &filename, true, Some(trace.clone()))
         .await
         .unwrap();
     let attachment_ms = scan_started.elapsed().as_millis();
@@ -813,6 +813,32 @@ async fn benchmark_synthetic_windows_attachment_and_publish() {
         gib, extension, populated, internet_source, populate_ms, save_ms, attachment_ms, rename_ms, publish_ms
     );
     drop(protected);
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn optional_attachment_check_still_marks_internet_origin() {
+    let root = std::env::temp_dir().join(format!("fetchrail-origin-test-{}", Uuid::new_v4()));
+    fs::create_dir_all(&root).await.unwrap();
+    let path = root.join("safe-test.bin");
+    fs::write(&path, b"verified payload").await.unwrap();
+    crate::platform::mark_download(
+        &path,
+        "https://example.com/safe-test.bin",
+        "safe-test.bin",
+        false,
+        #[cfg(feature = "test-tools")]
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(fs::read(&path).await.unwrap(), b"verified payload");
+    let origin = fs::read_to_string(format!("{}:Zone.Identifier", path.display()))
+        .await
+        .unwrap();
+    assert!(origin.contains("ZoneId=3"));
+    assert!(origin.contains("HostUrl=https://example.com/safe-test.bin"));
+    fs::remove_dir_all(&root).await.unwrap();
 }
 
 #[tokio::test]

@@ -5459,7 +5459,9 @@ impl DownloadManager {
             trace.phase(trace::Phase::Attachment);
         }
         #[cfg(windows)]
-        let overlapping = if total >= 64 * 1024 * 1024 && {
+        let windows_attachment_check = self.settings.read().await.windows_attachment_check;
+        #[cfg(windows)]
+        let overlapping = if windows_attachment_check && total >= 64 * 1024 * 1024 && {
             let enabled = true;
             #[cfg(feature = "test-tools")]
             let enabled = enabled
@@ -5498,6 +5500,7 @@ impl DownloadManager {
                                 &path,
                                 &url,
                                 &name,
+                                true,
                                 #[cfg(feature = "test-tools")]
                                 scan_trace,
                             ))
@@ -5523,6 +5526,7 @@ impl DownloadManager {
                     &temp_path,
                     &record.url,
                     desired_name,
+                    windows_attachment_check,
                     #[cfg(feature = "test-tools")]
                     task.trace.clone(),
                 )
@@ -5938,6 +5942,7 @@ fn default_settings(download_dir: &Path) -> DownloadSettings {
         connections_per_download: 8,
         performance_auto: false,
         min_segment_size_mb: 4,
+        windows_attachment_check: true,
         launch_on_start: false,
         minimize_to_tray: true,
         theme: Default::default(),

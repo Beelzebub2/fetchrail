@@ -1,10 +1,12 @@
 # Windows finalization
 
-Fetchrail completes a download after its bytes are durable, Windows Attachment Services accepts it, every byte matches the pre-scan digest or committed range hashes, no-overwrite publication succeeds, and both catalog generations acknowledge the completed record. The finished file is released and private transfer data is cleaned before the completion event. There is no deferred payload cleanup or post-completion verification.
+Fetchrail completes a download after its bytes are durable, the configured Windows attachment check (enabled by default) has run, every byte matches the pre-attachment digest or committed range hashes, no-overwrite publication succeeds, and both catalog generations acknowledge the completed record. The finished file is released and private transfer data is cleaned before the completion event. There is no deferred payload cleanup or post-completion verification.
+
+Settings → Downloads → Files offers a Windows-only option to skip the app-initiated Attachment Services approval step. Existing profiles default to enabled, and the UI warns before a user saves an opt-out. Internet-zone provenance is still written and synced when the filesystem supports it, and full content verification, protected no-clobber publishing and durable completion remain mandatory. Windows Defender real-time scanning is managed by Windows and is unaffected by this setting; skipping the attachment check does not guarantee a shorter finalization or bypass other Windows security checks.
 
 Windows private assembly names retain the requested file extension after their unique `.fetchrail-part` marker. This presents a consistent file type to Windows before publication. Existing extensionless `.fetchrail-part` checkpoints remain recoverable; extensionless downloads keep their previous naming. Linux generation keeps its existing naming.
 
-For Windows files of at least 64 MiB, Fetchrail can check all bytes concurrently with attachment processing. A read-cache notification observes primary-stream changes without denying scanner writes or deletion. After scanning, the ordinary write-denying publication handle is acquired and identity/length are checked. The concurrent full verification is reused only if the notification is still pending. Otherwise a fresh protected verification is mandatory. Unsupported notifications, exhausted capacity and smaller files retain sequential checks.
+With Windows checking enabled, for files of at least 64 MiB, Fetchrail can check all bytes concurrently with attachment processing. A read-cache notification observes primary-stream changes without denying scanner writes or deletion. After scanning, the ordinary write-denying publication handle is acquired and identity/length are checked. The concurrent full verification is reused only if the notification is still pending. Otherwise a fresh protected verification is mandatory. Unsupported notifications, exhausted capacity, smaller files and user opt-outs retain sequential protected checks.
 
 At most two scans can add concurrent integrity readers. Existing per-file reader and buffer limits still apply. Finalization continues to count as busy work for calibration and disk admission. No user connection count, bandwidth limit, antivirus policy or origin-marking behavior is changed.
 
@@ -18,7 +20,7 @@ A local same-binary ABBA comparison using a roughly 20 GiB archive measured fina
 
 Deferred cleanup and metadata-only publication experiments were rejected: their observed waits were shifted into file operations or remained present. The production publisher keeps its existing writable protection, no-replacement rename and final flush. The completed event does not precede those checks or owned cleanup.
 
-Windows trust services can take time to inspect large files. Their acceptance remains a completion prerequisite; zero elapsed finalization is not guaranteed.
+Windows trust services can take time to inspect large files. Their acceptance remains a completion prerequisite when Windows checking is enabled; zero elapsed finalization is not guaranteed in either mode.
 
 ## Platform references
 

@@ -211,6 +211,9 @@ pub struct DownloadSettings {
     #[serde(default)]
     pub performance_auto: bool,
     pub min_segment_size_mb: u64,
+    /// Ask Windows Attachment Services to check the file before publication.
+    #[serde(default = "default_true")]
+    pub windows_attachment_check: bool,
     #[serde(default)]
     pub launch_on_start: bool,
     #[serde(default = "default_true")]
@@ -560,6 +563,7 @@ mod tests {
             connections_per_download: 8,
             performance_auto: false,
             min_segment_size_mb: 4,
+            windows_attachment_check: true,
             launch_on_start: false,
             minimize_to_tray: true,
             theme: Theme::default(),
@@ -613,10 +617,20 @@ mod tests {
         let mut legacy = serialized.as_object().unwrap().clone();
         legacy.remove("sortIntoCategoryFolders");
         legacy.remove("deleteFilesOnRemove");
+        legacy.remove("windowsAttachmentCheck");
         let restored: DownloadSettings =
             serde_json::from_value(serde_json::Value::Object(legacy)).unwrap();
         assert!(restored.sort_into_category_folders);
         assert_eq!(restored.delete_files_on_remove, None);
+        assert!(
+            restored.windows_attachment_check,
+            "existing profiles retain Windows checking"
+        );
+        let mut opted_out = settings.clone();
+        opted_out.windows_attachment_check = false;
+        let roundtrip: DownloadSettings =
+            serde_json::from_value(serde_json::to_value(opted_out).unwrap()).unwrap();
+        assert!(!roundtrip.windows_attachment_check);
         assert!(default_categories()
             .iter()
             .any(|category| category.name == "Programs"
