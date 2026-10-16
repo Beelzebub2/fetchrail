@@ -113,7 +113,7 @@ impl SetupChoices {
         };
         let mut arguments = vec![
             format!("--theme={}", name(serde_json::to_value(self.theme))),
-            format!("--accent={}", name(serde_json::to_value(self.accent))),
+            format!("--accent={}", name(serde_json::to_value(&self.accent))),
             format!("--download-dir={}", self.download_dir.trim()),
         ];
         if self.launch_on_start {
@@ -724,14 +724,14 @@ mod tests {
     #[test]
     fn setup_hands_its_choices_to_the_installed_app() {
         let choices: SetupChoices = serde_json::from_str(
-            r#"{"launchOnStart":true,"theme":"light","accent":"iris","downloadDir":"E:\\My Files"}"#,
+            r##"{"launchOnStart":true,"theme":"light","accent":"#A594FF","downloadDir":"E:\\My Files"}"##,
         )
         .unwrap();
         assert_eq!(
             choices.arguments(),
             [
                 "--theme=light",
-                "--accent=iris",
+                "--accent=#a594ff",
                 r"--download-dir=E:\My Files",
                 "--launch-on-start"
             ]
@@ -741,7 +741,7 @@ mod tests {
         )
         .unwrap();
         assert!(settings.apply_setup_arguments(&choices.arguments()));
-        assert_eq!(settings.accent, Accent::Iris);
+        assert_eq!(settings.accent, Accent("#a594ff".into()));
         assert_eq!(settings.default_download_dir, r"E:\My Files");
 
         let quiet = SetupChoices {

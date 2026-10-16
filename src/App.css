@@ -67,12 +67,7 @@
   --accent-soft: rgba(242,106,27,.12);
   --tip: #a83f05;
 }
-:root[data-accent=azure] { --accent: #5aa9ff; --accent-ink: #04101f; --accent-text: #7bbaff; --accent-soft: rgba(90,169,255,.14); --tip: #cfe5ff; }
-:root[data-accent=jade] { --accent: #3fd6a0; --accent-ink: #03170f; --accent-text: #5fe0b3; --accent-soft: rgba(63,214,160,.13); --tip: #c9f5e3; }
-:root[data-accent=iris] { --accent: #a594ff; --accent-ink: #100a2b; --accent-text: #b5a8ff; --accent-soft: rgba(165,148,255,.15); --tip: #e3ddff; }
-:root[data-theme=light][data-accent=azure] { --accent: #1f6feb; --accent-ink: #fff; --accent-text: #1a5fd0; --accent-soft: rgba(31,111,235,.1); --tip: #0b3d91; }
-:root[data-theme=light][data-accent=jade] { --accent: #0b7f57; --accent-ink: #fff; --accent-text: #0a6f4c; --accent-soft: rgba(11,127,87,.1); --tip: #064a32; }
-:root[data-theme=light][data-accent=iris] { --accent: #5d45e6; --accent-ink: #fff; --accent-text: #4f39cf; --accent-soft: rgba(93,69,230,.1); --tip: #2f1f8f; }
+/* The accent colors above are Ember until applyLook paints the picked accent over them. */
 
 * { box-sizing: border-box; scrollbar-width: thin; scrollbar-color: var(--line) transparent; }
 html, body, #root { margin: 0; height: 100%; }
@@ -328,7 +323,6 @@ h1, h2, p { margin: 0; }
 .form .choice:has(:focus-visible) { outline: 2px solid var(--accent); outline-offset: 2px; }
 .choice input { position: absolute; opacity: 0; pointer-events: none; }
 .theme-cards { max-width: 420px; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
-.accent-cards { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; }
 .form .look-card { position: relative; display: grid; align-content: start; gap: 10px; padding: 8px 8px 10px; border: 1px solid var(--line); border-radius: 14px; color: var(--text-2); font-size: 13.5px; font-weight: 600; cursor: pointer; transition: background 180ms, color 150ms, border-color 180ms, transform 220ms var(--ease); }
 .form .look-card:hover { color: var(--text); transform: translateY(-2px); }
 .form .look-card:has(:checked) { border-color: var(--accent); color: var(--text); background: var(--accent-soft); }
@@ -349,14 +343,30 @@ h1, h2, p { margin: 0; }
 .theme-preview span + span i:first-child { width: 12px; height: 12px; border-radius: 3px; background: var(--p-raised); }
 .theme-preview span + span i:nth-child(2) { width: 34%; background: var(--p-mute); }
 .theme-preview span + span i:last-child { flex: 1; background: linear-gradient(to right, var(--accent) var(--w), var(--p-line) var(--w)); }
-.accent-strands { display: flex; gap: 2px; height: 8px; margin: 4px 4px 0; }
-.accent-strands i { flex: 1; border-radius: 4px; background: var(--swatch); }
-.accent-strands i:first-child { flex: 3; }
-.accent-strands i:nth-child(2) { flex: 2; }
-.look-card[data-accent=ember] { --swatch: #ff8a3d; }
-.look-card[data-accent=azure] { --swatch: #5aa9ff; }
-.look-card[data-accent=jade] { --swatch: #3fd6a0; }
-.look-card[data-accent=iris] { --swatch: #a594ff; }
+.accent-picker { display: grid; gap: 14px; }
+.accent-tools { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.accent-presets { position: relative; display: flex; gap: 6px; margin-right: auto; }
+.accent-preset { width: 44px; height: 44px; display: grid; place-items: center; padding: 0; border: 0; border-radius: 50%; background: transparent; cursor: pointer; }
+.accent-preset span { width: 28px; height: 28px; border-radius: 50%; transition: background 300ms, transform 320ms var(--spring); }
+.accent-preset:hover span { transform: scale(1.12); }
+.accent-preset:active span { transform: scale(.92); }
+.accent-ring { position: absolute; top: 0; left: 0; width: 44px; height: 44px; border: 2px solid var(--accent); border-radius: 50%; pointer-events: none; transition: transform 460ms var(--spring), opacity 200ms, border-color 300ms; }
+.form input.accent-hex { width: 112px; text-transform: uppercase; }
+.accent-sample { width: 40px; padding: 0; }
+.accent-field { position: relative; height: 148px; border-radius: 12px; box-shadow: inset 0 0 0 1px rgba(255,255,255,.07); cursor: crosshair; touch-action: none; user-select: none; }
+:root[data-theme=light] .accent-field { box-shadow: inset 0 0 0 1px rgba(18,21,28,.08); }
+/* The thumb's layer spans the field, so a percentage translate lands it on the picked spot. */
+.accent-thumb { position: absolute; inset: 0; pointer-events: none; will-change: transform; transition: transform 560ms var(--spring); }
+.moving .accent-thumb { transition: transform 90ms var(--ease); }
+.accent-thumb button { position: absolute; top: 0; left: 0; width: 28px; height: 28px; margin: -14px 0 0 -14px; padding: 0; border: 3px solid #fff; border-radius: 50%; outline: 0; background: var(--accent); box-shadow: 0 0 0 1px rgba(0,0,0,.18), 0 4px 14px rgba(0,0,0,.35); transition: transform 340ms var(--spring), background 300ms, box-shadow 200ms; }
+.accent-thumb button:focus-visible { box-shadow: 0 0 0 1px rgba(0,0,0,.18), 0 0 0 6px rgba(255,255,255,.5), 0 4px 14px rgba(0,0,0,.35); }
+:is(.pressed,.moving) .accent-thumb button { transform: scale(1.2); }
+.moving .accent-thumb button { transition: transform 340ms var(--spring), background 60ms, box-shadow 200ms; }
+.accent-loupe { position: absolute; top: -22px; left: 0; display: flex; align-items: center; gap: 8px; padding: 5px 10px 5px 5px; border-radius: 10px; color: var(--text); background: var(--raised); font-size: 12px; font-weight: 600; white-space: nowrap; box-shadow: 0 10px 30px var(--shade); opacity: 0; transform: translate(-50%, -90%) scale(.85); transform-origin: 50% 100%; transition: opacity 150ms, transform 320ms var(--spring); }
+.accent-loupe i { width: 18px; height: 18px; border-radius: 6px; background: var(--accent); }
+.moving .accent-loupe { opacity: 1; transform: translate(-50%, -100%) scale(1); }
+.accent-note { min-height: 18px; display: flex; align-items: center; gap: 6px; color: var(--text-3); font-size: 12px; }
+.accent-note svg { flex: none; color: var(--accent-text); }
 
 /* The room under the last card is what the save bar floats over. */
 .settings { --field: var(--bg); max-width: 1180px; margin: 0 auto; padding-bottom: 72px; }
@@ -522,7 +532,9 @@ h1, h2, p { margin: 0; }
 .setup-foot .primary-button svg { transition: transform 220ms var(--ease); }
 .setup-foot .primary-button:hover:not(:disabled) svg { transform: translateX(3px); }
 .setup .looks { grid-template-columns: 252px minmax(0, 1fr); gap: 22px; }
-.setup :is(.theme-cards,.accent-cards) { max-width: none; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
+.setup .looks { align-items: start; }
+.setup .accent-field { height: 96px; }
+.setup .theme-cards { max-width: none; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
 .setup .look-card { gap: 8px; padding: 7px 7px 9px; border-radius: 13px; font-size: 13px; }
 .setup .theme-preview { height: 62px; gap: 8px; padding: 8px; }
 .setup .theme-preview > :last-child { display: none; }
@@ -566,7 +578,6 @@ h1, h2, p { margin: 0; }
 @media (max-width:760px) {
   .rail-main { padding-inline: 16px; }
   .queue-pills { margin-left: 0; }
-  .accent-cards { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .queue-settings-item { grid-template-columns: minmax(0, 1fr) auto; }
   .queue-settings-item.axis { display: none; }
   .queue-plan { grid-column: 1 / -1; grid-row: 2; }

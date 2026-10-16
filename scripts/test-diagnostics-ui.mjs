@@ -5,6 +5,7 @@ import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { dirname, extname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { accentColors, accentSpot } from "../src/accent.js";
 
 // Run after npm run build. Pass a Playwright module path when using the bundled runtime.
 const { chromium } = createRequire(import.meta.url)(process.argv[2] ?? "playwright");
@@ -239,7 +240,7 @@ try {
   assert.equal(await page.getByRole("heading",{name:"How long downloads might take",exact:true}).count(),0);
   await page.getByRole("button",{name:"Grade scale",exact:true}).click();
   assert.ok(await page.locator(".diag-badge").evaluateAll(badges=>badges.every(badge=>[badge,...badge.querySelectorAll("*")].every(el=>getComputedStyle(el).animationName==="none"))),"All grades must rest without reduced motion enabled");
-  for (const theme of ["dark","light"]) for (const accent of ["ember","azure","jade","iris"]) {await page.evaluate(({theme,accent})=>{document.documentElement.dataset.theme=theme;document.documentElement.dataset.accent=accent;},{theme,accent});await page.screenshot({path:join(output,`diagnostics-grades-${theme}-${accent}.png`),fullPage:true});}
+  for (const theme of ["dark","light"]) for (const accent of ["ember","azure","jade","iris"]) {await page.evaluate(({theme,colors})=>{document.documentElement.dataset.theme=theme;for(const [name,value] of Object.entries(colors))document.documentElement.style.setProperty(name,value);},{theme,colors:accentColors(accentSpot(accent),theme)});await page.screenshot({path:join(output,`diagnostics-grades-${theme}-${accent}.png`),fullPage:true});}
   await page.emulateMedia({reducedMotion:"reduce"});await page.setViewportSize({width:375,height:800});
   await page.screenshot({path:join(output,"diagnostics-grades-narrow-reduced.png"),fullPage:true});
   assert.ok(await page.locator(".diagnostics").evaluate(el=>el.getBoundingClientRect().width<=window.innerWidth));

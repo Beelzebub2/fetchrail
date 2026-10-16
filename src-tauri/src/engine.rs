@@ -6084,6 +6084,7 @@ fn default_settings(download_dir: &Path) -> DownloadSettings {
         sort_into_category_folders: true,
         auto_update: true,
         delete_files_on_remove: None,
+        progress_details: false,
     }
 }
 
