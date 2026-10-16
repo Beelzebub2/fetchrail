@@ -369,6 +369,19 @@ try {
   await rail.getByRole("status").filter({ hasText: "All changes saved" }).waitFor();
   assert.equal(await page.getByRole("heading", { name: "Connections", exact: true }).isVisible(), true, "Saving keeps Settings open.");
 
+  const windowsCheck = page.getByRole("checkbox", { name: "Check downloads with Windows security (recommended)" });
+  assert.equal(await windowsCheck.isChecked(), true, "Legacy settings keep Windows attachment checking enabled.");
+  await page.getByLabel("About Windows download security checks").click();
+  await page.getByText("there is no fixed maximum", { exact: false }).waitFor();
+  await page.screenshot({ path: join(output, "windows-download-security.png"), fullPage: true });
+  await windowsCheck.uncheck();
+  await page.getByRole("alert").filter({ hasText: "Unsafe files may reach your downloads folder" }).waitFor();
+  await page.getByRole("button", { name: "Save settings", exact: true }).click();
+  await page.waitForFunction(() => window.testSettings.windowsAttachmentCheck === false);
+  await windowsCheck.check();
+  await page.getByRole("button", { name: "Save settings", exact: true }).click();
+  await page.waitForFunction(() => window.testSettings.windowsAttachmentCheck === true);
+
   await page.getByRole("button", { name: "Increase simultaneous downloads", exact: true }).click();
   await page.locator(".save-dock").getByText("1 unsaved change", { exact: true }).waitFor();
   await page.getByRole("button", { name: "Discard", exact: true }).click();
@@ -592,6 +605,7 @@ try {
   console.log("PASS: Linux policy restrictions and connection selection block unsupported actions; saved actions remain clearable after capability loss");
   console.log("PASS: live progress, connection details, pause/resume/cancel, speed limits, completion settings, keyboard tabs, themes, completion actions, close behavior, and prompt handoff");
   console.log("PASS: settings contain switches, update buttons and long error text; both restart actions report launch failures");
+  console.log("PASS: Windows security check defaults on, explains variable finalization time, warns on opt-out and saves both choices");
   console.log("PASS: Windows/Linux companion settings recommend the store, report launch failures and retain Chromium/Firefox manual installation");
   console.log("Screenshots: " + output);
 } finally {

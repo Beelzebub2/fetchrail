@@ -155,6 +155,7 @@ export type DownloadSettings = Appearance & {
   connectionsPerDownload: number;
   performanceAuto: boolean;
   minSegmentSizeMb: number;
+  windowsAttachmentCheck: boolean;
   launchOnStart: boolean;
   minimizeToTray: boolean;
 };
@@ -2433,6 +2434,27 @@ function SettingsPage({
                       ))}
                     </div>
                   </fieldset>
+                  {capabilities?.os === "windows" && (
+                    <div className="windows-check">
+                      <div className="windows-check-row">
+                        <label className="check">
+                          <input
+                            type="checkbox"
+                            checked={draft.windowsAttachmentCheck !== false}
+                            onChange={(event) => onChange({ windowsAttachmentCheck: event.target.checked })}
+                          />
+                          Check downloads with Windows security (recommended)
+                        </label>
+                        <details className="windows-check-info">
+                          <summary aria-label="About Windows download security checks" title="About Windows download security checks"><Info size={16} /></summary>
+                          <p>Windows can run antivirus and attachment-policy checks before saving. On this computer, ~20 GB files took 14–25 seconds to finalize in tests, including verification and publishing. Checks may take longer; there is no fixed maximum. Turning this off skips Windows attachment approval. SHA-256 and Internet-origin marking stay on, and Defender real-time protection is unchanged.</p>
+                        </details>
+                      </div>
+                      {draft.windowsAttachmentCheck === false && (
+                        <p className="windows-check-warning" role="alert">Windows will no longer be asked to approve downloaded files before Fetchrail completes them. Unsafe files may reach your downloads folder.</p>
+                      )}
+                    </div>
+                  )}
                 </section>
               </div>
 
