@@ -228,7 +228,7 @@ async fn shared_http2_failures_keep_validated_prefixes_and_the_three_attempt_bud
         let transfer = async {
             DownloadManager::download_ranges(
                 &client,
-                &Arc::new(RateLimiter::new(0)),
+                &RateLimiter::new(0),
                 &job,
                 &CancellationToken::new(),
                 &server.url,
@@ -357,7 +357,7 @@ async fn micro_range_manifest_resumes_exact_prefixes_and_keeps_legacy_bounds() {
     assert!(!valid_manifest_ranges(&manifest, total));
     let job = task();
     let client = download_client_builder().no_proxy().build().unwrap();
-    let limiter = Arc::new(RateLimiter::new(0));
+    let limiter = RateLimiter::new(0);
     let segments = segment_counters(&dir, &ranges).await.unwrap();
     let cancel = CancellationToken::new();
     let (result, _) = tokio::join!(
@@ -455,7 +455,7 @@ async fn queued_ranges_keep_worker_ceiling_and_permits_across_successive_claims(
         *job.performance.lock().unwrap() = Some(policy.clone());
         DownloadManager::download_ranges(
             &download_client_builder().no_proxy().build().unwrap(),
-            &Arc::new(RateLimiter::new(0)),
+            &RateLimiter::new(0),
             &job,
             &CancellationToken::new(),
             &server.url,
@@ -510,7 +510,7 @@ async fn drained_group_recovers_each_slow_range_once_from_its_prefix() {
     job.record.write().await.connections = 8;
     DownloadManager::download_ranges(
         &download_client_builder().no_proxy().build().unwrap(),
-        &Arc::new(RateLimiter::new(0)),
+        &RateLimiter::new(0),
         &job,
         &CancellationToken::new(),
         &server.url,
@@ -568,7 +568,7 @@ async fn queued_ranges_fill_idle_workers_before_a_slow_range_finishes() {
         let started = Instant::now();
         DownloadManager::download_ranges(
             &download_client_builder().no_proxy().build().unwrap(),
-            &Arc::new(RateLimiter::new(0)),
+            &RateLimiter::new(0),
             &task(),
             &CancellationToken::new(),
             &server.url,
@@ -630,7 +630,7 @@ async fn cancellation_flushes_partial_bytes_and_resume_appends_exactly() {
     let (dir, segments, probe) = parts(total, 1).await;
     let task = task();
     let client = Client::builder().no_proxy().build().unwrap();
-    let limiter = Arc::new(RateLimiter::new(0));
+    let limiter = RateLimiter::new(0);
     let cancel = CancellationToken::new();
     let (result, _) = tokio::join!(
         DownloadManager::download_ranges(
@@ -684,7 +684,7 @@ async fn automatic_admission_waits_cancels_and_resumes_exact_parts() {
     let policy = crate::performance::LivePolicy::new(1, 4, 64 * 1024);
     *task.performance.lock().unwrap() = Some(policy.clone());
     let client = Client::builder().no_proxy().build().unwrap();
-    let limiter = Arc::new(RateLimiter::new(0));
+    let limiter = RateLimiter::new(0);
     let token = CancellationToken::new();
     let (result, _) = tokio::join!(
         DownloadManager::download_ranges(
@@ -754,7 +754,7 @@ async fn automatic_admission_waits_cancels_and_resumes_exact_parts() {
 async fn transient_failures_retry_only_the_failed_range() {
     let total = 8 * 1024 * 1024;
     let client = Client::builder().no_proxy().build().unwrap();
-    let limiter = Arc::new(RateLimiter::new(0));
+    let limiter = RateLimiter::new(0);
     for mode in ["retry", "drop", "short"] {
         let server = TestServer::new(total, mode);
         let (dir, segments, probe) = parts(total, 4).await;
@@ -806,7 +806,7 @@ async fn changed_or_encoded_representations_are_rejected_before_writing() {
         }
         let result = DownloadManager::download_ranges(
             &Client::builder().no_proxy().build().unwrap(),
-            &Arc::new(RateLimiter::new(0)),
+            &RateLimiter::new(0),
             &task(),
             &CancellationToken::new(),
             &server.url,
@@ -872,7 +872,7 @@ async fn unknown_total_never_sends_if_range_without_range() {
     let segments = segment_counters(&dir, &ranges).await.unwrap();
     DownloadManager::download_ranges(
         &download_client_builder().no_proxy().build().unwrap(),
-        &Arc::new(RateLimiter::new(0)),
+        &RateLimiter::new(0),
         &task(),
         &CancellationToken::new(),
         &server.url,
@@ -896,7 +896,7 @@ async fn trickling_tail_resumes_only_its_flushed_suffix() {
         Duration::from_secs(50),
         DownloadManager::download_ranges(
             &download_client_builder().no_proxy().build().unwrap(),
-            &Arc::new(RateLimiter::new(0)),
+            &RateLimiter::new(0),
             &task(),
             &CancellationToken::new(),
             &server.url,
@@ -928,7 +928,7 @@ async fn weak_transport_recovers_while_healthy_ranges_continue() {
     let (dir, segments, mut probe) = parts(total, 4).await;
     probe.validator = Some("\"fixture\"".into());
     let client = download_client_builder().no_proxy().build().unwrap();
-    let limiter = Arc::new(RateLimiter::new(0));
+    let limiter = RateLimiter::new(0);
     let task = task();
     let cancel = CancellationToken::new();
     let transfer = DownloadManager::download_ranges(
@@ -972,7 +972,7 @@ async fn shared_host_pause_does_not_renew_healthy_transports() {
     let (dir, segments, probe) = parts(total, 4).await;
     DownloadManager::download_ranges(
         &download_client_builder().no_proxy().build().unwrap(),
-        &Arc::new(RateLimiter::new(0)),
+        &RateLimiter::new(0),
         &task(),
         &CancellationToken::new(),
         &server.url,
@@ -997,7 +997,7 @@ async fn a_fast_completed_range_does_not_restart_steady_peers() {
         Duration::from_secs(90),
         DownloadManager::download_ranges(
             &download_client_builder().no_proxy().build().unwrap(),
-            &Arc::new(RateLimiter::new(0)),
+            &RateLimiter::new(0),
             &task(),
             &CancellationToken::new(),
             &server.url,
@@ -1070,7 +1070,7 @@ async fn shared_staging_resumes_verified_prefixes_and_repairs_only_corrupted_ran
     let cancel = CancellationToken::new();
     let client = download_client_builder().no_proxy().build().unwrap();
     let download_task = task();
-    let limiter = Arc::new(RateLimiter::new(0));
+    let limiter = RateLimiter::new(0);
     let (result, _) = tokio::join!(
         DownloadManager::download_ranges(
             &client,
@@ -1208,7 +1208,7 @@ async fn old_large_part_files_keep_their_layout_and_resume_offsets() {
     let segments = segment_counters(&dir, &ranges).await.unwrap();
     DownloadManager::download_ranges(
         &download_client_builder().no_proxy().build().unwrap(),
-        &Arc::new(RateLimiter::new(0)),
+        &RateLimiter::new(0),
         &task(),
         &CancellationToken::new(),
         &server.url,
@@ -1232,7 +1232,7 @@ async fn old_large_part_files_keep_their_layout_and_resume_offsets() {
 async fn single_stream_retries_restart_and_unknown_lengths_complete() {
     let total = 512 * 1024;
     let client = Client::builder().no_proxy().build().unwrap();
-    let limiter = Arc::new(RateLimiter::new(0));
+    let limiter = RateLimiter::new(0);
     for (mode, ranges, validated) in [
         ("retry", false, true),
         ("drop", false, true),
@@ -1292,7 +1292,7 @@ async fn single_stream_retries_restart_and_unknown_lengths_complete() {
 async fn ignored_and_invalid_ranges_stop_all_connections() {
     let total = 2 * 1024 * 1024;
     let client = Client::builder().no_proxy().build().unwrap();
-    let limiter = Arc::new(RateLimiter::new(0));
+    let limiter = RateLimiter::new(0);
     for mode in ["ignore", "invalid"] {
         let server = TestServer::new(total, mode);
         let (dir, segments, probe) = parts(total, 4).await;
@@ -1329,7 +1329,7 @@ async fn buffered_connections_still_share_live_speed_limits() {
     let (dir, segments, probe) = parts(total, 4).await;
     let task = task();
     task.limiter.set_limit(256 * 1024);
-    let limiter = Arc::new(RateLimiter::new(128 * 1024));
+    let limiter = RateLimiter::new(128 * 1024);
     let client = Client::builder().no_proxy().build().unwrap();
     let started = Instant::now();
     DownloadManager::download_ranges(
@@ -1367,7 +1367,7 @@ async fn transfer_throughput() {
     )
     .unwrap();
     let client = download_client_builder().no_proxy().build().unwrap();
-    let limiter = Arc::new(RateLimiter::new(0));
+    let limiter = RateLimiter::new(0);
     let connections =
         std::env::var("FETCHRAIL_BENCH_CONNECTIONS").unwrap_or_else(|_| "1,4,8".into());
     for connections in connections

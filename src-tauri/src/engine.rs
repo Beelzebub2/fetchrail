@@ -10,7 +10,7 @@ use std::{
 };
 
 use chrono::{DateTime, Utc};
-use futures_util::StreamExt;
+use futures_util::{future::join_all, StreamExt};
 use reqwest::{
     header::{
         self, HeaderMap, ACCEPT_ENCODING, CONTENT_DISPOSITION, CONTENT_LENGTH, CONTENT_RANGE,
@@ -1131,7 +1131,7 @@ pub struct DownloadManager {
     persist_lock: tokio::sync::Mutex<()>,
     dirty_progress: Mutex<ProgressEvents>,
     minimize_to_tray: AtomicBool,
-    limiter: Arc<RateLimiter>,
+    limiter: RateLimiter,
     dispatch_lock: tokio::sync::Mutex<()>,
     dispatch_suspended: AtomicBool,
 }
@@ -1430,7 +1430,7 @@ impl DownloadManager {
             client,
             tasks: RwLock::new(task_map),
             minimize_to_tray: AtomicBool::new(settings.minimize_to_tray),
-            limiter: Arc::new(RateLimiter::new(settings.speed_limit_bps)),
+            limiter: RateLimiter::new(settings.speed_limit_bps),
             dispatch_lock: tokio::sync::Mutex::new(()),
             bandwidth_broker: Mutex::new((Instant::now(), 0, (false, false), (0, 0))),
             dispatch_suspended: AtomicBool::new(false),
@@ -4309,25 +4309,25 @@ impl DownloadManager {
     #[allow(clippy::too_many_arguments)]
     async fn download_ranges(
         client: &Client,
-        limiter: &Arc<RateLimiter>,
+        limiter: &RateLimiter,
         task: &Arc<DownloadTask>,
         cancel: &CancellationToken,
         url: &Url,
         part_dir: &Path,
-        segments: &Segments,
+        segments: &[SegmentCounter],
         probe: &ProbeResult,
     ) -> EngineResult<()> {
         task.check_stopped(cancel)?;
         let batch_cancel = cancel.child_token();
         *task.received_sha256.lock().expect("received hash poisoned") = None;
-        let peer_rate = Arc::new(AtomicU64::new(0));
-        let live_peer_rate = Arc::new(AtomicU64::new(0));
+        let peer_rate = AtomicU64::new(0);
+        let live_peer_rate = AtomicU64::new(0);
         let shared = shared_staging(part_dir).await?;
         #[cfg(feature = "test-tools")]
         if let Some(trace) = &task.trace {
             trace.phase(trace::Phase::Body);
         }
-        let next_range = Arc::new(AtomicUsize::new(0));
+        let next_range = AtomicUsize::new(0);
         let record = task.record.read().await;
         let workers = record
             .requested_connections
@@ -4336,19 +4336,12 @@ impl DownloadManager {
             .min(segments.len());
         drop(record);
         let futures = (0..workers).map(|_| {
-            let batch_cancel = batch_cancel.clone();
-            let peer_rate = peer_rate.clone();
-            let live_peer_rate = live_peer_rate.clone();
-            let next_range = next_range.clone();
-            let client = client.clone();
-            let limiter = limiter.clone();
-            let task = task.clone();
-            let url = url.clone();
-            let part_dir = part_dir.to_owned();
-            let segments = segments.clone();
-            let probe = probe.clone();
+            let batch_cancel = &batch_cancel;
+            let peer_rate = &peer_rate;
+            let live_peer_rate = &live_peer_rate;
+            let next_range = &next_range;
             async move {
-                let mut client = client;
+                let mut client = client.clone();
                 let policy = task
                     .performance
                     .lock()
@@ -4356,7 +4349,7 @@ impl DownloadManager {
                     .clone();
                 let mut range_permit = None;
                 loop {
-                    task.check_stopped(&batch_cancel)?;
+                    task.check_stopped(batch_cancel)?;
                     let index = next_range.fetch_add(1, Ordering::Relaxed);
                     let Some(segment) = segments.get(index) else {
                         return Ok(());
@@ -4384,14 +4377,14 @@ impl DownloadManager {
                                     );
                                 }
                             }
-                            task.check_stopped(&batch_cancel)?;
+                            task.check_stopped(batch_cancel)?;
                             if let Some(policy) = &policy {
                                 if range_permit.is_none() || policy.should_drain() {
                                     drop(range_permit.take());
                                     segment.waiting.store(true, Ordering::Relaxed);
                                     range_permit = Some(
                                         policy
-                                            .acquire(&batch_cancel)
+                                            .acquire(batch_cancel)
                                             .await
                                             .ok_or(EngineError::Cancelled)?,
                                     );
@@ -4400,19 +4393,19 @@ impl DownloadManager {
                             }
                             let result = Self::download_segment(
                                 &client,
-                                &limiter,
-                                &task,
-                                &batch_cancel,
-                                &url,
-                                &part_dir,
+                                limiter,
+                                task,
+                                batch_cancel,
+                                url,
+                                part_dir,
                                 index,
                                 segment,
-                                &probe,
-                                &peer_rate,
-                                &segments,
+                                probe,
+                                peer_rate,
+                                segments,
                                 workers,
                                 shared,
-                                &live_peer_rate,
+                                live_peer_rate,
                                 !recovered_slow_peer
                                     && probe.accepts_ranges
                                     && probe.validator.is_some(),
@@ -4540,30 +4533,7 @@ impl DownloadManager {
                 sampled_at = Instant::now();
             }
         };
-        let joined = async {
-            #[cfg(feature = "test-tools")]
-            if task.trace.is_some()
-                && std::env::var("FETCHRAIL_TEST_WORKER_SCHEDULING").is_ok_and(|v| v == "joined")
-            {
-                return futures_util::future::join_all(futures).await;
-            }
-            let mut workers = tokio::task::JoinSet::new();
-            for worker in futures {
-                workers.spawn(worker);
-            }
-            let mut results = Vec::with_capacity(workers.len());
-            while let Some(result) = workers.join_next().await {
-                results.push(match result {
-                    Ok(result) => result,
-                    Err(error) => {
-                        batch_cancel.cancel();
-                        Err(EngineError::Message(format!("Download worker stopped: {error}")))
-                    }
-                });
-            }
-            results
-        };
-        let results = tokio::select! { results = joined => results, _ = receiving_rates => unreachable!() };
+        let results = tokio::select! { results = join_all(futures) => results, _ = receiving_rates => unreachable!() };
         let mut errors = results
             .into_iter()
             .filter_map(Result::err)
@@ -4857,8 +4827,6 @@ impl DownloadManager {
                 let Some(item) = item else { continue; };
                 let Some(chunk) = item else { break; };
                 let chunk = chunk?;
-                #[cfg(feature = "test-tools")]
-                let _processing = task.trace.as_deref().map(|trace| trace.guard(trace::Phase::BodyProcessing));
                 #[cfg(feature = "test-tools")]
                 if let Some(trace) = &task.trace {trace.received(chunk.len() as u64);}
                 written = written.saturating_add(chunk.len() as u64);
