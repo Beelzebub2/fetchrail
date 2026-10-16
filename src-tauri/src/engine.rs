@@ -3904,17 +3904,24 @@ impl DownloadManager {
                         selected.push((
                             record.created_at,
                             record.id,
-                            task.health.snapshot(record.torrent.is_some()),
+                            task.clone(),
                             saved_at,
+                            record.torrent.is_some(),
                         ));
                     }
                 }
                 selected.sort_by_key(|c| std::cmp::Reverse(c.0));
                 selected.truncate(20);
+                let selected = selected
+                    .into_iter()
+                    .map(|(_, id, task, saved_at, torrent)| {
+                        (id, task.health.snapshot(torrent), saved_at)
+                    })
+                    .collect::<Vec<_>>();
                 let root = breadcrumbs.data_dir.clone();
                 let _ = tokio::task::spawn_blocking(move || -> Result<(), String> {
                     let mut cases = crate::health_history::load(&root, now)?;
-                    for (_, id, report, saved_at) in selected {
+                    for (id, report, saved_at) in selected {
                         cases.retain(|case| case.id != id);
                         cases.push(crate::health_history::Case {
                             id,
