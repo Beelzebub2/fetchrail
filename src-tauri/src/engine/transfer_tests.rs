@@ -98,6 +98,7 @@ struct TestServer {
 
 impl TestServer {
     fn new(total: u64, mode: &'static str) -> Self {
+        let http2 = mode.starts_with("h2-");
         let mut command = Command::new("node");
         #[cfg(windows)]
         {
@@ -108,10 +109,18 @@ impl TestServer {
             .args([
                 "--input-type=module",
                 "--eval",
-                HTTP_FIXTURE,
+                if http2 {
+                    include_str!("fixtures/http2-reset.mjs")
+                } else {
+                    HTTP_FIXTURE
+                },
                 &total.to_string(),
                 mode,
             ])
+            .env(
+                "FETCHRAIL_H2_FIXTURE_DIR",
+                concat!(env!("CARGO_MANIFEST_DIR"), "/src/engine/fixtures"),
+            )
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
             .spawn()
@@ -132,7 +141,11 @@ impl TestServer {
             }
         });
         Self {
-            url: Url::parse(&format!("http://127.0.0.1:{port}/file.bin")).unwrap(),
+            url: Url::parse(&format!(
+                "{}://127.0.0.1:{port}/file.bin",
+                if http2 { "https" } else { "http" }
+            ))
+            .unwrap(),
             requests,
             process,
             worker: Some(worker),
@@ -186,6 +199,141 @@ async fn verify_parts(dir: &Path, segments: &[SegmentCounter]) {
             segment.range.len()
         );
         assert!(!segment.active.load(Ordering::Relaxed));
+    }
+}
+
+#[tokio::test]
+async fn shared_http2_failures_keep_validated_prefixes_and_the_three_attempt_budget() {
+    for (mode, failures) in [("h2-reset-once", 1), ("h2-reset-always", 3)] {
+        let total = 128 * 1024 * 1024;
+        let server = TestServer::new(total, mode);
+        let (dir, _, mut probe) = parts(total, 16).await;
+        probe.final_url = Some(server.url.clone());
+        let ranges = split_ranges(total, 16);
+        prepare_parts(&dir, &probe, &ranges).await.unwrap();
+        let segments = segment_counters(&dir, &ranges).await.unwrap();
+        let client = download_client_builder()
+            .no_proxy()
+            .add_root_certificate(
+                reqwest::Certificate::from_pem(include_bytes!("fixtures/localhost-ca.pem"))
+                    .unwrap(),
+            )
+            .build()
+            .unwrap();
+        let head = client.head(server.url.clone()).send().await.unwrap();
+        assert_eq!(head.version(), reqwest::Version::HTTP_2);
+        drop(head);
+        let job = task();
+        job.record.write().await.connections = 16;
+        let transfer = async {
+            DownloadManager::download_ranges(
+                &client,
+                &RateLimiter::new(0),
+                &job,
+                &CancellationToken::new(),
+                &server.url,
+                &dir,
+                &segments,
+                &probe,
+            )
+            .await
+        };
+        let interrupt = async {
+            for attempt in 1..=failures {
+                loop {
+                    if segments
+                        .iter()
+                        .all(|s| s.downloaded.load(Ordering::Relaxed) >= attempt * 128 * 1024)
+                    {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                let reset = client
+                    .get(server.url.join("/reset").unwrap())
+                    .send()
+                    .await
+                    .unwrap();
+                assert_eq!(reset.status(), StatusCode::OK);
+                reset.bytes().await.unwrap();
+                tokio::time::sleep(Duration::from_millis(40)).await;
+            }
+        };
+        let (result, _) = tokio::time::timeout(Duration::from_secs(30), async {
+            tokio::join!(transfer, interrupt)
+        })
+        .await
+        .expect("Correlated HTTP/2 failures must recover or exhaust the existing budget");
+        if failures == 1 {
+            result.unwrap();
+            assert_eq!(
+                completed_shared_hashes(&dir, total)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .len(),
+                16
+            );
+        } else {
+            assert!(matches!(result, Err(EngineError::Request(_))));
+        }
+        let stats: serde_json::Value = client
+            .get(server.url.join("/stats").unwrap())
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(stats["resets"], failures);
+        assert!(stats["peak"].as_u64().unwrap() <= 16);
+        let initial_sessions: HashSet<_> = stats["requests"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .take(16)
+            .map(|request| request["session"].as_u64().unwrap())
+            .collect();
+        assert_eq!(
+            initial_sessions.len(),
+            1,
+            "The initial failure must affect sixteen streams on one socket"
+        );
+        assert!(stats["resetGroups"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|group| group["active"] == 16));
+        let requests = server.requests.lock().unwrap().clone();
+        assert_eq!(requests.len(), if failures == 1 { 32 } else { 48 });
+        let data = fs::read(dir.join("0.part")).await.unwrap();
+        assert_eq!(data.len() as u64, total);
+        if failures == 1 {
+            assert!(data.iter().all(|&byte| byte == 0x5a));
+        }
+        for (index, segment) in segments.iter().enumerate() {
+            let visits: Vec<_> = requests
+                .iter()
+                .filter(|(_, end)| *end == segment.range.end)
+                .collect();
+            assert_eq!(visits.len(), if failures == 1 { 2 } else { 3 });
+            assert_eq!(visits[0].0, segment.range.start);
+            for pair in visits.windows(2) {
+                assert!(pair[0].0 < pair[1].0 && pair[1].0 <= segment.range.end);
+            }
+            let checkpoint: PartCheckpoint = serde_json::from_slice(
+                &fs::read(dir.join(format!("{index}.progress.json")))
+                    .await
+                    .unwrap(),
+            )
+            .unwrap();
+            let bytes = &data
+                [segment.range.start as usize..(segment.range.start + checkpoint.bytes) as usize];
+            assert!(bytes.iter().all(|&byte| byte == 0x5a));
+            assert_eq!(checkpoint.bytes, segment.downloaded.load(Ordering::Relaxed));
+            assert_eq!(checkpoint.sha256, format!("{:x}", Sha256::digest(bytes)));
+        }
+        fs::remove_dir_all(dir).await.unwrap();
     }
 }
 

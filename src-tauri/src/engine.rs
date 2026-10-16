@@ -4828,7 +4828,7 @@ impl DownloadManager {
                 let Some(chunk) = item else { break; };
                 let chunk = chunk?;
                 #[cfg(feature = "test-tools")]
-                if let Some(trace) = &task.trace {trace.network_bytes.fetch_add(chunk.len() as u64,Ordering::Relaxed);}
+                if let Some(trace) = &task.trace {trace.received(chunk.len() as u64);}
                 written = written.saturating_add(chunk.len() as u64);
                 if expected_len.is_some_and(|expected| written > expected) {
                     return Err(EngineError::Message(
@@ -5069,7 +5069,20 @@ impl DownloadManager {
         let planned = segments.len();
         #[cfg(feature = "test-tools")]
         if let Some(trace) = &task.trace {
-            trace.sample(downloaded, receiving, connecting, planned);
+            let target = task
+                .performance
+                .lock()
+                .expect("task performance poisoned")
+                .as_ref()
+                .map(|policy| policy.target.load(Ordering::Relaxed));
+            trace.sample(
+                downloaded,
+                &segments,
+                match target {
+                    Some(target) => target,
+                    None => task.record.read().await.connections,
+                },
+            );
         }
         let snapshot = {
             let mut record = task.record.write().await;
