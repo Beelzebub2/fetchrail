@@ -654,7 +654,10 @@ fn setup_info(app: AppHandle, mode: State<'_, install::SetupMode>) -> Result<Set
             .to_string_lossy()
             .into_owned(),
         theme: saved.as_ref().map(|saved| saved.theme).unwrap_or_default(),
-        accent: saved.as_ref().map(|saved| saved.accent).unwrap_or_default(),
+        accent: saved
+            .as_ref()
+            .map(|saved| saved.accent.clone())
+            .unwrap_or_default(),
         launch_on_start: saved.as_ref().is_some_and(|saved| saved.launch_on_start),
         sorts_into_folders: saved
             .as_ref()
