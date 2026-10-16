@@ -1015,6 +1015,7 @@ pub fn run() {
             repair_browser_integration,
             download_window::get_download,
             download_window::show_download_progress,
+            download_window::set_progress_details,
             download_window::set_download_completion_options,
             download_window::open_download,
             add_download,

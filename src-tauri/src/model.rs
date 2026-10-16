@@ -230,6 +230,9 @@ pub struct DownloadSettings {
     /// Whether removing a download from the list also deletes its file; unset asks each time.
     #[serde(default)]
     pub delete_files_on_remove: Option<bool>,
+    /// The progress window opens showing its connection details, as it was last left.
+    #[serde(default)]
+    pub progress_details: bool,
 }
 
 impl DownloadSettings {
@@ -563,6 +566,7 @@ mod tests {
             accent: Accent::default(),
             auto_update: true,
             delete_files_on_remove: None,
+            progress_details: false,
             sort_into_category_folders: true,
             categories: vec![
                 Category {
