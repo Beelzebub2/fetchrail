@@ -173,6 +173,7 @@ struct Span {
 pub(crate) struct Trace {
     spans: [Span; NAMES.len()],
     pub network_bytes: AtomicU64,
+    pub transport_only: AtomicBool,
     pub durable_bytes: AtomicU64,
     pub requests: AtomicU64,
     pub retries: AtomicU64,
@@ -498,7 +499,7 @@ impl Trace {
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
-        json!({"engineBuild":env!("FETCHRAIL_ENGINE_BUILD"),"elapsedMs":self.started.get().map(|started|started.elapsed().as_millis().min(u64::MAX as u128) as u64),"phase":NAMES[self.phase.load(Ordering::Relaxed)],"phaseTransitions":transitions,"retryEvents":retry_events,"slowIoEvents":slow_io_events,"networkBytes":self.network_bytes.load(Ordering::Relaxed),"durableBytes":self.durable_bytes.load(Ordering::Relaxed),"receivingElapsedMs":receiving_elapsed.as_millis(),"networkWindowBytes":network_windows,"receivingEpochs":self.receiving_epochs.load(Ordering::Relaxed),"networkWindowsTruncated":receiving_elapsed>=Duration::from_secs(3600),"catalogAcknowledged":self.catalog_acknowledged.load(Ordering::Acquire),"requests":self.requests.load(Ordering::Relaxed),"retries":self.retries.load(Ordering::Relaxed),"refusals":self.refusals.load(Ordering::Relaxed),"hardLinks":self.linked.load(Ordering::Relaxed),"protocols":self.protocols.iter().map(|v|v.load(Ordering::Relaxed)).collect::<Vec<_>>(),"spans":phases.into_iter().map(|(name,value)|(name.to_string(),value)).collect::<serde_json::Map<_,_>>()})
+        json!({"engineBuild":env!("FETCHRAIL_ENGINE_BUILD"),"elapsedMs":self.started.get().map(|started|started.elapsed().as_millis().min(u64::MAX as u128) as u64),"phase":NAMES[self.phase.load(Ordering::Relaxed)],"phaseTransitions":transitions,"retryEvents":retry_events,"slowIoEvents":slow_io_events,"networkBytes":self.network_bytes.load(Ordering::Relaxed),"transportOnly":self.transport_only.load(Ordering::Relaxed),"durableBytes":self.durable_bytes.load(Ordering::Relaxed),"receivingElapsedMs":receiving_elapsed.as_millis(),"networkWindowBytes":network_windows,"receivingEpochs":self.receiving_epochs.load(Ordering::Relaxed),"networkWindowsTruncated":receiving_elapsed>=Duration::from_secs(3600),"catalogAcknowledged":self.catalog_acknowledged.load(Ordering::Acquire),"requests":self.requests.load(Ordering::Relaxed),"retries":self.retries.load(Ordering::Relaxed),"refusals":self.refusals.load(Ordering::Relaxed),"hardLinks":self.linked.load(Ordering::Relaxed),"protocols":self.protocols.iter().map(|v|v.load(Ordering::Relaxed)).collect::<Vec<_>>(),"spans":phases.into_iter().map(|(name,value)|(name.to_string(),value)).collect::<serde_json::Map<_,_>>()})
     }
 }
 

@@ -4567,6 +4567,39 @@ impl DownloadManager {
         Err(errors.swap_remove(index))
     }
 
+    #[cfg(feature = "test-tools")]
+    async fn receive_transport_only(
+        mut response: reqwest::Response,
+        expected: u64,
+        trace: &trace::Trace,
+        cancel: &CancellationToken,
+    ) -> EngineResult<()> {
+        trace.transport_only.store(true, Ordering::Relaxed);
+        let mut received = 0u64;
+        let deadline = tokio::time::sleep(Duration::from_secs(40));
+        tokio::pin!(deadline);
+        loop {
+            let chunk = transfer_span!(Some(trace), Body, tokio::select! {
+                biased;
+                _ = cancel.cancelled() => return Err(EngineError::Cancelled),
+                _ = &mut deadline => return Err(EngineError::Message("Transport-only diagnostic reached its safety bound.".into())),
+                chunk = response.chunk() => chunk?,
+            });
+            let Some(chunk) = chunk else {
+                return Err(if received == expected {
+                    EngineError::Message("Transport-only diagnostics cannot publish a file.".into())
+                } else {
+                    EngineError::Incomplete
+                });
+            };
+            trace.received(chunk.len() as u64);
+            received = received.saturating_add(chunk.len() as u64);
+            if received > expected {
+                return Err(EngineError::Message("Server sent more bytes than requested.".into()));
+            }
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn download_segment(
         client: &Client,
@@ -4778,6 +4811,22 @@ impl DownloadManager {
                     "Server returned bytes outside the requested range.".into(),
                 ));
             }
+        }
+
+        #[cfg(feature = "test-tools")]
+        if let Some(trace) = task.trace.as_deref().filter(|_| {
+            crate::platform::test_root().is_ok_and(|root| root.is_some())
+                && std::env::var("FETCHRAIL_TEST_RECEIVE_MODE").is_ok_and(|v| v == "memory")
+        }) {
+            if existing != 0 || expected_len.is_none()
+                || limiter.quantum() != usize::MAX || task.limiter.quantum() != usize::MAX
+            {
+                return Err(EngineError::Message("Transport-only diagnostics require fresh, known ranges and unlimited test limits.".into()));
+            }
+            segment.active.store(true, Ordering::Relaxed);
+            let result = Self::receive_transport_only(response, expected_len.unwrap(), trace, cancel).await;
+            segment.active.store(false, Ordering::Relaxed);
+            return result;
         }
 
         let mut output = fs::OpenOptions::new()
