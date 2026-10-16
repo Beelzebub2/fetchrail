@@ -3852,6 +3852,7 @@ impl DownloadManager {
             let record = task.record.read().await;
             let (id, status) = (record.id, record.status.clone());
             let health = task.health.snapshot(record.torrent.is_some());
+            let quality = self.analytics.quality.preview();
             let health_root = root.clone();
             drop(record);
             let _ = tokio::task::spawn_blocking(move || {
@@ -3859,7 +3860,9 @@ impl DownloadManager {
                 crate::platform::write_private_atomic(
                     &health_root.join(format!("dev-health-{id}.json")),
                     &bytes,
-                )
+                )?;
+                let bytes = serde_json::to_vec(&quality).map_err(std::io::Error::other)?;
+                crate::platform::write_private_atomic(&health_root.join("dev-quality.json"), &bytes)
             })
             .await;
             if !matches!(
@@ -5234,7 +5237,10 @@ impl DownloadManager {
                 }
                 let Some(item) = item else { continue; };
                 let Some(chunk) = item else { break; };
-                let chunk = chunk?;
+                let chunk = chunk.map_err(|error| {
+                    task.health.failure(crate::health::Phase::Body);
+                    EngineError::from(error)
+                })?;
                 #[cfg(feature = "test-tools")]
                 let _processing = task.trace.as_deref().map(|trace| trace.guard(trace::Phase::BodyProcessing));
                 #[cfg(feature = "test-tools")]
@@ -6286,14 +6292,21 @@ impl DownloadManager {
             _ => return,
         };
         let mut sample = task.quality_sample.lock().unwrap();
-        if let Some(sample) = sample.as_mut() {
+        if let Some(observation) = sample.as_mut() {
+            if !self.analytics.quality.eligible(observation) {
+                *sample = None;
+                return;
+            }
             self.analytics.quality.outcome(
-                sample,
+                observation,
                 record.torrent.is_some(),
                 outcome,
                 record.total_bytes,
                 &task.health.snapshot(record.torrent.is_some()),
             );
+            if !self.analytics.quality.eligible(observation) {
+                *sample = None;
+            }
         }
     }
 

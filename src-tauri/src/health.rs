@@ -572,6 +572,11 @@ impl Health {
     pub fn failed_phase(&self) -> Option<Phase> {
         PHASES.get(self.failed_phase.load(Relaxed)).copied()
     }
+    pub fn failure(&self, phase: Phase) {
+        let _ = self
+            .failed_phase
+            .compare_exchange(PHASE_COUNT, phase as usize, Relaxed, Relaxed);
+    }
     pub fn clear(&self) {
         self.events.lock().unwrap().clear();
         self.activities.lock().unwrap().clear();
@@ -795,12 +800,7 @@ pub struct Guard<'a> {
 impl Guard<'_> {
     pub fn observe<T: Outcome>(&self, result: &T) {
         if result.failed() {
-            let _ = self.health.failed_phase.compare_exchange(
-                PHASE_COUNT,
-                self.phase as usize,
-                Relaxed,
-                Relaxed,
-            );
+            self.health.failure(self.phase);
         }
     }
 }

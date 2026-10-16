@@ -95,6 +95,10 @@ impl Quality {
             terminal: false,
         })
     }
+    pub fn eligible(&self, sample: &Sample) -> bool {
+        let s = self.0.lock().unwrap();
+        s.enabled && s.epoch == sample.epoch && sample.registered && !sample.terminal
+    }
     pub fn added(&self, sample: &mut Sample, torrent: bool) {
         let mut s = self.0.lock().unwrap();
         if !s.enabled || s.epoch != sample.epoch || sample.registered {
@@ -371,9 +375,11 @@ mod tests {
         let mut sample = quality.prepare().unwrap();
         quality.added(&mut sample, false);
         quality.added(&mut sample, false);
+        assert!(quality.eligible(&sample));
         let (_, token) = quality.take_report().unwrap();
         quality.configure(&Consent::choice(false));
         assert!(token.is_cancelled());
+        assert!(!quality.eligible(&sample));
         quality.configure(&Consent::choice(true));
         let health = crate::health::Health::default();
         health.completed(123);

@@ -294,6 +294,32 @@ async fn safe_transport_faults_observe_boundaries_without_inventing_dns_or_tls_c
         result
     };
     check(&health, result.unwrap_err(), Cause::Timeout, Phase::Body);
+    let body = TestServer::new(1024 * 1024, "weak");
+    let task = task();
+    let (dir, segments, probe) = parts(1024 * 1024, 1).await;
+    DownloadManager::download_ranges(
+        &client,
+        &RateLimiter::new(0),
+        &task,
+        &CancellationToken::new(),
+        &body.url,
+        &dir,
+        &segments,
+        &probe,
+    )
+    .await
+    .unwrap();
+    let report = task.health.snapshot(false);
+    assert!(
+        report
+            .events
+            .iter()
+            .any(|event| event.cause == Some(Cause::Timeout) && event.phase == Some(Phase::Body)),
+        "The real nested body stream must retain the failed boundary before recovery"
+    );
+    assert!(report.durable_completed_ms.is_none());
+    verify_parts(&dir, &segments).await;
+    fs::remove_dir_all(dir).await.unwrap();
 }
 
 async fn parts(total: u64, connections: usize) -> (PathBuf, Segments, ProbeResult) {
