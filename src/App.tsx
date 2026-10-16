@@ -1,4 +1,4 @@
-import { CSSProperties, FormEvent, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { ChangeEvent, CSSProperties, FormEvent, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { getVersion } from "@tauri-apps/api/app";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
@@ -16,6 +16,7 @@ import {
   Ellipsis,
   FolderOpen,
   Globe,
+  Info,
   Link,
   ListChecks,
   Minus,
@@ -23,6 +24,7 @@ import {
   Moon,
   PanelBottom,
   Pause,
+  Pipette,
   Play,
   Plus,
   Power,
@@ -36,6 +38,7 @@ import {
   X,
 } from "lucide-react";
 import "./App.css";
+import { PRESETS, accentColors, accentField, accentHex, accentSpot, distance, spotOf, type AccentSpot } from "./accent";
 import { PerformanceInvitation, PerformancePage, type PerformanceView } from "./Performance";
 import { AnalyticsPrompt, PrivacySettings } from "./Privacy";
 import type { AnalyticsConsent } from "./Privacy";
@@ -107,7 +110,8 @@ export type CompletionOptions = {
 };
 
 type Theme = "dark" | "light";
-type Accent = "ember" | "azure" | "jade" | "iris";
+// A #rrggbb color, or a preset name an older version saved.
+type Accent = string;
 type Appearance = { theme: Theme; accent: Accent };
 
 type Category = {
@@ -241,21 +245,23 @@ const settingsSections = [
 ] as const;
 type SettingsSection = (typeof settingsSections)[number][0];
 
-const accents: Accent[] = ["ember", "azure", "jade", "iris"];
 const connectionChoices = [0, 1, 2, 4, 8, 16, 32];
-
-// The saved look is applied before the first paint; the engine's settings confirm it a moment later.
-document.documentElement.dataset.theme = localStorage.getItem("theme") ?? "dark";
-document.documentElement.dataset.accent = localStorage.getItem("accent") ?? "ember";
 
 const isTauri = () => "__TAURI_INTERNALS__" in window;
 
-export function applyLook(look: Appearance) {
-  for (const key of ["theme", "accent"] as const) {
-    document.documentElement.dataset[key] = look[key];
-    localStorage.setItem(key, look[key]);
-  }
+// Colors the whole app with an accent without saving it.
+function paintAccent(spot: AccentSpot, theme: Theme) {
+  for (const [name, value] of Object.entries(accentColors(spot, theme))) document.documentElement.style.setProperty(name, value);
 }
+
+export function applyLook(look: Appearance) {
+  document.documentElement.dataset.theme = look.theme;
+  paintAccent(accentSpot(look.accent), look.theme);
+  for (const key of ["theme", "accent"] as const) localStorage.setItem(key, look[key]);
+}
+
+// The saved look is applied before the first paint; the engine's settings confirm it a moment later.
+applyLook({ theme: localStorage.getItem("theme") === "light" ? "light" : "dark", accent: localStorage.getItem("accent") ?? "ember" });
 
 // These two mirror the engine's folder_for: a file's ending picks its category, a category its folder.
 function categoryFor(fileName: string, settings: DownloadSettings) {
@@ -1920,20 +1926,198 @@ function LookFields({ look, onChange }: { look: Appearance; onChange: (look: Par
           ))}
         </div>
       </fieldset>
-      <fieldset className="choice-field">
-        <legend>Accent</legend>
-        <div className="accent-cards">
-          {accents.map((accent) => (
-            <label key={accent} className="look-card" data-accent={accent}>
-              <input type="radio" name="accent" checked={look.accent === accent} onChange={() => onChange({ accent })} />
-              <span className="accent-strands" aria-hidden="true"><i /><i /><i /></span>
-              <span className="look-name">{accent[0].toUpperCase() + accent.slice(1)}</span>
-              <span className="tick" aria-hidden="true"><Check size={13} /></span>
-            </label>
-          ))}
-        </div>
-      </fieldset>
+      <AccentPicker accent={look.accent} theme={look.theme} onChange={(accent) => onChange({ accent })} />
     </div>
+  );
+}
+
+type EyeDropperWindow = { EyeDropper?: new () => { open: () => Promise<{ sRGBHex: string }> } };
+const EyeDropper = (window as unknown as EyeDropperWindow).EyeDropper;
+const presetSpots = Object.entries(PRESETS).map(([name, hex]) => ({ name: name[0].toUpperCase() + name.slice(1), ...accentSpot(hex) }));
+const unit = (value: number) => Math.min(1, Math.max(0, value));
+
+// Any color, picked on a field of hue across and vibrance down. The app is its own preview: it
+// recolors as the thumb moves, and the color is saved once the thumb settles.
+function AccentPicker({ accent, theme, onChange }: { accent: Accent; theme: Theme; onChange: (accent: Accent) => void }) {
+  const [spot, setSpot] = useState(() => accentSpot(accent));
+  const [dragging, setDragging] = useState<"" | "pressed" | "moving">("");
+  const [draft, setDraft] = useState<string | null>(null);
+  // A color asked for by hex or from the screen, which may be shown brighter or darker.
+  const [asked, setAsked] = useState<string | null>(null);
+  const latest = useRef(spot);
+  const saved = useRef(accent);
+  const pending = useRef<string | null>(null);
+  const timer = useRef(0);
+  const box = useRef<DOMRect | null>(null);
+  const thumb = useRef<HTMLButtonElement>(null);
+  const report = useRef(onChange);
+  report.current = onChange;
+  const ring = useRef(0);
+  const colors = useMemo(() => accentColors(spot, theme), [spot, theme]);
+  const field = useMemo(() => accentField(theme), [theme]);
+  const swatches = useMemo(() => presetSpots.map((preset) => accentColors(preset, theme)["--accent"]), [theme]);
+  const match = presetSpots.findIndex((preset) => Math.abs(preset.x - spot.x) < 0.004 && Math.abs(preset.v - spot.v) < 0.01);
+  if (match >= 0) ring.current = match;
+  const shown = colors["--accent"].toUpperCase();
+
+  useLayoutEffect(() => paintAccent(spot, theme), [spot, theme]);
+  useEffect(() => {
+    if (accent === saved.current) return;
+    saved.current = accent;
+    move(accentSpot(accent));
+    setAsked(null);
+  }, [accent]);
+  // A change made just before Settings closes is still saved.
+  useEffect(() => flush, []);
+
+  function move(next: AccentSpot) {
+    latest.current = next;
+    setSpot(next);
+  }
+
+  function flush() {
+    window.clearTimeout(timer.current);
+    if (pending.current === null) return;
+    saved.current = pending.current;
+    report.current(pending.current);
+    pending.current = null;
+  }
+
+  function save(next: AccentSpot, wait = 0) {
+    const hex = accentHex(next);
+    pending.current = hex === saved.current ? null : hex;
+    window.clearTimeout(timer.current);
+    timer.current = window.setTimeout(flush, wait);
+  }
+
+  function pointAt(event: React.PointerEvent) {
+    const { left, top, width, height } = box.current!;
+    return { x: unit((event.clientX - left) / width), v: 1 - unit((event.clientY - top) / height) };
+  }
+
+  function press(event: React.PointerEvent<HTMLDivElement>) {
+    if (event.button !== 0) return;
+    event.currentTarget.setPointerCapture(event.pointerId);
+    box.current = event.currentTarget.getBoundingClientRect();
+    // A press springs the thumb over; only moving makes it follow the pointer closely.
+    setDragging("pressed");
+    setAsked(null);
+    move(pointAt(event));
+  }
+
+  function follow(event: React.PointerEvent<HTMLDivElement>) {
+    if (!dragging) return;
+    setDragging("moving");
+    move(pointAt(event));
+  }
+
+  function release() {
+    if (!dragging) return;
+    setDragging("");
+    save(latest.current);
+    // Arrow keys fine-tune next; focusing on press would lose to the browser's own mousedown focus.
+    thumb.current?.focus({ preventScroll: true });
+  }
+
+  function nudge(event: React.KeyboardEvent) {
+    const step = event.shiftKey ? 0.05 : 0.01;
+    const arrow = ({ ArrowLeft: [-step, 0], ArrowRight: [step, 0], ArrowUp: [0, step], ArrowDown: [0, -step] } as Record<string, number[]>)[event.key];
+    if (!arrow) return;
+    event.preventDefault();
+    const next = { x: unit(latest.current.x + arrow[0]), v: unit(latest.current.v + arrow[1]) };
+    move(next);
+    setAsked(null);
+    save(next, 400);
+  }
+
+  function type(event: ChangeEvent<HTMLInputElement>) {
+    const text = event.target.value, next = spotOf(text, theme, latest.current.x);
+    setDraft(text);
+    if (!next) return;
+    move(next);
+    setAsked(text);
+    save(next, 400);
+  }
+
+  async function sample() {
+    try {
+      const { sRGBHex } = await new EyeDropper!().open();
+      const next = spotOf(sRGBHex, theme, latest.current.x);
+      if (!next) return;
+      move(next);
+      setAsked(sRGBHex);
+      save(next);
+    } catch {
+      // Closed with Escape.
+    }
+  }
+
+  return (
+    <fieldset className="choice-field">
+      <legend>
+        Accent
+        <small>{match >= 0 ? presetSpots[match].name : "Custom"} · <span className="mono">{shown}</span></small>
+      </legend>
+      <div className={"accent-picker " + dragging}>
+        <div className="accent-tools">
+          <div className="accent-presets" role="group" aria-label="Presets">
+            <span className="accent-ring" style={{ transform: `translateX(${ring.current * 50}px)`, opacity: match < 0 ? 0 : 1 }} aria-hidden="true" />
+            {presetSpots.map((preset, index) => (
+              <button
+                key={preset.name}
+                type="button"
+                className="accent-preset"
+                title={preset.name}
+                aria-label={preset.name}
+                aria-pressed={index === match}
+                onClick={() => {
+                  move(preset);
+                  setAsked(null);
+                  save(preset);
+                }}
+              >
+                <span style={{ background: swatches[index] }} />
+              </button>
+            ))}
+          </div>
+          <input
+            className="mono accent-hex"
+            aria-label="Hex color"
+            value={draft ?? shown}
+            onChange={type}
+            onBlur={() => setDraft(null)}
+            onKeyDown={(event) => {
+              // Enter would otherwise submit the form around the picker.
+              if (event.key === "Enter") {
+                event.preventDefault();
+                event.currentTarget.blur();
+              }
+            }}
+            maxLength={7}
+            spellCheck={false}
+            autoComplete="off"
+          />
+          {EyeDropper && (
+            <button type="button" className="secondary-button accent-sample" title="Pick from screen" aria-label="Pick a color from the screen" onClick={sample}>
+              <Pipette size={16} />
+            </button>
+          )}
+        </div>
+        <div className="accent-field" style={{ background: field }} onPointerDown={press} onPointerMove={follow} onPointerUp={release} onPointerCancel={release}>
+          <div className="accent-thumb" style={{ transform: `translate(${spot.x * 100}%, ${(1 - spot.v) * 100}%)` }}>
+            <button ref={thumb} type="button" aria-label={`Accent ${shown}, vibrance ${Math.round(spot.v * 100)}%. Arrow keys move it.`} onKeyDown={nudge} />
+            <span className="accent-loupe mono" aria-hidden="true"><i />{shown}</span>
+          </div>
+        </div>
+        <p className="accent-note">
+          {asked !== null && distance(asked, shown) > 0.02 ? (
+            <><Info size={14} />Shown as {shown} so text stays readable</>
+          ) : (
+            "Drag across for hue and down for softer; arrow keys fine-tune"
+          )}
+        </p>
+      </div>
+    </fieldset>
   );
 }
 

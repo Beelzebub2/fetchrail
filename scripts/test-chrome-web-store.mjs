@@ -25,7 +25,7 @@ const source = join(dir, "source"); const output = join(dir, "output");
 await mkdir(source, { recursive: true }); await mkdir(join(source, "icons")); await mkdir(join(source, "fonts"));
 await writeFile(join(source, "manifest.json"), JSON.stringify({ version: "1.2.3", key: "dev" }));
 await writeFile(join(source, "background.js"), "ok"); await writeFile(join(source, "build-info.json"), "dev");
-for (const file of ["panel.html", "panel.js", "panel.css", "icon.svg"]) await writeFile(join(source, file), "fixture");
+for (const file of ["accent.js", "panel.html", "panel.js", "panel.css", "icon.svg"]) await writeFile(join(source, file), "fixture");
 prepareExtension({ sourceDir: source, outputDir: output, version: "1.2.3" });
 assert.equal((await readFile(join(output, "manifest.json"), "utf8")).includes('"key"'), false);
 assert.equal(await readFile(join(output, "background.js"), "utf8"), "ok");

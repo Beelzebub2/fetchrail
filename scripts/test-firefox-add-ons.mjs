@@ -32,7 +32,7 @@ assert.match(policy, /Authentication information/i);
 assert.match(policy, /native messaging/i);
 assert.match(policy, /https:\/\/fetchrail\.rrmtools\.uk\/privacy/);
 
-for (const file of ["background.js", "panel.html", "panel.js", "panel.css", "icons/128.png", "fonts/geist.woff2"]) {
+for (const file of ["background.js", "accent.js", "panel.html", "panel.js", "panel.css", "icons/128.png", "fonts/geist.woff2"]) {
   assert.ok((await stat(new URL(`../browser-extension/dist/firefox/${file}`, import.meta.url))).size > 0, `${file} must be bundled for signing`);
 }
 

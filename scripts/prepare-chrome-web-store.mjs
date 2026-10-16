@@ -24,7 +24,7 @@ export function prepareExtension({ sourceDir, outputDir, version }) {
   if (manifest.version !== version) throw new Error(`Built manifest is ${manifest.version}; expected ${version}`);
   rmSync(outputPath, { recursive: true, force: true });
   mkdirSync(outputPath, { recursive: true });
-  const files = ["background.js", "panel.html", "panel.js", "panel.css", "icon.svg", "icons", "fonts"];
+  const files = ["background.js", "accent.js", "panel.html", "panel.js", "panel.css", "icon.svg", "icons", "fonts"];
   for (const name of files) cpSync(join(sourcePath, name), join(outputPath, name), { recursive: true });
   writeFileSync(join(outputPath, "manifest.json"), productionManifest(manifest, version), "utf8");
   return JSON.parse(readFileSync(join(outputPath, "manifest.json"), "utf8"));

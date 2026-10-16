@@ -24,9 +24,15 @@ const speedHistory = Array(22).fill(0);
 const cards = new Map();
 const opened = new Set();
 const known = new Set();
-// The look the desktop app last reported, applied before the first paint.
-document.documentElement.dataset.theme = localStorage.getItem("theme") ?? "dark";
-document.documentElement.dataset.accent = localStorage.getItem("accent") ?? "ember";
+// The look the desktop app last reported, applied before the first paint. accent.js is the app's own.
+function applyLook() {
+  const theme = localStorage.getItem("theme") ?? "dark";
+  document.documentElement.dataset.theme = theme;
+  for (const [name, value] of Object.entries(accentColors(accentSpot(localStorage.getItem("accent") ?? "ember"), theme))) {
+    document.documentElement.style.setProperty(name, value);
+  }
+}
+applyLook();
 
 async function request(type, params = {}) {
   if (!api?.runtime?.sendMessage) throw new Error("Open this panel from the installed Fetchrail browser extension.");
@@ -406,10 +412,9 @@ function connect({ quiet = false } = {}) {
       app = { version: result.appVersion, outdated: !result.capabilities.includes("getDownloads") };
       if (app.outdated) throw new Error("Update the Fetchrail app and native host to use this companion.");
       for (const key of ["theme", "accent"]) {
-        if (!result[key]) continue;
-        document.documentElement.dataset[key] = result[key];
-        localStorage.setItem(key, result[key]);
+        if (result[key]) localStorage.setItem(key, result[key]);
       }
+      applyLook();
       $("#connections-default").textContent = "Auto uses the app's " + result.connectionsPerDownload;
       $("#engine-hint").textContent = `Up to ${result.maxConcurrentDownloads} simultaneous downloads · ${result.minSegmentSizeMb} MB minimum segment. Servers without ranges use one connection.`;
       renderQueues(result.queues);
