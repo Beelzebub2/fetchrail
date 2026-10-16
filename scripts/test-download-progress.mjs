@@ -5,10 +5,14 @@ import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { dirname, extname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { accentColors, accentHex, accentSpot } from "../src/accent.js";
 
 // Run after npm run build. Pass a Playwright module path when using the bundled runtime.
 const { chromium } = createRequire(import.meta.url)(process.argv[2] ?? "playwright");
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
+// What the accent picker saves for a preset, and the accent a saved one paints in a theme.
+const savedAccent = (preset) => accentHex(accentSpot(preset));
+const paintedAccent = (accent, theme) => accentColors(accentSpot(accent), theme)["--accent"];
 const output = await mkdtemp(join(tmpdir(), "fetchrail-progress-ui-"));
 const mime = { ".html": "text/html", ".js": "text/javascript", ".css": "text/css", ".woff2": "font/woff2" };
 const server = createServer(async (request, response) => {
@@ -99,6 +103,26 @@ try {
   await page.waitForFunction(() => document.querySelector('[role="progressbar"]')?.getAttribute("aria-valuenow") === "25");
   await page.screenshot({ path: join(output, "download-status.png"), fullPage: true });
   assert((await page.locator("body").innerText()).includes("78.6 MB/s"), "Download speeds use decimal MB/s");
+  // The window shrinks to the transfer and its controls, and grows again for the details.
+  const fits = () => page.evaluate(() => document.documentElement.scrollHeight <= innerHeight);
+  await page.getByRole("button", { name: "Hide details" }).click();
+  await page.setViewportSize({ width: 500, height: 520 });
+  assert.equal(await page.locator("tbody tr").count(), 0);
+  for (const name of ["Speed limiter", "Options on completion", "Download status"]) {
+    await page.getByRole("tab", { name }).click();
+    assert.ok(await fits(), `${name} fits the window without its details.`);
+  }
+  await page.screenshot({ path: join(output, "download-status-small.png") });
+  await page.getByRole("button", { name: "Show details" }).click();
+  await page.setViewportSize({ width: 500, height: 756 });
+  assert.equal(await page.locator("tbody tr").count(), 4);
+  assert.ok(await fits(), "The details fit the window grown for them.");
+  await page.setViewportSize({ width: 640, height: 800 });
+  assert.deepEqual(
+    await page.evaluate(() => window.testCalls.filter((call) => call.name === "set_progress_details").map((call) => call.args.details)),
+    [false, true],
+    "Each switch resizes the window and is remembered for the next one.",
+  );
   await page.evaluate(() => {
     Object.assign(window.testRecord, {requestedConnections:16, receivingConnections:16, connectingConnections:0, plannedRanges:128});
     window.testEmit("fetchrail://download-updated", structuredClone(window.testRecord));
@@ -293,9 +317,31 @@ try {
   await rail.getByRole("status").filter({ hasText: "All changes saved" }).waitFor();
   assert.equal(await dockShown(), false, "The save bar stays away until something changes.");
 
-  await page.locator(".look-card", { hasText: "Azure" }).click();
-  await page.waitForFunction(() => document.documentElement.dataset.accent === "azure" && window.testSettings.accent === "azure");
+  await page.getByRole("button", { name: "Azure", exact: true }).click();
+  await page.waitForFunction(
+    (azure) => document.documentElement.style.getPropertyValue("--accent") === azure[document.documentElement.dataset.theme] && window.testSettings.accent === azure.saved,
+    { dark: paintedAccent(savedAccent("azure"), "dark"), light: paintedAccent(savedAccent("azure"), "light"), saved: savedAccent("azure") },
+  );
   assert.equal(await dockShown(), false, "A look applies at once and never raises the save bar.");
+  const saves = () => page.evaluate(() => window.testCalls.filter((call) => call.name === "update_settings").length);
+  const before = await saves();
+  const field = await page.locator(".accent-field").boundingBox();
+  await page.mouse.move(field.x + field.width * 0.2, field.y + field.height * 0.5);
+  await page.mouse.down();
+  await page.mouse.move(field.x + field.width * 0.7, field.y + field.height * 0.2, { steps: 8 });
+  assert.notEqual(await page.evaluate(() => document.documentElement.style.getPropertyValue("--accent")), paintedAccent(savedAccent("azure"), "dark"), "The app recolors while dragging.");
+  assert.equal(await saves(), before, "Dragging previews without saving.");
+  await page.mouse.up();
+  await page.waitForFunction((azure) => window.testSettings.accent !== azure, savedAccent("azure"));
+  assert.equal(await saves(), before + 1, "A drag saves once, when it ends.");
+  assert.match(await page.locator("legend", { hasText: "Accent" }).innerText(), /Custom · #[0-9A-F]{6}/);
+  const dragged = await page.evaluate(() => window.testSettings.accent);
+  await page.keyboard.press("ArrowRight");
+  await page.keyboard.press("ArrowRight");
+  await page.waitForFunction((last) => window.testSettings.accent !== last, dragged);
+  assert.equal(await saves(), before + 2, "Arrow keys save once they settle.");
+  await page.getByRole("button", { name: "Azure", exact: true }).click();
+  await page.waitForFunction((azure) => window.testSettings.accent === azure, savedAccent("azure"));
   const tray = page.getByRole("checkbox", { name: /^Minimize to tray on close/ });
   await tray.uncheck();
   await rail.getByRole("status").filter({ hasText: "1 unsaved change" }).waitFor();
@@ -318,7 +364,7 @@ try {
   await page.getByRole("heading", { name: "Connections", exact: true }).waitFor();
   await page.getByRole("button", { name: "Save settings", exact: true }).click();
   await page.locator(".save-dock").getByText("Settings saved", { exact: true }).waitFor();
-  assert.deepEqual(await page.evaluate(() => [window.testSettings.minimizeToTray, window.testSettings.launchOnStart, window.testSettings.accent]), [false, true, "azure"]);
+  assert.deepEqual(await page.evaluate(() => [window.testSettings.minimizeToTray, window.testSettings.launchOnStart, window.testSettings.accent]), [false, true, savedAccent("azure")]);
   await page.waitForFunction(() => !document.querySelector(".save-dock").classList.contains("shown"));
   await rail.getByRole("status").filter({ hasText: "All changes saved" }).waitFor();
   assert.equal(await page.getByRole("heading", { name: "Connections", exact: true }).isVisible(), true, "Saving keeps Settings open.");
@@ -493,9 +539,13 @@ try {
   await page.getByRole("heading", { name: "Make it yours" }).waitFor();
   assert.equal(await current(), 1);
   await page.locator(".look-card", { hasText: "Light" }).click();
-  await page.locator(".look-card", { hasText: "Jade" }).click();
-  assert.equal(await page.getByRole("radio", { name: "Jade", exact: true }).isChecked(), true);
-  assert.deepEqual(await page.evaluate(() => ({ ...document.documentElement.dataset })), { theme: "light", accent: "jade" }, "Setup wears the look that is picked in it.");
+  await page.getByRole("button", { name: "Jade", exact: true }).click();
+  assert.equal(await page.getByRole("button", { name: "Jade", exact: true }).getAttribute("aria-pressed"), "true");
+  // Setup wears the look that is picked in it.
+  await page.waitForFunction(
+    (jade) => document.documentElement.dataset.theme === "light" && document.documentElement.style.getPropertyValue("--accent") === jade,
+    paintedAccent(savedAccent("jade"), "light"),
+  );
   await page.getByLabel("Save downloads to").fill("D:\\Files");
   await page.screenshot({ path: join(output, "setup-look.png") });
   await page.getByRole("button", { name: "Back", exact: true }).click();
@@ -513,7 +563,7 @@ try {
   await page.waitForFunction(() => window.testCalls.some((call) => call.name === "setup_finish"));
   assert.deepEqual(await page.evaluate(() => window.testCalls.filter((call) => call.name.startsWith("setup_") && call.name !== "setup_info")), [
     { name: "setup_install", args: { options: { dir: "C:\\Programs\\Fetchrail", desktopShortcut: true, downloadDir: "D:\\Files" } } },
-    { name: "setup_finish", args: { choices: { launchOnStart: true, theme: "light", accent: "jade", downloadDir: "D:\\Files" } } },
+    { name: "setup_finish", args: { choices: { launchOnStart: true, theme: "light", accent: savedAccent("jade"), downloadDir: "D:\\Files" } } },
   ], "Setup installs once, then starts the app with what was chosen.");
 
   await page.goto(base + "?setup=install&installed");
