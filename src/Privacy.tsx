@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
-import { X } from "lucide-react";
+import { Monitor, X } from "lucide-react";
+import { PageHead } from "./PageHead";
 import type { DownloadSettings } from "./App";
 
 export type AnalyticsConsent = { enabled: boolean; decided: boolean; schema: number; purpose: string };
@@ -27,7 +28,7 @@ export function PrivacySettings({ settings, onChoice }: { settings: DownloadSett
     try { await onChoice(allow); } catch (error) { setError(String(error)); } finally { setBusy(false); }
   }
   return <section aria-labelledby="privacy-title">
-    <div className="page-head rise"><div><h1 id="privacy-title">Privacy</h1><p>Your choice, saved immediately.</p></div></div>
+    <PageHead id="privacy-title" icon={Monitor} title="Privacy">Your choice, saved immediately.</PageHead>
     <section className="card rise privacy-card">
       <div className="card-head"><h2>Optional improvement analytics</h2><p role="status">Analytics is {enabled(settings.analyticsConsent) ? "on" : "off"}.</p></div>
       <label className="check"><input type="checkbox" checked={!!enabled(settings.analyticsConsent)} disabled={busy} onChange={event => void choose(event.target.checked)} />Allow optional improvement analytics</label>

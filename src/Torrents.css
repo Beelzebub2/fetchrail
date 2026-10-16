@@ -6,7 +6,8 @@
 .torrent-tabs { display:flex; gap:20px; padding:0 20px; border-bottom:1px solid var(--line); }
 .torrent-tabs button { background:none; border:0; border-bottom:2px solid transparent; padding:10px 0; color:var(--text-3); font:inherit; cursor:pointer; }
 .torrent-tabs button[aria-selected=true] { color:var(--text); border-color:var(--accent); }
-.torrent-tab-body { padding:16px 20px; height:330px; overflow:auto; }
+/* Scales with the window so the list above keeps a few rows in a short one. */
+.torrent-tab-body { padding:16px 20px; height:clamp(200px, 32vh, 330px); overflow:auto; }
 .torrent-stats { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:16px; }
 .torrent-stats span { display:flex; flex-direction:column; gap:6px; font-size:12px; color:var(--text-3); }
 .torrent-stats b { color:var(--text); display:flex; gap:6px; align-items:center; font-size:14px; }
@@ -14,14 +15,15 @@
 .torrent-hashes { color:var(--text-3); font-size:11px; overflow-wrap:anywhere; }
 .torrent-controls { display:flex; gap:12px; flex-wrap:wrap; align-items:end; margin:12px 0; }
 .torrent-controls label,.torrent-import>label { display:flex; flex-direction:column; gap:6px; font-size:12px; color:var(--text-3); }
-.torrent-controls input,.torrent-controls select,.torrent-folder input,.torrent-file-tools input,.torrent-import>label>select { padding:8px 10px; border:1px solid var(--line); border-radius:6px; background:var(--bg); color:var(--text); font:inherit; min-width:0; }
+.torrent-controls input:not([type=checkbox]),.torrent-controls select,.torrent-folder input,.torrent-file-tools input,.torrent-import>label>select { height:40px; padding:0 12px; border:1px solid var(--line); border-radius:10px; background:var(--bg); color:var(--text); font:inherit; min-width:0; }
+.torrent-controls input:focus,.torrent-folder input:focus,.torrent-file-tools input:focus { outline:0; border-color:var(--accent); box-shadow:0 0 0 4px var(--accent-soft); }
 .torrent-controls input[type=number] { width:120px; }
 .torrent-controls .check-label,.torrent-import .check-label,.torrent-remove .check-label { flex-direction:row; align-items:center; gap:8px; }
 .torrent-import { width:min(760px,94vw); max-height:92vh; overflow:auto; padding:24px; display:flex; flex-direction:column; gap:16px; }
 .torrent-import .modal-head h2 { overflow-wrap:anywhere; }
 .torrent-folder { display:flex; gap:8px; }.torrent-folder input { flex:1; }
 .torrent-file-tools { display:flex; gap:8px; margin-bottom:8px; }.torrent-file-tools input { flex:1; }
-.torrent-file-scroll { height:300px; overflow:auto; border:1px solid var(--line); border-radius:6px; }
+.torrent-file-scroll { height:300px; overflow:auto; border:1px solid var(--line); border-radius:10px; }
 .torrent-file { height:44px; display:flex; align-items:center; padding:0 10px; gap:10px; border-bottom:1px solid var(--line); font-size:12px; }
 .torrent-file>span { flex:1; min-width:0; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }.torrent-file small { display:block; color:var(--text-3); font-size:10px; }
 .torrent-file select { background:var(--bg); color:var(--text); border:1px solid var(--line); padding:5px; border-radius:4px; }

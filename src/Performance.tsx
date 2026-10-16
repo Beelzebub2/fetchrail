@@ -3,6 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { Activity, Check, Copy, Play, RotateCw, X } from "lucide-react";
 import type { DownloadSettings } from "./App";
 import { Diagnostics } from "./Diagnostics";
+import { PageHead } from "./PageHead";
 import "./Performance.css";
 
 export type PerformanceView = "calibration" | "diagnostics";
@@ -71,6 +72,8 @@ export function PerformancePage({ settings, draft, onChange, view, onViewChange 
   const [note, setNote] = useState<string | null>(null);
   const [confirmReset, setConfirmReset] = useState(false);
   const [diagnosticsActive, setDiagnosticsActive] = useState(false);
+  // The test runs with sensible defaults; its budgets and sources wait behind Advanced.
+  const [advanced, setAdvanced] = useState(false);
   useEffect(() => { if (status?.running) onViewChange("calibration"); }, [status?.running, onViewChange]);
   const running = status?.running || busy;
   const report = status?.latest;
@@ -85,50 +88,74 @@ export function PerformancePage({ settings, draft, onChange, view, onViewChange 
   const loaded = report?.trials.filter(t => t.kind === "download").flatMap(t => t.loadedLatencyMs) ?? [];
   const idle = quantile(report?.idleLatencyMs ?? []);
   const peakMemory = quantile(report?.resources.flatMap(s => s.processMemoryBytes == null ? [] : [s.processMemoryBytes]) ?? [], 1);
+  // What the next test will use, in the words someone deciding whether to run it needs.
+  const budget = [
+    `About ${options.deep ? 10 : 3} minutes`,
+    options.online ? `Up to ${bytes(options.networkBudgetMib * 1024 ** 2)} of data` : "No internet tests",
+    `${bytes(options.diskBudgetMib * 1024 ** 2)} of temporary disk space`,
+    "Results stay on this computer",
+  ];
   return <section aria-labelledby="performance-title">
-    <div className="page-head rise"><div><h1 id="performance-title">Performance</h1><p>Optimize real downloads, or investigate this computer.</p></div></div>
-    <div className="performance-view-switch">
+    <PageHead id="performance-title" icon={Activity} title="Performance" actions={
       <div className="segmented" role="group" aria-label="Performance tools">
         <button type="button" aria-pressed={view === "calibration"} disabled={diagnosticsActive} onClick={() => onViewChange("calibration")}>Optimize downloads</button>
         <button type="button" aria-pressed={view === "diagnostics"} disabled={running} onClick={() => onViewChange("diagnostics")}>Hardware diagnostics</button>
       </div>
-      <p className="hint">{view === "calibration" ? "Start here to optimize downloads. Calibration includes its own drive, memory-pressure and download-pipeline measurements; you do not need Hardware diagnostics first. Reports stay local." : "Optional troubleshooting: inspect CPU, memory, drive and connection measurements. Grades and short samples explain this test's workload; they do not choose download settings. Download calibration measures the sustained workload it needs."}</p>
-      {view === "diagnostics" && <button type="button" className="ghost-button" disabled={diagnosticsActive || running} onClick={() => onViewChange("calibration")}>Go to download calibration</button>}
-    </div>
-    {view === "diagnostics" ? <Diagnostics onActivityChange={setDiagnosticsActive} /> : <>
+    }>
+      {view === "calibration" ? "Measure this computer once, and downloads start with settings that suit it." : "Optional troubleshooting for the processor, memory, drive and connection."}
+    </PageHead>
+    {view === "diagnostics" ? <>
+      <div className="performance-note">
+        <p className="hint">Grades and short samples explain this test's own workload; they do not choose download settings. Download calibration measures what it needs by itself.</p>
+        <button type="button" className="ghost-button" disabled={diagnosticsActive || running} onClick={() => onViewChange("calibration")}>Go to download calibration</button>
+      </div>
+      <Diagnostics onActivityChange={setDiagnosticsActive} />
+    </> : <>
     <div className="performance-layout">
       <section className="card rise d1" aria-labelledby="performance-test-title">
-        <div className="card-head"><h2 id="performance-test-title">Calibrate your connection and drive</h2><p>Run a test, review the results, then apply a usable calibration. Automatic tuning keeps learning from normal downloads.</p><p>Pause downloads and torrent seeding first. New queued downloads wait while testing.</p></div>
-        <fieldset className="choice-field" disabled={running}><legend>Test depth</legend><div className="segmented">
-          <button type="button" aria-pressed={!options.deep} onClick={() => setOptions({ ...options, deep: false, networkBudgetMib: 1024, diskBudgetMib: 256 })}>Quick</button>
-          <button type="button" aria-pressed={options.deep} onClick={() => setOptions({ ...options, deep: true, networkBudgetMib: options.downloadUrl?.trim() ? 16384 : 1024, diskBudgetMib: 1024 })}>Deep</button>
-        </div><p className="hint">{options.deep ? "Repeated 1–8 public or 1–32 provided-file request tests, a repeated HTTP/1 matrix and the full receive/write/hash path. Time budget: 10 minutes." : "A smaller baseline with repeated 1, 4 and 8 request tests. Fast connections may need Deep for enough evidence. Time budget: 3 minutes."}</p></fieldset>
-        <div className="performance-controls">
-          <label>Network payload budget<select disabled={running || !options.online} value={options.networkBudgetMib} onChange={e => setOptions({ ...options, networkBudgetMib: Number(e.target.value) })}>{[64,256,1024,4096,8192,16384,32768].map(v => <option key={v} value={v}>{bytes(v * 1024 ** 2)}</option>)}</select></label>
-          <label>Temporary disk space<select disabled={running} value={options.diskBudgetMib} onChange={e => setOptions({ ...options, diskBudgetMib: Number(e.target.value) })}>{[64,256,1024,2048].map(v => <option key={v} value={v}>{bytes(v * 1024 ** 2)}</option>)}</select></label>
-        </div>
-        <div className="performance-toggles">
-          <label><input type="checkbox" disabled={running} checked={options.online} onChange={e => setOptions({ ...options, online: e.target.checked, upload: options.upload && e.target.checked })} /> Include internet tests</label>
-          <label><input type="checkbox" disabled={running || !options.online || !!options.downloadUrl?.trim()} checked={options.upload} onChange={e => setOptions({ ...options, upload: e.target.checked })} /> Include upload test (generated bytes only)</label>
-        </div>
-        {options.online && <details className="performance-source"><summary>Use your own direct test file</summary><label>Direct file URL<input type="url" autoComplete="off" disabled={running} value={options.downloadUrl ?? ""} onChange={e => setOptions({ ...options, downloadUrl: e.target.value, upload: false })} /></label><p className="hint">Useful for sustained tests on fast connections when the public endpoint imposes limits. Choose a file you are permitted to download. It must support stable byte ranges; browser credentials are not sent. The link is held only in memory and is excluded from saved and copied reports. Test bytes are discarded after measuring; the file is not installed or unpacked.</p></details>}
-        <p className="hint">Tests use the saved download folder. Temporary space is capped at {bytes(options.diskBudgetMib * 1024 ** 2)}; repeated writes can total up to about {bytes(options.diskBudgetMib * 1024 ** 2 * 18)} when testing both volumes and comparing buffers. An extra 512 MiB free-space margin is required. Temporary files are removed after completion or cancellation.</p>
-        {options.online && <p className="hint">{options.downloadUrl?.trim() ? "Contacts the chosen file server, which sees your IP address." : "Contacts Cloudflare, which sees your IP address and may limit long tests; use a permitted direct test file for a larger sustained run."} Results stay on this computer. No downloaded files, browser cookies or tokens are uploaded. The payload budget excludes protocol overhead and tiny latency requests.</p>}
-        {folderChanged && <p role="status" className="extension-error">Save your new download folder before testing it.</p>}
+        <div className="card-head"><h2 id="performance-test-title">Optimize downloads for this computer</h2><p>A short test measures your connection and download drive, then suggests settings. Nothing changes until you apply the result.</p></div>
         {status?.running ? <div className="performance-progress" role="status"><strong>{status.phase}</strong><progress aria-label="Performance test progress" max={100} value={status.progress} /><p className="hint">Progress tracks measurement stages. You can leave this page and return; the test continues.</p><button type="button" className="secondary-button" disabled={busy} onClick={() => void action(() => invoke("cancel_calibration"))}><X size={15} /> Cancel test</button></div>
-          : <button type="button" className="primary-button" disabled={running || folderChanged || !status} onClick={() => void action(() => invoke("start_calibration", { options }))}><Play size={15} /> Start {options.deep ? "deep" : "quick"} test</button>}
+          : <div className="performance-start">
+            <button type="button" className="primary-button" disabled={running || folderChanged || !status} onClick={() => void action(() => invoke("start_calibration", { options }))}><Play size={16} /> Start {options.deep ? "deep" : "quick"} test</button>
+            <ul className="performance-budget" aria-label="This test uses">{budget.map(item => <li key={item}>{item}</li>)}</ul>
+          </div>}
+        <p className="hint">Pause other downloads and torrent sharing first; new queued downloads wait while the test runs.</p>
+        {folderChanged && <p role="status" className="extension-error">Save your new download folder before testing it.</p>}
         {(error || status?.error) && <p role="alert" className="extension-error">{error ?? status?.error}</p>}
         {note && <p role="status">{note}</p>}
+        {/* Everything below is optional; the quick test's defaults suit most connections. */}
+        <details className="performance-advanced" open={advanced} onToggle={e => setAdvanced(e.currentTarget.open)}>
+          <summary>Advanced test options</summary>
+          <div className="performance-advanced-body">
+            <fieldset className="choice-field" disabled={running}><legend>Test depth</legend><div className="segmented">
+              <button type="button" aria-pressed={!options.deep} onClick={() => setOptions({ ...options, deep: false, networkBudgetMib: 1024, diskBudgetMib: 256 })}>Quick</button>
+              <button type="button" aria-pressed={options.deep} onClick={() => setOptions({ ...options, deep: true, networkBudgetMib: options.downloadUrl?.trim() ? 16384 : 1024, diskBudgetMib: 1024 })}>Deep</button>
+            </div><p className="hint">{options.deep ? "Repeated 1–8 public or 1–32 provided-file request tests, a repeated HTTP/1 matrix and the full receive/write/hash path. Time budget: 10 minutes." : "A smaller baseline with repeated 1, 4 and 8 request tests. Fast connections may need Deep for enough evidence. Time budget: 3 minutes."}</p></fieldset>
+            <div className="performance-controls">
+              <label>Network payload budget<select disabled={running || !options.online} value={options.networkBudgetMib} onChange={e => setOptions({ ...options, networkBudgetMib: Number(e.target.value) })}>{[64,256,1024,4096,8192,16384,32768].map(v => <option key={v} value={v}>{bytes(v * 1024 ** 2)}</option>)}</select></label>
+              <label>Temporary disk space<select disabled={running} value={options.diskBudgetMib} onChange={e => setOptions({ ...options, diskBudgetMib: Number(e.target.value) })}>{[64,256,1024,2048].map(v => <option key={v} value={v}>{bytes(v * 1024 ** 2)}</option>)}</select></label>
+            </div>
+            <div className="performance-toggles">
+              <label><input type="checkbox" disabled={running} checked={options.online} onChange={e => setOptions({ ...options, online: e.target.checked, upload: options.upload && e.target.checked })} /> Include internet tests</label>
+              <label><input type="checkbox" disabled={running || !options.online || !!options.downloadUrl?.trim()} checked={options.upload} onChange={e => setOptions({ ...options, upload: e.target.checked })} /> Include upload test (generated bytes only)</label>
+            </div>
+            {options.online && <details className="performance-source"><summary>Use your own direct test file</summary><label>Direct file URL<input type="url" autoComplete="off" disabled={running} value={options.downloadUrl ?? ""} onChange={e => setOptions({ ...options, downloadUrl: e.target.value, upload: false })} /></label><p className="hint">Useful for sustained tests on fast connections when the public endpoint imposes limits. Choose a file you are permitted to download. It must support stable byte ranges; browser credentials are not sent. The link is held only in memory and is excluded from saved and copied reports. Test bytes are discarded after measuring; the file is not installed or unpacked.</p></details>}
+            <p className="hint">Tests use the saved download folder. Temporary space is capped at {bytes(options.diskBudgetMib * 1024 ** 2)}; repeated writes can total up to about {bytes(options.diskBudgetMib * 1024 ** 2 * 18)} when testing both volumes and comparing buffers. An extra 512 MiB free-space margin is required. Temporary files are removed after completion or cancellation.</p>
+            {options.online && <p className="hint">{options.downloadUrl?.trim() ? "Contacts the chosen file server, which sees your IP address." : "Contacts Cloudflare, which sees your IP address and may limit long tests; use a permitted direct test file for a larger sustained run."} Results stay on this computer. No downloaded files, browser cookies or tokens are uploaded. The payload budget excludes protocol overhead and tiny latency requests.</p>}
+          </div>
+        </details>
       </section>
       <section className="card rise d2" aria-labelledby="performance-auto-title">
-        <div className="card-head"><h2 id="performance-auto-title">Automatic tuning</h2><p>Learn from qualifying completed downloads. A usable calibration can supply a starting point; neither test is required.</p></div>
-        <label className="performance-toggle"><span>Use measured automatic tuning<small>Save this setting below to learn without a test. Applying calibration also enables it. Explicit per-download connection choices remain manual.</small></span><input className="switch" type="checkbox" checked={draft.performanceAuto ?? false} onChange={e => onChange({ performanceAuto: e.target.checked })} /></label>
-        <p className="hint">Your connection and simultaneous-download limits remain ceilings. Healthy ranges drain naturally; verified bytes and resume checkpoints are preserved. Competing transfers, speed caps, resumes and mixed request-count runs do not train completion profiles. Final-tail samples do not choose request counts.</p>
-        <p className="hint">Profiles expire after 14 days and are ignored when the engine build, detected network or destination volume changes. Learning is local and bounded to 128 server/count observations and four calibration reports.</p>
-        <p className="mono">{status?.learnedHosts ?? 0} learned server/count observations</p>
+        <div className="card-head"><h2 id="performance-auto-title">Automatic tuning</h2><p>Learns from your finished downloads. Works with or without a test.</p></div>
+        <label className="performance-toggle"><span>Use measured automatic tuning<small>Takes effect when you save settings; applying a calibration also turns it on. Connection counts you pick for a single download are left alone.</small></span><input className="switch" type="checkbox" checked={draft.performanceAuto ?? false} onChange={e => onChange({ performanceAuto: e.target.checked })} /></label>
         {draft.performanceAuto && <p role="status" className="hint">{status?.appliedActive ? "An applicable calibration supplies a starting point. Each download still checks its server." : "No applicable calibration is active. Tuning uses normal defaults and qualifying download observations within your limits."}</p>}
-        <button type="button" className="ghost-button" disabled={running} onClick={() => setConfirmReset(v => !v)}><RotateCw size={15} /> Reset calibration and learning</button>
-        {confirmReset && <div role="group" aria-label="Confirm performance reset"><p>Delete performance reports and learned profiles, and turn automatic tuning off? Your downloads and other settings stay.</p><button type="button" className="secondary-button" disabled={running} onClick={() => void action(async () => { await invoke("reset_calibration"); onChange({ performanceAuto: false }); setConfirmReset(false); })}>Confirm reset</button><button type="button" className="ghost-button" onClick={() => setConfirmReset(false)}>Keep results</button></div>}
+        <p className="performance-learned"><b className="mono">{status?.learnedHosts ?? 0}</b> learned server/count observations</p>
+        <details className="performance-more"><summary>How tuning works</summary>
+          <p className="hint">Your connection and simultaneous-download limits remain ceilings. Healthy ranges drain naturally; verified bytes and resume checkpoints are preserved. Competing transfers, speed caps, resumes and mixed request-count runs do not train completion profiles. Final-tail samples do not choose request counts.</p>
+          <p className="hint">Profiles expire after 14 days and are ignored when the engine build, detected network or destination volume changes. Learning is local and bounded to 128 server/count observations and four calibration reports.</p>
+        </details>
+        <div className="performance-reset"><button type="button" className="ghost-button" disabled={running} onClick={() => setConfirmReset(v => !v)}><RotateCw size={15} /> Reset calibration and learning</button></div>
+        {confirmReset && <div className="performance-confirm" role="group" aria-label="Confirm performance reset"><p>Delete performance reports and learned profiles, and turn automatic tuning off? Your downloads and other settings stay.</p><div className="performance-actions"><button type="button" className="secondary-button" disabled={running} onClick={() => void action(async () => { await invoke("reset_calibration"); onChange({ performanceAuto: false }); setConfirmReset(false); })}>Confirm reset</button><button type="button" className="ghost-button" onClick={() => setConfirmReset(false)}>Keep results</button></div></div>}
       </section>
     </div>
     {report && <section className="card performance-results rise" aria-labelledby="performance-results-title">
@@ -143,8 +170,8 @@ export function PerformancePage({ settings, draft, onChange, view, onViewChange 
       <p>{report.profile.confidence === "localOnly" ? "Local measurements only: this report does not establish network parallelism or a replacement buffer. Applying it can enable learning from normal downloads." : <>Suggested starting parallelism: <b>{report.profile.connections}</b> · write buffer: <b>{bytes(report.profile.bufferBytes)}</b>. The engine checks each server and can adjust this starting point.</>} Your saved simultaneous-download limit stays at <b>{settings.maxConcurrentDownloads}</b>; this test does not establish an optimal number of whole downloads.</p>
       <div className="performance-actions"><button type="button" className="primary-button" disabled={running || !!status.latestIssue || report.profile.confidence === "insufficient"} onClick={() => void action(async () => { await invoke("apply_calibration", { id: report.id }); onChange({ performanceAuto: true }); setNote("Calibration applied. Automatic tuning is enabled for future downloads."); })}><Check size={15} />{status.applied === report.id ? "Reapply calibration" : "Apply calibration"}</button>
         <button type="button" className="secondary-button" onClick={() => { const strip = (h: Hardware) => { const { networkKey: _network, driveKey: _drive, ...safe } = h; return safe; }; const { downloadUrl: _source, ...options } = report.options; void navigator.clipboard.writeText(JSON.stringify({ ...report, options, hardware: strip(report.hardware), stagingHardware: report.stagingHardware ? strip(report.stagingHardware) : null }, null, 2)).then(() => setNote("Report copied without private fingerprints or source links."), e => setError(String(e))); }}><Copy size={15} /> Copy detailed report</button></div>
-      <Trace values={networkSamples} label="One-second network samples across the test matrix" unit="MB/s" />
-      <Trace values={report.resources.flatMap(s => s.cpuPercent == null ? [] : [s.cpuPercent])} label="System CPU during calibration" unit="%" />
+      <details><summary>Measurement graphs</summary><div className="performance-traces"><Trace values={networkSamples} label="One-second network samples across the test matrix" unit="MB/s" />
+      <Trace values={report.resources.flatMap(s => s.cpuPercent == null ? [] : [s.cpuPercent])} label="System CPU during calibration" unit="%" /></div></details>
       <details><summary>Hardware, resource pressure and reliability</summary><dl className="performance-details">
         <dt>Platform</dt><dd>{report.hardware.processorModel ?? "Processor model unavailable"} · {report.hardware.os} · {report.hardware.architecture} · {report.hardware.logicalProcessors} available logical processors</dd>
         <dt>Memory / available at start / peak app</dt><dd>{bytes(report.hardware.memoryBytes)} / {bytes(report.hardware.availableMemoryBytes)} / {bytes(peakMemory)}</dd>

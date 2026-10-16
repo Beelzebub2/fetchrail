@@ -36,19 +36,25 @@ Schedules use local time in the interface. Fetchrail must be running to execute 
 
 ## File categories
 
-Files are sorted into **Compressed**, **Documents**, **Music**, **Programs**, and **Video** folders by default. Customize their extensions and destinations in **Settings → File categories**. Files without a matching category use the default download folder.
+Files are sorted into **Compressed**, **Documents**, **Music**, **Programs**, and **Video** folders by default. Customize their extensions and destinations in **Settings → File categories**. Files without a matching category use the default download folder. When two categories list the same ending, the one higher in the list gets the file.
 
-Switch off **Automatically sort new downloads into folders** to keep new files directly in the default Downloads folder. Explicitly selected save locations still take precedence. To sort files already loose in Downloads, select **Organize existing files** after saving your category rules. To get rid of category folders under Downloads, turn off automatic sorting, save, then select **Move files back to Downloads**. Both actions leave active/unfinished files and other subfolders alone, never overwrite existing files (name collisions get a numbered suffix), and update the saved locations of Fetchrail downloads. Empty category folders are removed when files are moved back; external category folders remain untouched.
+Each category keeps to one line with a count of its endings. Select the endings to edit them: type or paste several at once separated by spaces, commas or new lines (a leading `.` or `*.` is dropped and duplicates are skipped), filter a long list, or remove single endings, with **Undo** for the last removal. **Ctrl+S** saves settings while they are open.
+
+Switch off **Automatically sort new downloads** to keep new files directly in the default Downloads folder. Explicitly selected save locations still take precedence. To sort files already loose in Downloads, select **Organize existing files** after saving your category rules. To get rid of category folders under Downloads, turn off automatic sorting, save, then select **Move files back to Downloads**. Both actions leave active/unfinished files and other subfolders alone, never overwrite existing files (name collisions get a numbered suffix), and update the saved locations of Fetchrail downloads. Empty category folders are removed when files are moved back; external category folders remain untouched.
 
 ## Browser downloads
 
-Fetchrail includes companions for **Chrome, Chromium, Vivaldi, Brave, and Firefox**. Follow the [browser companion guide](../browser-extension/README.md#install-the-companion) to load the extension.
+Fetchrail includes companions for **Chrome, Chromium, Vivaldi, Brave, and Firefox**. **Settings → Browser** offers the store for your default browser: **Get from Firefox Add-ons** when it is Firefox, otherwise **Get from Chrome Web Store** (Chrome, Edge, Brave, Vivaldi and other Chromium-based browsers). Choose **Using another browser?** to see both. You can also follow the [browser companion guide](../browser-extension/README.md#install-the-companion) to load the bundled copy yourself.
 
 Open the companion to paste URL batches, choose links from **This page**, or control live transfers. You can also right-click a link and choose **Download with Fetchrail**.
 
 **Catch browser downloads** is enabled by default. The companion verifies a transfer before cancelling the browser's copy; a failed handoff continues in the browser. For a caught download, **Download file info** lets you confirm its name, category, and folder before starting or keeping it for later.
 
 For sites with several buttons or countdowns, open the companion's **Options** and set **Links point to** to **Download pages**. See the guide for [page batches and session support](../browser-extension/README.md#multi-step-download-pages) and [routing limits](../browser-extension/README.md#routing-limits).
+
+## Interface size
+
+On large screens the main window grows its interface automatically, to about 120% on a 1440p display. To choose a size yourself, use **Settings → General → Interface size**, or press **Ctrl+=** and **Ctrl+-**; **Ctrl+0** returns to the automatic size. The choice is kept on this computer.
 
 ## Progress windows
 
@@ -86,7 +92,8 @@ Analytics is off until you choose **Allow**. **No thanks** or closing the prompt
 ## Performance and diagnostics
 
 For download calibration and automatic tuning, open **Settings → Performance → Optimize downloads**.
-Choose Quick or Deep, whether to include online tests, and explicit network/temporary-space
+**Start quick test** runs with sensible defaults and lists the time, data and disk space it uses.
+Under **Advanced test options**, choose Quick or Deep, whether to include online tests, and explicit network/temporary-space
 budgets. Pause active downloads and seeding first. A completed, usable report can enable
 automatic tuning; your connection ceiling and explicit per-download overrides remain.
 The app learns lightly from uncapped, uncontaminated completed downloads and rejects stale
