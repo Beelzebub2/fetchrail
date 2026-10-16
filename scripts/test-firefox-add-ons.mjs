@@ -1,8 +1,13 @@
 import assert from "node:assert/strict";
-import { readFile, stat } from "node:fs/promises";
+import { mkdtemp, readFile, rm, stat } from "node:fs/promises";
 import { createHmac } from "node:crypto";
+import { execFileSync } from "node:child_process";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { authorization, syncPrivacyPolicy, verifyCredentials } from "./firefox-add-ons-policy.mjs";
 import { syncIcon } from "./firefox-add-ons-icon.mjs";
+import { localManifest } from "./prepare-local-firefox.mjs";
 
 const json = async (path) => JSON.parse(await readFile(new URL(`../${path}`, import.meta.url), "utf8"));
 const source = await json("browser-extension/manifests/firefox.json");
@@ -17,6 +22,27 @@ assert.ok(Number(built.browser_specific_settings.gecko.strict_min_version.split(
 assert.deepEqual(built.browser_specific_settings.gecko.data_collection_permissions.required,
   ["browsingActivity", "websiteContent", "websiteActivity", "authenticationInfo"], "Native messaging data and optional session credentials must be disclosed to Firefox users");
 assert.deepEqual(built.background.scripts, ["background.js"]);
+const local = localManifest(built);
+assert.equal(local.browser_specific_settings.gecko.id, "{bb4d3986-35bd-4e55-bbcb-bb7f67894086}");
+assert.equal(local.name, "Fetchrail Local Companion");
+assert.equal(built.browser_specific_settings.gecko.id, "browser@braid.rrmtools.uk");
+local.name = built.name;
+local.browser_specific_settings.gecko.id = built.browser_specific_settings.gecko.id;
+assert.deepEqual(local, built, "Local signing must preserve version, permissions, disclosures and browser behavior");
+assert.throws(() => localManifest({ browser_specific_settings: { gecko: { id: "unrelated-addon" } } }));
+const localRoot = await mkdtemp(join(tmpdir(), "fetchrail-local-firefox-"));
+try {
+  const target = join(localRoot, "companion");
+  const prepare = fileURLToPath(new URL("./prepare-local-firefox.mjs", import.meta.url));
+  execFileSync(process.execPath, [prepare, target], { stdio: "pipe" });
+  assert.deepEqual(JSON.parse(await readFile(join(target, "manifest.json"))), localManifest(built));
+  assert.deepEqual(await readFile(join(target, "accent.js")), await readFile(new URL("../browser-extension/dist/firefox/accent.js", import.meta.url)));
+  const marker = JSON.parse(await readFile(join(target, "build-info.json"))).build;
+  assert((await readFile(join(target, "background.js"), "utf8")).startsWith(`const FETCHRAIL_BUILD = ${JSON.stringify(marker)};`));
+  assert.throws(() => execFileSync(process.execPath, [prepare, target], { stdio: "pipe" }), "Never overwrite an existing package");
+} finally {
+  await rm(localRoot, { recursive: true });
+}
 assert.ok(!("key" in built) && !("update_url" in built), "Do not ship Chromium distribution fields to AMO");
 
 assert.equal(metadata.name?.["en-US"], built.name);

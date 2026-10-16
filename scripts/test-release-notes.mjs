@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -37,6 +37,9 @@ try {
   commit("fix: direct change with [brackets] *stars*");
   git("merge", "--no-ff", "-qm", "Merge feature with resolution", "feature");
   const merged = git("rev-parse", "HEAD");
+  mkdirSync("docs/releases", { recursive: true });
+  writeFileSync("docs/releases/v0.7.2.md", "Fetchrail 0.7.2 restores stalled downloads.\n\n## Highlights\n\n- Keep every verified byte.\n");
+  git("add", "docs/releases/v0.7.2.md");
   const current = commit("fix: successful 0.7.2", "v0.7.2");
   git("tag", "v0.8.0");
   const history = [
@@ -68,6 +71,9 @@ try {
   };
   const notes = githubReleaseNotes("v0.7.2", repository, fakeGh);
   assert.equal(notes.base, "v0.6.1");
+  assert.ok(notes.body.startsWith("Fetchrail 0.7.2 restores stalled downloads.\n"));
+  writeFileSync("docs/releases/v0.7.2.md", "Uncommitted text must not become release notes.");
+  assert.equal(githubReleaseNotes("v0.7.2", repository, fakeGh).body, notes.body);
   assert.match(notes.body, /## Features/);
   assert.match(notes.body, /Commits since v0\.6\.1/);
   for (const sha of git("rev-list", "v0.6.1..v0.7.2").split("\n")) assert.ok(notes.body.includes(`/commit/${sha}`), `Missing change ${sha}`);
@@ -75,7 +81,7 @@ try {
   assert.ok(!notes.body.includes(published));
   assert.ok(!notes.body.includes(initial));
   assert.ok(notes.body.includes("\\[brackets\\] \\*stars\\*"));
-  assert.equal(calls.length, 2);
+  assert.equal(calls.length, 4);
 
   let firstReleaseCalls = 0;
   const first = githubReleaseNotes("v0.7.2", repository, () => {

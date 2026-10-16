@@ -27,6 +27,7 @@ macro_rules! extension_files {
 extension_files!(
     "manifest.json",
     "background.js",
+    "accent.js",
     "panel.html",
     "panel.js",
     "panel.css",
@@ -344,6 +345,26 @@ pub fn open_store(app: &AppHandle) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn embedded_panel_assets_are_complete() {
+        for files in [CHROMIUM_FILES, FIREFOX_FILES] {
+            let panel = files
+                .iter()
+                .find(|(name, _)| *name == "panel.html")
+                .unwrap();
+            let html = std::str::from_utf8(panel.1).unwrap();
+            for attribute in ["src=\"", "href=\""] {
+                for reference in html.split(attribute).skip(1) {
+                    let name = reference.split('"').next().unwrap();
+                    assert!(
+                        files.iter().any(|(asset, _)| *asset == name),
+                        "panel asset is missing from the embedded companion: {name}"
+                    );
+                }
+            }
+        }
+    }
 
     #[test]
     fn install_repair_and_failed_update() {
