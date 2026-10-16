@@ -45,7 +45,8 @@ function fixtureServer(mode,workers) {
     const persistentSlow=mode==="tail-region"&&start<total/32;
     const retryTail=mode==="disconnect-tail"&&start<total/workers;
     if(retryTail)tailVisits++;
-    const slowTail=mode==="tail-recover"&&start===0||mode==="tail-stays-slow"&&start<total/workers||retryTail&&tailVisits===2;
+    const groupTail=mode.startsWith("tail-group")&&start<3*total/workers&&(mode==="tail-group-slow"||start%(total/workers)===0);
+    const slowTail=groupTail||mode==="tail-recover"&&start===0||mode==="tail-stays-slow"&&start<total/workers||retryTail&&tailVisits===2;
     const speed=slowTail?4e6:persistentSlow||(start===0&&mode==="tail-matrix")?1e6:mode==="skew"&&start===0?8e6:120e6/workers;
     const limit=mode==="ignored"?total:end-start+1;
     function pump() {
@@ -162,6 +163,14 @@ async function run(label,exe,plan,mode="uniform",workers=8,tracing=true) {
       if(mode==="disconnect")assert(result.trace?.retries>=1&&state.requests.length>workers,"Disconnect must actually trigger a suffix retry");
       if(mode==="tail-recover"&&label.includes("-B"))assert.equal(result.trace?.retries,1,"A drained slow tail must recover once from its durable suffix");
       if(mode==="tail-stays-slow")assert((result.trace?.retries??0)<=1,"A persistently slow source must finish without repeated tail restarts");
+      if(mode.startsWith("tail-group")&&label.includes("-B")) {
+        const renewals=result.trace.retryEvents.filter(e=>e.reason==="slowPeer");
+        assert(renewals.length>0&&renewals.length<=3,"Recover drained groups without repeatedly restarting a range");
+        if(mode==="tail-group-recover")assert.equal(renewals.length,3,"Every slow member must retain its recovery opportunity");
+        assert.equal(new Set(renewals.map(e=>e.rangeIndex)).size,renewals.length);
+        assert.equal(result.trace.retries,renewals.length);
+        assert(state.requests.every(request=>initialManifest.ranges.some(range=>request.start>=range.start&&request.start<=range.end&&request.end===range.end)),"Recovery must retain each verified prefix and original range boundary");
+      }
       if(mode==="disconnect-tail"){
         assert(state.requests.length>workers&&result.trace?.retryEvents.some(event=>["body","decode","incomplete"].includes(event.reason)),"A connection error must precede the slow suffix");
         const renewals=result.trace?.retryEvents.filter(event=>event.reason==="slowPeer")??[];
@@ -190,6 +199,7 @@ async function run(label,exe,plan,mode="uniform",workers=8,tracing=true) {
 }
 
 const cases=process.env.FETCHRAIL_APP_BENCH_CASES??"uniform,skew,faults";
+if(cases.includes("group-tail"))assert(total>=2*1024**3,"Slow-group recovery needs a sustained tail");
 if(cases.includes("matrix"))for(const mode of(cases.includes("tail-region")?["tail-region"]:["uniform","tail-matrix"]))for(const workers of[1,4,8,16,32])for(const count of[32,64,128,512])await run(`${mode}-${workers}w-${count}r`,candidate,`ranges=${count}`,mode,workers);
 if(cases.includes("resume"))assert(total>2*1024**3,"Use more than 2 GiB to exercise version-2 micro-range recovery");
 if(cases.includes("fixed"))for(const [label,exe]of [["fixed-A1",baseline],["fixed-B1",candidate],["fixed-B2",candidate],["fixed-A2",baseline]])await run(label,exe,"fixed");
@@ -198,6 +208,10 @@ if(cases.includes("tail-recovery")) {
   await run("tail-stays-slow-B",candidate,"fixed","tail-stays-slow",8);
 }
 if(cases.includes("disconnect-tail"))for(const [label,exe]of [["disconnect-tail-A1",baseline],["disconnect-tail-B1",candidate],["disconnect-tail-B2",candidate],["disconnect-tail-A2",baseline]])await run(label,exe,"fixed","disconnect-tail",8);
+if(cases.includes("group-tail")) {
+  for(const [label,exe]of [["group-tail-A1",baseline],["group-tail-B1",candidate],["group-tail-B2",candidate],["group-tail-A2",baseline]])await run(label,exe,"fixed","tail-group-recover",8);
+  await run("group-tail-stays-slow-B",candidate,"fixed","tail-group-slow",8);
+}
 if(cases.includes("uniform"))for(const [label,exe,plan]of [["uniform-A1",baseline,"fixed"],["uniform-B1",candidate,"64m"],["uniform-B2",candidate,"128m"],["uniform-A2",baseline,"fixed"]])await run(label,exe,plan);
 if(cases.includes("skew"))for(const [label,exe,plan]of [["skew-A1",baseline,"fixed"],["skew-B1",candidate,"double"],["skew-B2",candidate,"64m"],["skew-A2",baseline,"fixed"]])await run(label,exe,plan,"skew");
 if(cases.includes("faults"))for(const mode of["disconnect","refusal","invalid","changed","ignored"])await run(`fault-${mode}`,candidate,"64m",mode,4);

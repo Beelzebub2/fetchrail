@@ -55,14 +55,16 @@ const handler = (request, response) => {
   let remaining = count;
   let paused = false;
   const began = performance.now();
+  const pacedRate = mode === 'slow-group' ? (start < total * 3 / 8 && start % (total / 8) === 0 ? 128 * 1024 : 512 * 1024)
+    : ['queued-skew', 'queued-gated'].includes(mode) && start === 0 ? 2e6 : 0;
   function pump() {
     if (mode === 'host-pause' && !paused && remaining < count - 1024 * 1024) { paused = true; setTimeout(pump, 12000); return; }
     while (!response.destroyed && remaining > 0) {
       // Assert queue order without depending on disk/CPU timing under parallel CI load.
       if (mode === 'queued-gated' && start === 0 && remaining <= body.length && !served.some(visit => visit.start >= total / 2) && performance.now()-began < 20000) { setTimeout(pump, 5); return; }
       const trickling = mode === 'trickle' && fail && remaining < count - 1024 * 1024;
-      const budget = ['queued-skew', 'queued-gated'].includes(mode) && start === 0 ? Math.max(0, body.length + Math.floor((performance.now()-began)/1000*2e6) - (count-remaining)) : body.length;
-      if (!budget) { setTimeout(pump, Math.max(1,(count-remaining)/2e6*1000-(performance.now()-began))); return; }
+      const budget = pacedRate ? Math.max(0, body.length + Math.floor((performance.now()-began)/1000*pacedRate) - (count-remaining)) : body.length;
+      if (!budget) { setTimeout(pump, Math.max(1,(count-remaining)/pacedRate*1000-(performance.now()-began))); return; }
       const size = Math.min(remaining, budget, trickling ? 64 : mode === 'uneven-rates' && start > 0 ? 16 * 1024 : body.length);
       const blocked = !response.write(body.subarray(0, size));
       remaining -= size;
@@ -345,6 +347,56 @@ async fn queued_ranges_keep_worker_ceiling_and_permits_across_successive_claims(
         );
         fs::remove_dir_all(dir).await.unwrap();
     }
+}
+
+#[tokio::test]
+async fn drained_group_recovers_each_slow_range_once_from_its_prefix() {
+    let total = 64 * 1024 * 1024;
+    let server = TestServer::new(total, "slow-group");
+    let (dir, _, mut probe) = parts(total, 8).await;
+    probe.final_url = Some(server.url.clone());
+    let ranges = split_ranges(total, 8);
+    prepare_parts(&dir, &probe, &ranges).await.unwrap();
+    let segments = segment_counters(&dir, &ranges).await.unwrap();
+    let job = task();
+    job.record.write().await.connections = 8;
+    DownloadManager::download_ranges(
+        &download_client_builder().no_proxy().build().unwrap(),
+        &RateLimiter::new(0),
+        &job,
+        &CancellationToken::new(),
+        &server.url,
+        &dir,
+        &segments,
+        &probe,
+    )
+    .await
+    .unwrap();
+    let requests = server.requests.lock().unwrap();
+    for (index, range) in ranges.iter().enumerate() {
+        let visits: Vec<_> = requests
+            .iter()
+            .filter(|(_, end)| *end == range.end)
+            .collect();
+        assert_eq!(visits.len(), if index < 3 { 2 } else { 1 });
+        assert_eq!(visits[0].0, range.start);
+        if index < 3 {
+            assert!(visits[1].0 > range.start && visits[1].0 <= range.end);
+        }
+    }
+    drop(requests);
+    let data = fs::read(dir.join("0.part")).await.unwrap();
+    assert_eq!(data.len() as u64, total);
+    assert!(data.iter().all(|&byte| byte == 0x5a));
+    assert_eq!(
+        completed_shared_hashes(&dir, total)
+            .await
+            .unwrap()
+            .unwrap()
+            .len(),
+        8
+    );
+    fs::remove_dir_all(dir).await.unwrap();
 }
 
 #[tokio::test]

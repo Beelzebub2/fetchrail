@@ -4444,10 +4444,8 @@ impl DownloadManager {
                             }
                             if matches!(error, EngineError::Slow) {
                                 recovered_slow_peer = true;
+                                // Other slow ranges still need the healthy peers' reference rate.
                                 client = download_client_builder().build()?;
-                                // Re-establish available throughput on the new transport. A link
-                                // capacity change must not repeatedly reject a steady slower source.
-                                peer_rate.store(0, Ordering::Relaxed);
                             }
                             let delay = match &error {
                                 EngineError::RetryAfter { delay, .. } => *delay,
@@ -4818,7 +4816,9 @@ impl DownloadManager {
                 if recover_peer && response_wait >= Duration::from_secs(5) {
                     let peer = if limiter.quantum() == usize::MAX && task.limiter.quantum() == usize::MAX { live_peer_rate.load(Ordering::Relaxed) } else { 0 };
                     if crate::network::weak_peer(written.saturating_sub(watched_bytes), response_wait, peer, &mut weak_windows) { return Err(EngineError::Slow); }
-                    let draining = expected_len.is_some() && peers.iter().filter(|p| p.downloaded.load(Ordering::Relaxed) < p.range.len()).count() <= worker_count.div_ceil(4);
+                    // Require half the slots to drain so one fast outlier cannot restart steady peers.
+                    let tail_workers = policy.as_ref().map_or(worker_count, |p| p.target.load(Ordering::Acquire)).min(worker_count);
+                    let draining = expected_len.is_some() && peers.iter().filter(|p| p.downloaded.load(Ordering::Relaxed) < p.range.len()).count() <= (tail_workers / 2).max(1);
                     let tail_peer = if draining && limiter.quantum() == usize::MAX && task.limiter.quantum() == usize::MAX { peer_rate.load(Ordering::Relaxed) } else { 0 };
                     if crate::network::slow_tail(written.saturating_sub(watched_bytes), response_wait, tail_peer, expected_len.unwrap_or(0).saturating_sub(written), &mut tail_windows) { return Err(EngineError::Slow); }
                     watched_bytes = written;
