@@ -11,7 +11,7 @@ const HTTP_FIXTURE: &str = r#"
 import { createServer } from 'node:http';
 const total = Number(process.argv[1]), mode = process.argv[2];
 const body = Buffer.alloc(mode === 'uneven-rates' ? 64 * 1024 : 16 * 1024, 0x5a);
-let failed = false, active = 0, peak = 0;
+let failed = false, active = 0, peak = 0, firstRangeRequests = 0;
 const served = [];
 const handler = (request, response) => {
   if (request.url === '/stats') { response.end(JSON.stringify({peak, served})); return; }
@@ -28,6 +28,8 @@ const handler = (request, response) => {
   let end = range?.[2] ? Number(range[2]) : total - 1;
   console.log(JSON.stringify([start, end]));
   const visit = {start, end, at: performance.now()}; served.push(visit);
+  const renewal = mode.startsWith('renewal-');
+  const rangeAttempt = renewal && end === total/4-1 ? ++firstRangeRequests : 0;
   active++; peak = Math.max(peak, active);
   let ended = false;
   const done = () => { if (!ended) { ended = true; active--; visit.done = performance.now(); } };
@@ -56,13 +58,15 @@ const handler = (request, response) => {
   let paused = false;
   const began = performance.now();
   const pacedRate = mode === 'slow-group' ? (start < total * 3 / 8 && start % (total / 8) === 0 ? 128 * 1024 : 512 * 1024)
+    : renewal ? (rangeAttempt === 1 ? 64*1024 : rangeAttempt === 2 ? 512*1024 : 2*1024*1024)
     : ['queued-skew', 'queued-gated'].includes(mode) && start === 0 ? 2e6 : 0;
   function pump() {
     if (mode === 'host-pause' && !paused && remaining < count - 1024 * 1024) { paused = true; setTimeout(pump, 12000); return; }
     while (!response.destroyed && remaining > 0) {
       // Assert queue order without depending on disk/CPU timing under parallel CI load.
       if (mode === 'queued-gated' && start === 0 && remaining <= body.length && !served.some(visit => visit.start >= total / 2) && performance.now()-began < 20000) { setTimeout(pump, 5); return; }
-      const trickling = mode === 'trickle' && fail && remaining < count - 1024 * 1024;
+      const trickling = (mode === 'trickle' && fail && remaining < count - 1024 * 1024)
+        || (mode === 'renewal-regresses' && rangeAttempt === 2);
       const budget = pacedRate ? Math.max(0, body.length + Math.floor((performance.now()-began)/1000*pacedRate) - (count-remaining)) : body.length;
       if (!budget) { setTimeout(pump, Math.max(1,(count-remaining)/pacedRate*1000-(performance.now()-began))); return; }
       const size = Math.min(remaining, budget, trickling ? 64 : mode === 'uneven-rates' && start > 0 ? 16 * 1024 : body.length);
@@ -919,6 +923,76 @@ async fn trickling_tail_resumes_only_its_flushed_suffix() {
         .iter()
         .any(|&(start, end)| start > 1024 * 1024 && end == segments[0].range.end));
     fs::remove_dir_all(dir).await.unwrap();
+}
+
+#[tokio::test]
+async fn degraded_renewal_uses_the_last_attempt_without_restarting_an_improved_source() {
+    for (mode, attempts) in [("renewal-regresses", 3), ("renewal-improves", 2)] {
+        let total = 32 * 1024 * 1024;
+        let server = TestServer::new(total, mode);
+        let (dir, _, mut probe) = parts(total, 4).await;
+        probe.final_url = Some(server.url.clone());
+        let ranges = split_ranges(total, 4);
+        prepare_parts(&dir, &probe, &ranges).await.unwrap();
+        let segments = segment_counters(&dir, &ranges).await.unwrap();
+        let client = download_client_builder().no_proxy().build().unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(60),
+            DownloadManager::download_ranges(
+                &client,
+                &RateLimiter::new(0),
+                &task(),
+                &CancellationToken::new(),
+                &server.url,
+                &dir,
+                &segments,
+                &probe,
+            ),
+        )
+        .await
+        .expect("A replacement that regresses must not trap a validated range")
+        .unwrap();
+        assert_eq!(
+            completed_shared_hashes(&dir, total)
+                .await
+                .unwrap()
+                .unwrap()
+                .len(),
+            4
+        );
+        let data = fs::read(dir.join("0.part")).await.unwrap();
+        assert_eq!(data.len() as u64, total);
+        assert!(data.iter().all(|&byte| byte == 0x5a));
+        let stats: serde_json::Value = client
+            .get(server.url.join("/stats").unwrap())
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert!(stats["peak"].as_u64().unwrap() <= 4);
+        let visits = server.requests.lock().unwrap().clone();
+        let renewed: Vec<_> = visits
+            .iter()
+            .filter(|(_, end)| *end == segments[0].range.end)
+            .collect();
+        assert_eq!(renewed.len(), attempts, "{mode}: {visits:?}");
+        assert_eq!(visits.len(), 3 + attempts);
+        assert!(renewed.windows(2).all(|pair| pair[0].0 < pair[1].0));
+        for (index, segment) in segments.iter().enumerate() {
+            let checkpoint: PartCheckpoint = serde_json::from_slice(
+                &fs::read(dir.join(format!("{index}.progress.json")))
+                    .await
+                    .unwrap(),
+            )
+            .unwrap();
+            let bytes = &data[segment.range.start as usize..=segment.range.end as usize];
+            assert_eq!(checkpoint.bytes, segment.range.len());
+            assert_eq!(checkpoint.sha256, format!("{:x}", Sha256::digest(bytes)));
+        }
+        fs::remove_dir_all(dir).await.unwrap();
+    }
 }
 
 #[tokio::test]

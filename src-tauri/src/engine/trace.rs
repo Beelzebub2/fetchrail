@@ -87,7 +87,7 @@ impl RetryCause {
     pub(super) fn from_error(error: &super::EngineError) -> Self {
         use super::EngineError;
         match error {
-            EngineError::Slow => Self::SlowPeer,
+            EngineError::Slow(_) => Self::SlowPeer,
             EngineError::Incomplete => Self::Incomplete,
             EngineError::Request(error) if error.is_timeout() => Self::Timeout,
             EngineError::Request(error) if error.is_connect() => Self::Connect,
@@ -645,7 +645,7 @@ mod tests {
     fn retries_record_bounded_fixed_causes_without_error_strings() {
         let trace = Trace::default();
         assert_eq!(
-            RetryCause::from_error(&super::super::EngineError::Slow).label(),
+            RetryCause::from_error(&super::super::EngineError::Slow(1024)).label(),
             "slowPeer"
         );
         assert_eq!(
