@@ -82,6 +82,7 @@ pub(crate) fn download_client_builder() -> reqwest::ClientBuilder {
         .read_timeout(Duration::from_secs(30));
     #[cfg(feature = "test-tools")]
     let builder = if crate::platform::test_root().is_ok_and(|root| root.is_some()) {
+        trace::enable_h2_diagnostics();
         let mut builder = builder;
         if std::env::var("FETCHRAIL_TEST_HTTP2_WINDOW").is_ok_and(|v| v == "fixed") {
             builder = builder
@@ -4356,13 +4357,32 @@ impl DownloadManager {
             .clamp(1, 32)
             .min(segments.len());
         drop(record);
-        let futures = (0..workers).map(|_| {
+        #[cfg(feature = "test-tools")]
+        let test_clients = if crate::platform::test_root().is_ok_and(|root| root.is_some())
+            && std::env::var("FETCHRAIL_TEST_HTTP_POOLS").is_ok_and(|value| value == "4")
+        {
+            let mut clients = vec![client.clone()];
+            for _ in 1..workers.min(4) {
+                clients.push(download_client_builder().build()?);
+            }
+            clients
+        } else {
+            Vec::new()
+        };
+        let futures = (0..workers).map(|_worker_index| {
+            #[cfg(feature = "test-tools")]
+            let worker_client = test_clients
+                .get(_worker_index % test_clients.len().max(1))
+                .unwrap_or(client)
+                .clone();
+            #[cfg(not(feature = "test-tools"))]
+            let worker_client = client.clone();
             let batch_cancel = &batch_cancel;
             let peer_rate = &peer_rate;
             let live_peer_rate = &live_peer_rate;
             let next_range = &next_range;
             async move {
-                let mut client = client.clone();
+                let mut client = worker_client;
                 let policy = task
                     .performance
                     .lock()
