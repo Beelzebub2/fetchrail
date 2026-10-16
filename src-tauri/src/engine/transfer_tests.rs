@@ -1329,18 +1329,26 @@ async fn transport_only_diagnostics_cannot_complete_or_record_durable_bytes() {
     let server = TestServer::new(total, "normal");
     let client = Client::builder().no_proxy().build().unwrap();
     for cancelled in [false, true] {
-        let response = client.get(server.url.clone())
+        let response = client
+            .get(server.url.clone())
             .header(RANGE, format!("bytes=0-{}", total - 1))
-            .send().await.unwrap();
+            .send()
+            .await
+            .unwrap();
         assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
         let trace = trace::Trace::default();
         let cancel = CancellationToken::new();
-        if cancelled { cancel.cancel(); }
-        let result = DownloadManager::receive_transport_only(response, total, &trace, &cancel).await;
+        if cancelled {
+            cancel.cancel();
+        }
+        let result =
+            DownloadManager::receive_transport_only(response, total, &trace, &cancel).await;
         if cancelled {
             assert!(matches!(result, Err(EngineError::Cancelled)));
         } else {
-            assert!(matches!(result, Err(EngineError::Message(message)) if message.contains("cannot publish")));
+            assert!(
+                matches!(result, Err(EngineError::Message(message)) if message.contains("cannot publish"))
+            );
         }
         let snapshot = trace.snapshot();
         assert_eq!(snapshot["networkBytes"], if cancelled { 0 } else { total });

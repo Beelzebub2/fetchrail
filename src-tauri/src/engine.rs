@@ -91,7 +91,9 @@ pub(crate) fn download_client_builder() -> reqwest::ClientBuilder {
         }
         if let Ok(value) = std::env::var("FETCHRAIL_TEST_RESOLVE") {
             let (host, address) = value.split_once('=').expect("Diagnostic host=IP required");
-            let address = address.parse::<std::net::IpAddr>().expect("Diagnostic IP required");
+            let address = address
+                .parse::<std::net::IpAddr>()
+                .expect("Diagnostic IP required");
             builder = builder.resolve(host, std::net::SocketAddr::new(address, 0));
         }
         builder
@@ -4579,12 +4581,16 @@ impl DownloadManager {
         let deadline = tokio::time::sleep(Duration::from_secs(40));
         tokio::pin!(deadline);
         loop {
-            let chunk = transfer_span!(Some(trace), Body, tokio::select! {
-                biased;
-                _ = cancel.cancelled() => return Err(EngineError::Cancelled),
-                _ = &mut deadline => return Err(EngineError::Message("Transport-only diagnostic reached its safety bound.".into())),
-                chunk = response.chunk() => chunk?,
-            });
+            let chunk = transfer_span!(
+                Some(trace),
+                Body,
+                tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => return Err(EngineError::Cancelled),
+                    _ = &mut deadline => return Err(EngineError::Message("Transport-only diagnostic reached its safety bound.".into())),
+                    chunk = response.chunk() => chunk?,
+                }
+            );
             let Some(chunk) = chunk else {
                 return Err(if received == expected {
                     EngineError::Message("Transport-only diagnostics cannot publish a file.".into())
@@ -4595,7 +4601,9 @@ impl DownloadManager {
             trace.received(chunk.len() as u64);
             received = received.saturating_add(chunk.len() as u64);
             if received > expected {
-                return Err(EngineError::Message("Server sent more bytes than requested.".into()));
+                return Err(EngineError::Message(
+                    "Server sent more bytes than requested.".into(),
+                ));
             }
         }
     }
@@ -4818,13 +4826,16 @@ impl DownloadManager {
             crate::platform::test_root().is_ok_and(|root| root.is_some())
                 && std::env::var("FETCHRAIL_TEST_RECEIVE_MODE").is_ok_and(|v| v == "memory")
         }) {
-            if existing != 0 || expected_len.is_none()
-                || limiter.quantum() != usize::MAX || task.limiter.quantum() != usize::MAX
+            if existing != 0
+                || expected_len.is_none()
+                || limiter.quantum() != usize::MAX
+                || task.limiter.quantum() != usize::MAX
             {
                 return Err(EngineError::Message("Transport-only diagnostics require fresh, known ranges and unlimited test limits.".into()));
             }
             segment.active.store(true, Ordering::Relaxed);
-            let result = Self::receive_transport_only(response, expected_len.unwrap(), trace, cancel).await;
+            let result =
+                Self::receive_transport_only(response, expected_len.unwrap(), trace, cancel).await;
             segment.active.store(false, Ordering::Relaxed);
             return result;
         }
