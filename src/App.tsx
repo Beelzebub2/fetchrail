@@ -44,6 +44,7 @@ import { PRESETS, accentColors, accentField, accentHex, accentSpot, distance, sp
 import { INTERFACE_SCALES, useInterfaceScale } from "./interfaceScale";
 import { PageHead } from "./PageHead";
 import { PerformanceInvitation, PerformancePage, type PerformanceView } from "./Performance";
+import { DownloadHealth } from "./DownloadHealth";
 import { AnalyticsPrompt, PrivacySettings } from "./Privacy";
 import type { AnalyticsConsent } from "./Privacy";
 import { usePlatformCapabilities } from "./platform";
@@ -147,6 +148,8 @@ type SetupInfo = {
 
 export type DownloadSettings = Appearance & {
   analyticsConsent: AnalyticsConsent;
+  qualityConsent?: AnalyticsConsent & { decidedAt?: string; appVersion?: string };
+  localCrashHistory?: boolean;
   torrent: TorrentSettings;
   speedLimitBps: number;
   autoUpdate: boolean;
@@ -1974,6 +1977,7 @@ function DownloadRow({
               <dt>Speed limit</dt>
               <dd>{item.speedLimitBps ? formatSpeed(item.speedLimitBps) : "Unlimited"}</dd>
             </dl>
+            {expanded && <DownloadHealth id={item.id} />}
           </div>
         </div>
       </div>

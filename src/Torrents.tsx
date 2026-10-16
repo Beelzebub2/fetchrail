@@ -1,3 +1,4 @@
+import { DownloadHealth } from "./DownloadHealth";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
@@ -140,6 +141,7 @@ export function TorrentInspector({ item, onClose, command, onError }: { item: Do
       {tab === "Trackers" && <><div className="torrent-controls"><input aria-label="Tracker URL" placeholder="udp:// or https:// tracker" value={tracker} onChange={e => setTracker(e.target.value)} /><button className="secondary-button" onClick={() => void action({ op: "tracker", url: tracker }).then(result => { if (result) setTracker(""); })}>Add tracker</button></div>{details?.trackers.map(track => <div className="torrent-tracker" key={track.url}><span>{track.url}<small>{track.error || (track.verified ? "Verified" : "Pending")} · Tier {track.tier}{(track.seeds ?? -1) >= 0 ? ` · ${track.seeds} seeds / ${track.peers} peers` : ""}</small></span><button className="icon-button" aria-label={`Remove tracker ${track.url}`} onClick={() => void action({ op: "removeTracker", url: track.url })}><X size={14} /></button></div>)}</>}
       {tab === "Activity" && <div className="torrent-activity">{details?.activity?.map((entry, index) => <p key={index}><time>{new Date(entry.time).toLocaleTimeString()}</time> {entry.message}</p>)}{!details?.activity?.length && <p>No recent engine events.</p>}</div>}
     </div>
+    <DownloadHealth id={item.id} />
     {deleting && <div className="torrent-remove" role="alertdialog" aria-label="Remove torrent"><span>Remove {item.fileName}?</span><label className="check-label"><input type="checkbox" checked={deleteFiles} onChange={e => setDeleteFiles(e.target.checked)} />Delete torrent payload files</label><button className="secondary-button" onClick={() => setDeleting(false)}>Cancel</button><button className="primary-button" onClick={() => void command("remove_download", item.id, { deleteFile: deleteFiles }).then(ok => { if (ok) onClose(); })}><Check size={16} /> Remove</button></div>}
   </section>;
 }

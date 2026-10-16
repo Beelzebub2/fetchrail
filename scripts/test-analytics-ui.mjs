@@ -64,6 +64,16 @@ try {
           window.testEmit("fetchrail://settings-updated", structuredClone(window.testSettings));
           return structuredClone(window.testSettings);
         }
+        if (name === "set_quality_consent") {
+          window.testSettings.qualityConsent = { enabled: args.enabled, decided: true, schema: 2, purpose: "product-quality-v2" };
+          window.testEmit("fetchrail://settings-updated", structuredClone(window.testSettings)); return structuredClone(window.testSettings);
+        }
+        if (name === "quality_preview") return window.testSettings.qualityConsent?.enabled ? { schema: 2, purpose: "product-quality-v2", version: "0.7.4", os: "windows", arch: "x64", counters: {http_accepted: 1}, histograms: {} } : null;
+        if (name === "set_local_crash_history") { window.testSettings.localCrashHistory = args.enabled; window.testEmit("fetchrail://settings-updated", structuredClone(window.testSettings)); return structuredClone(window.testSettings); }
+        if (name === "local_health_history") return [];
+        if (name === "clear_local_health_history" || name === "clear_download_health") return;
+        if (name === "download_health") return { schema: 1, version: "0.7.4", os: "windows", arch: "x64", debugBuild: false, elapsedMs: 9000, observedFromAccept: true, durableCompletedMs: null, receivedWireBytes: 123, checkpointBytesWritten: 100, outputVerifiedBytes: null, fileLimitBps: 0, globalLimitBps: 0, activities: [], receiveWindows: [], receiveStalls: 1, receiveStalledMs: 3000, missingReceiveWindows: 0,
+          stages: [{phase: "body", calls: 1, workerMs: 3000, maxMs: 3000, active: 1, activeElapsedMs: 3000}], causes: [["http_503", 1]], events: [{elapsedMs: 1000, durationMs: 3000, phase: "body", cause: null}], evictedEvents: 0, diagnosis: {confidence: "Observed", observation: "ReceiveWait", next: "ReproduceSourceAndRoute"}, limitations: ["NoExternalRootCause"] };
         if (name === "update_settings") {
           if (window.testDelaySettings) await new Promise(resolve => { window.testFinishSettings = resolve; });
           window.testSettings = args.settings;
@@ -112,6 +122,18 @@ try {
   await page.getByLabel("Allow optional improvement analytics").check();
   await page.getByText("Analytics is on.", { exact: true }).waitFor();
   await page.screenshot({ path: join(output, "analytics-settings.png"), fullPage: true });
+  assert.equal(await page.getByLabel("Allow optional download reliability analytics").isChecked(), false, "A v1 grant never enables v2");
+  await page.getByLabel("Allow optional download reliability analytics").check();
+  await page.getByText("Reliability analytics is on.", {exact: true}).waitFor();
+  assert.equal(await page.evaluate(() => window.testSettings.analyticsConsent.enabled), true);
+  await page.getByRole("button", {name: "Preview reliability payload"}).click();
+  assert.ok((await page.locator("pre.health-preview").textContent()).includes("product-quality-v2"));
+  await page.getByLabel("Allow optional download reliability analytics").uncheck();
+  await page.getByText("Reliability analytics is off.", {exact: true}).waitFor();
+  await page.getByLabel("Keep optional local crash breadcrumbs").check();
+  await page.waitForFunction(() => window.testSettings.localCrashHistory === true);
+  await page.getByLabel("Keep optional local crash breadcrumbs").uncheck();
+  await page.waitForFunction(() => window.testSettings.localCrashHistory === false);
   await page.getByLabel("Allow optional improvement analytics").uncheck();
   await page.getByText("Analytics is off.", { exact: true }).waitFor();
   // Reconsent is required for a new scope; saving failure emits undecided/off settings.
@@ -145,6 +167,21 @@ try {
   await page.goto(base + "?progress=test-download");
   await page.getByRole("heading", { name: "example-archive.rar" }).waitFor();
   assert.equal(await page.getByRole("dialog", { name: "Help improve Fetchrail?" }).count(), 0);
+  assert.deepEqual(analyticsRequests, []);
+  await page.getByText("Troubleshoot this download", {exact: true}).click();
+  await page.getByText("Observed:", {exact: true}).waitFor();
+  await page.getByRole("button", {name: "Preview safe incident report"}).click();
+  const copy = page.getByRole("button", {name: "Copy safe report", exact: true});
+  assert.equal(await copy.isDisabled(), true, "Per-incident preview needs a fresh review choice");
+  const preview = await page.locator("section[aria-label='Safe incident preview'] pre").textContent();
+  assert.ok(preview.includes('"http_503"') && !preview.includes("example.com") && !preview.includes("example-archive.rar"));
+  await page.getByLabel("I reviewed this one incident", {exact: false}).check();
+  assert.equal(await copy.isEnabled(), true);
+  await page.getByRole("button", {name: "Cancel sharing"}).click();
+  assert.equal(await page.getByRole("region", {name: "Safe incident preview"}).count(), 0);
+  await page.getByRole("button", {name: "Preview safe incident report"}).click();
+  assert.equal(await page.getByRole("button", {name: "Copy safe report", exact: true}).isDisabled(), true);
+  await page.screenshot({path: join(output, "local-incident-preview-narrow.png"), fullPage: true});
   assert.deepEqual(analyticsRequests, []);
   assert.deepEqual(errors, []);
   console.log("PASS: initial off choice, equal refusal/allow, persistent decline, grant/revoke, cross-window updates, native save failure event, reconsent, Escape, narrow layout and no frontend analytics requests. Screenshots: " + output);

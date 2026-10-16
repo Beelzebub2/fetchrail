@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { Monitor, X } from "lucide-react";
 import { PageHead } from "./PageHead";
+import { invoke } from "@tauri-apps/api/core";
 import type { DownloadSettings } from "./App";
 
 export type AnalyticsConsent = { enabled: boolean; decided: boolean; schema: number; purpose: string };
@@ -23,6 +24,12 @@ function Details() {
 type Choice = (allow: boolean) => Promise<void>;
 export function PrivacySettings({ settings, onChoice }: { settings: DownloadSettings; onChoice: Choice }) {
   const [busy, setBusy] = useState(false), [error, setError] = useState<string | null>(null);
+  const [preview, setPreview] = useState<string | null>(null), [history, setHistory] = useState<string | null>(null);
+  const qualityOn = settings.qualityConsent?.enabled && settings.qualityConsent?.decided && settings.qualityConsent.schema === 2 && settings.qualityConsent.purpose === "product-quality-v2";
+  async function privacyAction(command: string, args?: Record<string, unknown>) {
+    setBusy(true); setError(null); setPreview(null);
+    try { await invoke(command, args); } catch (e) { setError(String(e)); } finally { setBusy(false); }
+  }
   async function choose(allow: boolean) {
     setBusy(true); setError(null);
     try { await onChoice(allow); } catch (error) { setError(String(error)); } finally { setBusy(false); }
@@ -33,8 +40,28 @@ export function PrivacySettings({ settings, onChoice }: { settings: DownloadSett
       <div className="card-head"><h2>Optional improvement analytics</h2><p role="status">Analytics is {enabled(settings.analyticsConsent) ? "on" : "off"}.</p></div>
       <label className="check"><input type="checkbox" checked={!!enabled(settings.analyticsConsent)} disabled={busy} onChange={event => void choose(event.target.checked)} />Allow optional improvement analytics</label>
       <Details />
-      {error && <p role="alert" className="extension-error">{error}</p>}
     </section>
+    <section className="card rise privacy-card">
+      <div className="card-head"><h2>Optional download reliability analytics</h2><p role="status">Reliability analytics is {qualityOn ? "on" : "off"}.</p></div>
+      <p>This separate choice covers product-quality-v2. Your existing improvement choice does not enable it. Every download feature works with both choices off.</p>
+      <p>If enabled after release approval, Fetchrail sends app release, broad OS/architecture, combined HTTP/torrent admission and outcome counts, coarse size counts, fixed retry/error categories and eight-bucket stage duration distributions. HTTP durable completion follows verification, publication and saved catalog acknowledgement. Torrent selected-ready is a different observation and does not claim disk durability.</p>
+      <p>Reports have no sources, paths, credentials, identifiers, exact times or per-download records. Only newly admitted transfers in this consent period qualify; no backfill. One RAM batching loop checks every 30 minutes, drops failures/exits and cancels unsent work on withdrawal. Stage work can overlap. Preview below shows actual serializer output. Duration buckets use upper bounds of 10, 100, 1,000, 10,000, 60,000, 300,000 and 1,800,000 milliseconds, then an overflow bucket; worker durations overlap.</p>
+      <p>Recipient: Fetchrail/RRMTools on Cloudflare. Protected daily aggregates last 30 UTC days, with recovery copies potentially another 30. Cloudflare sees IPs in transit and may process security metadata internationally; EU-only processing and absolute anonymity are not promised. Small groups are suppressed. Individual contributions cannot be retrieved from combined totals. Contact support.fetchrail@rrmtools.uk for privacy requests.</p>
+      <p>Release status: expanded remote collection remains disabled pending legal and production approval. A saved choice alone does not activate this release gate.</p>
+      <label className="check"><input type="checkbox" checked={!!qualityOn} disabled={busy} onChange={e => void privacyAction("set_quality_consent", { enabled: e.target.checked })} />Allow optional download reliability analytics</label>
+      <button className="secondary-button" disabled={busy} onClick={() => void invoke("quality_preview").then(data => setPreview(data ? JSON.stringify(data, null, 2) : "No reliability payload: this purpose is off.")).catch(e => setError(String(e)))}>Preview reliability payload</button>
+      {preview !== null && <pre className="health-preview" tabIndex={0}>{preview}</pre>}
+    </section>
+    <section className="card rise privacy-card">
+      <h2>Local troubleshooting history</h2>
+      <p>Recent numeric operational evidence stays in memory for your downloads, including before you open Troubleshoot. It is lost on exit or a hard crash. This does not authorize remote analytics or support sharing.</p>
+      <p>Optional crash breadcrumbs save sanitized checkpoints at most every 30 seconds: up to 20 transfers for 7 days, protected with Windows account encryption or private Linux permissions. The final seconds before a crash may be missing. Inspect and delete below. This separate local choice is off by default.</p>
+      <label className="check"><input type="checkbox" checked={!!settings.localCrashHistory} disabled={busy} onChange={e => void privacyAction("set_local_crash_history", { enabled: e.target.checked })} />Keep optional local crash breadcrumbs</label>
+      <button className="secondary-button" disabled={busy} onClick={() => void invoke("local_health_history").then(data => setHistory(JSON.stringify(data, null, 2))).catch(e => setError(String(e)))}>Inspect saved local history</button>
+      <button className="secondary-button" disabled={busy} onClick={() => void privacyAction("clear_local_health_history").then(() => setHistory(null))}>Delete local diagnostic history</button>
+      {history !== null && <pre className="health-preview" tabIndex={0}>{history}</pre>}
+    </section>
+    {error && <p role="alert" className="extension-error">{error}</p>}
   </section>;
 }
 

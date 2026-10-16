@@ -10,6 +10,7 @@ import {
 import "./DownloadProgress.css";
 import { usePlatformCapabilities } from "./platform";
 import { TorrentInspector, TorrentRow } from "./Torrents";
+import { DownloadHealth } from "./DownloadHealth";
 
 const tabs = ["Download status", "Speed limiter", "Options on completion"] as const;
 type Tab = typeof tabs[number];
@@ -237,6 +238,7 @@ export function DownloadProgress({ id }: { id: string }) {
           </section>}
         </>
       )}
+      {item && <DownloadHealth id={id} />}
       {message && <p className="extension-error" role="alert">{message}</p>}
       <footer className="transfer-footer"><span>Closing this window keeps the download running.</span><button className="ghost-button" onClick={() => void getCurrentWindow().destroy().catch((error) => setMessage(String(error)))}>Close</button></footer>
     </main>
