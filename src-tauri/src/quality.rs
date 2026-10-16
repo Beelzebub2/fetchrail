@@ -180,7 +180,8 @@ impl Quality {
         for &(cause, n) in &health.causes {
             counter(&mut s, cause_key(cause), n);
         }
-        for stage in &health.stages {
+        // A persisted cancellation can precede worker drain; unfinished spans have no final duration.
+        for stage in health.stages.iter().filter(|stage| stage.active == 0) {
             if let Some(key) = stage_key(stage.phase) {
                 histogram(&mut s, key, stage.worker_ms);
             }
@@ -307,6 +308,25 @@ pub fn stage_key(phase: Phase) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn cancellation_does_not_turn_an_active_stage_into_a_zero_duration_sample() {
+        let quality = Quality::default();
+        quality.configure(&Consent::choice(true));
+        let mut sample = quality.prepare().unwrap();
+        quality.added(&mut sample, false);
+        let health = crate::health::Health::default();
+        let _body = health.guard(Phase::Body);
+        quality.outcome(
+            &mut sample,
+            false,
+            Outcome::Cancelled,
+            None,
+            &health.snapshot(false),
+        );
+        let report = quality.take_report().unwrap().0;
+        assert_eq!(report.counters["http_cancelled"], 1);
+        assert!(!report.histograms.contains_key("body_wait_worker_ms_v1"));
+    }
     #[test]
     fn randomized_lifecycle_counts_each_eligible_logical_transfer_at_most_once() {
         let quality = Quality::default();
