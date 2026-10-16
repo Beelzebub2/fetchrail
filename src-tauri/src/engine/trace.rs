@@ -35,8 +35,9 @@ pub(crate) enum Phase {
     PublishRename,
     PublishSync,
     ScanOverlap,
+    BodyProcessing,
 }
-const NAMES: [&str; 25] = [
+const NAMES: [&str; 26] = [
     "probe",
     "originAdmission",
     "globalAdmission",
@@ -62,6 +63,7 @@ const NAMES: [&str; 25] = [
     "publishRename",
     "publishSync",
     "scanHashOverlap",
+    "bodyProcessing",
 ];
 #[derive(Clone, Copy)]
 pub(crate) enum RetryCause {
