@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { cp, mkdir, readFile, writeFile } from "node:fs/promises";
+import { cp, mkdir, readFile, readdir, writeFile } from "node:fs/promises";
 import { createHash } from "node:crypto";
 import { dirname, join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -17,7 +17,9 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
   const target = resolve(process.argv[2] ?? "artifacts/local-firefox");
   await mkdir(dirname(target), { recursive: true });
   await mkdir(target);
-  await cp(source, target, { recursive: true, force: false, errorOnExist: true });
+  for (const name of await readdir(source)) {
+    await cp(join(source, name), join(target, name), { recursive: true, force: false, errorOnExist: true });
+  }
   const manifest = localManifest(JSON.parse(await readFile(join(target, "manifest.json"))));
   const oldBuild = JSON.parse(await readFile(join(target, "build-info.json"))).build;
   const build = createHash("sha256").update(oldBuild).update(JSON.stringify(manifest)).digest("hex");
