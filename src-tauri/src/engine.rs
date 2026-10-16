@@ -266,7 +266,7 @@ enum EngineError {
     #[error("download was cancelled")]
     Cancelled,
     #[error("A receiving connection stalled; resuming its verified range.")]
-    Slow,
+    Slow(u64),
     #[error("Server ended a range before all requested bytes arrived.")]
     Incomplete,
     #[error("{0}")]
@@ -302,7 +302,7 @@ fn failure_category(error: &EngineError) -> (&'static str, bool) {
             ("permission_denied", false)
         }
         EngineError::Io(e) if matches!(e.raw_os_error(), Some(28 | 112)) => ("disk_full", false),
-        EngineError::Slow | EngineError::Incomplete => ("transient_network", true),
+        EngineError::Slow(_) | EngineError::Incomplete => ("transient_network", true),
         EngineError::RangeUnsupported => ("range_unsupported", false),
         EngineError::Message(e) if e.contains("checksum") || e.contains("SHA-256") => {
             ("checksum_failed", false)
@@ -330,6 +330,13 @@ struct ProbeResult {
     suggested_file_name: Option<String>,
     validator: Option<StrongEtag>,
     final_url: Option<Url>,
+}
+
+#[derive(Clone, Copy)]
+enum PeerRecovery {
+    Disabled,
+    Peers,
+    Replacement(u64),
 }
 
 /// Dates are deliberately excluded: second-resolution timestamps cannot prove byte identity.
@@ -4401,8 +4408,7 @@ impl DownloadManager {
                     let result = async {
                         #[cfg(feature = "test-tools")]
                         let mut previous_retry_cause = None;
-                        // A transport failure must not consume the one slow-peer renewal.
-                        let mut recovered_slow_peer = false;
+                        let mut recovery = PeerRecovery::Peers;
                         for attempt in 0..3 {
                             #[cfg(feature = "test-tools")]
                             if attempt > 0 {
@@ -4449,9 +4455,11 @@ impl DownloadManager {
                                 workers,
                                 shared,
                                 live_peer_rate,
-                                !recovered_slow_peer
-                                    && probe.accepts_ranges
-                                    && probe.validator.is_some(),
+                                if attempt < 2 && probe.accepts_ranges && probe.validator.is_some() {
+                                    recovery
+                                } else {
+                                    PeerRecovery::Disabled
+                                },
                             )
                             .await;
                             let Err(error) = result else {
@@ -4460,7 +4468,7 @@ impl DownloadManager {
                             #[cfg(test)]
                             eprintln!("Range {index}, attempt {attempt}: {error:?}");
                             let transient = match &error {
-                                EngineError::Slow | EngineError::Incomplete => true,
+                                EngineError::Slow(_) | EngineError::Incomplete => true,
                                 EngineError::Request(error) => {
                                     error.is_timeout()
                                         || error.is_connect()
@@ -4485,8 +4493,8 @@ impl DownloadManager {
                             {
                                 previous_retry_cause = Some(trace::RetryCause::from_error(&error));
                             }
-                            if matches!(error, EngineError::Slow) {
-                                recovered_slow_peer = true;
+                            if let EngineError::Slow(previous_rate) = &error {
+                                recovery = PeerRecovery::Replacement(*previous_rate);
                                 // Other slow ranges still need the healthy peers' reference rate.
                                 client = download_client_builder().build()?;
                             }
@@ -4646,8 +4654,9 @@ impl DownloadManager {
         worker_count: usize,
         shared: bool,
         live_peer_rate: &AtomicU64,
-        recover_peer: bool,
+        recovery: PeerRecovery,
     ) -> EngineResult<()> {
+        let recover_peer = !matches!(recovery, PeerRecovery::Disabled);
         let range = segment.range;
         let part_path = part_dir.join(format!("{}.part", if shared { 0 } else { index }));
         let expected_len = if range.end == u64::MAX {
@@ -4915,13 +4924,21 @@ impl DownloadManager {
                 });
                 response_wait += waiting_at.elapsed();
                 if recover_peer && response_wait >= Duration::from_secs(5) {
-                    let peer = if limiter.quantum() == usize::MAX && task.limiter.quantum() == usize::MAX { live_peer_rate.load(Ordering::Relaxed) } else { 0 };
-                    if crate::network::weak_peer(written.saturating_sub(watched_bytes), response_wait, peer, &mut weak_windows) { return Err(EngineError::Slow); }
+                    let peer = if matches!(recovery, PeerRecovery::Peers) && limiter.quantum() == usize::MAX && task.limiter.quantum() == usize::MAX { live_peer_rate.load(Ordering::Relaxed) } else { 0 };
+                    let waiting_rate = (written.saturating_sub(watched_bytes) as f64 / response_wait.as_secs_f64().max(0.001)) as u64;
+                    if crate::network::weak_peer(written.saturating_sub(watched_bytes), response_wait, peer, &mut weak_windows) { return Err(EngineError::Slow(waiting_rate)); }
                     // Require half the slots to drain so one fast outlier cannot restart steady peers.
                     let tail_workers = policy.as_ref().map_or(worker_count, |p| p.target.load(Ordering::Acquire)).min(worker_count);
                     let draining = expected_len.is_some() && peers.iter().filter(|p| p.downloaded.load(Ordering::Relaxed) < p.range.len()).count() <= (tail_workers / 2).max(1);
-                    let tail_peer = if draining && limiter.quantum() == usize::MAX && task.limiter.quantum() == usize::MAX { peer_rate.load(Ordering::Relaxed) } else { 0 };
-                    if crate::network::slow_tail(written.saturating_sub(watched_bytes), response_wait, tail_peer, expected_len.unwrap_or(0).saturating_sub(written), &mut tail_windows) { return Err(EngineError::Slow); }
+                    // Back out a slower replacement, without retrying a steady slow source again.
+                    let tail_peer = if limiter.quantum() == usize::MAX && task.limiter.quantum() == usize::MAX {
+                        match recovery {
+                            PeerRecovery::Replacement(previous) => previous,
+                            PeerRecovery::Peers if draining => peer_rate.load(Ordering::Relaxed),
+                            _ => 0,
+                        }
+                    } else { 0 };
+                    if crate::network::slow_tail(written.saturating_sub(watched_bytes), response_wait, tail_peer, expected_len.unwrap_or(0).saturating_sub(written), &mut tail_windows) { return Err(EngineError::Slow(waiting_rate)); }
                     watched_bytes = written;
                     response_wait = Duration::ZERO;
                 }
@@ -5007,8 +5024,8 @@ impl DownloadManager {
                         );
                         peer_rate.fetch_max(best_rate as u64, Ordering::Relaxed);
                         slow_windows = if slow { slow_windows + 1 } else { 0 };
-                        if slow_windows >= 2 && started.elapsed() >= Duration::from_secs(30) {
-                            return Err(EngineError::Slow);
+                        if matches!(recovery, PeerRecovery::Peers) && slow_windows >= 2 && started.elapsed() >= Duration::from_secs(30) {
+                            return Err(EngineError::Slow((written.saturating_sub(progress_bytes) as f64 / progress_at.elapsed().as_secs_f64().max(0.001)) as u64));
                         }
                     } else {
                         best_rate = 0.0;

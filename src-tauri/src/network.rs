@@ -44,7 +44,7 @@ pub fn slow_tail(
     windows: &mut usize,
 ) -> bool {
     let rate = bytes as f64 / elapsed.as_secs_f64().max(0.001);
-    // Retry a long, drained tail once; short tails finish sooner than reopening a request.
+    // Short tails finish sooner than reopening a request.
     *windows = if peer > 0 && rate < peer as f64 * 0.5 && remaining as f64 > rate * 20.0 {
         *windows + 1
     } else {
