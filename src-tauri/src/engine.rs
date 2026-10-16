@@ -72,14 +72,33 @@ fn initial_checkpoint_interval(index: usize, workers: usize, range_bytes: u64) -
 }
 
 pub(crate) fn download_client_builder() -> reqwest::ClientBuilder {
-    Client::builder()
+    let builder = Client::builder()
         .user_agent(concat!("Fetchrail/", env!("CARGO_PKG_VERSION")))
         .redirect(reqwest::redirect::Policy::none())
         .pool_max_idle_per_host(32)
         .tcp_nodelay(true)
         .http2_adaptive_window(true)
         .connect_timeout(Duration::from_secs(15))
-        .read_timeout(Duration::from_secs(30))
+        .read_timeout(Duration::from_secs(30));
+    #[cfg(feature = "test-tools")]
+    let builder = if crate::platform::test_root().is_ok_and(|root| root.is_some()) {
+        let mut builder = builder;
+        if std::env::var("FETCHRAIL_TEST_HTTP2_WINDOW").is_ok_and(|v| v == "fixed") {
+            builder = builder
+                .http2_adaptive_window(false)
+                .http2_initial_connection_window_size(16 * 1024 * 1024)
+                .http2_initial_stream_window_size(16 * 1024 * 1024);
+        }
+        if let Ok(value) = std::env::var("FETCHRAIL_TEST_RESOLVE") {
+            let (host, address) = value.split_once('=').expect("Diagnostic host=IP required");
+            let address = address.parse::<std::net::IpAddr>().expect("Diagnostic IP required");
+            builder = builder.resolve(host, std::net::SocketAddr::new(address, 0));
+        }
+        builder
+    } else {
+        builder
+    };
+    builder
 }
 
 fn global_budget() -> &'static tokio::sync::Semaphore {
@@ -4827,6 +4846,8 @@ impl DownloadManager {
                 let Some(item) = item else { continue; };
                 let Some(chunk) = item else { break; };
                 let chunk = chunk?;
+                #[cfg(feature = "test-tools")]
+                let _processing = task.trace.as_deref().map(|trace| trace.guard(trace::Phase::BodyProcessing));
                 #[cfg(feature = "test-tools")]
                 if let Some(trace) = &task.trace {trace.received(chunk.len() as u64);}
                 written = written.saturating_add(chunk.len() as u64);
