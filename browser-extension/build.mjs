@@ -11,8 +11,10 @@ const fonts = {
   "fonts/geist.woff2": "@fontsource-variable/geist/files/geist-latin-wght-normal.woff2",
   "fonts/geist-mono.woff2": "@fontsource-variable/geist-mono/files/geist-mono-latin-wght-normal.woff2",
 };
-const files = ["background.js", "panel.html", "panel.js", "panel.css", "icon.svg", ...[16, 32, 48, 128].map((size) => `icons/${size}.png`), ...Object.keys(fonts)];
-const source = (file) => (fonts[file] ? join(root, "..", "node_modules", fonts[file]) : join(root, "src", file));
+const files = ["background.js", "accent.js", "panel.html", "panel.js", "panel.css", "icon.svg", ...[16, 32, 48, 128].map((size) => `icons/${size}.png`), ...Object.keys(fonts)];
+// The accent colors are the app's own module, so the panel and the app always agree.
+const shared = { "accent.js": "src/accent.js" };
+const source = (file) => (fonts[file] ? join(root, "..", "node_modules", fonts[file]) : shared[file] ? join(root, "..", shared[file]) : join(root, "src", file));
 rmSync(out, { recursive: true, force: true });
 
 for (const browser of ["chromium", "firefox"]) {
@@ -30,6 +32,8 @@ for (const browser of ["chromium", "firefox"]) {
   // Embed the running build in code: fetching a stamp at startup could read a newer build.
   writeFileSync(join(target, "background.js"), `const FETCHRAIL_BUILD = ${JSON.stringify(build)};\n` + readFileSync(join(root, "src", "background.js"), "utf8"));
   writeFileSync(join(target, "build-info.json"), JSON.stringify({ build }) + "\n");
+  // The panel loads it as a plain script, which cannot export.
+  writeFileSync(join(target, "accent.js"), readFileSync(source("accent.js"), "utf8").replace(/^export /gm, ""));
 }
 
 console.log("Built browser extensions:");

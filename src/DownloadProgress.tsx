@@ -17,7 +17,8 @@ type Tab = typeof tabs[number];
 export function DownloadProgress({ id }: { id: string }) {
   const [item, setItem] = useState<DownloadRecord | null>(null);
   const [tab, setTab] = useState<Tab>("Download status");
-  const [details, setDetails] = useState(true);
+  // The window opens at the height the remembered choice asks for, so its height says which it was.
+  const [details, setDetails] = useState(() => window.innerHeight >= 560);
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
   const [limitEnabled, setLimitEnabled] = useState(false);
@@ -103,6 +104,12 @@ export function DownloadProgress({ id }: { id: string }) {
     await command("set_download_completion_options", { options: next });
   }
 
+  // The window grows to show details and shrinks to hide them, and the next one opens the same way.
+  function showDetails(next: boolean) {
+    setDetails(next);
+    void invoke("set_progress_details", { details: next }).catch((error) => setMessage(String(error)));
+  }
+
   const parts = item ? partsOf(item) : [];
   const complete = item?.status === "completed";
   const canPause = item && ["queued", "scheduled", "connecting", "downloading"].includes(item.status);
@@ -117,7 +124,7 @@ export function DownloadProgress({ id }: { id: string }) {
   return (
     <main className="transfer-window form">
       <header className="transfer-head">
-        <Logo size={36} />
+        <Logo size={32} />
         <div>
           <p className="overline">{complete ? "Download complete" : "Download progress"}</p>
           <h1 title={item?.fileName}>{item?.fileName ?? "Loading download…"}</h1>
@@ -207,7 +214,7 @@ export function DownloadProgress({ id }: { id: string }) {
           </div>
           <div className="transfer-progress-caption"><span>{item.status === "merging" ? "Finalizing file" : complete ? "File saved" : "Overall progress"}</span><strong className="mono">{item.totalBytes || complete ? `${progress.toFixed(1)}%` : formatBytes(item.downloadedBytes)}</strong></div>
           <div className="transfer-actions">
-            <button type="button" className="ghost-button" aria-expanded={details} aria-controls="transfer-connections" onClick={() => setDetails(!details)}>{details ? <ChevronUp size={16} /> : <ChevronDown size={16} />}{details ? "Hide details" : "Show details"}</button>
+            <button type="button" className="ghost-button" aria-expanded={details} aria-controls="transfer-connections" onClick={() => showDetails(!details)}>{details ? <ChevronUp size={16} /> : <ChevronDown size={16} />}{details ? "Hide details" : "Show details"}</button>
             <div>
               {complete ? <><button className="secondary-button" disabled={busy} onClick={() => void command("open_download")}><Play size={15} />Open file</button><button className="secondary-button" disabled={busy} onClick={() => void command("reveal_download")}><FolderOpen size={15} />Open folder</button></> : <>
                 {canPause && <button className="secondary-button" disabled={busy} onClick={() => void command("pause_download")}><Pause size={15} />Pause</button>}

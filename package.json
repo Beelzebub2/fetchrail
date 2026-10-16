@@ -43,7 +43,7 @@
     "release:signatures": "node scripts/test-signatures.mjs",
     "website:sync-downloads": "node scripts/sync-website-downloads.mjs",
     "updates:test": "npm test --prefix update-service",
-    "ui:test": "node scripts/test-download-progress.mjs",
+    "ui:test": "node scripts/test-accent.mjs && node scripts/test-download-progress.mjs",
     "analytics:ui": "node scripts/test-analytics-ui.mjs",
     "diagnostics:ui": "node scripts/test-diagnostics-ui.mjs"
   },
