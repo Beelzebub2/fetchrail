@@ -67,6 +67,7 @@ try {
         }
         if (name === "setup_info") return { mode: new URLSearchParams(location.search).get("setup"), version: "0.6.1", dir: "C:\\Programs\\Fetchrail", installed: location.search.includes("installed"), desktopShortcut: true, theme: "dark", accent: "ember", downloadDir: "C:\\Downloads", sortsIntoFolders: true, launchOnStart: location.search.includes("installed") };
         if (window.testOpenError === name) throw new Error(name === "open_browser_extension_store" ? "Could not open the Chrome Web Store" : "Could not open destination");
+        if (name === "default_browser") return new URLSearchParams(location.search).get("browser");
         if (name === "platform_capabilities") return window.testCapabilities ?? (location.search.includes("platform=linux") ? { os: "linux", startup: { available: true, reason: "XDG startup" }, tray: { available: false, reason: "No watcher" }, shutdown: { available: false, reason: "Shutdown denied by policy" }, forceShutdown: { available: false, reason: "Old logind" }, disconnect: { available: true, reason: "Allowed" }, connections: [{ id: "connection-uuid", name: "Test connection" }], updateOwner: "package-manager", browserIntegration: { available: true, reason: "Native browser" } } : { os: "windows", startup: { available: true, reason: "Startup enabled" }, tray: { available: true, reason: "Tray available" }, shutdown: { available: true, reason: "Allowed" }, forceShutdown: { available: true, reason: "Allowed" }, disconnect: { available: true, reason: "Allowed" }, connections: [], updateOwner: "setup", browserIntegration: { available: true, reason: "Native browser" } });
         if (name === "performance_status") return structuredClone(window.testPerformance);
         if (name === "diagnostics_state") return { bands: [], active: false, progress: null, latest: null, message: null, sharing: "local" };
@@ -414,6 +415,79 @@ try {
   assert.equal(await gear.getAttribute("aria-pressed"), "false", "A second click on the gear closes Settings.");
   await page.evaluate(() => { window.testSettings = { ...window.testSettings, accent: "ember", minimizeToTray: true, launchOnStart: false }; });
 
+  // The combined speed is shown once, in the rail; its counts open from it, and section headings do not repeat it.
+  await page.locator(".throughput").click();
+  const transfers = page.locator("#throughput-details");
+  await transfers.getByText("Connections", { exact: true }).waitFor();
+  assert.match(await transfers.innerText(), /↓ 78\.6 MB\/s/);
+  assert.equal(await page.locator(".list-section .note").evaluateAll((notes) => notes.map((note) => note.textContent).join("")), "", "Section headings must not repeat the combined speed.");
+  await page.keyboard.press("Escape");
+
+  // A category with more than a hundred endings keeps to one line until opened; its list then scrolls inside a fixed box.
+  await page.setViewportSize({ width: 1280, height: 620 });
+  await page.goto(base);
+  await page.getByRole("button", { name: /^All downloads/ }).waitFor();
+  await page.evaluate((extensions) => {
+    window.testSettings.categories = [{ name: "Compressed", extensions: ["rar", "zip"], folder: "Compressed" }, { name: "Video", extensions, folder: "Video" }];
+    window.testEmit("fetchrail://settings-updated", structuredClone(window.testSettings));
+  }, Array.from({ length: 120 }, (_, index) => "x" + index));
+  await gear.click();
+  await rail.getByRole("tab", { name: "File categories", exact: true }).click();
+  const videoEndings = page.getByRole("button", { name: "Edit file endings for Video, 120 endings", exact: true });
+  await videoEndings.waitFor();
+  const ruleHeight = await videoEndings.evaluate((button) => button.closest(".category").getBoundingClientRect().height);
+  assert.ok(ruleHeight < 60, `A long category keeps to one line (${ruleHeight}px).`);
+  await videoEndings.click();
+  const endingsEditor = page.getByRole("group", { name: "File endings for Video" });
+  const endingsList = endingsEditor.getByRole("list");
+  assert.equal(await endingsList.getByRole("listitem").count(), 120);
+  const [shownHeight, fullHeight] = await endingsList.evaluate((list) => [list.clientHeight, list.scrollHeight]);
+  assert.ok(shownHeight <= 170 && fullHeight > shownHeight, "The open list scrolls inside a fixed height.");
+  await endingsEditor.getByLabel("Add file endings to Video").fill("MKV, .webm *.x5 rar;x200");
+  await endingsEditor.getByRole("status").getByText("Added mkv, webm, rar, x200 · 1 already listed · rar also in Compressed", { exact: true }).waitFor();
+  assert.equal(await endingsList.getByRole("listitem").count(), 124, "Separators, dots, case and duplicates are handled when several endings are added at once.");
+  assert.equal(await endingsList.locator("li.shadowed").count(), 1, "An ending an earlier category takes is marked.");
+  await endingsEditor.getByLabel("Filter file endings for Video").fill("x1");
+  assert.equal(await endingsList.getByRole("listitem").count(), 31);
+  await endingsEditor.getByRole("button", { name: "Remove x10", exact: true }).click();
+  assert.equal(await endingsList.getByRole("listitem").count(), 30);
+  assert.ok(await endingsEditor.getByRole("button", { name: "Remove x11", exact: true }).evaluate((button) => document.activeElement === button), "Focus moves to the next ending after a removal.");
+  await endingsEditor.getByRole("button", { name: "Undo", exact: true }).click();
+  assert.equal(await endingsList.getByRole("listitem").count(), 31);
+  await endingsEditor.getByLabel("Filter file endings for Video").press("Escape");
+  const closedEndings = page.getByRole("button", { name: "Edit file endings for Video, 124 endings", exact: true });
+  await closedEndings.waitFor();
+  assert.equal(await closedEndings.evaluate((button) => document.activeElement === button), true, "Escape closes the editor and returns focus to its category.");
+  await page.keyboard.press("Control+s");
+  await page.waitForFunction(() => window.testSettings.categories[1].extensions.length === 124);
+  assert.deepEqual(await page.evaluate(() => window.testSettings.categories[1].extensions.slice(-4)), ["mkv", "webm", "rar", "x200"], "Ctrl+S saves the endings in the order they were added.");
+  assert.equal(await page.evaluate(() => window.testSettings.categories[1].extensions.indexOf("x10")), 10, "Undo puts an ending back where it was.");
+  assert.deepEqual(await page.evaluate(() => window.testSettings.categories.map((category) => category.name)), ["Compressed", "Video"]);
+
+  // Each section opens at its top, and the section tabs follow the arrow keys, Home and End.
+  await closedEndings.click();
+  const content = page.locator(".content");
+  await content.evaluate((element) => element.scrollTo({ top: element.scrollHeight }));
+  assert.ok(await content.evaluate((element) => element.scrollTop > 0), "File categories scrolls in a short window.");
+  await rail.getByRole("tab", { name: "File categories", exact: true }).focus();
+  await page.keyboard.press("ArrowRight");
+  await page.getByRole("heading", { name: "Torrents", exact: true }).waitFor();
+  assert.equal(await rail.getByRole("tab", { name: "Torrents", exact: true }).evaluate((tab) => document.activeElement === tab && tab.tabIndex === 0), true);
+  assert.equal(await content.evaluate((element) => element.scrollTop), 0, "A section opens at its top.");
+  await page.keyboard.press("End");
+  assert.equal(await rail.getByRole("tab", { name: "Privacy", exact: true }).getAttribute("aria-selected"), "true");
+  await page.keyboard.press("Home");
+  await page.getByRole("heading", { name: "General", exact: true }).waitFor();
+  // The interface size is kept on this computer and applies at once, never as an unsaved change.
+  await page.waitForFunction(() => !document.querySelector(".save-dock").classList.contains("shown"));
+  await page.locator("label.choice", { hasText: "125%" }).click();
+  assert.equal(await page.evaluate(() => localStorage.getItem("interfaceScale")), "1.25");
+  assert.equal(await dockShown(), false);
+  await page.locator("label.choice", { hasText: "Automatic" }).click();
+  assert.equal(await page.evaluate(() => localStorage.getItem("interfaceScale")), "0");
+  await gear.click();
+  await page.setViewportSize({ width: 1280, height: 900 });
+
   for (const platform of ["windows", "linux"]) {
     await page.setViewportSize({ width: 960, height: 1000 });
     await page.goto(base + "?platform=" + platform);
@@ -423,6 +497,7 @@ try {
     const store = companion.getByRole("button", { name: "Get from Chrome Web Store", exact: true });
     await store.waitFor();
     assert.equal(await companion.getByText("Recommended", { exact: true }).count(), 1);
+    assert.equal(await companion.getByRole("button", { name: "Get from Firefox Add-ons", exact: true }).count(), 0, "Without Firefox as the default browser, only the Chromium companion is offered.");
     await page.evaluate(() => { window.testCalls = []; });
     await store.click();
     await page.waitForFunction(() => window.testCalls.some(call => call.name === "open_browser_extension_store"));
@@ -432,13 +507,29 @@ try {
     await store.click();
     await companion.getByRole("alert").filter({ hasText: "Could not open the Chrome Web Store" }).waitFor();
     assert.equal(await store.isEnabled(), true, "A failed store launch must allow retry and manual installation.");
-    await companion.getByRole("heading", { name: "Manual installation and Firefox", exact: true }).waitFor();
+    await companion.getByRole("heading", { name: "Manual installation", exact: true }).waitFor();
+    await page.evaluate(() => { window.testOpenError = null; });
+    await companion.getByRole("button", { name: "Using another browser?", exact: true }).click();
+    await companion.getByRole("button", { name: "Get from Firefox Add-ons", exact: true }).click();
+    await page.waitForFunction(() => window.testCalls.some(call => call.name === "open_browser_extension_store" && call.args.browser === "firefox"));
+    assert.equal(await page.evaluate(() => window.testCalls.find(call => call.name === "open_browser_extension_store").args.browser), "chromium");
     await companion.getByRole("button", { name: "Open extension folder", exact: true }).click();
     await companion.getByRole("button", { name: "Firefox folder", exact: true }).click();
     const folders = await page.evaluate(() => window.testCalls.filter(call => call.name === "open_browser_extension_folder").map(call => call.args.browser));
     assert.deepEqual(folders, ["chromium", "firefox"]);
     assert.equal(await companion.getByRole("alert").count(), 0, "A successful manual action clears the store launch error.");
   }
+  // With Firefox as the default browser, its store and steps lead and the Chromium ones stay out of the way.
+  await page.goto(base + "?browser=firefox");
+  await page.getByRole("button", { name: "Settings", exact: true }).click();
+  await page.getByRole("tab", { name: "Browser", exact: true }).click();
+  const firefoxCompanion = page.locator('[aria-labelledby="extension-settings-title"]');
+  await firefoxCompanion.getByRole("button", { name: "Get from Firefox Add-ons", exact: true }).waitFor();
+  await firefoxCompanion.getByText("Default browser", { exact: true }).waitFor();
+  await firefoxCompanion.getByRole("button", { name: "Firefox folder", exact: true }).waitFor();
+  assert.equal(await firefoxCompanion.getByRole("button", { name: "Get from Chrome Web Store", exact: true }).count(), 0, "A Firefox default hides the Chromium companion.");
+  assert.equal(await firefoxCompanion.getByRole("button", { name: "Open extension folder", exact: true }).count(), 0);
+  await page.screenshot({ path: join(output, "companion-firefox.png"), fullPage: true });
   await page.goto(base + "?progress=test-download&platform=linux");
   await page.getByRole("tab", { name: "Options on completion", exact: true }).click();
   const disconnect = page.getByLabel("Disconnect selected connection when done");
@@ -486,7 +577,10 @@ try {
   await page.getByRole("heading", {name:"Diagnostics",exact:true}).waitFor();
   assert.equal(await page.getByRole("button", {name:"Start quick test",exact:true}).count(),0);
   await page.getByRole("button", {name:"Go to download calibration",exact:true}).click();
-  await page.getByRole("heading", {name:"Calibrate your connection and drive",exact:true}).waitFor();
+  await page.getByRole("heading", {name:"Optimize downloads for this computer",exact:true}).waitFor();
+  assert.equal(await page.getByRole("button", {name:"Start quick test",exact:true}).isVisible(),true,"The easy path is one button with sensible defaults.");
+  assert.equal(await page.getByRole("button", {name:"Deep",exact:true}).isVisible(),false,"Test options wait behind Advanced.");
+  await page.getByText("Advanced test options", {exact:true}).click();
   assert.equal(await page.evaluate(() => window.testCalls.filter(c=>["start_diagnostics","apply_calibration","update_settings"].includes(c.name)).length),0,"Moving between tools must not run a prerequisite, apply results or save a draft");
   assert.equal(await page.evaluate(() => window.testCalls.filter(c=>c.name==="start_calibration").length),0);
   await page.getByRole("button", {name:"Deep",exact:true}).click();
@@ -602,11 +696,12 @@ try {
   assert.deepEqual(errors, []);
   console.log("PASS: setup walks through location, look and install, retries a failed install, and still updates and uninstalls");
   console.log("PASS: one rail strip for views and settings, a gliding underline, a save bar that counts, confirms and survives leaving Settings");
+  console.log("PASS: one combined speed with its details, compact file endings with 120+ entries, Ctrl+S, section tabs by keyboard, sections open at their top");
   console.log("PASS: Linux policy restrictions and connection selection block unsupported actions; saved actions remain clearable after capability loss");
   console.log("PASS: live progress, connection details, pause/resume/cancel, speed limits, completion settings, keyboard tabs, themes, completion actions, close behavior, and prompt handoff");
   console.log("PASS: settings contain switches, update buttons and long error text; both restart actions report launch failures");
   console.log("PASS: Windows security check defaults on, explains variable finalization time, warns on opt-out and saves both choices");
-  console.log("PASS: Windows/Linux companion settings recommend the store, report launch failures and retain Chromium/Firefox manual installation");
+  console.log("PASS: Windows/Linux companion settings lead with the default browser's store, report launch failures and retain Chromium/Firefox manual installation");
   console.log("Screenshots: " + output);
 } finally {
   await browser.close();
