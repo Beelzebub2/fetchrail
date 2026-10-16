@@ -175,6 +175,8 @@ Tag-only runs do not seed the shared `main` Rust and Windows vcpkg caches. A man
 
 The publisher creates a GitHub draft release with notes starting at the highest earlier stable version actually published on the tag's history. Failed tags, draft releases and prereleases do not advance that baseline, so their changes carry forward to the next successful release. Notes include GitHub's grouped merged pull requests plus every commit in that range, including direct fixes and merge resolutions; the first release lists the complete commit history. Apply the configured `feat`/`enhancement`, `fix`/`bug` or `perf`/`performance` labels to group pull requests under Features, Fixes or Performance; unlabeled pull requests appear under Other Changes. The README version badge also tracks published stable releases.
 
+For a reviewed user-facing summary, commit `docs/releases/vMAJOR.MINOR.PATCH.md` before tagging. The publisher reads that file from the tagged commit and prepends it to the complete generated changelog. Windows and both Linux architectures rebuild the final application without `test-tools`, then verify its embedded interface and retained companion handoffs before packaging; test harnesses remain CI-only assets.
+
 Release assets are:
 
 | Asset | Purpose |

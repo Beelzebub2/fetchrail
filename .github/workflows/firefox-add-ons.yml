@@ -6,10 +6,17 @@ on:
       policy_only:
         type: boolean
         default: false
+      local_companion:
+        type: boolean
+        default: false
   workflow_dispatch:
     inputs:
       policy_only:
         description: Repair or update the AMO icon and privacy policy without resubmitting the version
+        type: boolean
+        default: false
+      local_companion:
+        description: Sign an unlisted update for the retained local Firefox companion instead of publishing the public listing
         type: boolean
         default: false
 
@@ -55,7 +62,14 @@ jobs:
           zip -qr "artifacts/firefox-add-ons/source-${version}.zip" \
             browser-extension/src browser-extension/manifests browser-extension/build.mjs \
             browser-extension/README.md browser-extension/privacy-policy.txt \
+            src/accent.js scripts/prepare-local-firefox.mjs \
             package.json package-lock.json
+      - name: Prepare retained local Firefox package
+        if: inputs.local_companion
+        run: |
+          test '${{ inputs.policy_only }}' != true
+          node scripts/prepare-local-firefox.mjs
+          node browser-extension/publisher/node_modules/web-ext/bin/web-ext.js lint --source-dir artifacts/local-firefox
       - name: Check Mozilla credentials
         env:
           AMO_JWT_ISSUER: ${{ secrets.AMO_JWT_ISSUER }}
@@ -66,7 +80,7 @@ jobs:
             exit 1
           fi
       - name: Submit listed Firefox release to Mozilla
-        if: ${{ !inputs.policy_only }}
+        if: ${{ !inputs.policy_only && !inputs.local_companion }}
         env:
           WEB_EXT_API_KEY: ${{ secrets.AMO_JWT_ISSUER }}
           WEB_EXT_API_SECRET: ${{ secrets.AMO_JWT_SECRET }}
@@ -84,12 +98,34 @@ jobs:
             --approval-timeout 0 \
             --artifacts-dir artifacts/firefox-add-ons \
             --no-input
+      - name: Sign retained local Firefox update
+        if: inputs.local_companion
+        env:
+          WEB_EXT_API_KEY: ${{ secrets.AMO_JWT_ISSUER }}
+          WEB_EXT_API_SECRET: ${{ secrets.AMO_JWT_SECRET }}
+        run: |
+          export WEB_EXT_API_KEY="$(node -e 'process.stdout.write(process.env.WEB_EXT_API_KEY.trim())')"
+          export WEB_EXT_API_SECRET="$(node -e 'process.stdout.write(process.env.WEB_EXT_API_SECRET.trim())')"
+          version="$(node -p 'JSON.parse(require("fs").readFileSync("package.json", "utf8")).version')"
+          node browser-extension/publisher/node_modules/web-ext/bin/web-ext.js sign \
+            --source-dir artifacts/local-firefox --channel unlisted \
+            --upload-source-code "artifacts/firefox-add-ons/source-${version}.zip" \
+            --approval-timeout 600000 --artifacts-dir artifacts/firefox-add-ons --no-input
+      - name: Retain signed local Firefox update
+        if: inputs.local_companion
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: signed-local-firefox
+          path: artifacts/firefox-add-ons/*.xpi
+          if-no-files-found: error
       - name: Publish and verify Firefox listing icon
+        if: ${{ !inputs.local_companion }}
         env:
           AMO_JWT_ISSUER: ${{ secrets.AMO_JWT_ISSUER }}
           AMO_JWT_SECRET: ${{ secrets.AMO_JWT_SECRET }}
         run: node scripts/firefox-add-ons-icon.mjs
       - name: Publish and verify Firefox privacy policy
+        if: ${{ !inputs.local_companion }}
         env:
           AMO_JWT_ISSUER: ${{ secrets.AMO_JWT_ISSUER }}
           AMO_JWT_SECRET: ${{ secrets.AMO_JWT_SECRET }}

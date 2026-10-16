@@ -171,6 +171,14 @@ jobs:
         run: node scripts/test-torrent-desktop.mjs src-tauri/target/release/fetchrail.exe src-tauri/target/release/torrent-harness.exe
       - name: Test setup and removal
         run: npm run setup:test
+      - name: Build and verify the production executable without test tools
+        run: |
+          cargo build --manifest-path src-tauri/Cargo.toml --release --bin fetchrail --no-default-features --features tauri/custom-protocol --locked
+          if ($LASTEXITCODE -ne 0) { throw 'Production build failed.' }
+          node scripts/smoke-desktop.mjs
+          if ($LASTEXITCODE -ne 0) { throw 'Production frontend and native bridge checks failed.' }
+          node scripts/test-local-companion.mjs
+          if ($LASTEXITCODE -ne 0) { throw 'Production companion handoff checks failed.' }
       - name: Package Windows build without release secrets
         if: github.ref_type != 'tag'
         run: ./scripts/package-release.ps1 -FragmentOnly
@@ -302,6 +310,12 @@ jobs:
         run: xvfb-run -a -s "-screen 0 1280x1024x24 -noreset" dbus-run-session -- npm run linux:desktop
       - name: Test native Wayland settings and progress windows
         run: npm run linux:wayland
+      - name: Build and verify the production executable without test tools
+        run: |
+          set -euo pipefail
+          cargo build --manifest-path src-tauri/Cargo.toml --release --bin fetchrail --no-default-features --features tauri/custom-protocol --locked
+          xvfb-run -a -s "-screen 0 1280x1024x24 -noreset" dbus-run-session -- node scripts/smoke-desktop.mjs
+          xvfb-run -a -s "-screen 0 1280x1024x24 -noreset" dbus-run-session -- node scripts/test-local-companion.mjs
       - name: Build Linux packages without release secrets
         if: github.ref_type != 'tag'
         run: |

@@ -54,7 +54,10 @@ export function githubReleaseNotes(tag, repository, run = execFileSync) {
     return `- ${escape(subject.join(" "))} ([${sha.slice(0, 7)}](https://github.com/${repository}/commit/${sha}))`;
   }) : ["- No new commits."];
   const body = [generated, `## Commits${base ? ` since ${base}` : " in this first release"}`, lines.join("\n")].filter(Boolean).join("\n\n") + "\n";
-  return { base, body };
+  const summaryPath = `docs/releases/${tag}.md`;
+  const summary = git("ls-tree", "--name-only", tag, "--", summaryPath)
+    ? git("show", `${tag}:${summaryPath}`) : "";
+  return { base, body: summary ? `${summary}\n\n${body}` : body };
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
