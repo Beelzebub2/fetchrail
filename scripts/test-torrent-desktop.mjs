@@ -89,6 +89,9 @@ try {
   await consent.waitFor({ state: "visible", timeout: 15000 });
   await consent.getByRole("button", { name: "No thanks", exact: true }).click();
   await consent.waitFor({ state: "hidden" });
+  assert.equal(await invoke("quality_preview"), null, "Declining v1 never enables v2");
+  assert.deepEqual(await invoke("local_health_history"), []);
+  await assert.rejects(access(join(fixture.stateDir, "diagnostic-history.json")), "Default inspection cannot create persistent diagnostics");
   let settings = await invoke("get_settings");
   settings.autoUpdate = false; settings.maxConcurrentDownloads = 2; settings.speedLimitBps = 2 * 1024 * 1024;
   Object.assign(settings.torrent, localTorrentConfig, { ratioLimit: 0, seedTimeLimit: 0, maxSeeds: 1 });
@@ -130,7 +133,13 @@ try {
   await assert.rejects(access(join(destination, "Payload", "wanted.bin")), "Rejected HTTP directory cannot occupy a torrent's future file");
   await invoke("torrent_command", { id: job.id, request: { op: "sequential", enabled: true } });
   assert.equal((await invoke("list_downloads")).find(r => r.id === job.id).torrent.sequential, true);
+  const grant = await invoke("set_quality_consent", { enabled: true });
+  assert.equal(grant.analyticsConsent.enabled, false, "v2 cannot enable v1");
+  await invoke("set_local_crash_history", { enabled: true });
   const transfer = await invoke("add_download", { request: { url: http + "/http.bin", directory: join(root, "http"), connections: 4 } });
+  const quality = await invoke("quality_preview");
+  assert.equal(quality.counters.http_accepted, 1);
+  assert.equal(quality.counters.torrent_accepted, undefined, "Pre-consent torrent never joins the new epoch");
   await invoke("resume_download", { id: job.id });
   await invoke("torrent_command", { id: job.id, request: { op: "peer", address: "127.0.0.1", port: peerPort } });
   await until(async () => (await invoke("list_downloads")).filter(r => r.downloadedBytes > 1024 * 1024).length === 2, "mixed engines transfer", 60000);
@@ -143,10 +152,30 @@ try {
   assert.ok(report.mixedLimit.actualBytesPerSecond <= settings.speedLimitBps * 1.05, JSON.stringify(report.mixedLimit));
   assert.ok(after.every(r => r.downloadedBytes > records.find(old => old.id === r.id).downloadedBytes), "Both engines make progress");
   await invoke("pause_download", { id: job.id }); await invoke("pause_download", { id: transfer.id });
+  const health = await invoke("download_health", { id: transfer.id });
+  assert.equal(health.observedFromAccept, true);
+  assert.equal(health.durableCompletedMs, null);
+  assert.equal(health.globalLimitBps, settings.speedLimitBps);
+  assert.ok(health.stages.some(stage => stage.phase === "limiter"));
+  const torrentHealth = await invoke("download_health", { id: job.id });
+  assert.ok(torrentHealth.torrentHealth);
+  assert.equal(torrentHealth.durableCompletedMs, null, "Selected payload cannot fabricate HTTP durability");
+  for (const text of [JSON.stringify(health), JSON.stringify(torrentHealth), JSON.stringify(await invoke("local_health_history"))]) {
+    assert.ok(!text.includes(http) && !text.includes(root) && !text.includes(metadata.hashes[0]));
+  }
+  assert.ok((await invoke("local_health_history")).length > 0, "Explicit choice produces protected periodic breadcrumbs");
+  const incident = join(root, "reviewed-incident.json");
+  await assert.rejects(invoke("export_health_report", { path: incident, report: health, permission: false }), /Review/);
+  await invoke("export_health_report", { path: incident, report: health, permission: true });
+  assert.deepEqual(JSON.parse(await readFile(incident, "utf8")), health);
+  await assert.rejects(invoke("export_health_report", { path: incident, report: health, permission: true }), /existing|new filename/);
   await delay(1000); const stopped = (await invoke("list_downloads")).find(r => r.id === job.id);
   await delay(1000); assert.equal((await invoke("list_downloads")).find(r => r.id === job.id).downloadedBytes, stopped.downloadedBytes);
   await quit(); await access(join(fixture.stateDir, "torrents", job.id + ".resume"));
   await seed.call({ op: "pause", id: seedId }); await launch();
+  assert.equal((await invoke("get_settings")).qualityConsent.enabled, true);
+  assert.deepEqual((await invoke("quality_preview")).counters, {}, "Restart never replays accepted tasks or old outcomes");
+  assert.equal((await invoke("download_health", { id: transfer.id })).observedFromAccept, false);
   const restored = (await invoke("list_downloads")).find(r => r.id === job.id);
   await seed.call({ op: "inspect", path: join(fixture.stateDir, "torrents", job.id + ".torrent") });
   assert.equal(restored.status, "paused"); assert.equal(restored.downloadedBytes, stopped.downloadedBytes);
@@ -189,6 +218,11 @@ try {
   assert.equal(replacement.status, "paused"); assert.equal(replacement.downloadedBytes, 0);
   assert.ok(!replacement.url.includes("synthetic-secret-token"));
   assert.ok((await readdir(join(fixture.stateDir, "parts"))).some(name => name.startsWith(transfer.id + ".previous-source-")), "Changing source preserves the old attempt instead of trusting the reused ETag");
+  await invoke("set_quality_consent", { enabled: false });
+  await invoke("set_local_crash_history", { enabled: false });
+  assert.equal(await invoke("quality_preview"), null);
+  await assert.rejects(access(join(fixture.stateDir, "diagnostic-history.json")), "Withdrawal removes owned breadcrumb history");
+  report.tests.push("native independent consent, no backfill/replay, pre-incident health, protected breadcrumbs and reviewed no-clobber export");
   const remote = await invoke("import_torrent", { request: { source: http + "/payload.torrent" } });
   const remoteReady = await until(async () => (await invoke("torrent_import_status", { id: remote.id })).metadata, "remote metadata preview");
   assert.equal(remoteReady.name, metadata.name);
@@ -203,6 +237,8 @@ try {
   await writeFile(join(fixture.stateDir, "torrents", broken.id + ".resume"), "invalid resume");
   await writeFile(join(fixture.stateDir, "torrents", broken.id + ".torrent"), "invalid metadata");
   await launch();
+  assert.equal((await invoke("get_settings")).qualityConsent.enabled, false, "Withdrawal survives restart");
+  assert.equal((await invoke("get_settings")).localCrashHistory, false);
   assert.equal((await invoke("list_downloads")).find(item => item.id === broken.id).status, "failed");
   await assert.rejects(invoke("remove_download", { id: broken.id, deleteFile: true }), /not loaded|metadata|paths/);
   await invoke("remove_download", { id: broken.id, deleteFile: false });
