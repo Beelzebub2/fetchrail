@@ -11,7 +11,7 @@ const enabled = (consent?: AnalyticsConsent) => current(consent) && consent?.ena
 
 function Details() {
   return <div className="privacy-details">
-    <p>Help RRMTools, the Fetchrail maintainer, improve download reliability and choose useful future features. This is optional; every feature works the same with analytics off.</p>
+    <p>Help RRMTools, the Fetchrail project maintainer in Portugal, improve download reliability and choose useful future features. This is optional; every feature works the same with analytics off.</p>
     <p><strong>Exactly what is collected:</strong> app release version, broad operating system (Windows, Linux or other), CPU architecture (x64, arm64 or other), and counts of app launches; HTTP and torrent downloads added, completed, failed or cancelled; pause, resume, speed limit, queue, schedule, browser handoff and batch use. Completed downloads contribute only a size bucket: below 10 MiB, 10 MiB to below 1 GiB, or 1 GiB and above.</p>
     <p>Only transfers newly added while you allow analytics are eligible, with their first terminal outcome counted once. There are no historical imports. Counters are combined in memory, sent at most every 30 minutes, and discarded on failure or exit.</p>
     <p><strong>Never included:</strong> URLs or sites, magnets, filenames or paths, download history, cookies or credentials, headers, errors, peers or trackers, exact times, user/device/session/transfer IDs, or detailed machine specifications. No advertising, third-party analytics SDK or cross-service tracking.</p>
@@ -19,6 +19,7 @@ function Details() {
     <p>Turn this off here at any time. Withdrawal clears unsent counts and stops future collection; already combined totals cannot identify your contribution for removal. The browser companion has no analytics instrumentation. Automatic app update checks are a separate setting.</p>
     <p><strong>Diagnostics has separate permission:</strong> full measurements stay local. The optional connection test contacts Cloudflare only after Run, with at most 128 MiB of requested payload. Sharing a completed diagnostic report requires a separate per-run choice showing only coarse processor/drive/memory/network bands. This usage switch does not authorize that sharing. The same Fetchrail recipient and aggregate retention apply.</p>
     <p>Privacy questions: <a href="mailto:support.fetchrail@rrmtools.uk">support.fetchrail@rrmtools.uk</a>. Consent covers product improvement schema 1; a changed collection scope requires a new choice.</p>
+    <p>Optional analytics and per-run sharing rely on your consent. You may withdraw at any time without affecting earlier lawful processing. Contact the privacy address to request access, correction, erasure, restriction or portability where applicable, or to object where applicable. You may complain to Portugal's data protection authority, CNPD (cnpd.pt). We cannot isolate an unidentified contribution after aggregation, and do not require extra identifiers to enable analytics.</p>
   </div>;
 }
 
@@ -60,7 +61,7 @@ export function PrivacySettings({ settings, onChoice }: { settings: DownloadSett
       <p>Imports and browser handoffs may fail before a download exists. Their latest 20 source-free operation reports remain available here, separately from fleet counts.</p>
       <button className="secondary-button" disabled={busy} onClick={() => void invoke<Report[]>("recent_operation_health").then(setOperations).catch(e => setError(String(e)))}>Inspect recent imports and browser handoffs</button>
       {operations !== null && <section aria-label="Recent pre-admission observations">{operations.length ? operations.map((report, i) => <DownloadHealth key={i} initialReport={report} />) : <p>No import or browser handoff observations in this session.</p>}</section>}
-      <p>Optional crash breadcrumbs save sanitized checkpoints at most every 30 seconds: up to 20 transfers for 7 days, protected with Windows account encryption or private Linux permissions. The final seconds before a crash may be missing. Inspect and delete below. This separate local choice is off by default.</p>
+      <p>Optional crash breadcrumbs save sanitized checkpoints at most every 30 seconds: up to 20 reports for 7 days, protected with Windows account encryption or private Linux permissions. The final seconds before a crash may be missing. Inspect and delete below. This separate local choice is off by default.</p>
       <label className="check"><input type="checkbox" checked={!!settings.localCrashHistory} disabled={busy} onChange={e => void privacyAction("set_local_crash_history", { enabled: e.target.checked })} />Keep optional local crash breadcrumbs</label>
       <button className="secondary-button" disabled={busy} onClick={() => void invoke("local_health_history").then(data => setHistory(JSON.stringify(data, null, 2))).catch(e => setError(String(e)))}>Inspect saved local history</button>
       <button className="secondary-button" disabled={busy} onClick={() => void privacyAction("clear_local_health_history").then(() => { setHistory(null); setOperations(null); })}>Delete local diagnostic history</button>
