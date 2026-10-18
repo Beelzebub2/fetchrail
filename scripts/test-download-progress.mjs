@@ -33,6 +33,7 @@ try {
     const callbacks = new Map(), listeners = new Map();
     let next = 0;
     window.testCalls = [];
+    window.testBootstrap = {};
     window.testRecord = {
       id: "test-download", fileName: "example-archive.rar", url: "https://example.com/example-archive.rar",
       destination: "C:\\Downloads\\Compressed\\example-archive.rar", status: "downloading",
@@ -58,18 +59,23 @@ try {
         if (name === "plugin:event|listen") { listeners.set(args.handler, args.event); return args.handler; }
         if (name === "plugin:event|unlisten") { listeners.delete(args.eventId); return; }
         if (name === "get_download") return structuredClone(window.testRecord);
-        if (name === "list_downloads") return [structuredClone(window.testRecord)];
-        if (name === "get_settings") return structuredClone(window.testSettings);
-        if (name === "update_settings") {
+        if (name === "list_downloads") { const snapshot = [structuredClone(window.testRecord)]; if (location.search.includes("bootstrap")) { snapshot.push({ ...structuredClone(window.testRecord), id: "untouched", fileName: "untouched.bin" }, { ...structuredClone(window.testRecord), id: "removed", fileName: "removed.bin" }); return new Promise(resolve => { window.testBootstrap.downloads = () => resolve(snapshot); }); } return snapshot; }
+        if (name === "get_settings") { const snapshot = structuredClone(window.testSettings); if (location.search.includes("bootstrap")) return new Promise(resolve => { window.testBootstrap.settings = () => resolve(snapshot); }); return snapshot; }
+        if (name === "remember_download_folder") {
+          if (args.category) window.testSettings.categories.find(rule => rule.name === args.category).folder = args.directory;
+          else window.testSettings.defaultDownloadDir = args.directory;
+          return structuredClone(window.testSettings);
+        }
+        if (name === "patch_settings") {
           if (window.testDelaySettings) await new Promise(resolve => { window.testFinishSettings = resolve; });
-          window.testSettings = args.settings;
+          window.testSettings = { ...window.testSettings, ...args.patch };
           return structuredClone(window.testSettings);
         }
         if (name === "setup_info") return { mode: new URLSearchParams(location.search).get("setup"), version: "0.6.1", dir: "C:\\Programs\\Fetchrail", installed: location.search.includes("installed"), desktopShortcut: true, theme: "dark", accent: "ember", downloadDir: "C:\\Downloads", sortsIntoFolders: true, launchOnStart: location.search.includes("installed") };
         if (window.testOpenError === name) throw new Error(name === "open_browser_extension_store" ? "Could not open the Chrome Web Store" : "Could not open destination");
         if (name === "default_browser") return new URLSearchParams(location.search).get("browser");
         if (name === "platform_capabilities") return window.testCapabilities ?? (location.search.includes("platform=linux") ? { os: "linux", startup: { available: true, reason: "XDG startup" }, tray: { available: false, reason: "No watcher" }, shutdown: { available: false, reason: "Shutdown denied by policy" }, forceShutdown: { available: false, reason: "Old logind" }, disconnect: { available: true, reason: "Allowed" }, connections: [{ id: "connection-uuid", name: "Test connection" }], updateOwner: "package-manager", browserIntegration: { available: true, reason: "Native browser" } } : { os: "windows", startup: { available: true, reason: "Startup enabled" }, tray: { available: true, reason: "Tray available" }, shutdown: { available: true, reason: "Allowed" }, forceShutdown: { available: true, reason: "Allowed" }, disconnect: { available: true, reason: "Allowed" }, connections: [], updateOwner: "setup", browserIntegration: { available: true, reason: "Native browser" } });
-        if (name === "performance_status") return structuredClone(window.testPerformance);
+        if (name === "performance_status") { if (window.testPerformanceFailures > 0 && args.includeReport) { window.testPerformanceFailures--; throw Error("Transient status failure"); } return structuredClone(window.testPerformance); }
         if (name === "diagnostics_state") return { bands: [], active: false, progress: null, latest: null, message: null, sharing: "local" };
         if (name === "start_calibration") { window.testCalibrationOptions = args.options; window.testPerformance.running = true; window.testPerformance.phase = "drive writes, flushes, reads and finalization"; window.testPerformance.progress = 5; return structuredClone(window.testPerformance); }
         if (name === "cancel_calibration") { window.testPerformance.running = false; window.testPerformance.phase = "cancelled"; return; }
@@ -77,7 +83,8 @@ try {
         if (name === "apply_calibration") { window.testPerformance.applied = args.id; window.testSettings.performanceAuto = true; window.testEmit("fetchrail://settings-updated", structuredClone(window.testSettings)); return structuredClone(window.testSettings); }
         if (name === "reset_calibration") { window.testPerformance.latest = null; window.testPerformance.applied = null; window.testSettings.performanceAuto = false; window.testEmit("fetchrail://settings-updated", structuredClone(window.testSettings)); return structuredClone(window.testSettings); }
         if (name === "get_overview") return { active: 0, queued: 0, completed: 1, failed: 0, currentSpeedBps: 0 };
-        if (name === "list_queues") return [{ name: "Default", paused: false, startsAt: null, stopsAt: null }];
+        if (name === "request_browser_downloads") return "browser-request-fixture";
+        if (name === "list_queues") { const snapshot = [{ name: "Default", paused: false, startsAt: null, stopsAt: null }]; if (location.search.includes("bootstrap")) return new Promise(resolve => { window.testBootstrap.queues = () => resolve(snapshot); }); return snapshot; }
         if (name === "plugin:app|version") return "0.5.2";
         if (name === "update_status") return { state: "current" };
         if (name === "restart_app") throw "Could not restart Fetchrail: test launch failure";
@@ -215,10 +222,35 @@ try {
   assert.equal(calls.filter((call) => call.name === "cancel_download").length, 1, "Closing must not cancel the transfer.");
   await page.evaluate(() => { window.testRecord.status = "paused"; window.testCalls = []; });
   await page.goto(base + "?confirm=test-download");
+  await page.getByRole("button", { name: "Start download", exact: true }).waitFor();
+  await page.evaluate(() => {
+    window.testSettings = { ...window.testSettings, theme: "light", speedLimitBps: 789, categories: [...window.testSettings.categories, { name: "Fresh", extensions: ["bin"], folder: "D:/Fresh" }] };
+    window.testEmit("fetchrail://settings-updated", structuredClone(window.testSettings));
+  });
+  await page.locator(".prompt select").selectOption("Fresh");
+  await page.getByRole("checkbox", { name: "Remember this folder for Fresh", exact: true }).check();
   await page.getByRole("button", { name: "Start download", exact: true }).click();
   await page.waitForFunction(() => window.testCalls.some((call) => call.name === "resume_download"));
   const promptCalls = await page.evaluate(() => window.testCalls.map((call) => call.name));
+  assert.ok(promptCalls.includes("remember_download_folder") && !promptCalls.includes("patch_settings"));
+  assert.equal(await page.evaluate(() => window.testSettings.speedLimitBps), 789, "Remembering a folder preserves a newer setting from another window");
   assert.ok(promptCalls.indexOf("show_download_progress") < promptCalls.indexOf("resume_download"), "Start must open the progress window before the transfer begins.");
+  await page.goto(base + "?bootstrap");
+  await page.waitForFunction(() => Object.keys(window.testBootstrap).length === 3);
+  await page.evaluate(() => {
+    window.testEmit("fetchrail://download-updated", { ...window.testRecord, fileName: "fresh.rar" });
+    window.testEmit("fetchrail://download-updated", { ...window.testRecord, id: "newer", fileName: "newer.bin" });
+    window.testEmit("fetchrail://download-removed", "removed");
+    window.testEmit("fetchrail://settings-updated", { ...window.testSettings, theme: "light" });
+    window.testEmit("fetchrail://queues-updated", [{ name: "Default", paused: false }, { name: "Fresh queue", paused: true }]);
+    Object.values(window.testBootstrap).forEach(finish => finish());
+  });
+  await page.getByText("fresh.rar", { exact: true }).waitFor();
+  await page.getByText("newer.bin", { exact: true }).waitFor();
+  await page.getByText("untouched.bin", { exact: true }).waitFor();
+  assert.equal(await page.getByText("removed.bin", { exact: true }).count(), 0);
+  assert.equal(await page.evaluate(() => document.documentElement.dataset.theme), "light");
+  await page.getByRole("button", { name: /Fresh queue/ }).waitFor();
   await page.goto(base);
   await page.getByRole("button", { name: "Settings", exact: true }).click();
   await page.getByRole("heading", { name: "Background behavior" }).waitFor();
@@ -274,6 +306,21 @@ try {
   const dockShown = () => page.locator(".save-dock").evaluate((bar) => bar.classList.contains("shown"));
   const glide = () => page.locator(".tab-glide").evaluate((bar) => ({ opacity: bar.style.opacity, transform: bar.style.transform }));
   await page.getByRole("button", { name: /^All downloads/ }).waitFor();
+  await page.getByRole("button", { name: "Download options", exact: true }).click();
+  await page.getByRole("textbox", { name: "Download URLs" }).fill("https://github.com/private/repo/archive/main.zip");
+  await page.getByRole("checkbox", { name: "Use browser session for signed-in sites or private repositories" }).check();
+  await page.screenshot({ path: join(output, "browser-session-desktop.png"), fullPage: true });
+  await page.locator(".modal").getByRole("button", { name: "Use browser", exact: true }).click();
+  await page.getByRole("alert").filter({ hasText: "Waiting for browser sign-in" }).waitFor();
+  const browserRequest = await page.evaluate(() => window.testCalls.find(call => call.name === "request_browser_downloads"));
+  assert.equal(browserRequest.args.requests[0].url, "https://github.com/private/repo/archive/main.zip");
+  assert.equal(browserRequest.args.requests[0].queue, "Default");
+  assert.equal(await page.evaluate(() => window.testCalls.some(call => call.name === "add_downloads")), false,
+    "A desktop browser-session request must wait for the chosen browser, without starting an unauthenticated transfer.");
+  await page.getByRole("button", { name: "Dismiss error" }).click();
+  await page.getByRole("button", { name: "Download options", exact: true }).click();
+  await page.getByRole("checkbox", { name: "Use browser session for signed-in sites or private repositories" }).uncheck();
+  await page.getByRole("button", { name: "Close new download dialog" }).click();
   // Large files may queue 32 immutable byte ranges on 16 live connections.
   // Neither the connection label nor the throughput header may confuse those units.
   await page.evaluate(() => {
@@ -324,7 +371,7 @@ try {
     { dark: paintedAccent(savedAccent("azure"), "dark"), light: paintedAccent(savedAccent("azure"), "light"), saved: savedAccent("azure") },
   );
   assert.equal(await dockShown(), false, "A look applies at once and never raises the save bar.");
-  const saves = () => page.evaluate(() => window.testCalls.filter((call) => call.name === "update_settings").length);
+  const saves = () => page.evaluate(() => window.testCalls.filter((call) => call.name === "patch_settings").length);
   const before = await saves();
   const field = await page.locator(".accent-field").boundingBox();
   await page.mouse.move(field.x + field.width * 0.2, field.y + field.height * 0.5);
@@ -581,7 +628,7 @@ try {
   assert.equal(await page.getByRole("button", {name:"Start quick test",exact:true}).isVisible(),true,"The easy path is one button with sensible defaults.");
   assert.equal(await page.getByRole("button", {name:"Deep",exact:true}).isVisible(),false,"Test options wait behind Advanced.");
   await page.getByText("Advanced test options", {exact:true}).click();
-  assert.equal(await page.evaluate(() => window.testCalls.filter(c=>["start_diagnostics","apply_calibration","update_settings"].includes(c.name)).length),0,"Moving between tools must not run a prerequisite, apply results or save a draft");
+  assert.equal(await page.evaluate(() => window.testCalls.filter(c=>["start_diagnostics","apply_calibration","patch_settings"].includes(c.name)).length),0,"Moving between tools must not run a prerequisite, apply results or save a draft");
   assert.equal(await page.evaluate(() => window.testCalls.filter(c=>c.name==="start_calibration").length),0);
   await page.getByRole("button", {name:"Deep",exact:true}).click();
   await page.getByLabel("Network payload budget").selectOption("64");
@@ -630,6 +677,22 @@ try {
   assert.equal(await page.getByRole("button", {name:"Apply calibration",exact:true}).isDisabled(),true,"Old measured results cannot be applied after invalidation");
   assert.equal(await page.getByText("Insufficient samples",{exact:true}).count(),2,"Unproven fast disk samples must not be shown as zero hardware performance");
   console.log("PASS: opt-in calibration, selected budgets, cancellation, application, redacted report, reset, uncertainty and responsive results");
+  await page.goto(base);
+  await page.getByRole("button", { name: "Settings", exact: true }).click();
+  await page.evaluate(() => { window.testPerformanceFailures = 1; window.testPerformance.running = true; });
+  await page.getByRole("tab", { name: "Performance", exact: true }).click();
+  await page.getByRole("alert").filter({ hasText: "Transient status failure" }).waitFor();
+  await page.getByRole("button", { name: "Cancel test", exact: true }).waitFor();
+  assert.equal(await page.getByRole("alert").filter({ hasText: "Transient status failure" }).count(), 0);
+  await page.evaluate(() => { window.testPerformanceFailures = 1; });
+  await page.getByRole("alert").filter({ hasText: "Transient status failure" }).waitFor();
+  await page.waitForFunction(() => !document.body.innerText.includes("Transient status failure"));
+  await page.evaluate(() => { window.testPerformance.running = false; });
+  await page.getByRole("button", { name: "Cancel test", exact: true }).click();
+  await page.getByRole("tab", { name: "General", exact: true }).click();
+  const fullPolls = await page.evaluate(() => window.testCalls.filter(call => call.name === "performance_status" && call.args.includeReport).length);
+  await page.waitForTimeout(1200);
+  assert.equal(await page.evaluate(() => window.testCalls.filter(call => call.name === "performance_status" && call.args.includeReport).length), fullPolls, "Unmount cancels the full-status polling loop");
 
   // The setup program is the same page with `setup` in its address: three steps to install, one screen to remove.
   await page.setViewportSize({ width: 920, height: 600 });

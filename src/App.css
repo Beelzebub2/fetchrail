@@ -314,6 +314,9 @@ h1, h2, p { margin: 0; }
 .path-input { display: flex; gap: 8px; }
 .hint { color: var(--text-3); font-size: 12.5px; font-weight: 400; line-height: 1.5; }
 .modal-backdrop { position: fixed; inset: 0; z-index: 10; display: grid; align-items: start; justify-items: center; overflow: auto; padding: min(64px, 6vh) 16px 24px; background: var(--backdrop); animation: fade-in 160ms ease-out; }
+dialog.modal-backdrop { width: 100vw; max-width: none; height: 100dvh; max-height: none; margin: 0; border: 0; background: transparent; color: inherit; }
+dialog.modal-backdrop:not([open]) { display: none; }
+dialog.modal-backdrop::backdrop { background: var(--backdrop); }
 /* Tight enough that the new-download dialog fits a 768-pixel-high window without scrolling. */
 .modal { --field: var(--bg); width: min(600px, 100%); display: grid; gap: 14px; padding: 22px 24px 20px; border: 1px solid var(--line); border-radius: 22px; background: var(--surface); box-shadow: 0 28px 72px var(--shade); animation: rise-in 220ms var(--ease); }
 .modal.compact { width: min(440px, 100%); }

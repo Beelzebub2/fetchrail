@@ -44,6 +44,14 @@ cargo check --manifest-path src-tauri/Cargo.toml --all-targets --locked
 
 `npm run build` builds both extension variants, type-checks the frontend, and creates its production bundle. `npm run browser:build` builds just the extensions. `npm run browser:check` verifies extension sender checks, URL handling, batching, deduplication, options, and automatic routing.
 
+`npm run browser:check` also injects lost native handoff replies and worker restarts, including private sessions and ambiguous request contexts. `node scripts/test-browser-session-native.mjs` exercises the actual Rust session queue and protocol without libtorrent.
+
+`npm run torrent:ui` retains the cold inspector opening, 1,000 transfers, 10,000 files, 2,000 peers and 15 seconds of 4 Hz telemetry. It waits for first contentful paint before measuring interactions; mounted DOM nodes and animation frames alone can precede Chrome's initial presentation. The action p95 limit remains 100 ms. Set `TORRENT_PROFILE=trace` to save a CPU profile and timeline in `artifacts/`.
+
+On Windows, build the exact isolated desktop fixture with `cargo build --manifest-path src-tauri/Cargo.toml --locked --features tauri/custom-protocol,test-tools --bin fetchrail`, then run `npm run engine:repairs`. It uses real WebView2 IPC, private temporary state and loopback HTTP to check persistence failures, recoverable removal, denied power actions and scheduler interleavings. Its configuration-failure and admission barriers are compiled only with `test-tools` and require an isolated test root. Machine actions are disabled in fixtures.
+
+`node scripts/test-browser-session-native.mjs` runs the actual browser-session request queue and native-protocol tests independently of the libtorrent build. It uses the production request types and modules, with a small Cargo harness under ignored `artifacts/`. It checks option preservation, single pickup, retry, expiry, size limits and protocol boundaries; it does not replace a full desktop build.
+
 The progress-window interaction check runs against the built frontend with mocked native commands and Microsoft Edge. With Playwright available, run `node scripts/test-download-progress.mjs`; optionally pass an absolute path to a Playwright module as its first argument. It checks the tabs, live updates, connection details, controls, speed limits, completion settings, themes, and the transition from the file-info prompt, and saves screenshots to a temporary folder.
 
 For the real download-engine check, close Fetchrail before running:

@@ -29,7 +29,7 @@ Chrome 116 or newer is required for automatic panel-aware companion reloads. Oth
 
 ### Firefox
 
-Firefox's official store release is submitted through [Mozilla Add-ons automation](../docs/firefox-add-ons-automation.md) and requires Mozilla approval before the public listing is available. Once listed, install from Firefox Add-ons for automatic updates. Until then, a temporary add-on can be tested:
+Install the signed companion from [Firefox Add-ons](https://addons.mozilla.org/en-US/firefox/addon/fetchrail-browser-integration/) for automatic updates. Store availability was checked on 18 October 2026. For temporary testing of the bundled version:
 
 1. In Fetchrail's browser companion settings, expand **Manual installation and Firefox**, then choose **Firefox folder**.
 2. Open `about:debugging` and choose **Load Temporary Add-on**.
@@ -64,6 +64,12 @@ Captured batch files inherit the queue, connections, speed cap and start time ch
 
 Enable **Use my browser session** in **Options** for cookie-dependent downloads. This forwards only the observed final GET's Cookie, Referer, User-Agent and Authorization headers when the browser exposes them. Headers are stored in the desktop app's local `downloads.json` for unfinished transfers so resume and schedules can survive restarts; they are omitted from UI events and bridge responses and removed from disk on completion or removal. Treat unfinished download history as private. Temporary request observations remain in browser session storage and expire after two minutes.
 
+For private GitHub repositories and other signed-in sites, enable **Use my browser session**. Normal clicks are captured directly. Right-click **Download with Fetchrail** and links pasted into the companion first open in that browser window, allowing its cookies and redirects to resolve the file before capture. These explicit requests work even with **Catch browser downloads** switched off. The browser batch preserves your queue, connections, speed limit and start time.
+
+For links pasted into the desktop app, open **Download options**, enable **Use browser session**, and submit. Open the companion from a page in the window where you are signed in, then choose **Use this window** on the pending request. The desktop app does not guess a browser profile. Its pending links stay in memory for 15 minutes or until it closes; download options, destination and expected SHA-256 carry over to the browser handoff. This requires the updated desktop app as well as the companion.
+
+To capture private-window downloads, also enable **Allow in incognito** in Chrome/Edge's extension details, or **Run in Private Windows → Allow** in Firefox. Private and regular request headers remain separate; private observations and private browser batches stay in extension memory. Request observations are cleared when their tab closes. Accepted private downloads still appear in Fetchrail's local history and follow the same desktop retention rules above.
+
 The companion needs one reload to pick up its new `webRequest` permission. Optional website access is requested by the Browse pages action or session switch. Regular page scanning continues to use `activeTab`.
 
 ## Automatic download routing
@@ -79,11 +85,11 @@ For an eligible browser download, the companion:
 
 The caught transfer waits paused for that confirmation. Closing its information window cancels it.
 
-Host errors, rejected verification, and cancellation failures restore the browser transfer. Downloads that finish before they can be paused stay in the browser. Only the browser filename's basename is sent to the engine.
+Rejected verification and confirmed rollbacks restore the browser transfer. Captured HTTP downloads use a stable, staged handoff: Fetchrail starts only after the browser transfer is cancelled. Lost replies are reconciled by handoff ID when the companion reopens. If ownership is still unknown, the browser and staged app download stay paused with an actionable error. Normal recovery stores ownership IDs locally; private recovery stays in memory and a worker restart leaves the private transfer paused for manual recovery. Downloads that finish before they can be paused stay in the browser. Only the browser filename's basename is sent to the engine.
 
 ### Routing limits
 
-Blob/data URLs, private downloads, browser-flagged unsafe files, and downloads initiated by other extensions stay in the browser.
+Blob/data URLs, browser-flagged unsafe files, and downloads initiated by other extensions stay in the browser. Private downloads stay in the browser unless you allow the extension in private windows.
 
 Session support is off until explicitly enabled. POST bodies, blob/data files, protected streams and credentials hidden by the browser cannot be replayed. One-time links can fail verification or expire before a scheduled start; those transfers remain in the browser or require reopening their download page. The batch follows clear download controls; it cannot infer arbitrary site-specific buttons or bypass login/CAPTCHA steps.
 
@@ -110,7 +116,7 @@ Once approved and published, Chrome Web Store and Mozilla Add-ons copies receive
 
 For manually loaded companions, Fetchrail refreshes the stable folders from its embedded companion on launch. Replacements are atomic, and readiness is published last.
 
-The unpacked extension checks the local build every minute. It reloads after all companion panels close and pending browser actions finish. This deploys the companion bundled with Fetchrail; desktop releases update through Fetchrail's signed updater.
+The unpacked extension checks the local build every minute. It reloads after all companion panels close, pending browser actions finish, and waiting/capturing batches and unresolved handoffs end, including private batches. This deploys the companion bundled with Fetchrail; desktop releases update through Fetchrail's signed updater.
 
 Existing builds from before this update mechanism need one manual reload to enable it.
 

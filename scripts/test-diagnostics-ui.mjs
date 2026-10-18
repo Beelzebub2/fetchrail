@@ -23,10 +23,10 @@ await new Promise((done) => server.listen(0, "127.0.0.1", done));
 const base = `http://127.0.0.1:${server.address().port}/`;
 const browser = await chromium.launch({ headless: true, ...(process.env.PLAYWRIGHT_CHANNEL ? { channel: process.env.PLAYWRIGHT_CHANNEL } : process.platform === "win32" ? { channel: "msedge" } : {}) });
 try {
-  const page = await browser.newPage({ viewport: { width: 640, height: 800 } });
+  const page = await browser.newPage({ viewport: { width: 640, height: 800 }, locale: "en-US" });
   const errors = [];
   page.on("pageerror", (error) => errors.push(error.message));
-  await page.addInitScript(() => {
+  const installFixture = () => {
     const callbacks = new Map(), listeners = new Map();
     let next = 0;
     window.testCalls = [];
@@ -79,9 +79,9 @@ try {
           window.testEmit("fetchrail://settings-updated", structuredClone(window.testSettings));
           return structuredClone(window.testSettings);
         }
-        if (name === "update_settings") {
+        if (name === "patch_settings") {
           if (window.testDelaySettings) await new Promise(resolve => { window.testFinishSettings = resolve; });
-          window.testSettings = args.settings;
+          window.testSettings = { ...window.testSettings, ...args.patch };
           return structuredClone(window.testSettings);
         }
         if (name === "setup_info") return { mode: new URLSearchParams(location.search).get("setup"), version: "0.6.1", dir: "C:\\Programs\\Fetchrail", installed: location.search.includes("installed"), desktopShortcut: true, theme: "dark", accent: "ember", downloadDir: "C:\\Downloads", sortsIntoFolders: true, launchOnStart: location.search.includes("installed") };
@@ -102,7 +102,8 @@ try {
         return structuredClone(window.testRecord);
       },
     };
-  });
+  };
+  await page.addInitScript(installFixture);
   await page.setViewportSize({width:1280,height:1000});
   await page.goto(base);
   await page.getByRole("button",{name:"Settings",exact:true}).click();
@@ -112,7 +113,7 @@ try {
   await page.getByRole("button",{name:"Hardware diagnostics",exact:true}).click();
   await page.getByRole("heading",{name:"Diagnostics",exact:true}).waitFor();
   assert.equal(await page.locator(".save-dock").evaluate(el => el.classList.contains("shown")),false);
-  assert.equal(await page.evaluate(() => window.testCalls.filter(call=>call.name==="update_settings").length),0);
+  assert.equal(await page.evaluate(() => window.testCalls.filter(call=>call.name==="patch_settings").length),0);
   await page.waitForTimeout(600);
   const moving = selector => page.locator(selector).first().evaluate(el => getComputedStyle(el).animationName);
   const track = () => page.locator(".diag-track i").evaluateAll(fills => fills.map(fill => fill.style.transform));
@@ -182,6 +183,16 @@ try {
   await page.getByRole("heading",{name:"Diagnostics report",exact:true}).waitFor();
   await page.locator(".diag-speed").filter({hasText:"20 MB/s"}).waitFor();
   assert.ok((await page.locator(".diag-overall").innerText()).includes("Measured potential: 62.5 MB/s"));
+  const portuguese = await browser.newPage({ viewport: { width: 1280, height: 1000 }, locale: "pt-PT" });
+  await portuguese.addInitScript(installFixture);
+  await portuguese.goto(base);
+  await portuguese.getByRole("button", { name: "Settings", exact: true }).click();
+  await portuguese.getByRole("tab", { name: "Performance", exact: true }).click();
+  await portuguese.getByRole("button", { name: "Hardware diagnostics", exact: true }).click();
+  await portuguese.evaluate(() => { window.diagState.latest = window.diagReport; window.testEmit("fetchrail://diagnostics", structuredClone(window.diagState)); });
+  await portuguese.getByRole("button", { name: "Latest report", exact: true }).click();
+  assert.ok((await portuguese.locator(".diag-overall").innerText()).includes("62,5 MB/s"), "pt-PT retains localized decimal separators");
+  await portuguese.close();
   await page.setViewportSize({width:375,height:800});
   await page.locator(".content").evaluate(el=>el.scrollTop=el.scrollHeight);
   assert.ok(await page.locator(".diagnostics").evaluate(el=>el.scrollWidth<=el.clientWidth),"Report content must fit a narrow window");
@@ -250,6 +261,6 @@ try {
   assert.equal(await moving(".diag-idle-grid .diag-cores rect"),"none","Reduced motion stops the drawings");
   await page.screenshot({path:join(output,"diagnostics-idle-narrow-reduced.png"),fullPage:true});
   assert.deepEqual(errors,[]);
-  assert.equal(await page.evaluate(() => window.testCalls.filter(call=>call.name==="update_settings").length),0,"Diagnostic actions cannot submit unrelated pending settings");
+  assert.equal(await page.evaluate(() => window.testCalls.filter(call=>call.name==="patch_settings").length),0,"Diagnostic actions cannot submit unrelated pending settings");
   console.log("PASS: moving idle+running drawings, forward-only step track, grade lands on stage before its row, finished stage before report, real sample gauge250Mbps=-45deg/no jitter, cancel/failure/latest, no settings save, exact estimates, copy exclusions, per-run permission preview/keep-local/cancel, theme+accent+reduced-motion screenshots: "+output);
 } finally {await browser.close();await new Promise(done=>server.close(done));}
