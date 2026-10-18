@@ -30,6 +30,8 @@ pub enum NativeMethod {
     GetHandoff,
     CommitHandoff,
     GetDownloads,
+    TakeBrowserRequest,
+    FinishBrowserRequest,
     ControlDownload,
     ShowApp,
 }
@@ -37,6 +39,9 @@ pub enum NativeMethod {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct NativeParams {
+    pub completed: Option<bool>,
+    pub directory: Option<String>,
+    pub expected_sha256: Option<String>,
     pub handoff_id: Option<String>,
     pub handoff_protocol: Option<u8>,
     pub auto_start: Option<bool>,
@@ -159,6 +164,16 @@ pub fn validate_request(request: &NativeRequest) -> Result<(), String> {
                     .ok_or("Handoff id is required.")?,
             )
             .map_err(|_| "Handoff id must be a UUID.")?;
+        }
+        NativeMethod::TakeBrowserRequest | NativeMethod::FinishBrowserRequest => {
+            if request.params.download_id.is_none() {
+                return Err("Browser request id is required.".into());
+            }
+            if matches!(request.method, NativeMethod::FinishBrowserRequest)
+                && request.params.completed.is_none()
+            {
+                return Err("Browser request completion status is required.".into());
+            }
         }
         NativeMethod::Ping | NativeMethod::GetDownloads | NativeMethod::ShowApp => {}
         NativeMethod::AddDownloads | NativeMethod::AddTorrents => {
@@ -289,10 +304,38 @@ pub fn validate_request(request: &NativeRequest) -> Result<(), String> {
     {
         return Err("Download options are only accepted by addDownloads.".into());
     }
-    if request.method != NativeMethod::ControlDownload
-        && (request.params.download_id.is_some() || request.params.action.is_some())
+    if !matches!(
+        request.method,
+        NativeMethod::ControlDownload
+            | NativeMethod::TakeBrowserRequest
+            | NativeMethod::FinishBrowserRequest
+    ) && request.params.download_id.is_some()
     {
-        return Err("Control options are only accepted by controlDownload.".into());
+        return Err("Download ids require a download or browser request control.".into());
+    }
+    if request.params.action.is_some() && request.method != NativeMethod::ControlDownload {
+        return Err("Download actions are only accepted by controlDownload.".into());
+    }
+    if request.params.completed.is_some() && request.method != NativeMethod::FinishBrowserRequest {
+        return Err("Completion status is only accepted by finishBrowserRequest.".into());
+    }
+    if request.params.directory.is_some() || request.params.expected_sha256.is_some() {
+        if request.method != NativeMethod::AddDownloads {
+            return Err("File options are only accepted by addDownloads.".into());
+        }
+        if request
+            .params
+            .directory
+            .as_ref()
+            .is_some_and(|path| path.len() > 32767 || path.chars().any(char::is_control))
+        {
+            return Err("Invalid download directory.".into());
+        }
+        if request.params.expected_sha256.as_ref().is_some_and(|hash| {
+            hash.len() != 64 || !hash.bytes().all(|byte| byte.is_ascii_hexdigit())
+        }) {
+            return Err("Expected SHA-256 must have 64 hexadecimal characters.".into());
+        }
     }
     if request.params.handoff_protocol.is_some()
         && (request.params.handoff_protocol != Some(2)
@@ -317,6 +360,28 @@ pub fn validate_request(request: &NativeRequest) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn browser_request_controls_and_preserved_options_are_scoped() {
+        let mut req = request("https://example.com/file.zip");
+        req.params.directory = Some("C:/Chosen folder".into());
+        req.params.expected_sha256 = Some("a".repeat(64));
+        assert!(validate_request(&req).is_ok());
+        req.params.expected_sha256 = Some("not-a-hash".into());
+        assert!(validate_request(&req).is_err());
+        req.params = NativeParams {
+            download_id: Some(Uuid::new_v4()),
+            ..Default::default()
+        };
+        req.method = NativeMethod::TakeBrowserRequest;
+        assert!(validate_request(&req).is_ok());
+        req.method = NativeMethod::FinishBrowserRequest;
+        assert!(validate_request(&req).is_err());
+        req.params.completed = Some(false);
+        assert!(validate_request(&req).is_ok());
+        req.method = NativeMethod::GetDownloads;
+        assert!(validate_request(&req).is_err());
+    }
 
     #[test]
     fn installed_companion_handoff_is_accepted_without_relaxing_header_validation() {

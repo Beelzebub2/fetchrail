@@ -10,6 +10,7 @@ let total = 0;
 let links = [];
 let selected = new Set();
 let tabId = Number(query.get("tab")) || null;
+let sourceIncognito;
 let busy = false;
 let connected = false;
 let checked = false;
@@ -36,7 +37,7 @@ applyLook();
 
 async function request(type, params = {}) {
   if (!api?.runtime?.sendMessage) throw new Error("Open this panel from the installed Fetchrail browser extension.");
-  const response = await api.runtime.sendMessage({ type, ...params });
+  const response = await api.runtime.sendMessage({ type, tabId, incognito: sourceIncognito, ...params });
   if (!response?.ok) throw new Error(response?.error ?? "Fetchrail did not respond.");
   return response.result;
 }
@@ -369,8 +370,38 @@ async function refresh() {
   $("#list-note").hidden = result.total <= downloads.length;
   $("#list-note").textContent = `Showing the latest ${downloads.length} of ${result.total}`;
   renderDownloads(arrived);
+  renderDesktopRequests(result.browserRequests ?? []);
   loaded = true;
   renderBrowserBatch(await request("getBrowserBatch"), first);
+}
+
+function renderDesktopRequests(requests) {
+  const container = $("#desktop-requests");
+  container.hidden = !requests.length;
+  container.replaceChildren(...requests.map((pending) => {
+    const card = document.createElement("section");
+    card.className = "batch-card";
+    const text = document.createElement("p");
+    text.textContent = `${pending.count} download${pending.count === 1 ? "" : "s"} from the desktop app waiting for browser sign-in.`;
+    const button = document.createElement("button");
+    button.className = "text-button";
+    button.textContent = "Use this window";
+    button.addEventListener("click", async () => {
+      button.disabled = true;
+      try {
+        if (!await api.permissions.request({ origins: ["http://*/*", "https://*/*"] })) throw new Error("Browser access is required to capture the signed-in download.");
+        await api.storage.local.set({ useBrowserSession: true });
+        $("#browser-session").checked = true;
+        const batch = await request("takeBrowserRequest", { id: pending.id });
+        renderBrowserBatch(batch);
+        card.remove();
+        notice("Downloads opened in this browser window. Finish any sign-in steps there.");
+      } catch (error) { notice(error.message, true); }
+      finally { button.disabled = false; }
+    });
+    card.append(text, button);
+    return card;
+  }));
 }
 
 function renderBrowserBatch(batch, instant = false) {
@@ -556,7 +587,8 @@ async function add(items, fromSelection = false) {
   updateSelection();
   try {
     const result = await request("addDownloads", { items, ...transferOptions() });
-    const added = `${result.accepted} download${result.accepted === 1 ? "" : "s"} added to Fetchrail`;
+    const added = result.browserPending ? "Downloads opened in your signed-in browser. Fetchrail will capture the files." : `${result.accepted} download${result.accepted === 1 ? "" : "s"} added to Fetchrail`;
+    if (result.batch) renderBrowserBatch(result.batch);
     const refused = `${result.rejected} link${result.rejected === 1 ? "" : "s"} rejected: ${result.errors[0]?.message}`;
     notice(result.rejected ? (result.accepted ? added + ". " : "") + refused : added, !!result.rejected);
     if (fromSelection) {
@@ -722,7 +754,8 @@ async function initialize() {
     optionsSummary();
     const [tab] = await api.tabs.query({ active: true, currentWindow: true });
     const ownTab = await api.tabs.getCurrent?.();
-    if (!tabId && !ownTab && !tab?.url?.startsWith(api.runtime.getURL(""))) tabId = tab?.id;
+    if (!tabId) tabId = ownTab?.id ?? tab?.id;
+    sourceIncognito = tabId != null ? (await api.tabs.get?.(tabId))?.incognito : undefined;
     if (ownTab || tab?.url?.startsWith(api.runtime.getURL("")) || !api?.runtime) {
       document.body.classList.add("expanded");
       $("#expand").hidden = true;

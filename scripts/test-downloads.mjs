@@ -53,7 +53,7 @@ const server = createServer((request, response) => {
   }
   if (name === "auth.bin") { response.writeHead(403).end(); return; }
   if (name === "landing.html") { response.writeHead(200, { "Content-Type": "text/html" }).end("<button>Download</button>"); return; }
-  if (name === "session.bin" && (request.headers.cookie !== "session=fetchrail-test" || request.headers.referer !== base + "step/5")) { response.writeHead(403).end(); return; }
+  if ((name === "session.bin" || name.startsWith("private-session-")) && (request.headers.cookie !== "session=fetchrail-test" || request.headers.referer !== base + "step/5")) { response.writeHead(403).end(); return; }
   const entry = observed.get(name) ?? { ranges: [], active: 0, peak: 0 };
   observed.set(name, entry);
   response.setHeader("Content-Type", "application/octet-stream");
@@ -133,8 +133,7 @@ async function launch() {
     } catch { return false; }
   }, "app startup");
 }
-const native = (method, params = {}) => new Promise((done, reject) => {
-  const id = randomUUID();
+const native = (method, params = {}, id = randomUUID()) => new Promise((done, reject) => {
   const payload = Buffer.from(JSON.stringify({ v: 1, id, method, params }));
   const frame = Buffer.alloc(4); frame.writeUInt32LE(payload.length);
   const timeout = setTimeout(() => { pending.delete(id); reject(new Error("Native timeout: " + method)); }, 35000);
@@ -184,6 +183,15 @@ try {
   });
   const ping = await native("ping");
   assert.ok(ping.capabilities.includes("controlDownload"));
+  const handoffId = randomUUID(), scheduledFor = new Date(Date.now() + 3600000).toISOString();
+  const staged = await native("addDownloads", { source: "browserBatch", handoffProtocol: 2, scheduledFor, items: [{ url: base + "handoff-scheduled.bin" }] }, handoffId);
+  assert.equal(staged.accepted, 1); ids.push(staged.ids[0]);
+  assert.equal((await record(staged.ids[0])).status, "paused", "Staged handoffs cannot dispatch before browser cancellation");
+  assert.deepEqual((await native("getHandoff", { handoffId })).ids, staged.ids);
+  await native("commitHandoff", { handoffId, autoStart: true, source: "browserBatch" });
+  assert.equal((await record(staged.ids[0])).status, "scheduled", "Commit preserves the requested future schedule");
+  assert.equal((await record(staged.ids[0])).scheduledFor, scheduledFor);
+  await native("controlDownload", { downloadId: staged.ids[0], action: "cancel" });
   // Exercise the window before unrelated transfers can consume its start/stop interval.
   assert.ok(Date.now() < windowStart, "Desktop startup must finish before the fixture's queue window");
   const windowed = await add("windowed.bin", { queue: "Window", speedLimitBps: 128 * 1024 });
@@ -272,10 +280,12 @@ try {
   console.log("PASS: intermediate download pages are rejected instead of saved as files");
   for (const browser of ["chromium", "firefox"]) {
     const name = `opaque-${browser}`;
-    const detectedName = `${name}.rar`;
+    let detectedName = `${name}.rar`;
     let listener;
+    let webRequest;
     let captured;
     const events = [];
+    const extensionState = { useBrowserSession: true };
     const item = { id: 42, state: "in_progress", paused: false, incognito: false, danger: "safe",
       url: base + name, filename: join(out, name), totalBytes: data.length, bytesReceived: 1024, mime: "application/octet-stream" };
     const api = {
@@ -283,7 +293,8 @@ try {
         onInstalled: { addListener() {} }, onStartup: { addListener() {} }, onMessage: { addListener() {} } },
       alarms: { create() {}, onAlarm: { addListener() {} } },
       contextMenus: { onClicked: { addListener() {} } },
-      storage: { local: { async get() { return {}; } } },
+      storage: { local: { async get(key) { return { [key]: structuredClone(extensionState[key]) }; }, async set(values) { Object.assign(extensionState, structuredClone(values)); } } },
+      webRequest: { onBeforeSendHeaders: { addListener(fn) { webRequest = fn; } } },
       action: { async setBadgeBackgroundColor() {}, async setBadgeText() {}, async setTitle() {} },
       downloads: {
         onCreated: { addListener(value) { listener = value; } },
@@ -301,7 +312,7 @@ try {
     const sendNative = async (hostName, message) => {
       assert.equal(hostName, "com.rrmtools.braid");
       events.push(message.method);
-      const result = await native(message.method, message.params);
+      const result = await native(message.method, message.params, message.id);
       if (result.accepted) { captured = result.ids[0]; ids.push(captured); }
       return { ok: true, result };
     };
@@ -311,11 +322,11 @@ try {
         api.runtime.lastError = { message: error.message }; callback(); delete api.runtime.lastError;
       });
     };
-    const context = vm.createContext({ [browser === "firefox" ? "browser" : "chrome"]: api, crypto: { randomUUID }, URL });
+    const context = vm.createContext({ [browser === "firefox" ? "browser" : "chrome"]: api, crypto: { randomUUID }, URL, structuredClone });
     vm.runInContext(await readFile(join(root, "browser-extension", "dist", browser, "background.js"), "utf8"), context);
     listener({ ...item });
     await waitFor(() => vm.runInContext("activeActions", context) === 0, `${browser} extension capture`);
-    assert.deepEqual(events, ["pause", "search", "addDownloads", "search", "cancel", "erase"]);
+    assert.deepEqual(events, ["pause", "search", "addDownloads", "search", "cancel", "commitHandoff", "erase"]);
     assert.equal((await record(captured)).fileName, detectedName);
     assert.ok(observed.get(name).ranges.some(({ start, end }) => start === 0 && end === 0), "Capture must verify a GET before accepting the browser handoff.");
     await native("controlDownload", { downloadId: captured, action: "resume" });
@@ -325,7 +336,23 @@ try {
     listener({ ...item });
     await waitFor(() => vm.runInContext("activeActions", context) === 0, `${browser} authenticated download fallback`);
     assert.deepEqual(events, ["pause", "search", "addDownloads", "resume"]);
-    console.log(`PASS: ${browser} extension capture through the real native host and engine, exact SHA-256, browser fallback`);
+    // Replay a private-window GET against a real cookie/referrer-protected server.
+    events.length = 0;
+    detectedName = `private-session-${browser}.bin`;
+    Object.assign(item, { state: "in_progress", paused: false, incognito: true, url: base + "private-source-" + browser, filename: join(out, detectedName),
+      ...(browser === "chromium" ? { finalUrl: base + detectedName } : {}) });
+    webRequest({ url: item.url, tabId: 10, incognito: true, requestId: "private-redirect", method: "GET", requestHeaders: [{ name: "Cookie", value: "original-host-only" }] });
+    webRequest({ url: base + detectedName, tabId: 10, incognito: true, requestId: "private-redirect", method: "GET", requestHeaders: [
+      { name: "Cookie", value: "session=fetchrail-test" }, { name: "Referer", value: base + "step/5" },
+    ] });
+    webRequest({ url: base + detectedName, tabId: 11, incognito: false, method: "GET", requestHeaders: [{ name: "Cookie", value: "wrong-regular-session" }] });
+    listener({ ...item });
+    await waitFor(() => vm.runInContext("activeActions", context) === 0, `${browser} private session capture`);
+    assert.deepEqual(events, ["pause", "search", "addDownloads", "search", "cancel", "commitHandoff", "erase"]);
+    assert.equal((await record(captured)).requestContext, undefined);
+    await native("controlDownload", { downloadId: captured, action: "resume" });
+    await complete(captured, 4);
+    console.log(`PASS: ${browser} regular/private extension capture through the real native host and engine, exact SHA-256, browser fallback`);
   }
   for (const item of [{ url: base + "auth.bin" }, { url: base + "range.bin", expectedBytes: data.length + 1 },
     { url: base + "range.bin", expectedMime: "text/html" }, { url: base + "invalid.bin" }]) {

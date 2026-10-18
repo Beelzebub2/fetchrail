@@ -4,6 +4,7 @@ compile_error!("Release builds must embed the frontend: enable --features tauri/
 mod analytics;
 mod browser_bridge;
 mod browser_extension;
+mod browser_session;
 mod diagnostics;
 mod download_window;
 mod engine;
@@ -162,6 +163,14 @@ async fn add_download(
         .add(request)
         .await
         .map(DownloadRecord::public_view)
+}
+
+#[tauri::command]
+fn request_browser_downloads(
+    pending: State<'_, browser_session::Requests>,
+    requests: Vec<AddDownloadRequest>,
+) -> Result<Uuid, String> {
+    pending.enqueue(requests)
 }
 
 #[tauri::command]
@@ -376,9 +385,9 @@ async fn reset_calibration(
     manager: State<'_, Arc<DownloadManager>>,
 ) -> Result<DownloadSettings, String> {
     manager.performance.reset()?;
-    let mut settings = manager.settings().await;
-    settings.performance_auto = false;
-    manager.update_settings(settings).await
+    manager
+        .patch_settings(serde_json::json!({"performanceAuto":false}))
+        .await
 }
 
 #[tauri::command]
@@ -440,6 +449,23 @@ async fn set_analytics_consent(
     enabled: bool,
 ) -> Result<DownloadSettings, String> {
     manager.set_analytics_consent(enabled).await
+}
+
+#[tauri::command]
+async fn patch_settings(
+    manager: State<'_, Arc<DownloadManager>>,
+    patch: serde_json::Value,
+) -> Result<DownloadSettings, String> {
+    manager.patch_settings(patch).await
+}
+
+#[tauri::command]
+async fn remember_download_folder(
+    manager: State<'_, Arc<DownloadManager>>,
+    category: Option<String>,
+    directory: String,
+) -> Result<DownloadSettings, String> {
+    manager.remember_download_folder(category, directory).await
 }
 
 #[tauri::command]
@@ -775,6 +801,7 @@ pub fn run() {
                 *ready.1.lock().expect("frontend URL poisoned") = Some(payload.url().to_string());
             }
         })
+        .manage(browser_session::Requests::default())
         .manage(ShuttingDown(AtomicBool::new(false)))
         .manage(TrayReady(AtomicBool::new(false)))
         .manage(BrowserIntegration(std::sync::Mutex::new(
@@ -1032,6 +1059,7 @@ pub fn run() {
             download_window::open_download,
             add_download,
             add_downloads,
+            request_browser_downloads,
             import_torrent,
             torrent_import_status,
             cancel_torrent_import,
@@ -1055,6 +1083,8 @@ pub fn run() {
             default_browser,
             open_browser_extension_folder,
             update_settings,
+            patch_settings,
+            remember_download_folder,
             set_analytics_consent,
             start_diagnostics,
             diagnostics_state,

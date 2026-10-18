@@ -3,6 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 import { Activity, Check, Ellipsis, FolderOpen, Pause, Play, Share2, Upload, X } from "lucide-react";
 import { PageHead } from "./PageHead";
+import { Modal } from "./Modal";
 import { DownloadRecord, formatBytes, formatEta, formatSpeed, progressOf, statusLabel } from "./App";
 import "./Torrents.css";
 
@@ -75,7 +76,7 @@ export function TorrentImportDialog({ initial, defaultDirectory, queues, onClose
   }, [initial.id, metadata]);
   const cancel = async () => { setBusy(true); try { await invoke("cancel_torrent_import", { id: initial.id }); onClose(); } catch (e) { setError(String(e)); } finally { setBusy(false); } };
   const commit = async () => { setBusy(true); setError(""); try { const record = await invoke<DownloadRecord>("commit_torrent", { request: { id: initial.id, directory, priorities, queue, startPaused: paused, verifyExisting, scheduledFor: null } }); onAdded(record); onClose(); } catch (e) { setError(String(e)); } finally { setBusy(false); } };
-  return <div className="modal-backdrop"><section className="modal torrent-import" role="dialog" aria-modal="true" aria-labelledby="torrent-import-title">
+  return <Modal label="torrent-import-title" busy={busy} onClose={() => void cancel()}><section className="modal torrent-import">
     <div className="modal-head"><h2 id="torrent-import-title">{metadata?.name ?? "Resolving torrent metadata…"}</h2><button className="icon-button" aria-label="Cancel torrent import" disabled={busy} onClick={() => void cancel()}><X size={18} /></button></div>
     {metadata ? <><p>{formatBytes(metadata.totalBytes)} · {metadata.files.length} files · {metadata.private ? "Private torrent" : "Public torrent"}</p>
       <FileList files={metadata.files} priorities={priorities} onChange={setPriorities} />
@@ -87,7 +88,7 @@ export function TorrentImportDialog({ initial, defaultDirectory, queues, onClose
     </> : <p>Connecting to peers for the file list. Payload downloads start after you confirm your selection.</p>}
     {error && <p className="error-text" role="alert">{error}</p>}
     <div className="modal-actions"><button className="secondary-button" disabled={busy} onClick={() => void cancel()}>Cancel</button><button className="primary-button" disabled={busy || !metadata || !priorities.some(p => p > 0)} onClick={() => void commit()}>{busy ? "Working…" : paused ? "Add torrent" : "Start torrent"}</button></div>
-  </section></div>;
+  </section></Modal>;
 }
 
 export function TorrentRow({ item, selected, onSelect, command }: { item: DownloadRecord; selected: boolean; onSelect: () => void; command: Command }) {
@@ -117,12 +118,62 @@ export function TorrentInspector({ item, onClose, command, onError }: { item: Do
   const [peerPort, setPeerPort] = useState(6881);
   const [deleting, setDeleting] = useState(false);
   const [deleteFiles, setDeleteFiles] = useState(false);
+  const [removing, setRemoving] = useState(false);
+  const priorityState = useRef({ generation: 0, writing: false, uncertain: false, values: [] as number[], pending: new Map<number, number>() });
+  const alive = useRef(true);
+  useEffect(() => { alive.current = true; return () => { alive.current = false; }; }, []);
+  const showPriorities = (values: number[]) => { if (alive.current) setDetails(current => current?.metadata ? { ...current, metadata: { ...current.metadata, files: current.metadata.files.map(file => ({ ...file, priority: values[file.index] })) } } : current); };
+  const drainPriorities = async () => {
+    const state = priorityState.current;
+    if (state.writing) return;
+    state.writing = true;
+    try {
+      while (alive.current && state.pending.size) {
+        // A timed-out setter may have applied. Read its result before deriving another full-array write.
+        if (state.uncertain) {
+          const snapshot = await invoke<Details>("torrent_command", { id: item.id, request: { op: "details", view: "files" } });
+          if (!snapshot.metadata) throw new Error("File selection is unavailable. Reopen Files to retry.");
+          state.values = snapshot.metadata.files.reduce((values, file) => { values[file.index] = file.priority; return values; }, Array(snapshot.metadata.fileCount).fill(0));
+          state.uncertain = false;
+        }
+        const edits = new Map(state.pending); state.pending.clear();
+        const next = [...state.values]; for (const [index, value] of edits) next[index] = value;
+        try {
+          await invoke("torrent_command", { id: item.id, request: { op: "priorities", priorities: next } });
+          state.values = next;
+        } catch (error) {
+          state.uncertain = true;
+          onError(String(error));
+          // Do not silently retry a failed edit. Later clicks retain only their own per-file intent.
+        }
+      }
+      if (state.uncertain && alive.current) {
+        const snapshot = await invoke<Details>("torrent_command", { id: item.id, request: { op: "details", view: "files" } });
+        if (!snapshot.metadata) throw new Error("File selection is unavailable. Reopen Files to retry.");
+        state.values = snapshot.metadata.files.reduce((values, file) => { values[file.index] = file.priority; return values; }, Array(snapshot.metadata.fileCount).fill(0));
+        state.uncertain = false;
+      }
+      const visible = [...state.values]; for (const [index, value] of state.pending) visible[index] = value;
+      showPriorities(visible);
+    } catch (error) { state.uncertain = true; onError(String(error)); }
+    finally { state.writing = false; }
+    if (state.pending.size && !state.uncertain && alive.current) void drainPriorities();
+  };
+  const changePriorities = (values: number[]) => {
+    const state = priorityState.current;
+    const previous = details?.metadata?.files;
+    if (!previous) return;
+    for (const file of previous) if (values[file.index] !== file.priority) state.pending.set(file.index, values[file.index]);
+    state.generation++; showPriorities(values); void drainPriorities();
+  };
   const action = async (request: Record<string, unknown>) => { try { return await invoke<Details>("torrent_command", { id: item.id, request }); } catch (e) { onError(String(e)); return null; } };
   useEffect(() => {
     let disposed = false, pending = false;
-    const refresh = async () => { if (pending || document.visibilityState === "hidden") return; pending = true; try { const snapshot = await invoke<Details>("torrent_command", { id: item.id, request: { op: "details", view: tab.toLowerCase() } }); if (!disposed) setDetails(snapshot); } catch (e) { if (!disposed) onError(String(e)); } finally { pending = false; } };
-    void refresh(); const timer = setInterval(() => void refresh(), 1000);
-    return () => { disposed = true; clearInterval(timer); };
+    const refresh = async () => { if (pending || document.visibilityState === "hidden") return; pending = true; const generation = priorityState.current.generation; try { const snapshot = await invoke<Details>("torrent_command", { id: item.id, request: { op: "details", view: tab.toLowerCase() } }); const state = priorityState.current; if (!disposed && !state.writing && !state.pending.size && generation === state.generation) { if (snapshot.metadata) { state.values = snapshot.metadata.files.reduce((values, file) => { values[file.index] = file.priority; return values; }, Array(snapshot.metadata.fileCount).fill(0)); state.uncertain = false; } setDetails(snapshot); } } catch (e) { if (!disposed) onError(String(e)); } finally { pending = false; } };
+    // Paint the immediately usable summary before requesting potentially large detail lists.
+    let frame = requestAnimationFrame(() => { frame = requestAnimationFrame(() => { void refresh(); }); });
+    const timer = setInterval(() => void refresh(), 1000);
+    return () => { disposed = true; cancelAnimationFrame(frame); clearInterval(timer); };
   }, [item.id, tab]);
   const t = item.torrent!;
   return <section className="torrent-inspector" aria-label={`Torrent details for ${item.fileName}`}>
@@ -135,12 +186,12 @@ export function TorrentInspector({ item, onClose, command, onError }: { item: Do
         <div className="torrent-controls"><label>Download limit (KiB/s)<input type="number" min={0} value={limit} onChange={e => setLimit(Number(e.target.value))} /></label><button className="secondary-button" onClick={() => void command("set_download_speed_limit", item.id, { speedLimitBps: Math.round(limit * 1024) })}>Set limit</button><label className="check-label"><input type="checkbox" checked={t.sequential} onChange={e => void action({ op: "sequential", enabled: e.target.checked })} />Sequential order</label></div>
         <div className="torrent-controls"><button className="secondary-button" onClick={() => void action({ op: "recheck" })}>Verify files</button><button className="secondary-button" onClick={() => void action({ op: "announce" })}>Reannounce</button><button className="secondary-button" disabled={["downloading", "seeding", "checking", "stalled", "connecting"].includes(item.status)} onClick={() => void open({ directory: true }).then(path => { if (typeof path === "string") return action({ op: "move", path }); }).catch(e => onError(String(e)))}>Move storage</button><button className="secondary-button danger" onClick={() => setDeleting(true)}>Remove…</button></div>
       </>}
-      {tab === "Files" && (details?.metadata ? <FileList files={details.metadata.files} priorities={details.metadata.files.reduce((values, file) => { values[file.index] = file.priority; return values; }, Array(details.metadata.fileCount).fill(0))} onChange={priorities => { setDetails(current => current?.metadata ? { ...current, metadata: { ...current.metadata, files: current.metadata.files.map(file => ({ ...file, priority: priorities[file.index] })) } } : current); void action({ op: "priorities", priorities }); }} /> : <p>Loading files…</p>)}
+      {tab === "Files" && (details?.metadata ? <FileList files={details.metadata.files} priorities={details.metadata.files.reduce((values, file) => { values[file.index] = file.priority; return values; }, Array(details.metadata.fileCount).fill(0))} onChange={changePriorities} /> : <p>Loading files…</p>)}
       {tab === "Peers" && <><div className="torrent-controls"><input aria-label="Peer IP address" placeholder="IPv4 or IPv6 address" value={peerAddress} onChange={e => setPeerAddress(e.target.value)} /><input aria-label="Peer port" type="number" min={1} max={65535} value={peerPort} onChange={e => setPeerPort(Number(e.target.value))} /><button className="secondary-button" onClick={() => void action({ op: "peer", address: peerAddress, port: peerPort })}>Connect peer</button></div><PeerList peers={details?.peers ?? []} /></>}
       {tab === "Trackers" && <><div className="torrent-controls"><input aria-label="Tracker URL" placeholder="udp:// or https:// tracker" value={tracker} onChange={e => setTracker(e.target.value)} /><button className="secondary-button" onClick={() => void action({ op: "tracker", url: tracker }).then(result => { if (result) setTracker(""); })}>Add tracker</button></div>{details?.trackers.map(track => <div className="torrent-tracker" key={track.url}><span>{track.url}<small>{track.error || (track.verified ? "Verified" : "Pending")} · Tier {track.tier}{(track.seeds ?? -1) >= 0 ? ` · ${track.seeds} seeds / ${track.peers} peers` : ""}</small></span><button className="icon-button" aria-label={`Remove tracker ${track.url}`} onClick={() => void action({ op: "removeTracker", url: track.url })}><X size={14} /></button></div>)}</>}
       {tab === "Activity" && <div className="torrent-activity">{details?.activity?.map((entry, index) => <p key={index}><time>{new Date(entry.time).toLocaleTimeString()}</time> {entry.message}</p>)}{!details?.activity?.length && <p>No recent engine events.</p>}</div>}
     </div>
-    {deleting && <div className="torrent-remove" role="alertdialog" aria-label="Remove torrent"><span>Remove {item.fileName}?</span><label className="check-label"><input type="checkbox" checked={deleteFiles} onChange={e => setDeleteFiles(e.target.checked)} />Delete torrent payload files</label><button className="secondary-button" onClick={() => setDeleting(false)}>Cancel</button><button className="primary-button" onClick={() => void command("remove_download", item.id, { deleteFile: deleteFiles }).then(ok => { if (ok) onClose(); })}><Check size={16} /> Remove</button></div>}
+    {deleting && <Modal label="remove-torrent-title" busy={removing} onClose={() => setDeleting(false)}><div className="modal torrent-remove"><span id="remove-torrent-title">Remove {item.fileName}?</span><label className="check-label"><input type="checkbox" checked={deleteFiles} onChange={e => setDeleteFiles(e.target.checked)} />Delete torrent payload files</label><button className="secondary-button" disabled={removing} autoFocus onClick={() => setDeleting(false)}>Cancel</button><button className="primary-button" disabled={removing} onClick={() => { setRemoving(true); void command("remove_download", item.id, { deleteFile: deleteFiles }).then(ok => { setDeleting(false); if (ok) onClose(); }).finally(() => setRemoving(false)); }}><Check size={16} /> Remove</button></div></Modal>}
   </section>;
 }
 

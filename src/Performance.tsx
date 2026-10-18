@@ -22,17 +22,22 @@ function useStatus(summary = false) {
   useEffect(() => {
     let disposed = false;
     let timer = 0;
+    let failures = 0;
     const poll = async () => {
+      let delay = 10000;
       try {
         const next = await invoke<Status>("performance_status", { includeReport: !summary });
         if (disposed || !next) return;
         setStatus(next); setError(null);
-        if (!summary || next.running) timer = window.setTimeout(poll, next.running ? 1000 : 10000);
-      } catch (e) { if (!disposed) setError(String(e)); }
+        failures = 0;
+        delay = next.running ? 1000 : 10000;
+        if (summary && !next.running) delay = 30000;
+      } catch (e) { if (!disposed) setError(String(e)); delay = Math.min(30000, 1000 * 2 ** Math.min(failures++, 5)); }
+      finally { if (!disposed) timer = window.setTimeout(poll, delay); }
     };
     void poll();
     return () => { disposed = true; window.clearTimeout(timer); };
-  }, [summary, status?.running]);
+  }, [summary]);
   return { status, setStatus, error, setError };
 }
 

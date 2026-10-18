@@ -158,6 +158,8 @@ jobs:
         run: node scripts/smoke-desktop.mjs
       - name: Test real multi-connection transfers
         run: npm run engine:test
+      - name: Test persistence and lifecycle repair invariants
+        run: node scripts/test-engine-repairs.mjs src-tauri/target/release/fetchrail.exe
       - name: Test bounded HTTP transfer slot reuse
         run: node scripts/test-http-slot-reuse.mjs src-tauri/target/release/fetchrail.exe
       - name: Test retained Firefox companion handoffs
