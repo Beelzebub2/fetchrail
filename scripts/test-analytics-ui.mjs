@@ -168,7 +168,7 @@ try {
   await page.getByRole("heading", { name: "example-archive.rar" }).waitFor();
   assert.equal(await page.getByRole("dialog", { name: "Help improve Fetchrail?" }).count(), 0);
   assert.deepEqual(analyticsRequests, []);
-  await page.getByText("Troubleshoot this download", {exact: true}).click();
+  await page.getByRole("tab", {name: "Troubleshoot", exact: true}).click();
   await page.getByText("Observed:", {exact: true}).waitFor();
   await page.getByRole("button", {name: "Preview safe incident report"}).click();
   const copy = page.getByRole("button", {name: "Copy safe report", exact: true});

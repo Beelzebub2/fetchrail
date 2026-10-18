@@ -12,7 +12,7 @@ import { usePlatformCapabilities } from "./platform";
 import { TorrentInspector, TorrentRow } from "./Torrents";
 import { DownloadHealth } from "./DownloadHealth";
 
-const tabs = ["Download status", "Speed limiter", "Options on completion"] as const;
+const tabs = ["Download status", "Speed limiter", "Options on completion", "Troubleshoot"] as const;
 type Tab = typeof tabs[number];
 
 export function DownloadProgress({ id }: { id: string }) {
@@ -137,7 +137,7 @@ export function DownloadProgress({ id }: { id: string }) {
         {tabs.map((name, index) => (
           <button
             type="button" key={name} role="tab" id={`transfer-tab-${index}`}
-            aria-selected={tab === name} aria-controls={`transfer-panel-${index}`}
+            aria-label={name} aria-selected={tab === name} aria-controls={`transfer-panel-${index}`}
             tabIndex={tab === name ? 0 : -1} onClick={() => setTab(name)}
             onKeyDown={(event) => {
               let next = index;
@@ -150,7 +150,7 @@ export function DownloadProgress({ id }: { id: string }) {
               setTab(tabs[next]);
               tabList.current?.querySelectorAll<HTMLButtonElement>("button")[next].focus();
             }}
-          >{name}</button>
+          >{name === "Options on completion" ? "On completion" : name}</button>
         ))}
       </div>
 
@@ -190,7 +190,7 @@ export function DownloadProgress({ id }: { id: string }) {
             <div><button className="secondary-button" disabled={busy || complete}>Apply limit</button></div>
             <p className="hint">Current limit: {item.speedLimitBps ? formatSpeed(item.speedLimitBps) : "Unlimited"}</p>
           </form>
-        ) : (
+        ) : tab === "Troubleshoot" ? <DownloadHealth id={id} initialOpen /> : (
           <div className="transfer-options">
             <div className="transfer-option-title"><Check size={18} /><h2>When this download finishes</h2></div>
             <fieldset className="transfer-checks" disabled={busy || complete}>
@@ -238,7 +238,6 @@ export function DownloadProgress({ id }: { id: string }) {
           </section>}
         </>
       )}
-      {item && <DownloadHealth id={id} />}
       {message && <p className="extension-error" role="alert">{message}</p>}
       <footer className="transfer-footer"><span>Closing this window keeps the download running.</span><button className="ghost-button" onClick={() => void getCurrentWindow().destroy().catch((error) => setMessage(String(error)))}>Close</button></footer>
     </main>

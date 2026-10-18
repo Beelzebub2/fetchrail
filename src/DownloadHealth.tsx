@@ -17,8 +17,8 @@ type Report = {
 };
 const label = (value: string) => value.replace(/([a-z])([A-Z])/g, "$1 $2").replace(/_/g, " ");
 const seconds = (ms: number) => `${(ms / 1000).toFixed(3)} s`;
-export function DownloadHealth({ id }: { id: string }) {
-  const [open, setOpen] = useState(false), [report, setReport] = useState<Report | null>(null);
+export function DownloadHealth({ id, initialOpen = false }: { id: string; initialOpen?: boolean }) {
+  const [open, setOpen] = useState(initialOpen), [report, setReport] = useState<Report | null>(null);
   const [preview, setPreview] = useState<string | null>(null), [reviewed, setReviewed] = useState(false);
   const [error, setError] = useState<string | null>(null), [copied, setCopied] = useState(false);
   useEffect(() => {
@@ -32,7 +32,7 @@ export function DownloadHealth({ id }: { id: string }) {
     read(); const timer = setInterval(read, 1000);
     return () => { cancelled = true; clearInterval(timer); };
   }, [id, open]);
-  return <details className="download-health" onToggle={event => setOpen(event.currentTarget.open)}>
+  return <details className="download-health" open={open} onToggle={event => setOpen(event.currentTarget.open)}>
     <summary>Troubleshoot this download</summary>
     <p>Private local observations, including recent evidence from before you opened this panel. Nothing is uploaded.</p>
     {error && <p role="alert">{error}</p>}
