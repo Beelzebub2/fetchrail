@@ -486,22 +486,38 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'Combined release verification failed.' }
           $manifestDigest = (Get-FileHash -LiteralPath release-artifacts/latest.json -Algorithm SHA256).Hash.ToLowerInvariant()
           "sha256=$manifestDigest" >> $env:GITHUB_OUTPUT
-      - name: Publish validated draft and then latest metadata
+      - name: Attach verified downloads and publish release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           $tag = $env:GITHUB_REF_NAME
-          node scripts/release-notes.mjs $tag release-artifacts/release-notes.md
-          if ($LASTEXITCODE -ne 0) { throw 'Release note generation failed; no draft was created.' }
+          $existingBody = gh release view $tag --json body --jq .body --repo "$env:GITHUB_REPOSITORY"
+          $releaseExists = $LASTEXITCODE -eq 0
+          if ($releaseExists) {
+            $existingBody -join "`n" | Set-Content -LiteralPath release-artifacts/release-notes.md -Encoding utf8
+          } else {
+            node scripts/release-notes.mjs $tag release-artifacts/release-notes.md
+            if ($LASTEXITCODE -ne 0) { throw 'Release note generation failed; no release was changed.' }
+            gh release create $tag --draft --verify-tag --title "Fetchrail $tag" --notes-file release-artifacts/release-notes.md --repo "$env:GITHUB_REPOSITORY"
+            if ($LASTEXITCODE -ne 0) { throw 'Draft release creation failed.' }
+          }
           $inventory = Get-Content -LiteralPath release-artifacts/release-inventory.json -Raw | ConvertFrom-Json
           $assetNames = @($inventory.files.name) + @('release-metadata.tar.gz', 'SHA256SUMS')
           $assets = $assetNames | ForEach-Object { (Get-Item -LiteralPath (Join-Path release-artifacts $_)).FullName }
-          gh release create $tag @assets --draft --verify-tag --title "Fetchrail $tag" --notes-file release-artifacts/release-notes.md --repo "$env:GITHUB_REPOSITORY"
-          if ($LASTEXITCODE -ne 0) { throw 'Draft release creation failed.' }
-          gh release upload $tag release-artifacts/latest.json --repo "$env:GITHUB_REPOSITORY"
-          if ($LASTEXITCODE -ne 0) { throw 'Latest manifest publication failed; release remains a draft.' }
-          gh release edit $tag --draft=false --repo "$env:GITHUB_REPOSITORY"
-          if ($LASTEXITCODE -ne 0) { throw 'Release remains a draft.' }
+          gh release upload $tag @assets --clobber --repo "$env:GITHUB_REPOSITORY"
+          if ($LASTEXITCODE -ne 0) { throw 'Verified asset upload failed; release notes were preserved.' }
+          gh release upload $tag release-artifacts/latest.json --clobber --repo "$env:GITHUB_REPOSITORY"
+          if ($LASTEXITCODE -ne 0) { throw 'Latest manifest publication failed; release notes were preserved.' }
+          $body = Get-Content -LiteralPath release-artifacts/release-notes.md -Raw
+          $downloads = "## Downloads`n`nVerified Windows and Linux downloads are attached below.`n`n"
+          if ($body -match '(?m)^## Downloads\s*$') {
+            $body = [regex]::Replace($body, '(?ms)^## Downloads\r?\n.*?(?=^## |\z)', $downloads)
+          } else {
+            $body = $body.TrimEnd() + "`n`n" + $downloads
+          }
+          $body | Set-Content -LiteralPath release-artifacts/release-notes.md -Encoding utf8
+          gh release edit $tag --draft=false --notes-file release-artifacts/release-notes.md --repo "$env:GITHUB_REPOSITORY"
+          if ($LASTEXITCODE -ne 0) { throw 'Could not update the release download status.' }
 
   notify-updates:
     name: Announce published update to Fetchrail
