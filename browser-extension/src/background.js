@@ -11,7 +11,7 @@ let useBrowserSession = false;
 const captureReady = Promise.all([
   api.storage.local.get("useBrowserSession").then((saved) => { useBrowserSession = saved.useBrowserSession === true; }),
   api.storage.session?.get("recentRequests").then((saved) => {
-    for (const [url, trace] of saved.recentRequests ?? []) if (Date.now() - trace.time < 120000) recentRequests.set(url, trace);
+    for (const [key, trace] of saved.recentRequests ?? []) if (!trace.incognito && Date.now() - trace.time < 120000) recentRequests.set(key, trace);
   }),
 ]).catch(() => {});
 api.storage.onChanged?.addListener((changes, area) => {
@@ -24,8 +24,27 @@ api.storage.onChanged?.addListener((changes, area) => {
   }
 });
 
+function requestKey(details, url = details.url) {
+  return JSON.stringify([!!details.incognito, details.cookieStoreId ?? "", details.requestId ?? `tab:${details.tabId}:${url}`]);
+}
+
+function matchingRequest(item) {
+  const url = item.finalUrl || item.url;
+  const matches = [...recentRequests.values()].filter(trace => Date.now() - trace.time < 120000
+    && trace.incognito === !!item.incognito && trace.cookieStoreId === item.cookieStoreId
+    && (trace.url === url || trace.originalUrl === url)
+    && (item.tabId == null || item.tabId < 0 || trace.tabId === item.tabId));
+  if (matches.length > 1) throw new Error("Several browser requests match this download. Finish it in the browser, or retry from one signed-in tab.");
+  return matches[0];
+}
+
+function saveRequests() {
+  // Private-window URLs and headers must never enter the shared browser cache.
+  void api.storage.session?.set({ recentRequests: [...recentRequests].filter(([, trace]) => !trace.incognito) }).catch(() => {});
+}
+
 function rememberRequest(details) {
-  if (details.incognito || details.tabId < 0) return;
+  if (details.tabId < 0) return;
   const context = {};
   if (useBrowserSession) {
     for (const header of details.requestHeaders ?? []) {
@@ -35,11 +54,17 @@ function rememberRequest(details) {
   }
   const now = Date.now();
   for (const [url, trace] of recentRequests) if (now - trace.time > 120000) recentRequests.delete(url);
-  recentRequests.delete(details.url);
-  recentRequests.set(details.url, { tabId: details.tabId, method: details.method, context, time: now });
+  const key = requestKey(details);
+  const previous = recentRequests.get(key);
+  recentRequests.delete(key);
+  const trace = { incognito: !!details.incognito, cookieStoreId: details.cookieStoreId, tabId: details.tabId,
+    requestId: details.requestId, originalUrl: previous?.originalUrl ?? details.url, url: details.url, method: details.method, context, time: now };
+  recentRequests.set(key, trace);
+  // Firefox DownloadItem has no finalUrl. Keep the redirect chain's original URL
+  // pointing at its final request, with that destination's own headers.
   if (recentRequests.size > 500) recentRequests.delete(recentRequests.keys().next().value);
   while (recentRequests.size > 1 && JSON.stringify([...recentRequests]).length > 512000) recentRequests.delete(recentRequests.keys().next().value);
-  void api.storage.session?.set({ recentRequests: [...recentRequests] }).catch(() => {});
+  saveRequests();
 }
 
 if (api.webRequest?.onBeforeSendHeaders) {
@@ -48,6 +73,38 @@ if (api.webRequest?.onBeforeSendHeaders) {
 }
 
 let batchOperations = Promise.resolve();
+let privateBatch = null;
+let privateBatchPort = null;
+async function loadBatch(incognito = false) {
+  return incognito ? privateBatch : (await api.storage.local.get("browserBatch")).browserBatch;
+}
+async function saveBatch(batch) {
+  if (batch.incognito) {
+    privateBatch = structuredClone(batch);
+    // Native messaging keeps Chromium's worker alive while a private batch is
+    // waiting for login/countdowns, without writing private links to storage.
+    if (!globalThis.browser && api.runtime.connectNative) {
+      if (["waiting", "capturing"].includes(batch.status) && !privateBatchPort) {
+        const port = api.runtime.connectNative(HOST_NAME);
+        privateBatchPort = port;
+        port.onDisconnect.addListener(() => {
+          const error = api.runtime.lastError;
+          if (privateBatchPort !== port) return;
+          privateBatchPort = null;
+          void setBadge("!", "Fetchrail: private browser batch connection was interrupted. Reopen the companion. " + (error?.message ?? ""));
+        });
+      } else if (!["waiting", "capturing"].includes(batch.status) && privateBatchPort) {
+        const port = privateBatchPort;
+        privateBatchPort = null;
+        port.disconnect();
+      }
+    }
+  }
+  else await api.storage.local.set({ browserBatch: batch });
+}
+async function batchForTab(tabId) {
+  return privateBatch?.tabIds.includes(tabId) || privateBatch?.tabId === tabId ? privateBatch : loadBatch();
+}
 function changeBatch(action) {
   const result = batchOperations.then(action);
   batchOperations = result.catch(() => {});
@@ -63,14 +120,15 @@ async function openBatchPage(batch) {
     batch.error = null;
     batch.followSteps = 0;
     if (batch.tabId == null) {
-      const tab = await api.tabs.create({ url: "about:blank", active: true });
+      const tab = await api.tabs.create({ url: "about:blank", active: true, ...(batch.windowId != null ? { windowId: batch.windowId } : {}) });
+      if (!!tab.incognito !== !!batch.incognito) throw new Error("The signed-in browser window is no longer available. Open the companion in that window and retry.");
       batch.tabId = tab.id;
     }
     batch.tabIds = [batch.tabId];
-    await api.storage.local.set({ browserBatch: batch });
+    await saveBatch(batch);
     await api.tabs.update(batch.tabId, { url: batch.items[batch.index].url, active: true });
   }
-  await api.storage.local.set({ browserBatch: batch });
+  await saveBatch(batch);
   return batch;
 }
 
@@ -123,36 +181,43 @@ async function stopFollowingButtons(tabIds) {
 api.tabs?.onUpdated?.addListener((tabId, change) => {
   if (change.status !== "complete") return;
   void changeBatch(async () => {
-    const { browserBatch: batch } = await api.storage.local.get("browserBatch");
+    const batch = await batchForTab(tabId);
     if (batch?.status === "waiting" && batch.followButtons && batch.tabIds.includes(tabId)) {
       await followDownloadButtons(tabId).catch(async (error) => {
         batch.error = "Follow the download buttons manually on this page. " + error.message;
-        await api.storage.local.set({ browserBatch: batch });
+        await saveBatch(batch);
       });
     }
   });
 });
 
-async function startBrowserBatch(items, options, followButtons = false) {
+async function startBrowserBatch(items, options, followButtons = false, sourceTab = null) {
   if (!Array.isArray(items) || !items.length || items.length > 1000) throw new Error("Choose between 1 and 1,000 download pages.");
   const unique = new Map();
   for (const item of items) {
     const url = new URL(item.url);
     if (!["http:", "https:"].includes(url.protocol)) throw new Error("Only HTTP and HTTPS pages are supported.");
     url.hash = "";
-    unique.set(url.href, { url: url.href });
+    const itemOptions = {};
+    for (const name of ["directory", "queue", "scheduledFor", "startPaused", "connections", "speedLimitBps", "expectedSha256"]) {
+      if (item.options?.[name] != null) itemOptions[name] = item.options[name];
+    }
+    unique.set(url.href, { url: url.href, ...(Object.keys(itemOptions).length ? { options: itemOptions } : {}) });
   }
   await nativeRequest("ping");
   return changeBatch(async () => {
-    const { browserBatch } = await api.storage.local.get("browserBatch");
+    const browserBatch = await loadBatch(!!sourceTab?.incognito);
     if (browserBatch && ["waiting", "capturing"].includes(browserBatch.status)) throw new Error("Finish or stop the current browser batch first.");
-    return openBatchPage({ id: crypto.randomUUID(), items: [...unique.values()], options, followButtons, index: 0, accepted: 0, skipped: 0, tabId: null, tabIds: [] });
+    const batch = { id: crypto.randomUUID(), items: [...unique.values()], options, followButtons, incognito: !!sourceTab?.incognito,
+      windowId: sourceTab?.windowId, index: 0, accepted: 0, skipped: 0, tabId: null, tabIds: [] };
+    try { return await openBatchPage(batch); }
+    catch (error) { batch.status = "stopped"; batch.error = error.message; await saveBatch(batch); throw error; }
   });
 }
 
-async function batchControl(action) {
+async function batchControl(action, incognito = false) {
   return changeBatch(async () => {
-    const { browserBatch: batch } = await api.storage.local.get("browserBatch");
+    const batch = await loadBatch(incognito);
     if (!batch || !["waiting", "capturing"].includes(batch.status)) throw new Error("There is no active browser batch.");
     if (batch.status === "capturing") throw new Error("Wait for the current download handoff to finish.");
     await stopFollowingButtons(batch.tabIds);
@@ -160,28 +225,35 @@ async function batchControl(action) {
     else if (action === "skip") { batch.index++; batch.skipped++; return openBatchPage(batch); }
     else if (action === "retry") { batch.tabId = null; return openBatchPage(batch); }
     else throw new Error("Unknown browser batch action.");
-    await api.storage.local.set({ browserBatch: batch });
+    await saveBatch(batch);
     return batch;
   });
 }
 
 api.tabs?.onCreated?.addListener((tab) => {
-  if (tab.incognito || tab.openerTabId == null) return;
+  if (tab.openerTabId == null) return;
   void changeBatch(async () => {
-    const { browserBatch: batch } = await api.storage.local.get("browserBatch");
+    const batch = await loadBatch(!!tab.incognito);
     if (batch?.status === "waiting" && batch.tabIds.includes(tab.openerTabId)) {
       batch.tabIds.push(tab.id);
-      await api.storage.local.set({ browserBatch: batch });
+      await saveBatch(batch);
     }
   });
 });
-api.tabs?.onRemoved?.addListener((tabId) => {
+api.tabs?.onRemoved?.addListener((tabId, info) => {
+  for (const [key, trace] of recentRequests) if (trace.tabId === tabId) recentRequests.delete(key);
+  saveRequests();
   void changeBatch(async () => {
-    const { browserBatch: batch } = await api.storage.local.get("browserBatch");
+    const batch = await batchForTab(tabId);
+    if (batch?.incognito && info?.isWindowClosing && info.windowId === batch.windowId) {
+      await saveBatch({ ...batch, status: "stopped", tabIds: [] });
+      privateBatch = null;
+      return;
+    }
     if (batch?.status === "waiting" && batch.tabId === tabId) {
       batch.tabId = null;
       batch.error = "The download page was closed. Reopen it or skip this item.";
-      await api.storage.local.set({ browserBatch: batch });
+      await saveBatch(batch);
     }
   });
 });
@@ -206,9 +278,9 @@ async function checkForExtensionUpdate() {
     if (!/^[a-f0-9]{64}$/.test(build) || build === FETCHRAIL_BUILD) return;
     const attempt = `${FETCHRAIL_BUILD}>${build}`;
     if ((await api.storage.local.get("fetchrailReloadAttempt")).fetchrailReloadAttempt === attempt) return;
-    if (await panelIsOpen() || activeActions) return;
+    if (await panelIsOpen() || await batchIsActive() || activeActions) return;
     await api.storage.local.set({ fetchrailReloadAttempt: attempt });
-    if (activeActions || await panelIsOpen() || activeActions) {
+    if (activeActions || await panelIsOpen() || await batchIsActive() || activeActions) {
       await api.storage.local.remove("fetchrailReloadAttempt");
       return;
     }
@@ -217,14 +289,19 @@ async function checkForExtensionUpdate() {
   finally { checkingUpdate = false; }
 }
 
+async function batchIsActive() {
+  return [privateBatch, await loadBatch()].some(batch => ["waiting", "capturing"].includes(batch?.status))
+    || privateHandoffs.size > 0 || Object.keys((await api.storage.local.get("pendingHandoffs")).pendingHandoffs ?? {}).length > 0;
+}
+
 // Local file checks never launch Fetchrail or contact an update server.
 void api.alarms.create(UPDATE_ALARM, { periodInMinutes: 1 });
 api.alarms.onAlarm.addListener((alarm) => {
   if (alarm.name === UPDATE_ALARM) void checkForExtensionUpdate();
 });
 
-async function nativeRequest(method, params = {}) {
-  const message = { v: 1, id: crypto.randomUUID(), method, params };
+async function nativeRequest(method, params = {}, id = crypto.randomUUID()) {
+  const message = { v: 1, id, method, params };
   const response = globalThis.browser
     ? await api.runtime.sendNativeMessage(HOST_NAME, message)
     : await new Promise((resolve, reject) => {
@@ -285,10 +362,27 @@ async function addItems(source, items, options = {}) {
   return { accepted, rejected: errors.length, errors, ids, pendingConfirmation };
 }
 
+async function addBrowserItems(source, items, options, tab) {
+  await captureReady;
+  if (!Array.isArray(items) || !items.length || items.length > 1000) throw new Error("Choose between 1 and 1,000 downloads.");
+  if (!useBrowserSession) return addItems(source, items, options);
+  const needsBrowser = (item) => /^https?:/i.test(item.url) && !new URL(item.url).pathname.toLowerCase().endsWith(".torrent");
+  const browserItems = items.filter(needsBrowser);
+  const directItems = items.filter((item) => !needsBrowser(item));
+  const batch = browserItems.length ? await startBrowserBatch(browserItems, options, false, tab) : null;
+  const result = directItems.length ? await addItems(source, directItems, options) : { accepted: 0, rejected: 0, errors: [], ids: [] };
+  return { ...result, accepted: result.accepted + browserItems.length, browserPending: !!batch, batch };
+}
+
+async function sourceTab(message) {
+  if (message.tabId != null) return api.tabs.get(message.tabId);
+  return (await api.tabs?.query?.({ active: true, currentWindow: true }))?.[0] ?? null;
+}
+
 function safeBrowserDownload(item) {
   const active = item?.state === "in_progress" || (globalThis.browser && item?.state === "interrupted"
     && item.paused && item.canResume && (!item.error || item.error === "USER_CANCELED"));
-  return active && !item.incognito && (!item.danger || item.danger === "safe")
+  return active && (!item.danger || item.danger === "safe")
     && (!item.byExtensionId || item.byExtensionId === api.runtime.id) && /^https?:\/\//i.test(item.finalUrl || item.url);
 }
 
@@ -299,18 +393,20 @@ async function routeBrowserDownload(item) {
   let handedOff = false;
   let batchId;
   let batchOptions;
-  const trace = recentRequests.get(item.finalUrl || item.url);
+  let handoff;
+  let uncertain = false;
   try {
+    const trace = matchingRequest(item);
     if (trace && Date.now() - trace.time < 120000) {
       await changeBatch(async () => {
-        const { browserBatch: batch } = await api.storage.local.get("browserBatch");
+        const batch = await loadBatch(!!item.incognito);
         if (batch?.status === "waiting" && batch.tabIds.includes(trace.tabId)) {
           batch.status = "capturing";
           batch.browserDownloadId = item.id;
           batchId = batch.id;
-          batchOptions = batch.options;
+          batchOptions = { ...batch.options, ...batch.items[batch.index].options };
           await stopFollowingButtons(batch.tabIds);
-          await api.storage.local.set({ browserBatch: batch });
+          await saveBatch(batch);
         }
       });
       if (trace.method !== "GET") throw new Error("This download uses a form submission and must finish in the browser.");
@@ -329,50 +425,139 @@ async function routeBrowserDownload(item) {
     await api.downloads.pause(item.id);
     paused = true;
     const [current] = await api.downloads.search({ id: item.id });
-    if (!safeBrowserDownload(current) || !current.paused) return;
-    const requestTrace = recentRequests.get(current.finalUrl || current.url);
+    if (!safeBrowserDownload(current) || !current.paused || !!current.incognito !== !!item.incognito
+      || current.cookieStoreId !== item.cookieStoreId) return;
+    const requestTrace = matchingRequest(current);
+    const downloadUrl = requestTrace?.method === "GET" && Date.now() - requestTrace.time < 120000 ? requestTrace.url : null;
     const context = useBrowserSession && requestTrace?.method === "GET" && Date.now() - requestTrace.time < 120000 ? requestTrace.context : {};
-    const result = await addItems(batchId ? "browserBatch" : "clickMonitor", [{
-      url: current.finalUrl || current.url,
+    const source = batchId ? "browserBatch" : "clickMonitor";
+    const capturedItem = {
+      url: downloadUrl || current.finalUrl || current.url,
       suggestedFileName: current.filename?.split(/[\\/]/).pop(),
-      expectedBytes: current.totalBytes >= 0 ? current.totalBytes : null,
+      ...(current.totalBytes >= 0 ? { expectedBytes: current.totalBytes } : {}),
       expectedMime: current.mime,
       ...(Object.keys(context).length ? { requestContext: context } : {}),
-    }], batchOptions ?? {});
+    };
+    const torrent = new URL(capturedItem.url).pathname.toLowerCase().endsWith(".torrent");
+    let result;
+    if (torrent) result = await addItems(source, [capturedItem], batchOptions ?? {});
+    else {
+      handoff = { id: crypto.randomUUID(), browserId: item.id, incognito: !!item.incognito, source,
+        autoStart: !!batchId && !batchOptions?.startPaused, phase: "staging" };
+      await saveHandoff(handoff);
+      try { result = await nativeRequest("addDownloads", { ...batchOptions, source, items: [capturedItem], handoffProtocol: 2 }, handoff.id); }
+      catch (error) {
+        // A transport error is not evidence that the engine rejected the request.
+        uncertain = true;
+        const staged = await nativeRequest("getHandoff", { handoffId: handoff.id });
+        if (!staged.ids?.length) throw error;
+        result = { accepted: staged.ids.length, ids: staged.ids, errors: [] };
+        uncertain = false;
+      }
+    }
     engineId = result.ids[0];
     if (result.accepted !== 1 || (!engineId && !result.pendingConfirmation)) throw new Error(result.errors[0]?.message ?? "Fetchrail did not accept the download.");
+    if (handoff) { handoff.phase = "staged"; await saveHandoff(handoff); }
     const [latest] = await api.downloads.search({ id: item.id });
     paused = latest?.paused && (latest.state === "in_progress" || (globalThis.browser && latest.state === "interrupted"));
     // Verification can outlast a user action or the browser's safety verdict.
     if (!paused || !safeBrowserDownload(latest)
+      || !!latest.incognito !== !!current.incognito || latest.cookieStoreId !== current.cookieStoreId
       || (latest.finalUrl || latest.url) !== (current.finalUrl || current.url)) {
       throw new Error("The browser download changed during verification.");
     }
+    if (handoff) { handoff.phase = "cancelling"; await saveHandoff(handoff); }
     await api.downloads.cancel(item.id);
+    if (handoff) {
+      // From here the browser is cancelled. Never resume it on an uncertain commit.
+      paused = false; uncertain = true;
+      try { await nativeRequest("commitHandoff", { handoffId: handoff.id, autoStart: handoff.autoStart, source }); }
+      catch (error) { if (!(await nativeRequest("getHandoff", { handoffId: handoff.id })).committed) throw error; }
+      uncertain = false;
+      await saveHandoff(handoff, true);
+    }
     handedOff = true;
     paused = false;
     // History cleanup must not roll back a successful handoff.
     await api.downloads.erase({ id: item.id }).catch(() => {});
     if (batchId) await changeBatch(async () => {
-      const { browserBatch: batch } = await api.storage.local.get("browserBatch");
+      const batch = await loadBatch(!!item.incognito);
       if (batch?.id !== batchId) return;
       batch.accepted++; batch.index++;
       await openBatchPage(batch);
     });
-    recentRequests.delete(current.finalUrl || current.url);
-    void api.storage.session?.set({ recentRequests: [...recentRequests] }).catch(() => {});
+    if (requestTrace) for (const [key, candidate] of recentRequests) if (candidate === requestTrace) recentRequests.delete(key);
+    saveRequests();
   } catch (error) {
-    if (engineId && !handedOff) await nativeRequest("controlDownload", { downloadId: engineId, action: "cancel" }).catch(() => {});
-    await setBadge("!", (handedOff ? "Fetchrail: file accepted; could not open the next page. " : "Fetchrail: continuing in your browser. ") + error.message);
+    if (engineId && !handedOff && !uncertain) {
+      try { await nativeRequest("controlDownload", { downloadId: engineId, action: "cancel" }); }
+      catch { uncertain = true; }
+    }
+    if (handoff && !uncertain) await saveHandoff(handoff, true).catch(() => {});
+    await setBadge("!", (uncertain ? "Fetchrail: handoff needs recovery; keep the browser download paused and reopen the companion. " : handedOff ? "Fetchrail: file accepted; could not open the next page. " : "Fetchrail: continuing in your browser. ") + error.message);
     if (batchId) await changeBatch(async () => {
-      const { browserBatch: batch } = await api.storage.local.get("browserBatch");
+      const batch = await loadBatch(!!item.incognito);
       if (batch?.id !== batchId) return;
       batch.status = "waiting";
-      batch.error = handedOff ? "File accepted. Reopen the next page to continue. " + error.message : "Continuing in the browser. " + error.message + " Skip this item once it finishes, or retry.";
-      await api.storage.local.set({ browserBatch: batch });
+      batch.error = uncertain ? "Handoff needs recovery. Keep the browser download paused and reopen the companion. " + error.message : handedOff ? "File accepted. Reopen the next page to continue. " + error.message : "Continuing in the browser. " + error.message + " Skip this item once it finishes, or retry.";
+      await saveBatch(batch);
     });
   } finally {
-    if (paused) await api.downloads.resume(item.id).catch((error) => setBadge("!", "Fetchrail: resume the browser download manually. " + error.message));
+    if (paused && !uncertain) await api.downloads.resume(item.id).catch((error) => setBadge("!", "Fetchrail: resume the browser download manually. " + error.message));
+  }
+}
+
+const privateHandoffs = new Map();
+let handoffOperations = Promise.resolve();
+function saveHandoff(handoff, remove = false) {
+  const action = handoffOperations.then(async () => {
+    if (handoff.incognito) { if (remove) privateHandoffs.delete(handoff.id); else privateHandoffs.set(handoff.id, { ...handoff }); return; }
+    // Only ownership identifiers survive a worker restart; never store URLs or credentials here.
+    const entries = (await api.storage.local.get("pendingHandoffs")).pendingHandoffs ?? {};
+    if (remove) delete entries[handoff.id]; else entries[handoff.id] = handoff;
+    await api.storage.local.set({ pendingHandoffs: entries });
+  });
+  handoffOperations = action.catch(() => {});
+  return action;
+}
+
+let recoveryPromise;
+function recoverHandoffs() {
+  if (!recoveryPromise) recoveryPromise = reconcileHandoffs().finally(() => { recoveryPromise = null; });
+  return recoveryPromise;
+}
+async function reconcileHandoffs() {
+  const entries = (await api.storage.local.get("pendingHandoffs")).pendingHandoffs ?? {};
+  for (const handoff of [...Object.values(entries), ...privateHandoffs.values()]) {
+    if (routingDownloads.has(handoff.browserId)) continue;
+    try {
+      const staged = await nativeRequest("getHandoff", { handoffId: handoff.id });
+      if (!staged.ids?.length) throw new Error("Acceptance is still unknown. Leave this download paused and retry recovery.");
+      const [browser] = await api.downloads.search({ id: handoff.browserId });
+      if (!staged.committed && staged.statuses?.includes("cancelled")) {
+        if (browser?.paused) await api.downloads.resume(handoff.browserId);
+        await saveHandoff(handoff, true); continue;
+      }
+      if (!staged.committed && browser?.state === "in_progress" && !browser.paused) {
+        for (const id of staged.ids) await nativeRequest("controlDownload", { downloadId: id, action: "cancel" });
+        await saveHandoff(handoff, true); continue;
+      }
+      if (browser?.state === "complete") throw new Error("The browser already completed this file. Check the paused copy in Fetchrail.");
+      if (!staged.committed && browser?.paused && (!safeBrowserDownload(browser) || !!browser.incognito !== !!handoff.incognito)) {
+        throw new Error("The paused browser download changed or failed its safety check. Review it before continuing.");
+      }
+      if (!staged.committed && !browser?.paused && handoff.phase !== "cancelling") {
+        throw new Error("The browser download disappeared before cancellation was confirmed. Review the staged copy in Fetchrail.");
+      }
+      if (browser?.state === "in_progress" || browser?.paused) await api.downloads.cancel(handoff.browserId);
+      if (!staged.committed) await nativeRequest("commitHandoff", { handoffId: handoff.id, autoStart: handoff.autoStart, source: handoff.source });
+      await api.downloads.erase({ id: handoff.browserId }).catch(() => {});
+      await saveHandoff(handoff, true);
+      await changeBatch(async () => {
+        const batch = await loadBatch(handoff.incognito);
+        if (batch?.browserDownloadId === handoff.browserId && ["capturing", "waiting"].includes(batch.status)) { batch.accepted++; batch.index++; await openBatchPage(batch); }
+      });
+    } catch (error) { await setBadge("!", "Fetchrail: handoff recovery paused. " + error.message); }
   }
 }
 
@@ -427,7 +612,7 @@ api.contextMenus.onClicked.addListener((info, tab) => {
     const url = info.linkUrl ?? info.srcUrl;
     if (url) {
       activeActions++;
-      void addItems("contextMenu", [{ url }])
+      void addBrowserItems("contextMenu", [{ url }], {}, tab)
         .catch((error) => setBadge("!", "Fetchrail: " + error.message))
         .finally(() => activeActions--);
     }
@@ -438,17 +623,17 @@ api.contextMenus.onClicked.addListener((info, tab) => {
 
 api.runtime.onMessage.addListener((message, sender, sendResponse) => {
   // Injected followers can only ask to advance an active batch step, never read local data.
-  if (message.type === "downloadStep" && sender.id === api.runtime.id && sender.tab && !sender.tab.incognito) {
+  if (message.type === "downloadStep" && sender.id === api.runtime.id && sender.tab) {
     void changeBatch(async () => {
-      const { browserBatch: batch } = await api.storage.local.get("browserBatch");
+      const batch = await loadBatch(!!sender.tab.incognito);
       if (batch?.status !== "waiting" || !batch.followButtons || !batch.tabIds.includes(sender.tab.id)) return { click: false };
       if ((batch.followSteps ?? 0) >= 20) {
         batch.error = "Automatic steps stopped after 20 buttons. Continue manually or skip this item.";
-        await api.storage.local.set({ browserBatch: batch });
+        await saveBatch(batch);
         return { click: false };
       }
       batch.followSteps = (batch.followSteps ?? 0) + 1;
-      await api.storage.local.set({ browserBatch: batch });
+      await saveBatch(batch);
       return { click: true };
     }).then(sendResponse, () => sendResponse({ click: false }));
     return true;
@@ -456,29 +641,46 @@ api.runtime.onMessage.addListener((message, sender, sendResponse) => {
   // Only extension pages can read or control local downloads.
   if (sender.id !== api.runtime.id || !sender.url?.startsWith(api.runtime.getURL(""))) return false;
   const run = async () => {
+    await captureReady;
     if (message.type === "collectLinks") return collectLinks(message.tabId);
     if (message.type === "startBrowserBatch") return startBrowserBatch(message.items, {
       connections: message.connections ?? null, queue: message.queue ?? null,
       startPaused: message.startPaused ?? false, scheduledFor: message.scheduledFor ?? null,
       speedLimitBps: message.speedLimitBps ?? 0,
-    }, message.followButtons === true);
-    if (message.type === "getBrowserBatch") return changeBatch(async () => {
-      const { browserBatch: batch } = await api.storage.local.get("browserBatch");
+    }, message.followButtons === true, await sourceTab(message));
+    if (message.type === "getBrowserBatch") { await recoverHandoffs(); return changeBatch(async () => {
+      const batch = await loadBatch(message.incognito ?? !!(await sourceTab(message))?.incognito);
       if (batch?.status === "capturing" && !routingDownloads.size) {
-        await api.downloads.resume(batch.browserDownloadId).catch(() => {});
         batch.status = "waiting";
         batch.error = "The previous handoff was interrupted. Check Fetchrail and browser downloads before retrying or skipping this item.";
-        await api.storage.local.set({ browserBatch: batch });
+        await saveBatch(batch);
       }
       return batch ?? null;
-    });
-    if (message.type === "browserBatchControl") return batchControl(message.action);
-    if (message.type === "addDownloads") return addItems("popup", message.items, {
+    }); }
+    if (message.type === "browserBatchControl") return batchControl(message.action, message.incognito ?? !!(await sourceTab(message))?.incognito);
+    if (message.type === "takeBrowserRequest") {
+      const tab = await sourceTab(message);
+      const current = await loadBatch(!!tab?.incognito);
+      if (current && ["waiting", "capturing"].includes(current.status)) {
+        throw new Error("Finish or stop the current browser batch first.");
+      }
+      const pending = await nativeRequest("takeBrowserRequest", { downloadId: message.id });
+      try {
+        const batch = await startBrowserBatch(pending.requests.map((request) => ({ url: request.url, options: request })), {}, false, tab);
+        // A lost acknowledgement must not release the request for a duplicate pickup.
+        await nativeRequest("finishBrowserRequest", { downloadId: message.id, completed: true }).catch(() => {});
+        return batch;
+      } catch (error) {
+        await nativeRequest("finishBrowserRequest", { downloadId: message.id, completed: false }).catch(() => {});
+        throw error;
+      }
+    }
+    if (message.type === "addDownloads") return addBrowserItems("popup", message.items, {
       connections: message.connections ?? null, queue: message.queue ?? null,
       startPaused: message.startPaused ?? false, scheduledFor: message.scheduledFor ?? null,
       speedLimitBps: message.speedLimitBps ?? 0,
-    });
-    if (["ping", "getDownloads", "showApp"].includes(message.type)) return nativeRequest(message.type);
+    }, useBrowserSession ? await sourceTab(message) : null);
+    if (["ping", "getDownloads", "showApp"].includes(message.type)) { if (message.type === "getDownloads") await recoverHandoffs(); return nativeRequest(message.type); }
     if (message.type === "controlDownload") return nativeRequest("controlDownload", { downloadId: message.downloadId, action: message.action });
     throw new Error("Unknown Fetchrail action.");
   };

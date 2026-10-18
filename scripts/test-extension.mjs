@@ -103,6 +103,14 @@ await pending;
 holdNativeRequest = null;
 await new Promise(setImmediate);
 const requestCount = requests.length;
+for (const status of ["waiting", "capturing"]) {
+  stored.browserBatch = { status };
+  await checkUpdate(); assert.equal(reloads, 0, `${status} batches must survive local update checks`);
+  delete stored.browserBatch;
+  vm.runInContext(`privateBatch = { status: "${status}" }`, context);
+  await checkUpdate(); assert.equal(reloads, 0, `Private ${status} batches must survive local update checks`);
+  vm.runInContext("privateBatch = null", context);
+}
 await checkUpdate();
 assert.equal(reloads, 1, "an idle extension should reload changed local files");
 assert.equal(requests.length, requestCount, "update checks must not launch the desktop app");

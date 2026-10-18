@@ -89,9 +89,10 @@ pub async fn set_progress_details(
     window
         .set_size(tauri::LogicalSize::new(width, height))
         .map_err(|error| error.to_string())?;
-    let mut settings = manager.settings().await;
-    settings.progress_details = details;
-    manager.update_settings(settings).await.map(|_| ())
+    manager
+        .patch_settings(serde_json::json!({"progressDetails":details}))
+        .await
+        .map(|_| ())
 }
 
 #[tauri::command]
@@ -124,10 +125,23 @@ pub async fn open_download(
 }
 
 pub async fn on_completion(app: &AppHandle, record: &DownloadRecord) {
+    let manager = app.state::<Arc<DownloadManager>>();
+    let _completion = manager.completion_guard().await;
     let options = record.completion_options.clone();
-    if options.turn_off_computer {
-        app.state::<Arc<DownloadManager>>().shutdown().await;
-    }
+    let paused = if options.turn_off_computer {
+        match manager.prepare_power_action().await {
+            Ok(paused) => paused,
+            Err(message) => {
+                let _ = app.emit(
+                    "fetchrail://completion-error",
+                    serde_json::json!({"id":record.id,"message":message}),
+                );
+                return;
+            }
+        }
+    } else {
+        Vec::new()
+    };
     #[cfg(windows)]
     let result = tauri::async_runtime::spawn_blocking(move || completion_actions(&options)).await;
     #[cfg(target_os = "linux")]
@@ -140,7 +154,7 @@ pub async fn on_completion(app: &AppHandle, record: &DownloadRecord) {
     };
     if let Some(message) = error {
         if record.completion_options.turn_off_computer {
-            app.state::<Arc<DownloadManager>>().resume_dispatch();
+            manager.recover_power_action(paused).await;
         }
         let _ = app.emit(
             "fetchrail://completion-error",

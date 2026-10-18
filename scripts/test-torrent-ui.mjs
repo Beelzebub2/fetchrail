@@ -19,8 +19,8 @@ try {
     const peers = Array.from({ length: 2000 }, (_, index) => ({ address: `192.0.${Math.floor(index / 250)}.${index % 250 + 1}`, port: 6881, client: "Local fixture", downloadSpeed: 65536, uploadSpeed: 32768, progress: 0.5 }));
     const records = Array.from({ length: 1000 }, (_, index) => ({ id: crypto.randomUUID(), fileName: `Torrent ${index}`, url: "magnet:?xt=urn:btih:" + metadata.hashes[0], destination: "C:\\Downloads", status: index % 3 ? "downloading" : "seeding", totalBytes: metadata.totalBytes, downloadedBytes: index % 3 ? 1024 * 1024 : metadata.totalBytes, speedBps: 1048576, mergedBytes: 0, etaSeconds: 100, connections: 10, requestedConnections: null, error: null, createdAt: new Date(Date.now() - index * 1000).toISOString(), finishedAt: null, queue: "Default", scheduledFor: null, segments: [], speedLimitBps: 0, resumeSupported: true, completionOptions: { showCompleteDialog: true }, torrent: { hashes: metadata.hashes, uploadedBytes: 1024 * 1024, allDownloadedBytes: 1024 * 1024, uploadSpeedBps: 12345, peers: 10, seeds: 3, selectedReady: !(index % 3), activeSeconds: 100, seedSeconds: 40, ratioLimit: 1, seedTimeLimit: 86400, sequential: false } }));
     const emit = (event, payload) => { for (const handler of listeners.get(event) ?? []) callbacks.get(handler)?.({ event, id: handler, payload }); };
-    window.__fixture = { records, emit, commands: [], stalls: [], importId: crypto.randomUUID() };
-    new PerformanceObserver(list => { for (const entry of list.getEntries()) window.__fixture.stalls.push(entry.duration); }).observe({ entryTypes: ["longtask"] });
+    window.__fixture = { records, metadata, emit, commands: [], stalls: [], importId: crypto.randomUUID(), writes: 0, maxWrites: 0 };
+    new PerformanceObserver(list => { for (const entry of list.getEntries()) { window.__fixture.stalls.push(entry.duration); (window.__fixture.longTasks ??= []).push({ start: entry.startTime, duration: entry.duration }); } }).observe({ entryTypes: ["longtask"] });
     window.__TAURI_INTERNALS__ = {
       metadata: { currentWindow: { label: "main" }, currentWebview: { label: "main" } },
       transformCallback: callback => { const id = serial++; callbacks.set(id, callback); return id; },
@@ -32,26 +32,35 @@ try {
         if (command === "plugin:app|version") return "0.5.2";
         if (command === "list_downloads") return records;
         if (command === "get_settings") return settings;
-        if (command === "update_settings") return { ...Object.assign(settings, args.settings) };
+        if (command === "patch_settings") return { ...Object.assign(settings, args.patch) };
         if (command === "list_queues") return [{ name: "Default", paused: false, startsAt: null, stopsAt: null }];
         if (command === "update_status") return { state: "unmanaged" };
         if (command === "get_overview") return { active: 666, queued: 0, completed: 334, failed: 0, currentSpeedBps: 1024 * 1024, uploadSpeedBps: 12345, seeding: 334 };
         if (command === "torrent_command") {
           const record = records.find(record => record.id === args.id);
-          if (args.request.op === "priorities") { for (const file of metadata.files) file.priority = args.request.priorities[file.index]; emit("fetchrail://torrent-updated", [record]); }
-          if (args.request.op === "details") return { metadata, peers, trackers: [], port: 6881, moving: false };
+          if (args.request.op === "priorities") {
+            window.__fixture.writes++; window.__fixture.maxWrites = Math.max(window.__fixture.maxWrites, window.__fixture.writes);
+            if (window.__fixture.holdWrite) await new Promise(resolve => { window.__fixture.releaseWrite = resolve; });
+            for (const file of metadata.files) file.priority = args.request.priorities[file.index]; emit("fetchrail://torrent-updated", [record]);
+            window.__fixture.writes--;
+            if (window.__fixture.failWrite) { window.__fixture.failWrite = false; throw Error("Priority reply lost after applying"); }
+          }
+          if (args.request.op === "details") { performance.mark("details-start"); const snapshot = structuredClone({ metadata, peers, trackers: [], port: 6881, moving: false }); performance.mark("details-cloned"); if (window.__fixture.holdDetails) { window.__fixture.holdDetails = false; return new Promise(resolve => { window.__fixture.releaseDetails = () => resolve(snapshot); }); } return snapshot; }
           return {};
         }
         if (command === "pause_download" || command === "resume_download") { const record = records.find(record => record.id === args.id); record.status = command === "pause_download" ? "paused" : "queued"; emit("fetchrail://download-updated", record); return record; }
         if (command === "import_torrent" || command === "torrent_import_status") return { id: window.__fixture.importId, metadata };
-        if (command === "cancel_torrent_import") return null;
+        if (command === "cancel_torrent_import") { if (window.__fixture.holdCancel) await new Promise(resolve => { window.__fixture.releaseCancel = resolve; }); return null; }
         throw Error("Unhandled fixture command: " + command);
       }
     };
   });
+  const profiler = process.env.TORRENT_PROFILE ? await page.context().newCDPSession(page) : null;
+  if (profiler) { if (process.env.TORRENT_PROFILE !== "traceonly") { await profiler.send("Profiler.enable"); await profiler.send("Profiler.start"); } await profiler.send("Tracing.start", { categories: "devtools.timeline,blink.user_timing,loading,disabled-by-default-devtools.timeline", transferMode: "ReturnAsStream" }); }
   await page.goto("http://127.0.0.1:1428");
   // The list is grouped by status: Torrent 1 leads the Downloading section, Torrent 0 is seeding far below it.
   await page.getByRole("button", { name: "Inspect Torrent 1", exact: true }).waitFor();
+  await page.waitForFunction(() => performance.getEntriesByType("paint").some(entry => entry.name === "first-contentful-paint"));
   // A mounted button can precede the first paint on a fresh hosted browser.
   // Finish page startup before measuring actions; the first inspector opening is still measured.
   const initialPaintMs = await page.evaluate(async () => {
@@ -66,12 +75,22 @@ try {
   for (let i = 0; i < 10; i++) {
     const elapsed = await page.evaluate(async () => {
       const start = performance.now();
+      performance.mark("inspector-open-start");
       document.querySelector('.torrent-row .icon-button').click();
-      await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+      const clickMs = performance.now() - start; let firstFrameMs;
+      await new Promise(resolve => requestAnimationFrame(() => { firstFrameMs = performance.now() - start; requestAnimationFrame(resolve); }));
+      (window.__fixture.actionPhases ??= []).push({ clickMs, firstFrameMs, totalMs: performance.now() - start });
       if (!document.querySelector('.torrent-inspector')?.getBoundingClientRect().height) throw Error("Torrent details did not render during the measured frames.");
+      performance.mark("inspector-open-painted");
       return performance.now() - start;
     });
     latencies.push(elapsed);
+    if (i === 0 && profiler) {
+      const profile = process.env.TORRENT_PROFILE === "traceonly" ? { profile: {} } : await profiler.send("Profiler.stop"); await mkdir("artifacts", { recursive: true }); await writeFile(`artifacts/torrent-cold-${process.env.TORRENT_PROFILE}.cpuprofile`, JSON.stringify(profile.profile));
+      const complete = new Promise(resolve => profiler.once("Tracing.tracingComplete", resolve)); await profiler.send("Tracing.end"); const { stream } = await complete; let trace = "";
+      for (;;) { const chunk = await profiler.send("IO.read", { handle: stream }); trace += chunk.data; if (chunk.eof) break; }
+      await profiler.send("IO.close", { handle: stream }); await writeFile(`artifacts/torrent-cold-${process.env.TORRENT_PROFILE}.json`, trace);
+    }
     await page.getByRole("button", { name: "Close torrent details", exact: true }).click();
   }
   await page.getByRole("button", { name: "Inspect Torrent 1", exact: true }).click();
@@ -80,6 +99,33 @@ try {
   assert.ok(await page.locator(".torrent-file").count() <= 16, "10,000 files must remain virtualized");
   await page.getByRole("checkbox", { name: "Download Dataset/folder-0/file-0.bin", exact: true }).uncheck();
   await page.waitForFunction(() => window.__fixture.commands.some(c => c.command === "torrent_command" && c.args.request.op === "priorities" && c.args.request.priorities[0] === 0));
+  const file = index => page.getByRole("checkbox", { name: `Download Dataset/folder-0/file-${index}.bin`, exact: true });
+  await page.evaluate(() => { window.__fixture.holdDetails = true; });
+  await page.waitForFunction(() => !!window.__fixture.releaseDetails);
+  await file(1).uncheck();
+  await page.waitForFunction(() => window.__fixture.metadata.files[1].priority === 0);
+  await page.evaluate(() => { window.__fixture.releaseDetails(); delete window.__fixture.releaseDetails; });
+  assert.equal(await file(1).isChecked(), false, "An older poll must not reset a newer exclusion");
+  await page.evaluate(() => { window.__fixture.holdWrite = true; });
+  await file(2).uncheck(); await page.waitForFunction(() => !!window.__fixture.releaseWrite);
+  await file(3).uncheck();
+  await page.getByRole("tab", { name: "Peers", exact: true }).click();
+  await page.getByRole("tab", { name: "Files", exact: true }).click();
+  await page.evaluate(() => { window.__fixture.holdWrite = false; window.__fixture.releaseWrite(); delete window.__fixture.releaseWrite; });
+  await page.waitForFunction(() => window.__fixture.metadata.files.slice(0, 4).every(file => file.priority === 0));
+  assert.equal(await page.evaluate(() => window.__fixture.maxWrites), 1, "Full-array writes must be serialized");
+  await page.evaluate(() => { window.__fixture.failWrite = true; window.__fixture.holdDetails = true; });
+  await file(4).uncheck(); await page.waitForFunction(() => !!window.__fixture.releaseDetails);
+  await file(5).uncheck();
+  await page.evaluate(() => { window.__fixture.releaseDetails(); delete window.__fixture.releaseDetails; });
+  await page.waitForFunction(() => window.__fixture.metadata.files.slice(0, 6).every(file => file.priority === 0));
+  await page.getByRole("button", { name: "Dismiss error", exact: true }).click();
+  await page.evaluate(() => { window.__fixture.holdWrite = true; });
+  await page.getByRole("button", { name: "Select none", exact: true }).click();
+  await page.waitForFunction(() => !!window.__fixture.releaseWrite);
+  await page.getByRole("button", { name: "Select all", exact: true }).click();
+  await page.evaluate(() => { window.__fixture.holdWrite = false; window.__fixture.releaseWrite(); delete window.__fixture.releaseWrite; });
+  await page.waitForFunction(() => window.__fixture.metadata.files.every(file => file.priority === 4));
   await page.getByRole("button", { name: "Pause Torrent 1", exact: true }).click();
   // Pausing moves the transfer to the Paused section, which the Paused view shows on its own.
   await page.getByRole("button", { name: "Paused", exact: true }).click();
@@ -94,9 +140,16 @@ try {
   await page.getByRole("textbox", { name: "Link to download", exact: true }).fill("magnet:?xt=urn:btih:abcdef0123456789abcdef0123456789abcdef0123");
   await page.getByRole("button", { name: "Download", exact: true }).click();
   await page.getByRole("dialog").waitFor();
+  for (let i = 0; i < 22; i++) { await page.keyboard.press(i % 2 ? "Shift+Tab" : "Tab"); assert.ok(await page.evaluate(() => !!document.activeElement?.closest("dialog[open]")), "Import focus stays inside its dialog"); }
   await page.getByRole("button", { name: "Select none", exact: true }).click();
   assert.ok(await page.getByRole("button", { name: "Start torrent", exact: true }).isDisabled());
-  await page.getByRole("button", { name: "Cancel", exact: true }).click();
+  await page.evaluate(() => { window.__fixture.holdCancel = true; });
+  await page.keyboard.press("Escape");
+  await page.waitForFunction(() => !!window.__fixture.releaseCancel);
+  await page.keyboard.press("Escape");
+  assert.equal(await page.getByRole("dialog").count(), 1, "Busy cancellation keeps the import dialog open");
+  assert.equal(await page.evaluate(() => window.__fixture.commands.filter(call => call.command === "cancel_torrent_import").length), 1);
+  await page.evaluate(() => { window.__fixture.releaseCancel(); });
   await page.getByRole("dialog").waitFor({ state: "hidden" });
   await mkdir("artifacts", { recursive: true });
   await page.screenshot({ path: "artifacts/torrent-ui-dark.png" });
@@ -114,7 +167,7 @@ try {
   await page.getByRole("tab", { name: "Files", exact: true }).click();
   await page.screenshot({ path: "artifacts/torrent-ui-narrow.png" });
   const p95 = [...latencies].sort((a, b) => a - b)[Math.ceil(latencies.length * 0.95) - 1];
-  const metrics = { records: 1000, files: 10000, peers: 2000, initialPaintMs, telemetryHz: 4, steadyTelemetrySeconds: 15, steadyStallsMs: steadyStalls, actionPaintP95Ms: p95, actionPaintSamplesMs: latencies, errors };
+  const metrics = { records: 1000, files: 10000, peers: 2000, initialPaintMs, telemetryHz: 4, steadyTelemetrySeconds: 15, steadyStallsMs: steadyStalls, actionPaintP95Ms: p95, actionPaintSamplesMs: latencies, actionPhases: await page.evaluate(() => window.__fixture.actionPhases), coldTrace: process.env.TORRENT_PROFILE ? await page.evaluate(() => ({ longTasks: window.__fixture.longTasks, marks: performance.getEntriesByType("mark").slice(0,12).map(x=>({name:x.name,start:x.startTime})) })) : undefined, errors };
   await writeFile("artifacts/torrent-ui-performance.json", JSON.stringify(metrics, null, 2));
   console.log("Torrent UI performance: " + JSON.stringify(metrics));
   assert.deepEqual(errors, []);

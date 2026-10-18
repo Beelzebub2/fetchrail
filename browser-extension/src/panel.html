@@ -36,6 +36,7 @@
             <span id="options-summary">Default queue · auto connections · starts now</span>
             <b>Options</b>
           </button>
+          <div id="desktop-requests" hidden></div>
           <div id="browser-batch" class="reveal" inert>
             <div>
               <section class="batch-card" aria-label="Browser download batch">
@@ -161,7 +162,7 @@
         </div>
         <div class="option-group tight">
           <label class="option-switch"><span>Use my browser session</span><input id="browser-session" class="switch" type="checkbox" /></label>
-          <p class="hint">Passes the file's cookies and sign-in to the app, so resume and schedules keep working.</p>
+          <p class="hint">Uses your sign-in for captured files, including private repositories. For private windows, also allow this extension in incognito/private browsing in your browser's extension settings. Accepted files appear in Fetchrail's history.</p>
         </div>
         <button id="options-reset" class="text-button reset">Reset to defaults</button>
       </div>
