@@ -19,6 +19,7 @@
     "engine:bench": "node scripts/benchmark-downloads.mjs",
     "torrent:deps": "node scripts/platform-command.mjs torrent:deps",
     "torrent:test": "node scripts/test-torrents.mjs",
+    "torrent:diagnostics": "node scripts/test-torrent-diagnostics.mjs",
     "torrent:listeners": "node scripts/test-torrent-listeners.mjs",
     "torrent:ui": "node scripts/test-torrent-ui.mjs",
     "torrent:desktop": "node scripts/test-torrent-desktop.mjs",

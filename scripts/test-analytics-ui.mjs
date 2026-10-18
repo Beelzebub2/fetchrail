@@ -72,8 +72,11 @@ try {
         if (name === "set_local_crash_history") { window.testSettings.localCrashHistory = args.enabled; window.testEmit("fetchrail://settings-updated", structuredClone(window.testSettings)); return structuredClone(window.testSettings); }
         if (name === "local_health_history") return [];
         if (name === "clear_local_health_history" || name === "clear_download_health") return;
-        if (name === "download_health") return { schema: 1, version: "0.7.4", os: "windows", arch: "x64", debugBuild: false, elapsedMs: 9000, observedFromAccept: true, durableCompletedMs: null, receivedWireBytes: 123, checkpointBytesWritten: 100, outputVerifiedBytes: null, fileLimitBps: 0, globalLimitBps: 0, activities: [], receiveWindows: [], receiveStalls: 1, receiveStalledMs: 3000, missingReceiveWindows: 0,
+        if (name === "download_health" || name === "recent_operation_health") {
+          const report = { schema: 1, version: "0.7.4", os: "windows", arch: "x64", debugBuild: false, elapsedMs: 9000, observedFromAccept: true, durableCompletedMs: null, receivedWireBytes: 123, checkpointBytesWritten: 100, outputVerifiedBytes: null, fileLimitBps: 0, globalLimitBps: 0, activities: [], receiveWindows: [], receiveStalls: 1, receiveStalledMs: 3000, missingReceiveWindows: 0,
           stages: [{phase: "body", calls: 1, workerMs: 3000, maxMs: 3000, active: 1, activeElapsedMs: 3000}], causes: [["http_503", 1]], events: [{elapsedMs: 1000, durationMs: 3000, phase: "body", cause: null}], evictedEvents: 0, diagnosis: {confidence: "Observed", observation: "ReceiveWait", next: "ReproduceSourceAndRoute"}, limitations: ["NoExternalRootCause"] };
+          return name === "download_health" ? report : [{...report, context: "browserVerification"}];
+        }
         if (name === "update_settings") {
           if (window.testDelaySettings) await new Promise(resolve => { window.testFinishSettings = resolve; });
           window.testSettings = args.settings;
@@ -119,6 +122,13 @@ try {
   assert.equal(await prompt.count(), 0);
   await page.getByRole("button", { name: "Settings", exact: true }).click();
   await page.getByRole("tab", { name: "Privacy", exact: true }).click();
+  await page.getByRole("button", {name: "Inspect recent imports and browser handoffs"}).click();
+  const operations = page.getByRole("region", {name: "Recent pre-admission observations"});
+  await operations.getByText("Troubleshoot browser Verification", {exact: true}).click();
+  await operations.getByRole("button", {name: "Preview safe incident report"}).click();
+  assert.equal(JSON.parse(await operations.locator("pre").textContent()).context, "browserVerification");
+  assert.equal(await operations.getByRole("button", {name: "Copy safe report", exact: true}).isDisabled(), true);
+  await operations.getByRole("button", {name: "Cancel sharing"}).click();
   await page.getByLabel("Allow optional improvement analytics").check();
   await page.getByText("Analytics is on.", { exact: true }).waitFor();
   await page.screenshot({ path: join(output, "analytics-settings.png"), fullPage: true });

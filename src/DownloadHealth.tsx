@@ -3,8 +3,9 @@ import { invoke } from "@tauri-apps/api/core";
 import { save } from "@tauri-apps/plugin-dialog";
 
 type Stage = { phase: string; calls: number; workerMs: number; maxMs: number; active: number; activeElapsedMs: number };
-type Report = {
+export type Report = {
   schema: number; version: string; os: string; arch: string; debugBuild: boolean; elapsedMs: number; observedFromAccept: boolean; durableCompletedMs: number | null;
+  context?: "transfer" | "browserVerification" | "browserCommit" | "torrentImport";
   receivedWireBytes: number; checkpointBytesWritten: number; outputVerifiedBytes: number | null;
   fileLimitBps: number | null; globalLimitBps: number | null;
   activities: { activity: string; elapsedMs: number; durationMs: number }[];
@@ -17,12 +18,13 @@ type Report = {
 };
 const label = (value: string) => value.replace(/([a-z])([A-Z])/g, "$1 $2").replace(/_/g, " ");
 const seconds = (ms: number) => `${(ms / 1000).toFixed(3)} s`;
-export function DownloadHealth({ id, initialOpen = false }: { id: string; initialOpen?: boolean }) {
-  const [open, setOpen] = useState(initialOpen), [report, setReport] = useState<Report | null>(null);
+export function DownloadHealth({ id, initialOpen = false, initialReport }: { id?: string; initialOpen?: boolean; initialReport?: Report }) {
+  const [open, setOpen] = useState(initialOpen), [report, setReport] = useState<Report | null>(initialReport ?? null);
   const [preview, setPreview] = useState<string | null>(null), [reviewed, setReviewed] = useState(false);
   const [error, setError] = useState<string | null>(null), [copied, setCopied] = useState(false);
+  useEffect(() => { setReport(initialReport ?? null); setPreview(null); setReviewed(false); setError(null); }, [id, initialReport]);
   useEffect(() => {
-    if (!open) return;
+    if (!open || !id) return;
     let cancelled = false, pending = false;
     const read = () => {
       if (pending || document.visibilityState === "hidden") return;
@@ -33,8 +35,9 @@ export function DownloadHealth({ id, initialOpen = false }: { id: string; initia
     return () => { cancelled = true; clearInterval(timer); };
   }, [id, open]);
   return <details className="download-health" open={open} onToggle={event => setOpen(event.currentTarget.open)}>
-    <summary>Troubleshoot this download</summary>
+    <summary>{report?.context && report.context !== "transfer" ? `Troubleshoot ${label(report.context)}` : "Troubleshoot this download"}</summary>
     <p>Private local observations, including recent evidence from before you opened this panel. Nothing is uploaded.</p>
+    {report?.context && report.context !== "transfer" && <p>This records an import or browser handoff operation before transfer admission. It is separate from download outcomes and cannot establish file completion.</p>}
     {error && <p role="alert">{error}</p>}
     {report && <>
       <p>Fetchrail {report.version} · {report.os}/{report.arch}{report.debugBuild ? " · debug build" : ""}</p>
@@ -42,7 +45,7 @@ export function DownloadHealth({ id, initialOpen = false }: { id: string; initia
       {report.diagnosis.stage && <p>Observed stage: {label(report.diagnosis.stage)}{report.diagnosis.durationMs != null ? ` · ${seconds(report.diagnosis.durationMs)} in the longest individual call or current activity` : ""}. This does not by itself prove the cause of the total delay.</p>}
       {report.diagnosis.cause && <p>Observed cause category: {label(report.diagnosis.cause)}.</p>}
       <dl className="details">
-        <dt>Observed elapsed time</dt><dd>{seconds(report.elapsedMs)} {report.observedFromAccept ? "from admission" : "(earlier history unavailable)"}</dd>
+        <dt>Observed elapsed time</dt><dd>{seconds(report.elapsedMs)} {report.observedFromAccept ? report.context && report.context !== "transfer" ? "from operation start" : "from admission" : "(earlier history unavailable)"}</dd>
         <dt>Durable completion</dt><dd>{report.durableCompletedMs == null ? "Not observed" : seconds(report.durableCompletedMs)}</dd>
         <dt>New HTTP body bytes</dt><dd>{report.receivedWireBytes.toLocaleString()} (excludes HTTP/TCP overhead)</dd>
         <dt>Checkpoint bytes written</dt><dd>{report.checkpointBytesWritten.toLocaleString()} (resumed bytes excluded)</dd>
@@ -59,7 +62,7 @@ export function DownloadHealth({ id, initialOpen = false }: { id: string; initia
       <details><summary>Recent boundary timeline ({report.evictedEvents} older observations evicted)</summary><ol>{report.events.map((event, i) => <li key={i}>+{seconds(event.elapsedMs)} · {label(event.cause ?? event.phase ?? "range attempt")} · {seconds(event.durationMs)}{event.rangeIndex != null ? ` · range ${event.rangeIndex + 1}, attempt ${event.attempt}, ${event.progressedBytes ?? 0} new progress bytes` : ""}</li>)}</ol></details>
       <p>{report.limitations.map(label).join(". ")}.</p>
       <button type="button" className="secondary-button" onClick={() => { setPreview(JSON.stringify(report, null, 2)); setReviewed(false); setCopied(false); }}>Preview safe incident report</button>
-      <button type="button" className="ghost-button" onClick={() => void invoke("clear_download_health", { id }).then(() => { setReport(null); setPreview(null); setReviewed(false); }).catch(e => setError(String(e)))}>Clear recent local evidence</button>
+      {id && <button type="button" className="ghost-button" onClick={() => void invoke("clear_download_health", { id }).then(() => { setReport(null); setPreview(null); setReviewed(false); }).catch(e => setError(String(e)))}>Clear recent local evidence</button>}
     </>}
     {preview !== null && <section aria-label="Safe incident preview">
       <p>This is the exact JSON to copy. It contains relative timings, numeric byte counts, stage and cause categories. No automatic upload occurs. Public GitHub issues are public; share through a private support channel and agree its retention first.</p>

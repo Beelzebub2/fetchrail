@@ -1238,6 +1238,7 @@ pub struct DownloadManager {
     closing: AtomicBool,
     diagnostics: Arc<crate::diagnostics::Service>,
     analytics: Arc<crate::analytics::Analytics>,
+    operation_health: crate::health::Operations,
     settings_update_lock: tokio::sync::Mutex<()>,
     torrent_engine: TorrentEngine,
     torrent_imports: RwLock<HashMap<Uuid, PendingTorrentImport>>,
@@ -1572,6 +1573,7 @@ impl DownloadManager {
                 analytics
             },
             settings_update_lock: tokio::sync::Mutex::new(()),
+            operation_health: Default::default(),
             torrent_engine: TorrentEngine::new(&data_dir.join("torrents"))?,
             torrent_imports: RwLock::new(HashMap::new()),
             torrent_checkpoint: Mutex::new(Instant::now()),
@@ -1760,6 +1762,26 @@ impl DownloadManager {
         key: &str,
         auto_start: bool,
     ) -> Result<Vec<DownloadRecord>, String> {
+        let operation = self
+            .operation_health
+            .start(crate::health::Context::BrowserCommit);
+        let result = {
+            let span = operation.health.guard(crate::health::Phase::Probe);
+            let result = self
+                .commit_handoff_observed(key, auto_start, &operation.health)
+                .await;
+            span.observe(&result);
+            result
+        };
+        self.operation_health.finish(operation, result.is_err());
+        result
+    }
+    async fn commit_handoff_observed(
+        self: &Arc<Self>,
+        key: &str,
+        auto_start: bool,
+        health: &crate::health::Health,
+    ) -> Result<Vec<DownloadRecord>, String> {
         self.reject_diagnostics()?;
         let dispatch = self.dispatch_lock.lock().await;
         self.reject_diagnostics()?;
@@ -1796,7 +1818,14 @@ impl DownloadManager {
             saved.extra.insert("handoffCommitted".into(), json!(true));
             *record = saved.clone();
         }
-        if let Err(error) = self.persist_records_locked().await {
+        let result = {
+            let span = health.guard(crate::health::Phase::Catalog);
+            let result = self.persist_records_locked().await;
+            span.observe(&result);
+            result
+        };
+        if let Err(error) = result {
+            health.cause(crate::health::Cause::Catalog);
             for (id, value) in previous {
                 let task = self.task(id).await?;
                 let mut saved = task.record.write().await;
@@ -1854,12 +1883,29 @@ impl DownloadManager {
         drop(dispatch);
         let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
         let manager = self.clone();
+        let operation = self
+            .operation_health
+            .start(crate::health::Context::TorrentImport);
         tauri::async_runtime::spawn(async move {
-            let result = tokio::select! {
-                result = tokio::time::timeout_at(deadline, manager.resolve_torrent_import(id, &source)) => result.unwrap_or_else(|_| Err("Torrent metadata timed out after two minutes. Cancel and retry.".into())),
-                _ = cancel.cancelled() => Err("Torrent import cancelled.".into()),
+            let result = {
+                let span = operation.health.guard(crate::health::Phase::Probe);
+                let result = tokio::select! {
+                    result = tokio::time::timeout_at(deadline, manager.resolve_torrent_import(id, &source, &operation.health)) => result.unwrap_or_else(|_| {
+                        operation.health.failure(crate::health::Phase::Probe);
+                        operation.health.cause(crate::health::Cause::Timeout);
+                        Err("Torrent metadata timed out after two minutes. Cancel and retry.".into())
+                    }),
+                    _ = cancel.cancelled() => {
+                        operation.health.failure(crate::health::Phase::Probe);
+                        operation.health.cause(crate::health::Cause::Cancelled);
+                        Err("Torrent import cancelled.".into())
+                    },
+                };
+                span.observe(&result);
+                result
             };
             let failed = result.is_err();
+            manager.operation_health.finish(operation, failed);
             if let Some(import) = manager.torrent_imports.write().await.get_mut(&id) {
                 match result {
                     Ok(metadata) => {
@@ -1893,6 +1939,7 @@ impl DownloadManager {
         &self,
         id: Uuid,
         source: &str,
+        health: &crate::health::Health,
     ) -> Result<Option<TorrentMetadata>, String> {
         let path = self.data_dir.join("torrents").join(format!("{id}.torrent"));
         let metadata = if source.starts_with("magnet:") {
@@ -1930,12 +1977,19 @@ impl DownloadManager {
                     &self.client,
                     self.client.get(source),
                     &CancellationToken::new(),
-                    None,
+                    Some(health),
                     #[cfg(feature = "test-tools")]
                     None,
                 )
                 .await
-                .map_err(|e| e.to_string())?;
+                .map_err(|e| {
+                    health.cause(e.health_cause(None));
+                    e.to_string()
+                })?;
+                if !response.status().is_success() {
+                    health.failure(crate::health::Phase::Headers);
+                    health.cause(EngineError::Http(response.status()).health_cause(None));
+                }
                 let response = response
                     .error_for_status()
                     .map_err(|e| e.without_url().to_string())?;
@@ -1947,8 +2001,23 @@ impl DownloadManager {
                 }
                 let mut bytes = Vec::new();
                 let mut stream = response.bytes_stream();
-                while let Some(chunk) = stream.next().await {
-                    let chunk = chunk.map_err(|e| e.without_url().to_string())?;
+                loop {
+                    let next = {
+                        let _span = health.guard(crate::health::Phase::Body);
+                        stream.next().await
+                    };
+                    let Some(chunk) = next else {
+                        break;
+                    };
+                    let chunk = chunk.map_err(|e| {
+                        health.failure(crate::health::Phase::Body);
+                        let error = EngineError::Request(e.without_url());
+                        health.cause(error.health_cause(None));
+                        error.to_string()
+                    })?;
+                    health
+                        .received
+                        .fetch_add(chunk.len() as u64, Ordering::Relaxed);
                     if bytes.len() + chunk.len() > 32 * 1024 * 1024 {
                         return Err("Torrent metadata exceeds 32 MiB.".into());
                     }
@@ -1962,14 +2031,29 @@ impl DownloadManager {
                 }
                 fs::read(source).await.map_err(|e| e.to_string())?
             };
-            fs::write(&path, bytes).await.map_err(|e| e.to_string())?;
-            let inspected = self
-                .torrent_engine
-                .call(json!({"op":"inspect", "path":path}))
-                .await;
+            {
+                let span = health.guard(crate::health::Phase::Write);
+                let result = fs::write(&path, bytes).await;
+                span.observe(&result);
+                result.map_err(|e| {
+                    health.cause(crate::health::Cause::Disk);
+                    e.to_string()
+                })?;
+            }
+            let inspected = {
+                let span = health.guard(crate::health::Phase::Verify);
+                let result = self
+                    .torrent_engine
+                    .call(json!({"op":"inspect", "path":path}))
+                    .await;
+                span.observe(&result);
+                result
+            };
             let value = match inspected {
                 Ok(value) => value,
                 Err(error) => {
+                    health.failure(crate::health::Phase::Verify);
+                    health.cause(crate::health::Cause::Unknown);
                     let _ = fs::remove_file(&path).await;
                     return Err(error);
                 }
@@ -2976,7 +3060,36 @@ impl DownloadManager {
         expected_mime: Option<&str>,
         context: Option<&BrowserRequestContext>,
     ) -> Result<Option<String>, String> {
+        let operation = self
+            .operation_health
+            .start(crate::health::Context::BrowserVerification);
+        let result = {
+            let span = operation.health.guard(crate::health::Phase::Probe);
+            let result = self
+                .validate_browser_download_observed(
+                    url,
+                    expected_bytes,
+                    expected_mime,
+                    context,
+                    &operation.health,
+                )
+                .await;
+            span.observe(&result);
+            result
+        };
+        self.operation_health.finish(operation, result.is_err());
+        result
+    }
+    async fn validate_browser_download_observed(
+        &self,
+        url: &str,
+        expected_bytes: Option<u64>,
+        expected_mime: Option<&str>,
+        context: Option<&BrowserRequestContext>,
+        health: &crate::health::Health,
+    ) -> Result<Option<String>, String> {
         // Verify a replayable GET before the extension gives up its browser transfer.
+        let _headers = health.guard(crate::health::Phase::Headers);
         let response = tokio::time::timeout(
             Duration::from_secs(15),
             self.client
@@ -2987,8 +3100,24 @@ impl DownloadManager {
                 .send(),
         )
         .await
-        .map_err(|_| "Browser download verification timed out.".to_string())?
-        .map_err(|error| error.to_string())?;
+        .map_err(|_| {
+            health.failure(crate::health::Phase::Headers);
+            health.cause(crate::health::Cause::Timeout);
+            "Browser download verification timed out.".to_string()
+        })?
+        .map_err(|error| {
+            health.failure(crate::health::Phase::Headers);
+            health.cause(if error.is_timeout() {
+                crate::health::Cause::Timeout
+            } else if error.is_connect() {
+                crate::health::Cause::DnsOrConnect
+            } else {
+                crate::health::Cause::Request
+            });
+            error.to_string()
+        })?;
+        drop(_headers);
+        health.protocol(response.version());
         let total = match response.status() {
             StatusCode::PARTIAL_CONTENT => {
                 let (start, end, total) = parse_content_range(response.headers())
@@ -3000,9 +3129,11 @@ impl DownloadManager {
             }
             StatusCode::OK => content_length_from_headers(response.headers()),
             status => {
+                health.failure(crate::health::Phase::Headers);
+                health.cause(EngineError::Http(status).health_cause(None));
                 return Err(format!(
                     "Browser download requires an unsupported session or returned HTTP {status}."
-                ))
+                ));
             }
         };
         if expected_bytes.is_some() && expected_bytes != total {
@@ -3654,6 +3785,7 @@ impl DownloadManager {
     pub async fn clear_local_health_history(&self) -> Result<(), String> {
         let _update = self.settings_update_lock.lock().await;
         crate::health_history::clear(&self.data_dir)?;
+        self.operation_health.clear();
         for task in self.tasks.read().await.values() {
             task.health.clear();
         }
@@ -3915,12 +4047,20 @@ impl DownloadManager {
                 }
                 selected.sort_by_key(|c| std::cmp::Reverse(c.0));
                 selected.truncate(20);
-                let selected = selected
+                let mut selected = selected
                     .into_iter()
                     .map(|(_, id, task, saved_at, torrent)| {
                         (id, task.health.snapshot(torrent), saved_at)
                     })
                     .collect::<Vec<_>>();
+                selected.extend(
+                    breadcrumbs
+                        .operation_health
+                        .cases()
+                        .into_iter()
+                        .filter(|case| case.saved_at > now - 7 * 86400 && case.saved_at <= now)
+                        .map(|case| (case.id, case.report, case.saved_at)),
+                );
                 let root = breadcrumbs.data_dir.clone();
                 let _ = tokio::task::spawn_blocking(move || -> Result<(), String> {
                     let mut cases = crate::health_history::load(&root, now)?;
@@ -6310,6 +6450,14 @@ impl DownloadManager {
         }
     }
 
+    pub fn recent_operation_health(&self) -> Vec<crate::health::Report> {
+        self.operation_health
+            .cases()
+            .into_iter()
+            .rev()
+            .map(|case| case.report)
+            .collect()
+    }
     pub async fn download_health(&self, id: Uuid) -> Result<crate::health::Report, String> {
         let task = self.task(id).await?;
         let torrent = task.record.read().await.torrent.is_some();

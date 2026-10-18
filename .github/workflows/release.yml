@@ -166,6 +166,8 @@ jobs:
         run: |
           npm run torrent:test
           if ($LASTEXITCODE -ne 0) { throw 'Torrent swarm checks failed.' }
+          npm run torrent:diagnostics
+          if ($LASTEXITCODE -ne 0) { throw 'Torrent diagnostic alert checks failed.' }
           npm run torrent:listeners
       - name: Test packaged torrent integration
         run: node scripts/test-torrent-desktop.mjs src-tauri/target/release/fetchrail.exe src-tauri/target/release/torrent-harness.exe
@@ -293,6 +295,8 @@ jobs:
           } 2>&1 | tee artifacts/linux-qualification/rust-checks.log
       - name: Build embedded Linux executables
         run: cargo build --manifest-path src-tauri/Cargo.toml --release --bins --features tauri/custom-protocol,test-tools --locked
+      - name: Test real torrent diagnostic alerts
+        run: node scripts/test-torrent-diagnostics.mjs src-tauri/target/release/torrent-harness
       - name: Check signed artifact verification
         run: node scripts/test-signatures.mjs
       - name: Check ELF dependencies

@@ -124,7 +124,12 @@ impl Quality {
         health: &HealthReport,
     ) {
         let mut s = self.0.lock().unwrap();
-        if !s.enabled || s.epoch != sample.epoch || !sample.registered || sample.terminal {
+        if !s.enabled
+            || s.epoch != sample.epoch
+            || !sample.registered
+            || sample.terminal
+            || health.context != crate::health::Context::Transfer
+        {
             return;
         }
         if matches!(outcome, Outcome::HttpDurable)
@@ -330,6 +335,19 @@ mod tests {
         let report = quality.take_report().unwrap().0;
         assert_eq!(report.counters["http_cancelled"], 1);
         assert!(!report.histograms.contains_key("body_wait_worker_ms_v1"));
+    }
+    #[test]
+    fn pre_admission_evidence_never_becomes_a_transfer_outcome() {
+        let quality = Quality::default();
+        quality.configure(&Consent::choice(true));
+        let mut sample = quality.prepare().unwrap();
+        quality.added(&mut sample, false);
+        let mut report = crate::health::Health::default().snapshot(false);
+        report.context = crate::health::Context::BrowserVerification;
+        quality.outcome(&mut sample, false, Outcome::Failed, None, &report);
+        let report = quality.take_report().unwrap().0;
+        assert_eq!(report.counters.len(), 1);
+        assert_eq!(report.counters["http_accepted"], 1);
     }
     #[test]
     fn randomized_lifecycle_counts_each_eligible_logical_transfer_at_most_once() {

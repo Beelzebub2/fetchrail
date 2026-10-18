@@ -457,6 +457,10 @@ fn quality_preview(manager: State<'_, Arc<DownloadManager>>) -> Option<quality::
     manager.quality_preview()
 }
 #[tauri::command]
+fn recent_operation_health(manager: State<'_, Arc<DownloadManager>>) -> Vec<health::Report> {
+    manager.recent_operation_health()
+}
+#[tauri::command]
 async fn download_health(
     manager: State<'_, Arc<DownloadManager>>,
     id: Uuid,
@@ -1118,6 +1122,7 @@ pub fn run() {
             set_analytics_consent,
             set_quality_consent,
             quality_preview,
+            recent_operation_health,
             download_health,
             clear_download_health,
             export_health_report,

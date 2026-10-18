@@ -3,7 +3,7 @@ import { spawn } from "node:child_process";
 import { chromium } from "playwright";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { createServer } from "node:http";
-import { createServer as tcpServer } from "node:net";
+import { createServer as tcpServer, createConnection } from "node:net";
 import { createReadStream } from "node:fs";
 import { mkdir, open, writeFile, readFile, access, readdir } from "node:fs/promises";
 import { join, resolve } from "node:path";
@@ -33,6 +33,15 @@ async function launch(recovery = false) {
   else await page.getByRole("textbox", { name: "Link to download", exact: true }).waitFor();
 }
 async function invoke(command, args = {}) { return page.evaluate(({ command, args }) => window.__TAURI_INTERNALS__.invoke(command, args), { command, args }); }
+async function bridge(method, params = {}) {
+  const config = JSON.parse(await readFile(join(fixture.stateDir, "browser-bridge.json"), "utf8"));
+  return new Promise((done, reject) => {
+    const socket = createConnection(config.port, "127.0.0.1"); let data = "";
+    socket.on("connect", () => socket.write(JSON.stringify({token: config.token, request: {v: 1, id: randomUUID(), method, params}}) + "\n"));
+    socket.on("data", bytes => { data += bytes; if (!data.includes("\n")) return; socket.end(); try { done(JSON.parse(data)); } catch(error) { reject(error); } });
+    socket.on("error", reject); socket.setTimeout(35000, () => { socket.destroy(); reject(Error("Fixture bridge timeout")); });
+  });
+}
 async function quit() {
   const quit = spawn(exe, ["--quit"], { windowsHide: true, env: fixture.env, stdio: "ignore" });
   await new Promise(done => quit.once("exit", done));
@@ -43,7 +52,7 @@ async function quit() {
 }
 const block = randomBytes(64 * 1024), httpBytes = 256 * 1024 * 1024;
 const server = createServer(async (request, response) => {
-  if (request.url === "/slow.torrent") {
+  if (request.url?.split("?")[0] === "/slow.torrent") {
     response.writeHead(200); response.flushHeaders();
     const drip = setInterval(() => response.write("."), 25);
     response.once("close", () => clearInterval(drip)); return;
@@ -97,13 +106,32 @@ try {
   Object.assign(settings.torrent, localTorrentConfig, { ratioLimit: 0, seedTimeLimit: 0, maxSeeds: 1 });
   settings = await invoke("update_settings", { settings });
   const importStarted = Date.now();
-  const dripping = await invoke("import_torrent", { request: { source: http + "/slow.torrent" } });
+  const dripping = await invoke("import_torrent", { request: { source: http + "/slow.torrent?token=FETCHRAIL-PRE-ADMISSION-SENTINEL" } });
   assert.ok(Date.now() - importStarted < 2000, "Import ID must exist before a slow body completes");
   const localPreview = await invoke("import_torrent", { request: { source: torrent } });
   await until(async () => (await invoke("torrent_import_status", { id: localPreview.id })).metadata, "independent local preview", 10000);
   await invoke("cancel_torrent_import", { id: dripping.id });
   await assert.rejects(invoke("torrent_import_status", { id: dripping.id }), /cancelled|expired/);
+  const importHealth = await until(async () => (await invoke("recent_operation_health")).find(r => r.context === "torrentImport" && r.causes.some(([cause]) => cause === "attempt_cancelled")), "pre-admission cancellation evidence");
+  assert.equal(importHealth.observedFromAccept, true);
+  assert.equal(importHealth.durableCompletedMs, null);
+  assert.ok(importHealth.stages.some(stage => stage.phase === "probe" && stage.calls > 0));
+  assert.ok(!JSON.stringify(importHealth).includes("FETCHRAIL-PRE-ADMISSION-SENTINEL") && !JSON.stringify(importHealth).includes(http));
+  assert.equal(await invoke("quality_preview"), null, "Pre-admission evidence works with both analytics grants absent");
   await invoke("cancel_torrent_import", { id: localPreview.id });
+  const rejected = await bridge("addDownloads", {source: "clickMonitor", handoffProtocol: 2, items: [{url: http + "/http.bin?token=FETCHRAIL-PRE-ADMISSION-SENTINEL", suggestedFileName: "FETCHRAIL-PRE-ADMISSION-SENTINEL.bin", expectedBytes: httpBytes + 1}]});
+  assert.equal(rejected.result.accepted, 0);
+  assert.equal((await invoke("list_downloads")).length, 0, "Failed validation cannot create an admitted download");
+  const uncommitted = await bridge("commitHandoff", {handoffId: randomUUID()});
+  assert.equal(uncommitted.ok, false);
+  const preAdmission = await invoke("recent_operation_health");
+  for (const context of ["browserVerification", "browserCommit"]) {
+    const observed = preAdmission.find(r => r.context === context);
+    assert.ok(observed?.stages.some(stage => stage.phase === "probe" && stage.calls > 0));
+    assert.equal(observed.durableCompletedMs, null);
+  }
+  assert.ok(!JSON.stringify(preAdmission).includes("FETCHRAIL-PRE-ADMISSION-SENTINEL") && !JSON.stringify(preAdmission).includes(http));
+  report.tests.push("pre-admission import cancellation, rejected browser verification and uncommitted handoff evidence with analytics off");
   const magnet = `magnet:?xt=urn:btih:${metadata.hashes.find(h => h.length === 40)}&x.pe=127.0.0.1:${peerPort}`;
   const linkInput = page.getByRole("textbox", { name: "Link to download", exact: true });
   await linkInput.fill(magnet);

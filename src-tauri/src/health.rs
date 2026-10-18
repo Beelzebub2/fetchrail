@@ -283,6 +283,8 @@ pub struct TorrentHealth {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Report {
     pub schema: u32,
+    #[serde(default)]
+    pub context: Context,
     pub version: String,
     pub os: OperatingSystem,
     pub arch: Architecture,
@@ -308,6 +310,67 @@ pub struct Report {
     pub evicted_events: u64,
     pub diagnosis: Diagnosis,
     pub limitations: Vec<Limitation>,
+}
+#[derive(Clone, Copy, Default, Serialize, Deserialize, Debug, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum Context {
+    #[default]
+    Transfer,
+    BrowserVerification,
+    BrowserCommit,
+    TorrentImport,
+}
+
+/// Pre-admission operations have their own grain and never enter fleet transfer counts.
+#[derive(Default)]
+pub struct Operations(Mutex<(u64, Vec<crate::health_history::Case>)>);
+pub struct Operation {
+    pub health: Health,
+    context: Context,
+    epoch: u64,
+}
+impl Operations {
+    pub fn start(&self, context: Context) -> Operation {
+        let health = Health::default();
+        health.accepted();
+        Operation {
+            health,
+            context,
+            epoch: self.0.lock().unwrap().0,
+        }
+    }
+    pub fn finish(&self, operation: Operation, failed: bool) {
+        if failed && operation.health.causes.iter().all(|n| n.load(Relaxed) == 0) {
+            operation.health.cause(Cause::Unknown);
+        }
+        operation.health.activity(if failed {
+            Activity::Failed
+        } else {
+            Activity::Complete
+        });
+        let mut report = operation.health.snapshot(false);
+        report.context = operation.context;
+        let mut state = self.0.lock().unwrap();
+        if state.0 != operation.epoch {
+            return;
+        }
+        if state.1.len() == 20 {
+            state.1.remove(0);
+        }
+        state.1.push(crate::health_history::Case {
+            id: uuid::Uuid::new_v4(),
+            saved_at: chrono::Utc::now().timestamp(),
+            report,
+        });
+    }
+    pub fn cases(&self) -> Vec<crate::health_history::Case> {
+        self.0.lock().unwrap().1.clone()
+    }
+    pub fn clear(&self) {
+        let mut state = self.0.lock().unwrap();
+        state.0 = state.0.wrapping_add(1);
+        state.1.clear();
+    }
 }
 #[derive(Clone, Serialize, Deserialize, Debug)]
 pub enum Limitation {
@@ -726,6 +789,7 @@ impl Health {
         events.sort_by_key(|event| event.elapsed_ms);
         Report {
             schema: 1,
+            context: Context::Transfer,
             version: env!("CARGO_PKG_VERSION").into(),
             os: match std::env::consts::OS {
                 "windows" => OperatingSystem::Windows,
@@ -834,6 +898,35 @@ impl Drop for Guard<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn pre_admission_operations_are_bounded_separate_and_clear_invalidates_pending_work() {
+        let operations = Operations::default();
+        for _ in 0..25 {
+            let operation = operations.start(Context::BrowserVerification);
+            {
+                let span = operation.health.guard(Phase::Headers);
+                span.observe(&Err::<(), ()>(()));
+            }
+            operation.health.cause(Cause::Http503);
+            operations.finish(operation, true);
+        }
+        let cases = operations.cases();
+        assert_eq!(cases.len(), 20);
+        assert!(cases
+            .iter()
+            .all(|c| c.report.context == Context::BrowserVerification
+                && c.report.durable_completed_ms.is_none()));
+        let pending = operations.start(Context::TorrentImport);
+        operations.clear();
+        operations.finish(pending, false);
+        assert!(operations.cases().is_empty());
+        let mut old = serde_json::to_value(Health::default().snapshot(false)).unwrap();
+        old.as_object_mut().unwrap().remove("context");
+        assert_eq!(
+            serde_json::from_value::<Report>(old).unwrap().context,
+            Context::Transfer
+        );
+    }
     #[test]
     fn export_requires_review_rejects_extra_fields_and_never_overwrites() {
         let root =

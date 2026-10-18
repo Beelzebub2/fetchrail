@@ -3,6 +3,7 @@ import { Monitor, X } from "lucide-react";
 import { PageHead } from "./PageHead";
 import { invoke } from "@tauri-apps/api/core";
 import type { DownloadSettings } from "./App";
+import { DownloadHealth, type Report } from "./DownloadHealth";
 
 export type AnalyticsConsent = { enabled: boolean; decided: boolean; schema: number; purpose: string };
 const current = (consent?: AnalyticsConsent) => consent?.decided && consent.schema === 1 && consent.purpose === "product-improvement-v1";
@@ -25,6 +26,7 @@ type Choice = (allow: boolean) => Promise<void>;
 export function PrivacySettings({ settings, onChoice }: { settings: DownloadSettings; onChoice: Choice }) {
   const [busy, setBusy] = useState(false), [error, setError] = useState<string | null>(null);
   const [preview, setPreview] = useState<string | null>(null), [history, setHistory] = useState<string | null>(null);
+  const [operations, setOperations] = useState<Report[] | null>(null);
   const qualityOn = settings.qualityConsent?.enabled && settings.qualityConsent?.decided && settings.qualityConsent.schema === 2 && settings.qualityConsent.purpose === "product-quality-v2";
   async function privacyAction(command: string, args?: Record<string, unknown>) {
     setBusy(true); setError(null); setPreview(null);
@@ -55,10 +57,13 @@ export function PrivacySettings({ settings, onChoice }: { settings: DownloadSett
     <section className="card rise privacy-card">
       <h2>Local troubleshooting history</h2>
       <p>Recent numeric operational evidence stays in memory for your downloads, including before you open Troubleshoot. It is lost on exit or a hard crash. This does not authorize remote analytics or support sharing.</p>
+      <p>Imports and browser handoffs may fail before a download exists. Their latest 20 source-free operation reports remain available here, separately from fleet counts.</p>
+      <button className="secondary-button" disabled={busy} onClick={() => void invoke<Report[]>("recent_operation_health").then(setOperations).catch(e => setError(String(e)))}>Inspect recent imports and browser handoffs</button>
+      {operations !== null && <section aria-label="Recent pre-admission observations">{operations.length ? operations.map((report, i) => <DownloadHealth key={i} initialReport={report} />) : <p>No import or browser handoff observations in this session.</p>}</section>}
       <p>Optional crash breadcrumbs save sanitized checkpoints at most every 30 seconds: up to 20 transfers for 7 days, protected with Windows account encryption or private Linux permissions. The final seconds before a crash may be missing. Inspect and delete below. This separate local choice is off by default.</p>
       <label className="check"><input type="checkbox" checked={!!settings.localCrashHistory} disabled={busy} onChange={e => void privacyAction("set_local_crash_history", { enabled: e.target.checked })} />Keep optional local crash breadcrumbs</label>
       <button className="secondary-button" disabled={busy} onClick={() => void invoke("local_health_history").then(data => setHistory(JSON.stringify(data, null, 2))).catch(e => setError(String(e)))}>Inspect saved local history</button>
-      <button className="secondary-button" disabled={busy} onClick={() => void privacyAction("clear_local_health_history").then(() => setHistory(null))}>Delete local diagnostic history</button>
+      <button className="secondary-button" disabled={busy} onClick={() => void privacyAction("clear_local_health_history").then(() => { setHistory(null); setOperations(null); })}>Delete local diagnostic history</button>
       {history !== null && <pre className="health-preview" tabIndex={0}>{history}</pre>}
     </section>
     {error && <p role="alert" className="extension-error">{error}</p>}
