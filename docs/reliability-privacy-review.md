@@ -1,8 +1,8 @@
 # Reliability processing review (draft, 16 October 2026)
 
-Release gate: owner and Portuguese legal review pending. This document records engineering decisions, not regulatory certification. The owner requested release preparation and publication on 18 October, conditional on readiness. That authorizes the release work; it does not establish the missing legal facts below.
+Release gate: confirmation of the responsible operator and actual provider arrangements is pending. This document records legal research and engineering decisions, not regulatory certification. The owner requested release preparation and publication on 18 October, conditional on readiness. That authorizes the release work; it does not establish the missing legal facts below. A registered company or an external lawyer is not automatically required merely to develop the engine; the actual responsible person/organisation and processing must still be identified and reviewed.
 
-On 18 October the owner selected the public project label **RRMTools**. The notice records Portugal and support.fetchrail@rrmtools.uk. Registration status and the legal person behind that label remain unconfirmed; no registered-company claim is made. Expanded remote analytics remains closed while this is unresolved.
+On 18 October the owner repeatedly selected **RRMTools** as the overall project/operator name used with its domain. The notice records RRMTools, Portugal and support.fetchrail@rrmtools.uk. No registered-company status or individually verified legal identity is claimed. Treat this as the owner's operator designation, not a registry check; whether that designation fully identifies the responsible person/body remains a final transparency review item. Do not keep requesting the same naming decision. Expanded remote analytics remains closed pending the processing/configuration review.
 
 ## Processing register and necessity
 
@@ -40,4 +40,4 @@ No inference of anonymization from omission of identifiers. Voluntary reports ar
 
 ## Rollout and rollback gate
 
-Build/test in isolated roots only. Review schema and disclosures, read-only backup/export of v1 if needed, test migration/restart/expiry locally, dry-run Worker packaging, then separately authorize deployment. Retain v1 object and tables. No secret rotation, live report read, incident upload, installed-app update, release publication or production migration is authorized by this source task. Canary, actual quota measurements and hardware/WAN validation remain release work.
+Build/test in isolated roots only. Review schema and disclosures, read-only backup/export of v1 if needed, test migration/restart/expiry locally, and dry-run Worker packaging. Retain v1 object and tables. The original source task did not authorize production work; the owner's later release instruction does, conditional on readiness. Actual synthetic provider qualification and protected read-access provisioning are recorded on 18 October. No incident upload, installed-app update, version publication or expanded production collection has occurred. Canary, account-wide capacity, remaining legal facts and representative hardware/WAN validation remain release work.

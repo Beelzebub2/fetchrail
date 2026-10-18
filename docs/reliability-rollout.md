@@ -2,6 +2,8 @@
 
 Source review draft, 17 October 2026. No command below authorizes installation, publication, production deployment, secret changes or incident submission. See the [processing review](reliability-privacy-review.md), [metric catalogue](reliability-metrics.md) and [coverage matrix](reliability-coverage.md).
 
+The owner subsequently authorized release preparation/publication conditional on readiness on 18 October. The [18 October validation record](reliability-validation-2026-10-18.md) records the actual synthetic provider qualification and secret-only production read-access change. New v2 delivery/intake remain closed. The original source-task restriction is not an additional permission requirement after that authorization; unresolved legal facts and demonstrated readiness still determine whether release is possible.
+
 ## Release gates
 
 1. Controller approves identity/contact, audience/children assessment, notices, necessity and lawful bases, ROPA/DPIA screen, rights and breach process, DPA/subprocessors/transfers and provider logging/recovery retention. Record the accepted Cloudflare contract and actual account configuration. A provider website or this source review is not that approval.
