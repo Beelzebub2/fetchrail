@@ -48,6 +48,8 @@ The combined Worker disables automatic [invocation logs](https://developers.clou
 
 Set `FETCHRAIL_ANALYTICS_READ_TOKEN` privately in the operator environment, then run `node scripts/read-analytics.mjs` to print the protected JSON report. `FETCHRAIL_ANALYTICS_URL` may point to a local Worker for testing; the default is the canonical Fetchrail origin. No public report/dashboard is exposed.
 
+The quality readout merges receipt days only within the same release, broad OS and architecture. It keeps protocols and end-to-end size definitions separate. Platform mixes must not manufacture a combined release percentile or conceal a platform-specific problem; comparisons still require enough observations and the same scope/metric definitions.
+
 Opt-in bias, short runs under 30 minutes, exits, capped counters, drops and network failures underrepresent activity. Launch/report counts do not count unique people. With no identifiers or retry IDs, no cohorts, retention, user funnels or precise population failure rates can be derived. Already combined totals cannot identify a contribution for removal; withdrawal prevents future collection and clears unsent memory.
 
 ## Diagnostic summaries use separate per-run permission
