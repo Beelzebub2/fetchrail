@@ -4,6 +4,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { open } from "@tauri-apps/plugin-dialog";
+import { Modal } from "./Modal";
 import {
   Activity,
   ArrowLeft,
@@ -146,6 +147,7 @@ type SetupInfo = {
 };
 
 export type DownloadSettings = Appearance & {
+  runtimeWarning?: string;
   analyticsConsent: AnalyticsConsent;
   torrent: TorrentSettings;
   speedLimitBps: number;
@@ -576,6 +578,7 @@ function App() {
   const [url, setUrl] = useState("");
   const [downloadLimit, setDownloadLimit] = useState(0);
   const [expectedSha256, setExpectedSha256] = useState("");
+  const [useBrowserSession, setUseBrowserSession] = useState(false);
   const [batchError, setBatchError] = useState<string | null>(null);
   const [directory, setDirectory] = useState("");
   const [selectedQueue, setSelectedQueue] = useState("Default");
@@ -624,25 +627,11 @@ function App() {
   useEffect(() => {
     if (!isTauri()) return;
     let disposed = false;
-    Promise.all([
-      invoke<DownloadRecord[]>("list_downloads"),
-      invoke<DownloadSettings>("get_settings"),
-      invoke<QueueRecord[]>("list_queues"),
-    ])
-      .then(([items, currentSettings, currentQueues]) => {
-        if (disposed) return;
-        setDownloads(items);
-        setSettings(currentSettings);
-        setQueues(currentQueues);
-        setSelectedQueue((current) =>
-          currentQueues.some((queue) => queue.name === current)
-            ? current
-            : currentQueues[0]?.name ?? "Default",
-        );
-      })
-      .catch((error) => { setMessage(String(error)); void invoke<typeof recovery>("recovery_status").then(setRecovery).catch(e => setMessage(String(e))); });
+    let booting = true;
+    const buffered: (() => void)[] = [];
+    const accept = (action: () => void) => { if (!disposed) { if (booting) buffered.push(action); else action(); } };
 
-    const unlisten = listen<DownloadRecord>("fetchrail://download-updated", (event) => {
+    const unlisten = listen<DownloadRecord>("fetchrail://download-updated", (event) => accept(() => {
       setDownloads((current) => {
         const exists = current.some((item) => item.id === event.payload.id);
         const next = exists
@@ -653,46 +642,55 @@ function App() {
             new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime(),
         );
       });
-    });
+    }));
 
     const unlistenRemoved = listen<string>("fetchrail://download-removed", (event) =>
-      setDownloads((current) => current.filter((item) => item.id !== event.payload)),
+      accept(() => setDownloads((current) => current.filter((item) => item.id !== event.payload))),
     );
-    const unlistenTorrents = listen<DownloadRecord[]>("fetchrail://torrent-updated", event => {
+    const unlistenTorrents = listen<DownloadRecord[]>("fetchrail://torrent-updated", event => accept(() => {
       const changed = new Map(event.payload.map(item => [item.id, item]));
       setDownloads(current => {
         const known = new Set(current.map(item => item.id));
         return [...event.payload.filter(item => !known.has(item.id)), ...current.map(item => changed.get(item.id) ?? item)];
       });
-    });
-    const unlistenQueues = listen<QueueRecord[]>("fetchrail://queues-updated", (event) => {
+    }));
+    const unlistenQueues = listen<QueueRecord[]>("fetchrail://queues-updated", (event) => accept(() => {
       setQueues(event.payload);
       setSelectedQueue((current) =>
         event.payload.some((queue) => queue.name === current)
           ? current
           : event.payload[0]?.name ?? "Default",
       );
-    });
-    const unlistenProgress = listen<DownloadRecord[]>("fetchrail://downloads-progress", event => {
+    }));
+    const unlistenProgress = listen<DownloadRecord[]>("fetchrail://downloads-progress", event => accept(() => {
       const changed = new Map(event.payload.map(item => [item.id, item]));
       setDownloads(current => current.map(item => changed.get(item.id) ?? item));
-    });
-    const unlistenSettings = listen<DownloadSettings>("fetchrail://settings-updated", (event) => setSettings(event.payload));
-    const unlistenUpdate = listen<UpdateStatus>("fetchrail://update-status", (event) => setUpdate(event.payload));
-    const unlistenCompletion = listen<{ id: string; message: string }>("fetchrail://completion-error", (event) => setMessage(event.payload.message));
+    }));
+    const unlistenSettings = listen<DownloadSettings>("fetchrail://settings-updated", (event) => accept(() => { setSettings(event.payload); if (event.payload.runtimeWarning) setMessage(event.payload.runtimeWarning); }));
+    const unlistenUpdate = listen<UpdateStatus>("fetchrail://update-status", (event) => { if (!disposed) setUpdate(event.payload); });
+    const unlistenCompletion = listen<{ id: string; message: string }>("fetchrail://completion-error", (event) => { if (!disposed) setMessage(event.payload.message); });
+    void Promise.all([unlisten, unlistenRemoved, unlistenTorrents, unlistenQueues, unlistenProgress, unlistenSettings])
+      .then(async () => {
+        if (disposed) return;
+        const [items, currentSettings, currentQueues] = await Promise.all([
+          invoke<DownloadRecord[]>("list_downloads"), invoke<DownloadSettings>("get_settings"), invoke<QueueRecord[]>("list_queues"),
+        ]);
+        if (disposed) return;
+        setDownloads(items); setSettings(currentSettings); setQueues(currentQueues);
+        setSelectedQueue(current => currentQueues.some(queue => queue.name === current) ? current : currentQueues[0]?.name ?? "Default");
+        booting = false;
+        for (const action of buffered.splice(0)) action();
+      }).catch(error => {
+        if (disposed) return;
+        booting = false; for (const action of buffered.splice(0)) action();
+        setMessage(String(error)); void invoke<typeof recovery>("recovery_status").then(value => !disposed && setRecovery(value)).catch(e => !disposed && setMessage(String(e)));
+      });
     void invoke<UpdateStatus>("update_status").then((status) => !disposed && setUpdate(status));
     void getVersion().then((current) => !disposed && setVersion(current));
 
     return () => {
       disposed = true;
-      void unlisten.then((stop) => stop());
-      void unlistenRemoved.then((stop) => stop());
-      void unlistenTorrents.then(stop => stop());
-      void unlistenProgress.then(stop => stop());
-      void unlistenQueues.then((stop) => stop());
-      void unlistenSettings.then((stop) => stop());
-      void unlistenUpdate.then((stop) => stop());
-      void unlistenCompletion.then((stop) => stop());
+      for (const pending of [unlisten, unlistenRemoved, unlistenTorrents, unlistenProgress, unlistenQueues, unlistenSettings, unlistenUpdate, unlistenCompletion]) void pending.then(stop => stop()).catch(() => {});
     };
   }, []);
 
@@ -783,8 +781,7 @@ function App() {
       const urls = allUrls.filter(source => !torrentUrls.includes(source));
       if (expectedSha256.trim() && (urls.length !== 1 || torrentUrls.length)) throw new Error("Use an expected SHA-256 with one HTTP file link at a time.");
       if (!urls.length) { setUrl(""); setShowAdd(false); return; }
-      const result = await invoke<{ accepted: DownloadRecord[]; errors: { index: number; message: string }[] }>("add_downloads", {
-        requests: urls.map((item) => ({
+      const requests = urls.map((item) => ({
           url: item,
           directory: directory.trim() || null,
           fileName: null,
@@ -794,8 +791,16 @@ function App() {
           connections: connections || null,
           speedLimitBps: downloadLimit * 1024,
           expectedSha256: expectedSha256.trim() || null,
-        })),
-      });
+        }));
+      if (useBrowserSession) {
+        await invoke("request_browser_downloads", { requests });
+        setUrl("");
+        setExpectedSha256("");
+        setShowAdd(false);
+        setMessage("Waiting for browser sign-in. Open the Fetchrail companion in your signed-in browser window and choose Use this window. Pending links expire after 15 minutes or when Fetchrail closes.");
+        return;
+      }
+      const result = await invoke<{ accepted: DownloadRecord[]; errors: { index: number; message: string }[] }>("add_downloads", { requests });
       if (result.errors.length) {
         setUrl(result.errors.map((error) => urls[error.index]).join("\n"));
         const error = `${result.accepted.length} added. ${result.errors.length} rejected: ${result.errors[0].message}`;
@@ -812,6 +817,7 @@ function App() {
         await invoke("show_download_progress", { id: result.accepted[0].id }).catch((error) => setMessage(String(error)));
       }
     } catch (error) {
+      setBatchError(String(error));
       setMessage(String(error));
     } finally {
       setBusy(false);
@@ -871,7 +877,9 @@ function App() {
     setSaveState("saving");
     setMessage(null);
     try {
-      setSettings(await invoke<DownloadSettings>("update_settings", { settings: draft }));
+      const saved = await invoke<DownloadSettings>("patch_settings", { patch: edits });
+      setSettings(saved);
+      if (saved.runtimeWarning) setMessage(saved.runtimeWarning);
       setEdits((current) => Object.fromEntries(
         Object.entries(current).filter(([key, value]) => differ(value, draft[key as keyof DownloadSettings]))
       ) as Partial<DownloadSettings>);
@@ -902,7 +910,9 @@ function App() {
   async function applySettings(change: Partial<DownloadSettings>) {
     if (!settings) return;
     try {
-      setSettings(await invoke<DownloadSettings>("update_settings", { settings: { ...settings, ...change } }));
+      const saved = await invoke<DownloadSettings>("patch_settings", { patch: change });
+      setSettings(saved);
+      if (saved.runtimeWarning) setMessage(saved.runtimeWarning);
     } catch (error) {
       setMessage(String(error));
     }
@@ -933,6 +943,7 @@ function App() {
   }
 
   function closeAdd() {
+    if (busy) return;
     setShowAdd(false);
     setStartMode("now");
   }
@@ -1013,7 +1024,7 @@ function App() {
             </div>
             <button className="primary-button" disabled={busy || !url.trim()}>
               <Download size={16} />
-              Download
+              {useBrowserSession ? "Use browser" : "Download"}
             </button>
             <button type="button" className="secondary-button" onClick={() => void open({ multiple: true, filters: [{ name: "Torrent", extensions: ["torrent"] }] }).then(paths => { if (paths) setTorrentSources(current => [...current, ...typeof paths === "string" ? [paths] : paths]); }).catch(e => setMessage(String(e)))}><FolderOpen size={16} /> Open torrent</button>
           </form>
@@ -1286,14 +1297,11 @@ function App() {
       {torrentImport && settings && <TorrentImportDialog key={torrentImport.id} initial={torrentImport} defaultDirectory={directory || settings.defaultDownloadDir} queues={queues.map(queue => queue.name)} onClose={() => setTorrentImport(null)} onAdded={item => { setDownloads(current => current.some(r => r.id === item.id) ? current : [item, ...current]); setSelectedTorrent(item.id); }} onError={setMessage} />}
 
       {showAdd && (
-        <div className="modal-backdrop" onMouseDown={closeAdd}>
+        <Modal label="add-download-title" busy={busy} onClose={closeAdd}>
           <form
             className="modal form"
             onSubmit={addDownload}
             onMouseDown={(e) => e.stopPropagation()}
-            role="dialog"
-            aria-modal="true"
-            aria-labelledby="add-download-title"
           >
             <div className="modal-head">
               <div>
@@ -1339,6 +1347,8 @@ function App() {
               </div>
             </label>
             <label>Expected SHA-256 (optional, one file)<input className="mono" value={expectedSha256} onChange={event => setExpectedSha256(event.target.value)} pattern="[0-9a-fA-F]{64}" placeholder="64 hexadecimal characters" spellCheck={false} /></label>
+            <label className="check"><input type="checkbox" checked={useBrowserSession} onChange={event => setUseBrowserSession(event.target.checked)} /> Use browser session for signed-in sites or private repositories</label>
+            {useBrowserSession && <p className="hint">Open the companion in the regular or private window where you are signed in, then choose Use this window to start these downloads.</p>}
             <fieldset className="choice-field">
               <legend>
                 Connections
@@ -1428,11 +1438,11 @@ function App() {
               </button>
               <button className="primary-button" disabled={busy || !url.trim()}>
                 {startMode === "schedule" ? <CalendarClock size={16} /> : <Download size={16} />}
-                {busy ? "Adding…" : startMode === "schedule" ? "Schedule downloads" : startMode === "paused" ? "Add paused" : "Download"}
+                {busy ? "Adding…" : useBrowserSession ? "Use browser" : startMode === "schedule" ? "Schedule downloads" : startMode === "paused" ? "Add paused" : "Download"}
               </button>
             </div>
           </form>
-        </div>
+        </Modal>
       )}
     </div>
   );
@@ -1571,7 +1581,7 @@ function RemoveDialog({
   const [remember, setRemember] = useState(false);
   const finished = item.status === "completed";
   return (
-    <div className="modal-backdrop" onMouseDown={onCancel}>
+    <Modal label="remove-download-title" onClose={onCancel}>
       <form
         className="modal compact form"
         onSubmit={(event) => {
@@ -1579,12 +1589,6 @@ function RemoveDialog({
           onConfirm(deleteFile, remember);
         }}
         onMouseDown={(event) => event.stopPropagation()}
-        onKeyDown={(event) => {
-          if (event.key === "Escape") onCancel();
-        }}
-        role="dialog"
-        aria-modal="true"
-        aria-labelledby="remove-download-title"
       >
         <div className="modal-head">
           <div>
@@ -1608,15 +1612,15 @@ function RemoveDialog({
         </label>
         {remember && <p className="hint">You can change this in Settings, under Downloads.</p>}
         <div className="modal-actions">
-          <button type="button" className="ghost-button" onClick={onCancel}>
+          <button type="button" className="ghost-button" autoFocus onClick={onCancel}>
             Cancel
           </button>
-          <button className="primary-button" autoFocus>
+          <button className="primary-button">
             <Trash2 size={16} /> {deleteFile && finished ? "Remove and delete file" : "Remove"}
           </button>
         </div>
       </form>
-    </div>
+    </Modal>
   );
 }
 
@@ -3262,8 +3266,23 @@ export function DownloadPrompt({ id }: { id: string }) {
   const [message, setMessage] = useState<string | null>(null);
 
   useEffect(() => {
-    Promise.all([invoke<DownloadRecord[]>("list_downloads"), invoke<DownloadSettings>("get_settings")])
+    let disposed = false, booting = true;
+    const buffered: (() => void)[] = [];
+    const accept = (action: () => void) => { if (!disposed) { if (booting) buffered.push(action); else action(); } };
+    const unlistenSettings = listen<DownloadSettings>("fetchrail://settings-updated", event => accept(() => { setSettings(event.payload); applyLook(event.payload); }));
+    // Subscribe before the snapshot so delayed IPC cannot overwrite a newer event.
+    const unlisten = listen<DownloadRecord>("fetchrail://download-updated", (event) => accept(() => {
+      if (event.payload.id === id && event.payload.status !== "paused") {
+        if (event.payload.status !== "cancelled") void invoke("show_download_progress", { id }).catch((error) => { if (!disposed) setMessage(String(error)); });
+        void getCurrentWindow().destroy();
+      }
+    }));
+    const unlistenRemoved = listen<string>("fetchrail://download-removed", (event) => accept(() => {
+      if (event.payload === id) void getCurrentWindow().destroy();
+    }));
+    Promise.all([unlistenSettings, unlisten, unlistenRemoved]).then(() => Promise.all([invoke<DownloadRecord[]>("list_downloads"), invoke<DownloadSettings>("get_settings")]))
       .then(([items, current]) => {
+        if (disposed) return;
         const found = items.find((entry) => entry.id === id);
         if (!found) return void getCurrentWindow().destroy();
         applyLook(current);
@@ -3272,21 +3291,12 @@ export function DownloadPrompt({ id }: { id: string }) {
         setName(found.fileName);
         setFolder(found.destination.slice(0, -found.fileName.length - 1));
         setCategory(current.sortIntoCategoryFolders ? categoryFor(found.fileName, current)?.name ?? "" : "");
+        booting = false; buffered.splice(0).forEach(action => action());
       })
-      .catch((error) => setMessage(String(error)));
-    // A download started from either window moves on to its progress window.
-    const unlisten = listen<DownloadRecord>("fetchrail://download-updated", (event) => {
-      if (event.payload.id === id && event.payload.status !== "paused") {
-        if (event.payload.status !== "cancelled") void invoke("show_download_progress", { id }).catch((error) => setMessage(String(error)));
-        void getCurrentWindow().destroy();
-      }
-    });
-    const unlistenRemoved = listen<string>("fetchrail://download-removed", (event) => {
-      if (event.payload === id) void getCurrentWindow().destroy();
-    });
+      .catch((error) => { if (!disposed) { booting = false; buffered.splice(0).forEach(action => action()); setMessage(String(error)); } });
     return () => {
-      void unlisten.then((stop) => stop());
-      void unlistenRemoved.then((stop) => stop());
+      disposed = true;
+      for (const pending of [unlisten, unlistenRemoved, unlistenSettings]) void pending.then(stop => stop()).catch(() => {});
     };
   }, [id]);
 
@@ -3299,14 +3309,7 @@ export function DownloadPrompt({ id }: { id: string }) {
         await invoke("remove_download", { id, deleteFile: false });
       } else {
         if (remember) {
-          await invoke("update_settings", {
-            settings: category
-              ? {
-                  ...settings,
-                  categories: settings.categories.map((entry) => (entry.name === category ? { ...entry, folder } : entry)),
-                }
-              : { ...settings, defaultDownloadDir: folder },
-          });
+          await invoke("remember_download_folder", { category: category || null, directory: folder });
         }
         await invoke("place_download", { id, directory: folder, fileName: name });
         if (action === "start") {

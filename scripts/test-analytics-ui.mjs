@@ -64,9 +64,9 @@ try {
           window.testEmit("fetchrail://settings-updated", structuredClone(window.testSettings));
           return structuredClone(window.testSettings);
         }
-        if (name === "update_settings") {
+        if (name === "patch_settings") {
           if (window.testDelaySettings) await new Promise(resolve => { window.testFinishSettings = resolve; });
-          window.testSettings = args.settings;
+          window.testSettings = { ...window.testSettings, ...args.patch };
           return structuredClone(window.testSettings);
         }
         if (name === "setup_info") return { mode: new URLSearchParams(location.search).get("setup"), version: "0.6.1", dir: "C:\\Programs\\Fetchrail", installed: location.search.includes("installed"), desktopShortcut: true, theme: "dark", accent: "ember", downloadDir: "C:\\Downloads", sortsIntoFolders: true, launchOnStart: location.search.includes("installed") };

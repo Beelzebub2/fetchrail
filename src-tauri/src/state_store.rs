@@ -106,6 +106,30 @@ pub fn write<T: Serialize + DeserializeOwned>(path: &Path, value: &T) -> Result<
     crate::platform::write_private_atomic(path, &encode(&bytes)?).map_err(|e| e.to_string())
 }
 
+/// Apply the secret policy to both generations, including legacy plaintext.
+pub fn write_settings(
+    path: &Path,
+    settings: &crate::model::DownloadSettings,
+) -> Result<(), String> {
+    fn persisted(mut value: crate::model::DownloadSettings) -> crate::model::DownloadSettings {
+        if !cfg!(windows) {
+            value.torrent.proxy_password.clear();
+        }
+        value.extra.remove("runtimeWarning");
+        value
+    }
+    let backup = path.with_extension("json.backup");
+    if let Ok(previous) = read::<crate::model::DownloadSettings>(path)
+        .or_else(|_| read::<crate::model::DownloadSettings>(&backup))
+    {
+        let bytes = serde_json::to_vec(&persisted(previous)).map_err(|e| e.to_string())?;
+        crate::platform::write_private_atomic(&backup, &encode(&bytes)?)
+            .map_err(|e| e.to_string())?;
+    }
+    let bytes = serde_json::to_vec(&persisted(settings.clone())).map_err(|e| e.to_string())?;
+    crate::platform::write_private_atomic(path, &encode(&bytes)?).map_err(|e| e.to_string())
+}
+
 /// Publication cleanup must be recoverable even if the primary catalog is later
 /// damaged. A completed transition updates the last-valid backup before its journal goes away.
 pub fn acknowledge<T: DeserializeOwned>(path: &Path) -> Result<(), String> {

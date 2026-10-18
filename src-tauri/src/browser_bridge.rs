@@ -132,7 +132,7 @@ async fn process_request(
                     "appVersion": env!("CARGO_PKG_VERSION"),
                     "frontendReady": frontend_ready,
                     "frontendUrl": frontend_url,
-                    "capabilities": ["addDownloads", "addTorrents", "getDownloads", "controlDownload", "showApp", "queues", "scheduling", "connections", "speedLimits", "browserSessions", "getHandoff", "commitHandoff", "sessionHeaders", "sha256"],
+                    "capabilities": ["addDownloads", "addTorrents", "getDownloads", "controlDownload", "showApp", "queues", "scheduling", "connections", "speedLimits", "browserSessions", "getHandoff", "commitHandoff", "sessionHeaders", "sha256", "browserSessionRequests"],
                     "speedLimitBps": settings.speed_limit_bps,
                     "connectionsPerDownload": settings.connections_per_download,
                     "maxConcurrentDownloads": settings.max_concurrent_downloads,
@@ -168,9 +168,28 @@ async fn process_request(
                 json!({
                     "downloads": downloads,
                     "total": records.len(),
-                    "overview": manager.overview().await
+                    "overview": manager.overview().await,
+                    "browserRequests": app.state::<crate::browser_session::Requests>().summaries()
                 }),
             )
+        }
+        NativeMethod::TakeBrowserRequest => {
+            match app
+                .state::<crate::browser_session::Requests>()
+                .take(request.params.download_id.unwrap())
+            {
+                Ok(requests) => NativeResponse::success(request.id, json!({"requests":requests})),
+                Err(error) => NativeResponse::failure(request.id, "BROWSER_REQUEST_FAILED", error),
+            }
+        }
+        NativeMethod::FinishBrowserRequest => {
+            match app.state::<crate::browser_session::Requests>().finish(
+                request.params.download_id.unwrap(),
+                request.params.completed.unwrap(),
+            ) {
+                Ok(()) => NativeResponse::success(request.id, json!({})),
+                Err(error) => NativeResponse::failure(request.id, "BROWSER_REQUEST_FAILED", error),
+            }
         }
         NativeMethod::ControlDownload => {
             let id = request.params.download_id.expect("validated download id");
@@ -285,9 +304,11 @@ async fn process_request(
                     manager
                         .add(AddDownloadRequest {
                             handoff_id: transactional.then(|| format!("{request_id}:{index}")),
-                            expected_sha256: item.expected_sha256,
+                            expected_sha256: item
+                                .expected_sha256
+                                .or_else(|| request.params.expected_sha256.clone()),
                             url: item.url,
-                            directory: None,
+                            directory: request.params.directory.clone(),
                             file_name,
                             queue: request.params.queue.clone(),
                             scheduled_for: request.params.scheduled_for,
