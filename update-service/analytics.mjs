@@ -124,6 +124,10 @@ export async function analyticsApi(request, env) {
     if (request.method !== "POST") return fail(405, "Use POST.");
     if (!/^application\/json(?:\s*;|$)/i.test(request.headers.get("content-type") ?? "")) return fail(415, "Use application/json.");
     if (["authorization", "content-encoding", "referer", "origin", "proxy-authorization"].some(name => request.headers.has(name))) return fail(400, "Unexpected analytics request headers.");
+    if (!env.ANALYTICS_RATE_LIMITER) return fail(503, "Analytics intake protection is unavailable.");
+    // Security-only transient provider key; never put it in aggregates, logs or receipts.
+    const { success } = await env.ANALYTICS_RATE_LIMITER.limit({ key: request.headers.get("cf-connecting-ip") ?? "unattributed" });
+    if (!success) return fail(429, "Analytics request rate exceeded.");
     const { data, bytes } = await readJson(new Response(request.body, { headers: request.headers }), 4096, 5000);
     if (data?.schema !== 2 && bytes.length > 2048) return fail(413, "Analytics report too large.");
     validateReport(data);

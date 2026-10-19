@@ -31,6 +31,7 @@ const options = {
   compatibilityDate: "2026-10-09",
   durableObjects: { RELEASE_FEED: { className: "ReleaseFeed", useSQLite: true }, ANALYTICS: { className: "AnalyticsStore", useSQLite: true } },
   bindings: { QUALITY_ANALYTICS_ENABLED: "true", ANALYTICS_READ_TOKEN: "test-read-secret-with-at-least-32-characters" },
+  ratelimits: { ANALYTICS_RATE_LIMITER: { namespace_id: "1", simple: { limit: 1000, period: 60 } } },
   serviceBindings: { ASSETS: "assets-test" },
   outboundService: async request => {
     if (request.url === "https://addons.opera.com/en/search/?query=Fetchrail") return new Response("No search results for &#x27;Fetchrail&#x27;", { headers: { "Content-Type": "text/html" } });
@@ -212,5 +213,28 @@ try {
   ] }));
   assert.equal((await readAnalytics()).status, 401, "Missing read secret fails closed even with a supplied token");
   assert.equal((await collect(qualityFixture)).status, 503, "Unconfigured v2 release gate rejects an otherwise valid report");
+  await worker.dispose();
+  worker = new Miniflare(convertV4MiniflareOptions({ https: true, resourcePersistencePath: directory, workers: [
+    { ...options, ratelimits: { ANALYTICS_RATE_LIMITER: { namespace_id: "1", simple: { limit: 2, period: 60 } } } },
+    { name: "assets-test", modules: [{ type: "ESModule", path: fileURLToPath(new URL("test-assets.mjs", import.meta.url)) }] },
+  ] }));
+  const protectedNamespace = await worker.getDurableObjectNamespace("ANALYTICS");
+  const protectedStore = protectedNamespace.get(protectedNamespace.idFromName("daily-v1"));
+  await protectedStore.testClearHourly(); await protectedStore.testDailyBudget(day, 0);
+  const limitedHeaders = { "CF-Connecting-IP": "192.0.2.123" };
+  assert.equal((await collect(reportFixture, limitedHeaders)).status, 204);
+  assert.equal((await collect(qualityFixture, limitedHeaders)).status, 204, "Both purposes share intake protection");
+  assert.equal((await collect(reportFixture, limitedHeaders)).status, 429, "A burst is rejected before reading or aggregating another body");
+  assert.equal((await collect(reportFixture, { "CF-Connecting-IP": "198.51.100.7" })).status, 204, "A different provider key has an independent burst allowance");
+  assert.equal((await get("/api/updates/latest")).status, 200, "Intake rate exhaustion leaves the signed updater available");
+  const protectedReport = await (await readAnalytics()).text();
+  assert.ok(!protectedReport.includes("192.0.2.123") && !protectedReport.includes("198.51.100.7"), "Security keys never enter private aggregate output");
+  await worker.dispose();
+  worker = new Miniflare(convertV4MiniflareOptions({ https: true, resourcePersistencePath: directory, workers: [
+    { ...options, ratelimits: {} },
+    { name: "assets-test", modules: [{ type: "ESModule", path: fileURLToPath(new URL("test-assets.mjs", import.meta.url)) }] },
+  ] }));
+  assert.equal((await collect(qualityFixture)).status, 503, "Missing intake protection fails closed even when v2 is enabled");
+  assert.equal((await get("/api/updates/latest")).status, 200);
   console.log("PASS: real Workers runtime verifies strict private analytics schema, auth, aggregation, retention alarm, cardinality/volume caps and persistence; OIDC publication, immutable replay, checksum mismatch, concurrent rollback protection, caching/ETag and static routing.");
 } finally { await worker.dispose(); await rm(directory, { recursive: true, force: true }); }
