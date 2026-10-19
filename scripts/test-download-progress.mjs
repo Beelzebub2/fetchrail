@@ -101,7 +101,7 @@ try {
   });
   await page.goto(base + "?progress=test-download");
   await page.getByRole("heading", { name: "example-archive.rar" }).waitFor();
-  assert.equal(await page.getByRole("tab").count(), 3);
+  assert.equal(await page.getByRole("tab").count(), 4);
   assert.equal(await page.locator("tbody tr").count(), 4);
   assert.equal(await page.getByRole("progressbar").getAttribute("aria-valuenow"), "12");
   await page.evaluate(() => {
@@ -118,7 +118,9 @@ try {
   assert.equal(await page.locator("tbody tr").count(), 0);
   for (const name of ["Speed limiter", "Options on completion", "Download status"]) {
     await page.getByRole("tab", { name }).click();
-    assert.ok(await fits(), `${name} fits the window without its details.`);
+    const layout = await page.evaluate(() => ({ height: innerHeight, scroll: document.documentElement.scrollHeight,
+      children: [...document.querySelector(".transfer-window").children].map(element => ({class: element.className, height: element.getBoundingClientRect().height})) }));
+    assert.ok(await fits(), `${name} fits the window without its details: ${JSON.stringify(layout)}`);
   }
   await page.screenshot({ path: join(output, "download-status-small.png") });
   await page.getByRole("button", { name: "Show details" }).click();
@@ -498,6 +500,7 @@ try {
   assert.equal(await endingsList.getByRole("listitem").count(), 31);
   await endingsEditor.getByRole("button", { name: "Remove x10", exact: true }).click();
   assert.equal(await endingsList.getByRole("listitem").count(), 30);
+  await page.waitForFunction(() => document.activeElement?.getAttribute("aria-label") === "Remove x11");
   assert.ok(await endingsEditor.getByRole("button", { name: "Remove x11", exact: true }).evaluate((button) => document.activeElement === button), "Focus moves to the next ending after a removal.");
   await endingsEditor.getByRole("button", { name: "Undo", exact: true }).click();
   assert.equal(await endingsList.getByRole("listitem").count(), 31);

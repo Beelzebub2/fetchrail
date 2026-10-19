@@ -197,6 +197,10 @@ impl<'de> Deserialize<'de> for Accent {
 pub struct DownloadSettings {
     #[serde(default)]
     pub analytics_consent: crate::analytics::Consent,
+    #[serde(default)]
+    pub quality_consent: crate::quality::Consent,
+    #[serde(default)]
+    pub local_crash_history: bool,
     #[serde(default, flatten)]
     pub extra: std::collections::BTreeMap<String, serde_json::Value>,
     #[serde(default)]
@@ -242,6 +246,8 @@ impl DownloadSettings {
     /// Full-settings drafts never control consent; only the dedicated native command does.
     pub fn preserve_analytics_consent(&mut self, current: &Self) {
         self.analytics_consent = current.analytics_consent.clone();
+        self.quality_consent = current.quality_consent.clone();
+        self.local_crash_history = current.local_crash_history;
     }
 
     /// Takes over what setup handed to this launch: the look and the download folder chosen
@@ -555,6 +561,8 @@ mod tests {
         };
         let settings = DownloadSettings {
             analytics_consent: Default::default(),
+            quality_consent: Default::default(),
+            local_crash_history: false,
             extra: Default::default(),
             torrent: Default::default(),
             speed_limit_bps: 0,
@@ -604,6 +612,8 @@ mod tests {
         assert_eq!(settings.folder_for("README"), base);
         let flat = DownloadSettings {
             analytics_consent: Default::default(),
+            quality_consent: Default::default(),
+            local_crash_history: false,
             extra: Default::default(),
             sort_into_category_folders: false,
             ..settings.clone()

@@ -671,3 +671,8 @@ dialog.modal-backdrop::backdrop { background: var(--backdrop); }
 .analytics-actions { position: sticky; bottom: 0; padding: 12px 0; background: var(--surface); }
 .analytics-actions button { flex: 1; }
 .privacy-card { max-width: 850px; }
+/* Local report JSON remains readable in narrow windows and at high zoom. */
+.health-preview { max-height: 24rem; max-width: 100%; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; padding: 1rem; border: 1px solid currentColor; border-radius: .5rem; font-size: .85rem; }
+.download-health { min-width: 0; margin-block: 1rem; }
+.download-health summary { cursor: pointer; }
+.download-health .diag-table-wrap { overflow-x: auto; }

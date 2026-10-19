@@ -18,6 +18,7 @@ const bin = resolve(root, process.argv[2] ?? "src-tauri/target/release");
 await access(join(bin, executableName("fetchrail")));
 const fixture = await createFixture("download-check");
 const { stateDir } = fixture;
+if (process.env.FETCHRAIL_VERIFY_HEALTH === "1") fixture.env.FETCHRAIL_TEST_TRACE = "1";
 const read = (name) => readFile(join(stateDir, name));
 const original = Object.fromEntries(await Promise.all(["downloads.json", "settings.json", "queues.json"].map(async (name) => [name, await read(name).catch((error) => { if (error.code === "ENOENT") return null; throw error; })])));
 const records = parseStateSnapshot(original["downloads.json"] ?? "[]");
@@ -156,6 +157,16 @@ async function complete(id, connections) {
   const full = parseStateSnapshot(await read("downloads.json")).find((item) => item.id === id);
   assert.equal(digest(await readFile(full.destination)), expectedHash, "Downloaded bytes must match the original.");
   assert.equal(item.downloadedBytes, data.length);
+  if (process.env.FETCHRAIL_VERIFY_HEALTH === "1") {
+    const health = await waitFor(async () => {
+      try { const report = JSON.parse(await read(`dev-health-${id}.json`)); return report.outputVerifiedBytes === data.length && report.durableCompletedMs != null && report; } catch { return false; }
+    }, "post-catalog local health snapshot");
+    assert.equal(health.outputVerifiedBytes, data.length);
+    assert.ok(health.durableCompletedMs != null);
+    assert.ok(health.stages.some(stage => stage.phase === "catalog" && stage.calls > 0));
+    assert.ok(!JSON.stringify(health).includes("FETCHRAIL-PRIVATE-SENTINEL"));
+    assert.ok(!JSON.stringify(health).includes("session=fetchrail-test"));
+  }
   return item;
 }
 try {
@@ -233,6 +244,10 @@ try {
   assert.ok(Date.now() - transferStarted >= 3600, "The global 4 MiB/s cap must be shared by both 8 MiB files and all eight connections.");
   assert.ok(observed.get("range.bin").peak >= 4, "Expected four simultaneous byte-range requests.");
   console.log("PASS: concurrent downloads, four connections, exact SHA-256 output");
+  if (process.env.FETCHRAIL_VERIFY_HEALTH === "1") {
+    await complete(await add("poisoned.bin?token=FETCHRAIL-PRIVATE-SENTINEL", { items: [{ url: base + "poisoned.bin?token=FETCHRAIL-PRIVATE-SENTINEL", suggestedFileName: "FETCHRAIL-PRIVATE-SENTINEL.bin" }] }), 4);
+    console.log("PASS: actual engine health follows verified publication/catalog and excludes poisoned source/filename");
+  }
   console.log("PASS: global speed limit caps the combined throughput of simultaneous downloads");
   const limitedStarted = Date.now();
   const limited = await add("limited.bin", { speedLimitBps: 2 * 1024 * 1024 });
