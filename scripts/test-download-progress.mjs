@@ -500,6 +500,7 @@ try {
   assert.equal(await endingsList.getByRole("listitem").count(), 31);
   await endingsEditor.getByRole("button", { name: "Remove x10", exact: true }).click();
   assert.equal(await endingsList.getByRole("listitem").count(), 30);
+  await page.waitForFunction(() => document.activeElement?.getAttribute("aria-label") === "Remove x11");
   assert.ok(await endingsEditor.getByRole("button", { name: "Remove x11", exact: true }).evaluate((button) => document.activeElement === button), "Focus moves to the next ending after a removal.");
   await endingsEditor.getByRole("button", { name: "Undo", exact: true }).click();
   assert.equal(await endingsList.getByRole("listitem").count(), 31);
