@@ -20,6 +20,9 @@ assert.ok(["ABBA","BAAB"].includes(largeOrder), "Use the matched ABBA or BAAB la
 const baselineBin = process.env.FETCHRAIL_RELIABILITY_BASELINE_BIN ? resolve(process.env.FETCHRAIL_RELIABILITY_BASELINE_BIN) : null;
 const ui = process.env.FETCHRAIL_RELIABILITY_UI === "1";
 assert.ok(!(ui && large), "Run capped UI qualification and unlimited large-file qualification separately.");
+const sourceRateBps = Number(process.env.FETCHRAIL_RELIABILITY_SOURCE_BPS ?? 0);
+assert.ok(sourceRateBps === 0 || Number.isInteger(sourceRateBps) && sourceRateBps >= 1024**2 && sourceRateBps <= 1024**3, "Use an explicit shared source rate between 1 MiB/s and 1 GiB/s");
+let sourceNextAt = 0;
 const version = JSON.parse(await readFile("package.json", "utf8")).version;
 const noticeRevision = (await readFile("src-tauri/src/quality.rs", "utf8")).match(/pub const NOTICE_REVISION: &str = "([^"]+)"/)[1];
 const payload = Buffer.alloc(1024 * 1024, 0x5a);
@@ -32,6 +35,17 @@ const server = createServer((request, response) => {
   if (request.method === "HEAD") { response.end(); return; }
   let remaining = end - start + 1;
   const pump = () => {
+    if (sourceRateBps && remaining > 0 && !response.destroyed) {
+      const count = Math.min(remaining, payload.length), at = Math.max(sourceNextAt, performance.now());
+      sourceNextAt = at + count / sourceRateBps * 1000;
+      setTimeout(() => {
+        if (response.destroyed) return;
+        remaining -= count;
+        if (response.write(payload.subarray(0, count))) pump();
+        else response.once("drain", pump);
+      }, Math.max(0, at - performance.now()));
+      return;
+    }
     while (remaining > 0 && !response.destroyed) {
       const count = Math.min(remaining, payload.length); remaining -= count;
       if (!response.write(payload.subarray(0, count))) { response.once("drain", pump); return; }
@@ -66,6 +80,7 @@ try {
   if (large) trials.push(...[...largeOrder].map(group => {const enabled=group==="B";return [1000,enabled,21*1024**3,!!baselineBin&&!enabled];}));
   for (const [historyCount, qualityEnabled, bytes, baseline = false] of trials) {
     total = bytes;
+    sourceNextAt = performance.now();
     const fixture = await createFixture("reliability-workload"); let app, host, browser, page;
     const trialBin = baseline ? baselineBin : bin;
     const pending = new Map();
@@ -157,7 +172,7 @@ try {
       assert.equal(outputSha256,expected.digest("hex"));
       latencies.sort((a,b)=>a-b);
       uiSamples.sort((a,b)=>a-b);
-      const measurement={historyCount,qualityEnabled,baseline,bytes,receivedBodyBytes:report?.receivedWireBytes??trace.networkBytes,checkpointBytesWritten:report?.checkpointBytesWritten??trace.durableBytes,debugBuild:report?.debugBuild??null,durableMs:report?.durableCompletedMs??null,catalogAcknowledgedMs,requestToCatalogMs,traceSnapshotMs:trace.elapsedMs,receiveMs:trace.receivingElapsedMs,receivingMBps:bytes/trace.receivingElapsedMs/1000,observedWallMs,
+      const measurement={historyCount,qualityEnabled,baseline,bytes,sourceRateBps,receivedBodyBytes:report?.receivedWireBytes??trace.networkBytes,checkpointBytesWritten:report?.checkpointBytesWritten??trace.durableBytes,debugBuild:report?.debugBuild??null,durableMs:report?.durableCompletedMs??null,catalogAcknowledgedMs,requestToCatalogMs,traceSnapshotMs:trace.elapsedMs,receiveMs:trace.receivingElapsedMs,receivingMBps:bytes/trace.receivingElapsedMs/1000,observedWallMs,
         uiInputToPaintP95Ms:uiSamples.length?uiSamples[Math.ceil(uiSamples.length*.95)-1]:null,uiSamples:uiSamples.length,
         bridgeP95Ms:latencies[Math.min(latencies.length-1,Math.ceil(latencies.length*.95)-1)],bridgeSamples:latencies.length,
         cpuSeconds:after&&before?after.cpuSeconds-before.cpuSeconds:null,peakWorkingSetBytes:after?.peakWorkingSetBytes??null,privateBytes:after?.privateBytes??null,

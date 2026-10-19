@@ -6,11 +6,12 @@ import {spawn,spawnSync} from "node:child_process";
 import {randomUUID,createHash} from "node:crypto";
 import {readFile,writeFile,mkdir} from "node:fs/promises";
 import {createReadStream} from "node:fs";
-import {join,resolve} from "node:path";
+import {join,resolve,sep} from "node:path";
 import {setTimeout as delay} from "node:timers/promises";
 import {chromium} from "playwright";
 import {createFixture,executableName} from "./test-runtime.mjs";
 import {localTorrentConfig} from "./torrent-fixture.mjs";
+import {parseStateSnapshot} from "./state-snapshot.mjs";
 
 assert.equal(process.env.FETCHRAIL_RUN_PRODUCTION_CANARY,"1","Explicitly authorize synthetic production canary traffic");
 assert.equal(process.platform,"win32","This canary uses the protected Windows operator reader");
@@ -42,7 +43,12 @@ async function download(context){
  const added=await context.native("addDownloads",{source:"popup",connections:4,items:[{url:`http://127.0.0.1:${server.address().port}/fixture.bin?secret=${sentinel}`,suggestedFileName:sentinel+".bin"}]});
  assert.equal(added.accepted,1);
  const record=await waitFor(async()=>{const result=await context.native("getDownloads");const row=result.downloads.find(r=>r.id===added.ids[0]);assert.notEqual(row?.status,"failed","Canary download failed");return row?.status==="completed"&&row;},"durable fixture completion");
- assert.equal(record.downloadedBytes,bytes);assert.equal(await hashFile(record.destination),digest);
+ assert.equal(record.downloadedBytes,bytes);
+ const saved=await waitFor(async()=>parseStateSnapshot(await readFile(join(context.fixture.stateDir,"downloads.json"))).find(row=>row.id===added.ids[0]&&row.status==="completed"),"protected fixture catalog");
+ assert.ok(resolve(saved.destination).startsWith(resolve(context.fixture.root)+sep),"Read only fixture-owned output");
+ assert.equal(await hashFile(saved.destination),digest);
+ const health=await waitFor(async()=>{const report=await context.page.evaluate(id=>window.__TAURI_INTERNALS__.invoke("download_health",{id}),added.ids[0]);return report.durableCompletedMs!==null&&report;},"native catalog acknowledgement");
+ assert.equal(health.outputVerifiedBytes,bytes);assert.ok(!JSON.stringify(health).includes(sentinel));
 }
 const started=Date.now();
 try{
@@ -68,7 +74,8 @@ try{
   await context.native("showApp");
   await context.page.getByRole("button",{name:"Settings",exact:true}).click();
   await context.page.getByRole("tab",{name:"Privacy",exact:true}).click();
-  await context.page.getByLabel("Allow optional download reliability analytics").check();
+  // Native persistence is asynchronous; wait for its authoritative result after the click.
+  await context.page.getByLabel("Allow optional download reliability analytics").click();
   await context.page.getByText("Reliability analytics is on.",{exact:true}).waitFor();
   await download(context);
   const preview=await context.page.evaluate(()=>window.__TAURI_INTERNALS__.invoke("quality_preview"));
@@ -84,7 +91,7 @@ try{
  assert.ok(!JSON.stringify(report).includes(sentinel));
  for(const context of contexts){
   assert.equal(await context.page.evaluate(()=>window.__TAURI_INTERNALS__.invoke("quality_preview")),null);
-  await context.page.getByLabel("Allow optional download reliability analytics").uncheck();
+  await context.page.getByLabel("Allow optional download reliability analytics").click();
   await context.page.getByText("Reliability analytics is off.",{exact:true}).waitFor();
   await download(context);
   assert.equal(await context.page.evaluate(()=>window.__TAURI_INTERNALS__.invoke("quality_preview")),null);
