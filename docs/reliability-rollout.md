@@ -4,7 +4,9 @@ Source review draft, 17 October 2026. No command below authorizes installation, 
 
 The owner subsequently authorized release preparation/publication conditional on readiness on 18 October. The [18 October validation record](reliability-validation-2026-10-18.md) records the actual synthetic provider qualification and secret-only production read-access change. New v2 delivery/intake remain closed. The original source-task restriction is not an additional permission requirement after that authorization; unresolved legal facts and demonstrated readiness still determine whether release is possible.
 
-## Release gates
+On 19 October the owner authorized a staged v0.8.1 application release with local troubleshooting and expanded remote analytics disabled, while deferring Cloudflare MFA enrollment. This does not approve new remote processing. The tested native `REMOTE_RELEASE_APPROVED=false`, draft notice revision and absent Worker enable flag remain unchanged. Account enrollment is not an automatic or blanket legal prerequisite to publishing this local-diagnostics release. The following gates govern expanded cloud activation; they are not silently waived by the staged app release.
+
+## Expanded cloud analytics activation gates
 
 1. Controller approves identity/contact, audience/children assessment, notices, necessity and lawful bases, ROPA/DPIA screen, rights and breach process, DPA/subprocessors/transfers and provider logging/recovery retention. Record the accepted Cloudflare contract and actual account configuration. A provider website or this source review is not that approval.
 2. Complete the open engineering qualifications in the coverage matrix. Run matched optimized hardware trials and a small voluntarily opted-in canary. Generated loopback throughput is not representative WAN evidence or proof of negligible observer overhead.
