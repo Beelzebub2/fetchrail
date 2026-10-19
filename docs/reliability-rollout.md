@@ -16,6 +16,8 @@ On 19 October the owner clarified that publication must include the full analyti
 
 ## Source artifacts and local validation
 
+19 October continuation: the compatible receiver and expanded preview disclosure were deployed with intake closed, preserving both existing namespace identities, migration tag, read secret, routes and logs/traces settings. Source now prepares the final `reliability-v2-20261019` notice and explicit delivery gates for the authorized canary. This preparation is not a completed canary or published app release; the dated validation record remains authoritative for actual rollout state. The processing review records the owner's general-user audience confirmation and verified official DPF participant evidence.
+
 The separate optimized test executable is `src-tauri/target/release/fetchrail.exe`, built with `test-tools,tauri/custom-protocol`. It is **not an installer**. Only `FETCHRAIL_TEST_ROOT` plus a unique `FETCHRAIL_TEST_ID` isolate its state. Development trace files additionally require `FETCHRAIL_TEST_TRACE=1`. Do not point test tools at a real profile. The workload script generates its own private roots and removes only owned outputs.
 
 The isolated trace additionally writes `dev-quality.json` for asserting the actual native aggregate alongside the post-catalog health snapshot; this is test-only evidence in that private fixture, not an ordinary disk queue. Frontend: `npm run build`. Native: the commands in the coverage matrix. Worker packaging, without network publication:
