@@ -74,3 +74,17 @@ The corrected canary completed with exit code zero at **09:46:58 UTC**, in 1,865
 This qualifies real native delivery and withdrawal for controlled Windows loopback downloads, not representative WAN behavior, unique-user statistics or recorder overhead. The first partial run and this complete run together intentionally contributed **ten synthetic batches** to the 19 October `0.8.2 / windows / x64` receipt group. That group must not be described as ten people or entirely real-user observations; after aggregation those individual contributions cannot be selectively removed. Routine isolated test builds remain unable to send without the explicit canary flag and valid test root.
 
 Performance qualification uses this PC's Windows 11 Pro build 26200, Core i5-13400F and Lexar NM620 NVMe system drive, with a generated 50 MiB/s shared loopback source. Local hardware evidence omits serial numbers and network identity. Twenty balanced small-workload repetitions are still running; the sustained large and final UI comparisons remain pending. No performance guardrail is marked passed by the canary.
+
+## Completed balanced small-workload comparison
+
+All **120 cases** completed successfully: twenty baseline and twenty candidate observations at each of 10/100/1,000 history records, alternating ABBA/BAAB pair order across invocations. Every case checked 64 MiB of actual received/checkpoint bytes, SHA-256 output, catalog acknowledgement, bounded evidence and consent behavior. Analysis validates every proof path, binary hash, pair order and sample count, using all twenty repetitions without excluding slow observations. Evidence: ignored `paced-repeat-1.log` through `paced-repeat-20.log`, their linked proofs and `paced-summary-20.json`.
+
+| History records | Baseline / candidate median receiving MB/s | Baseline / candidate p95 request-to-catalog ms | Candidate p95 change |
+| --- | --- | --- | --- |
+| 10 | 51.228 / 51.365 | 1,949.087 / 1,955.287 | +0.318% |
+| 100 | 51.033 / 51.053 | 2,000.391 / 1,980.746 | -0.982% |
+| 1,000 | 49.895 / 49.895 | 2,346.869 / 2,291.215 | -2.371% |
+
+Medians average the two middle values; p95 is the nearest-rank nineteenth observation of twenty. The provisional ≤1% median receiving loss and ≤2% p95 end-to-end increase are met **for this paced small-workload comparison**. Completion ends at the actual catalog span acknowledgement, using a checked common host clock, rather than the later polling or diagnostic-file write. Baseline/candidate whole-process median CPU at 1,000 records was 1.891/1.961 seconds; median peak working set was 70.109/72.475 MB. These exclude WebView/scanner/service processes and do not isolate causal recorder cost.
+
+The executable baseline predates the observer and also differs in intervening app repairs. A constrained source can hide limits that arise at higher rates. Canary withdrawal activity around 09:46 UTC overlapped part of this set and was not selectively excluded. Do not infer an uncapped, representative WAN, statistical speedup or universal negligible-overhead claim. Earlier noisy unpaced large trials remain documented; the new paced sustained large and current-candidate UI tests are separate and still running.
