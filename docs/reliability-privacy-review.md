@@ -2,7 +2,7 @@
 
 This document records legal research and engineering decisions, not regulatory certification. The 19 October review below updates the initial unresolved provider facts and records the owner's audience/operator decisions. The owner requested release preparation and publication on 18 October, conditional on readiness. That authorizes the release work; it does not establish unprovided facts or remove the remaining engineering qualifications. A registered company or an external lawyer is not automatically required merely to develop the engine.
 
-On 18 October the owner repeatedly selected **RRMTools** as the overall project/operator name used with its domain. The notice records RRMTools, Portugal and support.fetchrail@rrmtools.uk. No registered-company status or individually verified legal identity is claimed. Treat this as the owner's operator designation, not a registry check; whether that designation fully identifies the responsible person/body remains a final transparency review item. Do not keep requesting the same naming decision. Expanded remote analytics remains closed pending the processing/configuration review.
+On 18 October the owner repeatedly selected **RRMTools** as the overall project/operator name used with its domain. The notice records RRMTools, Portugal and support.fetchrail@rrmtools.uk. No registered-company status or individually verified legal identity is claimed. Treat this as the owner's operator designation, not a registry check; whether that designation fully identifies the responsible person/body remains a final transparency review item. Do not keep requesting the same naming decision. The 19 October review below supersedes initial unresolved provider/processing entries; final-notice collection is enabled for the controlled canary, while public app publication remains pending qualification.
 
 ## Processing register and necessity
 
@@ -40,7 +40,7 @@ No inference of anonymization from omission of identifiers. Voluntary reports ar
 
 ## Rollout and rollback gate
 
-Build/test in isolated roots only. Review schema and disclosures, read-only backup/export of v1 if needed, test migration/restart/expiry locally, and dry-run Worker packaging. Retain v1 object and tables. The original source task did not authorize production work; the owner's later release instruction does, conditional on readiness. Actual synthetic provider qualification and protected read-access provisioning are recorded on 18 October. No incident upload, installed-app update, version publication or expanded production collection has occurred. Canary, account-wide capacity, remaining legal facts and representative hardware/WAN validation remain release work.
+Build/test in isolated roots only. Review schema and disclosures, read-only backup/export of v1 if needed, test migration/restart/expiry locally, and dry-run Worker packaging. Retain v1 object and tables. The original source task did not authorize production work; the owner's later release instruction does, conditional on readiness. Actual provider qualification and protected read-access provisioning are recorded on 18 October. The 19 October record documents production receiver/final-notice activation and isolated native canary traffic. No incident upload, installed-app update or new app publication has occurred. Final canary/distribution/performance qualification, account-wide capacity and remaining legal assurance must be reported accurately; controlled tests cannot establish representative WAN behavior.
 
 ## 19 October processing and configuration review
 
