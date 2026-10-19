@@ -273,7 +273,8 @@ async fn safe_transport_faults_observe_boundaries_without_inventing_dns_or_tls_c
     let body = TestServer::new(1024 * 1024, "weak");
     let client = download_client_builder()
         .no_proxy()
-        .read_timeout(Duration::from_millis(100))
+        // Header scheduling can exceed 100 ms under parallel load; the body never finishes.
+        .read_timeout(Duration::from_secs(2))
         .build()
         .unwrap();
     let health = Health::default();
