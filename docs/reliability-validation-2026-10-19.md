@@ -94,3 +94,20 @@ The executable baseline predates the observer and also differs in intervening ap
 Full nonpublishing preflight [39230795782](https://github.com/Beelzebub2/fetchrail/actions/runs/39230795782), source `34523dd`, completed **successfully**. Windows x64, Linux x64/ARM64, Worker security/runtime and installed Fedora 44, Mint 22.3, Kali and Arch package/HTTP/torrent/native X11/Wayland checks all passed. This includes production executables built without test tools. The earlier failed Mint run is retained above; the corrected test waits for actual native save completion without changing startup implementation or deadlines.
 
 Publication, updater announcement and browser-store submission jobs were deliberately skipped in this manual preflight. Its development packages are unsigned; this does not establish signed release assets, store approval or app publication. Commits after `34523dd` so far only record the verified evidence and rollout state; runtime source remains the same as the completed canary. Sustained large and final UI comparisons remain in progress.
+
+## 20 October continuation: commits and sustained evidence
+
+A fresh upstream fetch found no new `main` commits beyond `96c29fd`. The candidate is clean at `706127e`, fifteen commits ahead and zero behind `origin/main`. The additional commits after the successful preflight contain evidence/runbook updates and final privacy wording; native runtime and receiver source remain unchanged. GitGuardian and the PR checks pass. No v0.8.2 tag/release exists; v0.8.0 remains published and the cancelled v0.8.1 tag remains intact.
+
+The paced ABBA workload finished all four **21 GiB** outputs with correct received/checkpoint bytes, SHA-256 and catalog acknowledgement. Evidence: ignored `workload-078e89fd-91e2-48d0-973d-7f7fffb694f7.json`, using the unchanged baseline/candidate executable hashes above.
+
+| Run | Receiving MB/s | Request-to-catalog seconds |
+| --- | --- | --- |
+| Baseline A1 | 52.415 | 441.362 |
+| Candidate B1 | 51.145 | 458.434 |
+| Candidate B2 | 52.300 | 443.581 |
+| Baseline A2 | 52.294 | 446.247 |
+
+The candidate's median receiving loss is **1.2065%**, outside the provisional 1% target for this comparison; median completion time increased 1.6231%. Two observations per build do not establish a reliable p95. This is an integrity pass, not an accepted large-workload overhead pass. The slow candidate recorded individual write/flush/sync waits up to 2.965/3.172/3.639 seconds and a 1.020-second catalog call. The next candidate was materially faster; the final baseline also showed write/sync waits up to 0.826/1.272 seconds. These are observed API boundaries. They support investigating variable local I/O, without proving storage firmware, antivirus, external network or recorder causation. Concurrent worker totals cannot be added as wall time.
+
+The subsequent UI log contains four completed cases, but no final proof/PASS line. Its execution session is no longer available and no owned qualification process remains. The stop cause is unknown; the incomplete run is not counted as a full UI pass. A reverse-order BAAB large comparison and complete UI rerun were started on 20 October using unchanged binaries and source pacing, without increasing timeouts or weakening any assertion. Both original and repeated observations must be retained in the final assessment.
