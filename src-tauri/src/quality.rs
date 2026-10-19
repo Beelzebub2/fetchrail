@@ -388,6 +388,10 @@ mod tests {
         stale.purpose = "product-improvement-v1".into();
         quality.configure(&stale);
         assert!(quality.prepare().is_none());
+        let mut stale_notice = Consent::choice(true);
+        stale_notice.notice_revision = "reliability-draft-old".into();
+        quality.configure(&stale_notice);
+        assert!(quality.prepare().is_none());
         quality.configure(&Consent::choice(true));
         assert!(quality.take_report().is_none());
         let mut sample = quality.prepare().unwrap();

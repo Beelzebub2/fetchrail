@@ -40,6 +40,7 @@ try {
     };
     window.testSettings = { analyticsConsent: { enabled: false, decided: false, schema: 0, purpose: "" }, theme: "dark", accent: "ember", speedLimitBps: 0, autoUpdate: false, categories: [{ name: "Compressed", extensions: ["rar"], folder: "Compressed" }], sortIntoCategoryFolders: true, defaultDownloadDir: "C:\\Downloads", maxConcurrentDownloads: 3, connectionsPerDownload: 4, minSegmentSizeMb: 1, launchOnStart: false, minimizeToTray: true };
     window.testSettings.torrent = { uploadLimitBps: 0, maxSeeds: 3, ratioLimit: 1, seedTimeLimit: 86400, dht: true, lsd: true, upnp: true, connections: 200, listenInterfaces: "0.0.0.0:6881,[::]:6881", outgoingInterfaces: "", encryption: 1, proxyType: 0, proxyHost: "", proxyPort: 0, proxyUsername: "", proxyPassword: "" };
+    window.testQualityRelease = { approved: true, noticeRevision: "reliability-test-current" };
     window.testEmit = (event, payload) => {
       for (const [id, name] of listeners) if (name === event) callbacks.get(id)?.({ event, payload });
     };
@@ -54,6 +55,7 @@ try {
         if (name === "get_download") return structuredClone(window.testRecord);
         if (name === "list_downloads") return [structuredClone(window.testRecord)];
         if (name === "get_settings") return structuredClone(window.testSettings);
+        if (name === "quality_release_status") return structuredClone(window.testQualityRelease);
         if (name === "set_analytics_consent") {
           if (window.testConsentFailure) {
             window.testSettings.analyticsConsent.enabled = false;
@@ -65,7 +67,7 @@ try {
           return structuredClone(window.testSettings);
         }
         if (name === "set_quality_consent") {
-          window.testSettings.qualityConsent = { enabled: args.enabled, decided: true, schema: 2, purpose: "product-quality-v2" };
+          window.testSettings.qualityConsent = { enabled: args.enabled, decided: true, schema: 2, purpose: "product-quality-v2", noticeRevision: window.testQualityRelease.noticeRevision };
           window.testEmit("fetchrail://settings-updated", structuredClone(window.testSettings)); return structuredClone(window.testSettings);
         }
         if (name === "quality_preview") return window.testSettings.qualityConsent?.enabled ? { schema: 2, purpose: "product-quality-v2", version: "0.7.4", os: "windows", arch: "x64", counters: {http_accepted: 1}, histograms: {} } : null;
@@ -133,6 +135,14 @@ try {
   await page.getByText("Analytics is on.", { exact: true }).waitFor();
   await page.screenshot({ path: join(output, "analytics-settings.png"), fullPage: true });
   assert.equal(await page.getByLabel("Allow optional download reliability analytics").isChecked(), false, "A v1 grant never enables v2");
+  const qualityChoices = await page.evaluate(() => window.testCalls.filter(call => call.name === "set_quality_consent").length);
+  await page.evaluate(() => {
+    window.testSettings.qualityConsent = { enabled: true, decided: true, schema: 2, purpose: "product-quality-v2", noticeRevision: "reliability-draft-old" };
+    window.testEmit("fetchrail://settings-updated", structuredClone(window.testSettings));
+  });
+  await page.getByText("Your previous reliability choice does not apply to the current notice. A fresh choice is required.", {exact: true}).waitFor();
+  assert.equal(await page.getByLabel("Allow optional download reliability analytics").isChecked(), false, "A stale notice grant must not appear enabled");
+  assert.equal(await page.evaluate(() => window.testCalls.filter(call => call.name === "set_quality_consent").length), qualityChoices, "Loading an old choice must not grant the new notice");
   await page.getByLabel("Allow optional download reliability analytics").check();
   await page.getByText("Reliability analytics is on.", {exact: true}).waitFor();
   assert.equal(await page.evaluate(() => window.testSettings.analyticsConsent.enabled), true);

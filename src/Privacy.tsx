@@ -5,7 +5,7 @@ import { invoke } from "@tauri-apps/api/core";
 import type { DownloadSettings } from "./App";
 import { DownloadHealth, type Report } from "./DownloadHealth";
 
-export type AnalyticsConsent = { enabled: boolean; decided: boolean; schema: number; purpose: string };
+export type AnalyticsConsent = { enabled: boolean; decided: boolean; schema: number; purpose: string; noticeRevision?: string };
 const current = (consent?: AnalyticsConsent) => consent?.decided && consent.schema === 1 && consent.purpose === "product-improvement-v1";
 const enabled = (consent?: AnalyticsConsent) => current(consent) && consent?.enabled;
 
@@ -28,7 +28,16 @@ export function PrivacySettings({ settings, onChoice }: { settings: DownloadSett
   const [busy, setBusy] = useState(false), [error, setError] = useState<string | null>(null);
   const [preview, setPreview] = useState<string | null>(null), [history, setHistory] = useState<string | null>(null);
   const [operations, setOperations] = useState<Report[] | null>(null);
-  const qualityOn = settings.qualityConsent?.enabled && settings.qualityConsent?.decided && settings.qualityConsent.schema === 2 && settings.qualityConsent.purpose === "product-quality-v2";
+  const [qualityRelease, setQualityRelease] = useState<{ approved: boolean; noticeRevision: string } | null>(null);
+  useEffect(() => {
+    let active = true;
+    void invoke<{ approved: boolean; noticeRevision: string }>("quality_release_status")
+      .then(status => { if (active) setQualityRelease(status); })
+      .catch(() => { if (active) setError("Could not read the current reliability privacy notice. Please reopen Privacy settings."); });
+    return () => { active = false; };
+  }, []);
+  const qualityAllowed = !!qualityRelease && settings.qualityConsent?.enabled && settings.qualityConsent?.decided && settings.qualityConsent.schema === 2 && settings.qualityConsent.purpose === "product-quality-v2" && settings.qualityConsent.noticeRevision === qualityRelease.noticeRevision;
+  const qualityOn = qualityAllowed && qualityRelease?.approved;
   async function privacyAction(command: string, args?: Record<string, unknown>) {
     setBusy(true); setError(null); setPreview(null);
     try { await invoke(command, args); } catch (e) { setError(String(e)); } finally { setBusy(false); }
@@ -50,8 +59,9 @@ export function PrivacySettings({ settings, onChoice }: { settings: DownloadSett
       <p>If enabled after release approval, Fetchrail sends app release, broad OS/architecture, combined HTTP/torrent admission and outcome counts, coarse size counts, fixed retry/error categories and eight-bucket stage duration distributions. HTTP durable completion follows verification, publication and saved catalog acknowledgement. Torrent selected-ready is a different observation and does not claim disk durability.</p>
       <p>Reports have no sources, paths, credentials, identifiers, exact times or per-download records. Only newly admitted transfers in this consent period qualify; no backfill. One RAM batching loop checks every 30 minutes, drops failures/exits and cancels unsent work on withdrawal. Stage work can overlap. Preview below shows actual serializer output. Duration buckets use upper bounds of 10, 100, 1,000, 10,000, 60,000, 300,000 and 1,800,000 milliseconds, then an overflow bucket; worker durations overlap.</p>
       <p>Recipient: Fetchrail/RRMTools on Cloudflare. Protected daily aggregates last 30 UTC days, with recovery copies potentially another 30. Cloudflare sees IPs in transit and may process security metadata internationally; EU-only processing and absolute anonymity are not promised. Small groups are suppressed. Individual contributions cannot be retrieved from combined totals. Contact support.fetchrail@rrmtools.uk for privacy requests.</p>
-      <p>Release status: expanded remote collection remains disabled pending legal and production approval. A saved choice alone does not activate this release gate.</p>
-      <label className="check"><input type="checkbox" checked={!!qualityOn} disabled={busy} onChange={e => void privacyAction("set_quality_consent", { enabled: e.target.checked })} />Allow optional download reliability analytics</label>
+      {!qualityRelease?.approved && <p>Expanded remote collection is disabled in this build. A saved choice alone does not activate it.</p>}
+      {settings.qualityConsent?.enabled && qualityRelease && !qualityAllowed && <p>Your previous reliability choice does not apply to the current notice. A fresh choice is required.</p>}
+      <label className="check"><input type="checkbox" checked={!!qualityAllowed} disabled={busy || !qualityRelease} onChange={e => void privacyAction("set_quality_consent", { enabled: e.target.checked })} />Allow optional download reliability analytics</label>
       <button className="secondary-button" disabled={busy} onClick={() => void invoke("quality_preview").then(data => setPreview(data ? JSON.stringify(data, null, 2) : "No reliability payload: this purpose is off.")).catch(e => setError(String(e)))}>Preview reliability payload</button>
       {preview !== null && <pre className="health-preview" tabIndex={0}>{preview}</pre>}
     </section>
