@@ -10,35 +10,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-#[derive(Clone, Copy)]
-pub(crate) enum Phase {
-    Probe,
-    Origin,
-    Global,
-    Headers,
-    Body,
-    Limiter,
-    Write,
-    Flush,
-    Sync,
-    Checkpoint,
-    Retry,
-    Assembly,
-    Attachment,
-    Verify,
-    Journal,
-    Publish,
-    Catalog,
-    AttachmentSetup,
-    AttachmentSave,
-    AttachmentAdsOpen,
-    AttachmentAdsWrite,
-    AttachmentAdsSync,
-    PublishRename,
-    PublishSync,
-    ScanOverlap,
-    BodyProcessing,
-}
+pub(crate) use crate::health::Phase;
 const NAMES: [&str; 26] = [
     "probe",
     "originAdmission",

@@ -13,6 +13,7 @@ pub(crate) async fn mark_download(
     url: &str,
     file_name: &str,
     check_with_windows: bool,
+    health: Option<std::sync::Arc<crate::health::Health>>,
     #[cfg(feature = "test-tools")] trace: Option<std::sync::Arc<crate::engine::trace::Trace>>,
 ) -> io::Result<()> {
     #[cfg(feature = "test-tools")]
@@ -31,6 +32,7 @@ pub(crate) async fn mark_download(
             let scan_path = path.to_path_buf();
             let source = url.to_string();
             let file_name = file_name.to_string();
+            let scan_health = health.clone();
             #[cfg(feature = "test-tools")]
             let scan_trace = trace.clone();
             tokio::task::spawn_blocking(move || -> io::Result<()> {
@@ -45,6 +47,9 @@ pub(crate) async fn mark_download(
                     },
                 };
                 unsafe {
+                    let setup_health_span = scan_health
+                        .as_deref()
+                        .map(|health| health.guard(crate::health::Phase::AttachmentSetup));
                     #[cfg(feature = "test-tools")]
                     let setup_span = scan_trace
                         .as_deref()
@@ -87,6 +92,10 @@ pub(crate) async fn mark_download(
                         .map_err(io::Error::other)?;
                     #[cfg(feature = "test-tools")]
                     drop(setup_span);
+                    drop(setup_health_span);
+                    let _save_health_span = scan_health
+                        .as_deref()
+                        .map(|health| health.guard(crate::health::Phase::AttachmentSave));
                     #[cfg(feature = "test-tools")]
                     let _save_span = scan_trace
                         .as_deref()
@@ -100,6 +109,9 @@ pub(crate) async fn mark_download(
         }
         // Always preserve internet provenance, including when the user skips attachment approval.
         let ads = PathBuf::from(format!("{}:Zone.Identifier", path.display()));
+        let ads_open_health_span = health
+            .as_deref()
+            .map(|health| health.guard(crate::health::Phase::AttachmentAdsOpen));
         #[cfg(feature = "test-tools")]
         let ads_open_span = trace
             .as_deref()
@@ -112,6 +124,7 @@ pub(crate) async fn mark_download(
             .await;
         #[cfg(feature = "test-tools")]
         drop(ads_open_span);
+        drop(ads_open_health_span);
         let mut file = match result {
             Ok(file) => file,
             Err(error) if matches!(error.raw_os_error(), Some(1 | 50 | 123)) => {
@@ -131,6 +144,9 @@ pub(crate) async fn mark_download(
             })
             .unwrap_or_default();
         {
+            let _write_health_span = health
+                .as_deref()
+                .map(|health| health.guard(crate::health::Phase::AttachmentAdsWrite));
             #[cfg(feature = "test-tools")]
             let _write_span = trace
                 .as_deref()
@@ -141,6 +157,9 @@ pub(crate) async fn mark_download(
             .await?;
         }
         {
+            let _sync_health_span = health
+                .as_deref()
+                .map(|health| health.guard(crate::health::Phase::AttachmentAdsSync));
             #[cfg(feature = "test-tools")]
             let _sync_span = trace
                 .as_deref()

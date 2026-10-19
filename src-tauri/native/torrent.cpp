@@ -184,6 +184,7 @@ struct Job {
     std::string checkpoint_error;
     bool removing = false;
     bool removed = false;
+    int hash_failures = 0, file_errors = 0, engine_errors = 0, metadata_failures = 0, checkpoint_errors = 0;
     std::set<std::string> paths;
     std::set<std::string> moving_paths;
     std::deque<json> activity;
@@ -317,11 +318,18 @@ struct Engine {
                     j.flushed = false; j.flushing = true; j.handle.flush_cache();
                 } else if (lt::alert_cast<lt::cache_flushed_alert>(a)) {
                     j.flushed = true; j.flushing = false;
+                } else if (lt::alert_cast<lt::hash_failed_alert>(a)) {
+                    j.hash_failures = std::min(j.hash_failures + 1, 1000000);
+                } else if (lt::alert_cast<lt::file_error_alert>(a)) {
+                    j.file_errors = std::min(j.file_errors + 1, 1000000);
+                } else if (lt::alert_cast<lt::metadata_failed_alert>(a)) {
+                    j.metadata_failures = std::min(j.metadata_failures + 1, 1000000);
                 } else if (auto s = lt::alert_cast<lt::save_resume_data_alert>(a)) {
                     j.pending_saves = std::max(0, j.pending_saves - 1);
                     j.checkpoint_error = "Cannot write torrent checkpoint";
                     try { write_file(j.resume_path, lt::write_resume_data_buf(s->params)); }
                     catch (std::exception const& e) {
+                        j.checkpoint_errors = std::min(j.checkpoint_errors + 1, 1000000);
                         j.checkpoint_error = e.what();
                         events.push_back({{"id", it->first}, {"type", "checkpointError"}, {"message", j.checkpoint_error}});
                         continue;
@@ -330,6 +338,7 @@ struct Engine {
                 } else if (auto s = lt::alert_cast<lt::save_resume_data_failed_alert>(a)) {
                     j.pending_saves = std::max(0, j.pending_saves - 1);
                     if (s->error != lt::errors::resume_data_not_modified || !j.saved_checkpoint || !checkpoint_exists(j.resume_path)) {
+                        j.checkpoint_errors = std::min(j.checkpoint_errors + 1, 1000000);
                         j.checkpoint_error = s->error.message();
                         events.push_back({{"id", it->first}, {"type", "checkpointError"}, {"message", j.checkpoint_error}});
                     }
@@ -344,6 +353,7 @@ struct Engine {
                     write_file(j.metadata_path, lt::write_torrent_file_buf(p, lt::write_flags::allow_missing_piece_layer));
                     events.push_back({{"id", it->first}, {"type", "metadata"}, {"metadata", m}});
                 } else if (auto e = lt::alert_cast<lt::torrent_error_alert>(a)) {
+                    j.engine_errors = std::min(j.engine_errors + 1, 1000000);
                     j.error = e->error.message();
                     events.push_back({{"id", it->first}, {"type", "error"}, {"message", j.error}});
                 } else if (lt::alert_cast<lt::storage_moved_alert>(a)) {
@@ -358,6 +368,7 @@ struct Engine {
                     events.push_back({{"id", it->first}, {"type", "error"}, {"message", e->error.message()}});
                 }
             } catch (std::exception const& e) {
+                j.engine_errors = std::min(j.engine_errors + 1, 1000000);
                 j.handle.pause(); j.error = e.what();
                 events.push_back({{"id", it->first}, {"type", "error"}, {"message", j.error}});
             }
@@ -419,6 +430,12 @@ struct Engine {
                     {"allDownloaded", s.all_time_download}, {"peers", s.num_peers}, {"seeds", s.num_seeds}, {"finished", ready},
                     {"activeSeconds", s.active_duration.count() + elapsed}, {"seedSeconds", s.finished_duration.count() + (s.is_finished ? elapsed : 0)},
                     {"verified", s.state != lt::torrent_status::checking_resume_data && s.state != lt::torrent_status::checking_files},
+                    {"health", {{"payloadReceivedBytes", std::max<std::int64_t>(0, s.total_payload_download)},
+                        {"failedPieceBytes", std::max<std::int64_t>(0, s.total_failed_bytes)}, {"redundantBytes", std::max<std::int64_t>(0, s.total_redundant_bytes)},
+                        {"hashFailures", pair.second.hash_failures}, {"fileErrors", pair.second.file_errors}, {"engineErrors", pair.second.engine_errors},
+                        {"metadataFailures", pair.second.metadata_failures}, {"checkpointErrors", pair.second.checkpoint_errors},
+                        {"peers", std::max(0, s.num_peers)}, {"seeds", std::max(0, s.num_seeds)}, {"selectedReady", ready},
+                        {"checking", state == "checking"}, {"metadata", !s.has_metadata}}},
                     {"error", s.errc ? s.errc.message() : pair.second.error}});
             }
             json out = {{"states", states}, {"events", events}}; events.clear(); return out;

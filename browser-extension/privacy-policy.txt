@@ -1,5 +1,9 @@
 Fetchrail Browser Integration Privacy Policy
 Last updated: 18 October 2026.
+
+Project maintainer: RRMTools, Portugal. Privacy contact: support.fetchrail@rrmtools.uk.
+
+Optional desktop analytics and per-run summary sharing rely on consent, withdrawable at any time without affecting earlier lawful processing. You may request access, correction, erasure, restriction or portability where applicable, or object where applicable, using the privacy contact. An unidentified contribution cannot be isolated after aggregation. You may complain to Portugal's data protection authority, CNPD (https://www.cnpd.pt/cidadaos/participacoes/), or your competent supervisory authority. See the complete policy for the processing details and local controls.
 Canonical policy: https://fetchrail.rrmtools.uk/privacy
 
 Fetchrail Browser Integration connects a supported desktop browser to the Fetchrail download manager installed on your Windows or Linux computer. It handles information needed to select, route and control downloads. The desktop app separately offers optional improvement analytics with user consent, described below.
@@ -55,3 +59,14 @@ Website, support and changes
 The Fetchrail website runs on Cloudflare, which may handle ordinary site request logs and website analytics. Visiting the site does not send extension download history or browser session headers to the developer. GitHub handles source downloads, release visits and support under its own policies.
 
 For questions, email support.fetchrail@rrmtools.uk or visit https://github.com/Beelzebub2/fetchrail/issues. Do not put private download links, cookies or credentials in public issues. Future changes to this policy will be reflected at https://fetchrail.rrmtools.uk/privacy, with the update date shown on the page.
+
+
+Desktop reliability diagnostics and separately scoped analytics (release gated)
+
+The source preview adds private local download health with bounded numeric stage/attempt timelines, HTTP body and checkpoint counters, fixed cause classes, broad software version/platform, and safe torrent observations. No source, filename/path, credential, tracker, peer address, infohash or arbitrary message enters a safe incident report. This does not add extension instrumentation or browser permissions. A separate per-incident preview and review choice is required to copy/export JSON; there is no automatic incident upload. Exported files remain until you delete them. Public GitHub issues are public; agree a private recipient and retention before sharing.
+
+Desktop imports and browser verification/commit operations have separate source-free local reports when no download was admitted. The latest 20 stay in session memory and never enter routine fleet download counts.
+
+Optional local crash breadcrumbs are separately enabled, off by default, protected with Windows account encryption or private Linux permissions, capped at 20 reports / 512 KiB and seven days, and cleaned at startup/read/periodic runs. If the app is closed, cleanup runs on its next start. Clear deletes owned diagnostic history. Unknown or damaged files are preserved for manual inspection. Hard termination can lose the last unsaved evidence.
+
+Existing improvement consent does not authorize product-quality-v2. This independent choice covers only combined outcome/size/error/protocol counts and fixed stage-duration histograms, broad release/OS/architecture, with no identifiers, source data, exact event times or per-transfer record. Only transfers newly admitted in the consent period qualify; withdrawal clears unsent counts and cancels pending sends, with no persistent retry queue. Already received aggregates cannot be recalled. Recipient and aggregate/PITR retention are the same Fetchrail/Cloudflare boundaries above; no EU-only or absolute-anonymity claim is made. Expanded remote collection remains disabled pending the controller/legal/configuration review and a separately authorized release with a fresh final notice choice.

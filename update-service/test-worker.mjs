@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, rm, readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -19,13 +19,18 @@ const options = {
     export class AnalyticsStore extends Store {
       testSeed(day) { this.ctx.storage.sql.exec("INSERT INTO analytics_daily VALUES (?, '0.0.1', 'other', 'other', '{\\"launch\\":1}', 1)", day); }
       testBudget() { this.ctx.storage.sql.exec("INSERT INTO analytics_budget VALUES (1, ?, 20000) ON CONFLICT(id) DO UPDATE SET hour = excluded.hour, reports = excluded.reports", Math.floor(Date.now()/3600000)); }
+      testDailyBudget(day, reports) { this.ctx.storage.sql.exec("INSERT INTO analytics_day_budget VALUES (1, ?, ?) ON CONFLICT(id) DO UPDATE SET day = excluded.day, reports = excluded.reports", day, reports); }
+      testClearHourly() { this.ctx.storage.sql.exec("DELETE FROM analytics_budget"); }
+      testResetDaily() { this.ctx.storage.sql.exec("DELETE FROM analytics_day_budget"); }
+      testReadDaily() { return this.ctx.storage.sql.exec("SELECT reports FROM analytics_day_budget WHERE id = 1").one().reports; }
+      testQualitySeed(day) { this.ctx.storage.sql.exec("INSERT INTO quality_daily VALUES (?, '0.0.1', 'other', 'other', '{}', '{}', 5)", day); }
       testAlarm() { return this.ctx.storage.getAlarm(); }
       testRunAlarm() { return this.alarm(); }
     }
-  ` }, ...["worker.mjs", "policy.mjs", "bootstrap.mjs", "analytics.mjs", "store-badges.mjs"].map(name => ({ type: "ESModule", path: fileURLToPath(new URL(name, import.meta.url)) }))],
+  ` }, ...["worker.mjs", "policy.mjs", "bootstrap.mjs", "analytics.mjs", "quality-schema.mjs", "store-badges.mjs"].map(name => ({ type: "ESModule", path: fileURLToPath(new URL(name, import.meta.url)) }))],
   compatibilityDate: "2026-10-09",
   durableObjects: { RELEASE_FEED: { className: "ReleaseFeed", useSQLite: true }, ANALYTICS: { className: "AnalyticsStore", useSQLite: true } },
-  bindings: { ANALYTICS_READ_TOKEN: "test-read-secret-with-at-least-32-characters" },
+  bindings: { QUALITY_ANALYTICS_ENABLED: "true", ANALYTICS_READ_TOKEN: "test-read-secret-with-at-least-32-characters" },
   serviceBindings: { ASSETS: "assets-test" },
   outboundService: async request => {
     if (request.url === "https://addons.opera.com/en/search/?query=Fetchrail") return new Response("No search results for &#x27;Fetchrail&#x27;", { headers: { "Content-Type": "text/html" } });
@@ -66,7 +71,7 @@ try {
     { ...reportFixture, arch: "machine fingerprint" }, { ...reportFixture, version: "0.6.1-user-name" },
     { ...reportFixture, schema: 2 }, null, [], "not json",
   ]) assert.equal((await collect(data)).status, 400);
-  assert.equal((await collect(" ".repeat(2049))).status, 413);
+  assert.equal((await collect(" ".repeat(4097))).status, 413);
   assert.equal((await collect(reportFixture, { Cookie: "secret=value" })).status, 400);
   assert.equal((await collect(reportFixture, { Authorization: "Bearer credential" })).status, 400);
   assert.equal((await collect(reportFixture, {}, "/api/analytics?url=secret")).status, 400);
@@ -93,7 +98,42 @@ try {
   await store.testRunAlarm();
   analytics = await (await readAnalytics()).json();
   assert.equal(analytics.rows.length, 1, "Alarm removes expired aggregates even with no new reports");
-  for (let patch = 0; patch < 63; patch++) assert.equal((await collect({ ...reportFixture, version: `2.0.${patch}` })).status, 204);
+  const qualityFixture = JSON.parse(await readFile(new URL("../fixtures/quality-v2.json", import.meta.url), "utf8"));
+  for (const data of [
+    {...qualityFixture, purpose: "product-improvement-v1"}, {...qualityFixture, schema: 1},
+    {...qualityFixture, source: "signed-url-secret"}, {...qualityFixture, counters: {unknown_tag: 1}},
+    {...qualityFixture, histograms: {http_e2e_small_ms_v1: [1]}},
+    {...qualityFixture, histograms: {http_e2e_small_ms_v1: [0,0,0,0,0,0,0,-1]}},
+    {...qualityFixture, histograms: {http_e2e_small_ms_v1: [0,0,0,0,0,0,0,1.1]}},
+    {...qualityFixture, histograms: {http_e2e_small_ms_v1: [0,0,0,0,0,0,0,1001]}},
+    {...qualityFixture, histograms: {http_e2e_small_ms_v1: Array(8).fill(0)}},
+    {...qualityFixture, version: "01.2.3"}, {...qualityFixture, arch: "private-cpu"},
+  ]) assert.equal((await collect(data)).status, 400, "v2 rejects poisoned fields and invalid histograms");
+  assert.equal((await collect(qualityFixture, {"Content-Encoding": "gzip"})).status, 400);
+  for (let i = 0; i < 4; i++) assert.equal((await collect(qualityFixture)).status, 204);
+  analytics = await (await readAnalytics()).json();
+  assert.equal(analytics.quality.rows.length, 0, "Rare groups do not leave protected readout");
+  assert.equal(analytics.quality.suppressedGroups, 1);
+  assert.equal((await collect(qualityFixture)).status, 204);
+  analytics = await (await readAnalytics()).json();
+  assert.equal(analytics.quality.rows[0].counters.http_verified_durable, 5);
+  assert.deepEqual(analytics.quality.rows[0].histograms.http_e2e_small_ms_v1, [0,0,5,0,0,0,0,0]);
+  assert.equal(analytics.rows[0].counters.http_verified_durable, undefined, "v1 and v2 never merge semantics");
+  assert.ok(!JSON.stringify(analytics).includes("signed-url-secret"));
+  await store.testQualitySeed(oldDay); await store.testRunAlarm();
+  assert.equal((await (await readAnalytics()).json()).quality.rows.length, 1);
+  const day = new Date().toISOString().slice(0, 10);
+  await store.testResetDaily();
+  assert.equal((await collect(reportFixture)).status, 204);
+  assert.equal(await store.testReadDaily(), 9, "First upgrade recovers 3 v1 + 5 v2 prior accepted reports before adding this batch");
+  await store.testDailyBudget(day, 20000); await store.testClearHourly();
+  assert.equal((await collect(reportFixture)).status, 429, "Shared daily ceiling blocks v1 after hourly rollover");
+  assert.equal((await collect(qualityFixture)).status, 429, "Same daily budget applies to v2");
+  assert.equal((await get("/api/updates/latest")).status, 200, "Telemetry exhaustion leaves updates available");
+  await store.testDailyBudget(oldDay, 20000);
+  assert.equal((await collect(qualityFixture)).status, 204, "UTC-day rollover resets the daily budget");
+  await store.testDailyBudget(day, 0);
+  for (let patch = 0; patch < 62; patch++) assert.equal((await collect({ ...reportFixture, version: `2.0.${patch}` })).status, 204);
   assert.equal((await collect({ ...reportFixture, version: "3.0.0" })).status, 429, "Daily dimension cap bounds forged version cardinality");
   await store.testBudget();
   assert.equal((await collect(reportFixture)).status, 429, "Shared hourly ceiling needs no IP address or identifier");
@@ -161,7 +201,7 @@ try {
   await (await worker.getCaches()).default.delete("https://fetchrail.rrmtools.uk/api/updates/latest");
   assert.equal((await (await get("/api/updates/latest")).json()).version, "1.2.5", "SQLite feed survives restart and concurrent notifications retain the newest release");
   analytics = await (await readAnalytics()).json();
-  assert.equal(analytics.rows.length, 64, "Aggregate totals survive SQLite restart");
+  assert.equal(analytics.rows.length, 63, "Aggregate totals survive SQLite restart");
   const release = await (await get("/api/releases/latest")).json();
   assert.equal(release.tag_name, "v1.2.5");
   assert.ok(release.assets.some(asset => asset.name === "Fetchrail-v1.2.5-linux-arm64.AppImage"));
@@ -171,5 +211,6 @@ try {
     { name: "assets-test", modules: [{ type: "ESModule", path: fileURLToPath(new URL("test-assets.mjs", import.meta.url)) }] },
   ] }));
   assert.equal((await readAnalytics()).status, 401, "Missing read secret fails closed even with a supplied token");
+  assert.equal((await collect(qualityFixture)).status, 503, "Unconfigured v2 release gate rejects an otherwise valid report");
   console.log("PASS: real Workers runtime verifies strict private analytics schema, auth, aggregation, retention alarm, cardinality/volume caps and persistence; OIDC publication, immutable replay, checksum mismatch, concurrent rollback protection, caching/ETag and static routing.");
 } finally { await worker.dispose(); await rm(directory, { recursive: true, force: true }); }
