@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { qualitySummary } from "./quality-report.mjs";
 import { BOUNDS_MS, percentile } from "../update-service/quality-schema.mjs";
+import { randomUUID } from "node:crypto";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 assert.deepEqual(BOUNDS_MS, [10,100,1000,10000,60000,300000,1800000]);
@@ -22,7 +23,10 @@ assert.equal(mixed.releases.length,3,"Platform mixes must not manufacture a rele
 assert.ok(mixed.releases.every(row=>row.distributions.http_e2e_large_ms_v1.p95.upperBoundMs===null));
 assert.equal(mixed.releases[0].protocols[0].failed,0);
 assert.equal(qualitySummary({schema: 1}), null);
-for (const origin of ["https://example.invalid", "http://fetchrail.rrmtools.uk", "https://fetchrail.rrmtools.uk:444", "https://fetchrail.rrmtools.uk/?token=private", "https://operator:private@fetchrail.rrmtools.uk", "file://localhost/"]) {
+const credentialOrigin = new URL("https://fetchrail.rrmtools.uk");
+credentialOrigin.username = "fixture";
+credentialOrigin.password = randomUUID();
+for (const origin of ["https://example.invalid", "http://fetchrail.rrmtools.uk", "https://fetchrail.rrmtools.uk:444", "https://fetchrail.rrmtools.uk/?token=private", credentialOrigin.href, "file://localhost/"]) {
   const result=spawnSync(process.execPath,[fileURLToPath(new URL("./read-analytics.mjs",import.meta.url))],{encoding:"utf8",timeout:10000,env:{...process.env,FETCHRAIL_ANALYTICS_READ_TOKEN:"private-test-token-with-at-least-32-characters",FETCHRAIL_ANALYTICS_URL:origin}});
   assert.notEqual(result.status,0);assert.match(result.stderr,/canonical Fetchrail origin/);
   assert.ok(!(result.stdout+result.stderr).includes("private-test-token-with-at-least-32-characters"));
