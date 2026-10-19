@@ -6,7 +6,7 @@ use tokio_util::sync::CancellationToken;
 pub const PURPOSE: &str = "product-quality-v2";
 // Requires the documented legal/configuration review and a separately authorized release.
 pub const REMOTE_RELEASE_APPROVED: bool = false;
-pub const NOTICE_REVISION: &str = "reliability-draft-20261016";
+pub const NOTICE_REVISION: &str = "reliability-draft-20261019";
 pub const BOUNDS_MS: [u64; 7] = [10, 100, 1000, 10_000, 60_000, 300_000, 1_800_000];
 const MAX: u32 = 1000;
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]

@@ -1,0 +1,32 @@
+# Full analytics release preparation — 19 October 2026
+
+The owner requires a full analytics release and explicitly rejected publishing the application with expanded cloud analytics disabled. MFA enrollment is deferred until later. Neither this document nor that deferral establishes regulatory certification or acceptance of unfinished production checks.
+
+## Publication state
+
+The attempted staged v0.8.1 publication was a scope error. Workflow [39187074995](https://github.com/Beelzebub2/fetchrail/actions/runs/39187074995) completed as cancelled, including publication and updater announcement. The release API returned no v0.8.1 release. Its existing annotated tag is preserved; the next full candidate is **0.8.2**. PR #59 restored the full release scope and passed GitGuardian. No PR was left open by that correction.
+
+Native delivery remains gated off, with a draft notice revision; the production Worker has no v2 enable flag. Candidate versions and release notes are preparation, not publication. Before enabling delivery, change the notice revision together with the release gate so no saved draft choice silently becomes permission to send.
+
+## Verified implementation increments
+
+* `743d51a`: Privacy obtains the current notice and delivery status from the native application. An old v2 grant is displayed as expired rather than on, and loading it does not silently save a new choice. The existing independent v1 choice remains intact. Frontend build and actual Privacy UI regression pass. All five native quality tests pass, including old-notice rejection, scope epochs, no backfill, first-outcome counting, pre-admission exclusion and bounded serialization. These focused checks preceded the 0.8.2 version/notice-only preparation; final candidate qualification is separate.
+* `9a3a36c`: analytics intake uses Cloudflare's per-location rate binding before reading report bodies. Both purposes share the burst allowance; missing protection fails closed. IP-derived provider keys are never copied into application aggregates, receipts or logs. Runtime tests prove burst rejection, separate key allowance, no key in protected output, missing-binding rejection and continued updater operation. The full update-service suite passes.
+
+## Actual Cloudflare qualification
+
+An independent Worker, `fetchrail-reliability-rate-check-20261019`, used its own SQLite namespace `a515fd9ddca64ae18354bd2cc128243a`, a separate rate namespace and an ephemeral random read credential. It had no production analytics/feed/assets binding and observability was disabled. Analytics source SHA-256: `0EB7A3EE26E92240E0E2B17747167599719F8876071ECD8D2EA18E6B4EFB83F6`.
+
+Actual requests proved missing/incorrect read authorization returns 401, four batches stay suppressed and the fifth becomes visible, and protected responses have `no-store` and no permissive CORS. After six setup batches, a 60-request burst accepted 15 and rejected 45. The provider limit is approximate and local to a Cloudflare location; this is not a strict global 20-request proof. Protected reads and the independent health route remained available. The signed updater was exercised separately in the full runtime tests; this temporary Worker did not implement that route.
+
+The temporary Worker and its implemented namespace were then deleted. Cloudflare confirmed the namespace was absent and both production namespace identities were still present. Detailed synthetic evidence is ignored at `artifacts/reliability/provider-rate-qualification.json`. The new limiter does not change the SQL aggregation path qualified on 18 October and does not cap Worker invocation billing or defeat every distributed attack. It also does not bypass or modify the zone's existing GitHub Actions skip rule.
+
+Production settings were read successfully: existing analytics and release-feed namespaces, protected read secret, assets and disabled invocation logs/traces remain present. Billing/subscription inspection was denied, but account-wide aggregate Worker request/error metrics were available through GraphQL. Adaptive metrics are not a billing guarantee; private production traffic totals are not published in this record. Continue budgeting conservatively against the documented Free allowances and account-wide workloads.
+
+## Legal and deployment findings
+
+Cloudflare's [self-serve agreement](https://www.cloudflare.com/terms/), section 6.1, incorporates its DPA where applicable personal data is processed; the agreement states acceptance can arise through using the service. A separate DPA signature is therefore not automatically required for the standard self-serve arrangement. This corrects an overly broad earlier signature/approval assumption. It does not prove the content of a different bespoke agreement, the controller's transfer assessment or every account entitlement. The live [DPA 6.4](https://www.cloudflare.com/cloudflare-customer-dpa/) covers processor duties and restricted-transfer SCCs. Its DPF representations are not an independently verified registry check by this project.
+
+[GDPR Article 32](https://eur-lex.europa.eu/eli/reg/2016/679/oj/eng#art_32) requires security appropriate to the risk, not universal MFA as a condition of publishing software. The owner has deferred administrator enrollment; do not mark it completed, enable enforcement before enrollment/recovery, or present it as the sole technical barrier. Keep the owner's chosen RRMTools designation and contact rather than repeatedly requesting the same naming decision. Processing/transparency, audience/necessity and transfer decisions must be recorded against actual behavior, without inventing a registered-company status, mandatory external lawyer or EU-only hosting rule.
+
+The full production rollout is still unfinished: updated receiver and disclosures, final current-notice delivery activation, an explicitly opted-in native-client production canary and final distribution qualification remain. The existing 21 GiB trials establish integrity, not the provisional 1% throughput / 2% latency overhead target; that uncertainty remains explicit. Do not claim these checks completed or publish another disabled partial release as a substitute.
