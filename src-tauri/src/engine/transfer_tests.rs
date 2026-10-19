@@ -175,7 +175,151 @@ fn task() -> Arc<DownloadTask> {
         "createdAt": Utc::now(), "finishedAt": null
     }))
     .unwrap();
-    Arc::new(DownloadTask::new(record, None, None))
+    Arc::new(DownloadTask::new(record, None, None, None))
+}
+
+#[tokio::test]
+async fn safe_transport_faults_observe_boundaries_without_inventing_dns_or_tls_causes() {
+    use crate::health::{Cause, Confidence, Health, Phase};
+    struct FailedDns;
+    impl reqwest::dns::Resolve for FailedDns {
+        fn resolve(&self, _: reqwest::dns::Name) -> reqwest::dns::Resolving {
+            Box::pin(async { Err(std::io::Error::from(std::io::ErrorKind::NotFound).into()) })
+        }
+    }
+    fn check(health: &Health, error: EngineError, cause: Cause, phase: Phase) {
+        assert_eq!(health.failed_phase(), Some(phase));
+        assert_eq!(
+            error.health_cause(health.failed_phase()),
+            cause,
+            "{error:?}"
+        );
+        health.cause(error.health_cause(health.failed_phase()));
+        let report = health.snapshot(false);
+        assert!(report
+            .causes
+            .iter()
+            .any(|&(actual, n)| actual == cause && n == 1));
+        assert!(matches!(report.diagnosis.confidence, Confidence::Observed));
+        assert!(report.durable_completed_ms.is_none());
+        assert!(!serde_json::to_string(&report).unwrap().contains("secret"));
+    }
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let refused = format!("http://{}/secret", listener.local_addr().unwrap());
+    drop(listener);
+    let client = download_client_builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .unwrap();
+    let health = Health::default();
+    let result = send_admitted(
+        &client,
+        client.get(refused),
+        &CancellationToken::new(),
+        Some(&health),
+        #[cfg(feature = "test-tools")]
+        None,
+    )
+    .await;
+    check(
+        &health,
+        result.err().unwrap(),
+        Cause::DnsOrConnect,
+        Phase::Headers,
+    );
+
+    let client = download_client_builder()
+        .no_proxy()
+        .dns_resolver(Arc::new(FailedDns))
+        .build()
+        .unwrap();
+    let health = Health::default();
+    let result = send_admitted(
+        &client,
+        client.get("http://secret.invalid/"),
+        &CancellationToken::new(),
+        Some(&health),
+        #[cfg(feature = "test-tools")]
+        None,
+    )
+    .await;
+    check(
+        &health,
+        result.err().unwrap(),
+        Cause::DnsOrConnect,
+        Phase::Headers,
+    );
+
+    let tls = TestServer::new(1024, "h2-reset-always");
+    let health = Health::default();
+    let client = download_client_builder().no_proxy().build().unwrap();
+    let result = send_admitted(
+        &client,
+        client.head(tls.url.clone()),
+        &CancellationToken::new(),
+        Some(&health),
+        #[cfg(feature = "test-tools")]
+        None,
+    )
+    .await;
+    check(
+        &health,
+        result.err().unwrap(),
+        Cause::DnsOrConnect,
+        Phase::Headers,
+    );
+
+    let body = TestServer::new(1024 * 1024, "weak");
+    let client = download_client_builder()
+        .no_proxy()
+        .read_timeout(Duration::from_millis(100))
+        .build()
+        .unwrap();
+    let health = Health::default();
+    let (response, _origin, _global) = send_admitted(
+        &client,
+        client.get(body.url.clone()),
+        &CancellationToken::new(),
+        Some(&health),
+        #[cfg(feature = "test-tools")]
+        None,
+    )
+    .await
+    .unwrap();
+    let result = {
+        let span = health.guard(Phase::Body);
+        let result = response.bytes().await.map_err(EngineError::from);
+        span.observe(&result);
+        result
+    };
+    check(&health, result.unwrap_err(), Cause::Timeout, Phase::Body);
+    let body = TestServer::new(1024 * 1024, "weak");
+    let task = task();
+    let (dir, segments, probe) = parts(1024 * 1024, 1).await;
+    DownloadManager::download_ranges(
+        &client,
+        &RateLimiter::new(0),
+        &task,
+        &CancellationToken::new(),
+        &body.url,
+        &dir,
+        &segments,
+        &probe,
+    )
+    .await
+    .unwrap();
+    let report = task.health.snapshot(false);
+    assert!(
+        report
+            .events
+            .iter()
+            .any(|event| event.cause == Some(Cause::Timeout) && event.phase == Some(Phase::Body)),
+        "The real nested body stream must retain the failed boundary before recovery"
+    );
+    assert!(report.durable_completed_ms.is_none());
+    verify_parts(&dir, &segments).await;
+    fs::remove_dir_all(dir).await.unwrap();
 }
 
 async fn parts(total: u64, connections: usize) -> (PathBuf, Segments, ProbeResult) {
@@ -762,10 +906,12 @@ async fn transient_failures_retry_only_the_failed_range() {
     for mode in ["retry", "drop", "short"] {
         let server = TestServer::new(total, mode);
         let (dir, segments, probe) = parts(total, 4).await;
+        let job = task();
+        job.health.accepted();
         DownloadManager::download_ranges(
             &client,
             &limiter,
-            &task(),
+            &job,
             &CancellationToken::new(),
             &server.url,
             &dir,
@@ -774,6 +920,32 @@ async fn transient_failures_retry_only_the_failed_range() {
         )
         .await
         .unwrap();
+        // Evidence exists before any UI inspection, even with both remote grants absent.
+        let report = job.health.snapshot(false);
+        assert!(job.analytics_sample.lock().unwrap().is_none());
+        assert!(job.quality_sample.lock().unwrap().is_none());
+        assert!(report.causes.iter().any(|(cause, n)| *n > 0
+            && *cause
+                == if mode == "retry" {
+                    crate::health::Cause::Http503
+                } else {
+                    crate::health::Cause::BodyIncomplete
+                }));
+        assert!(report.received_wire_bytes >= total);
+        assert!(report
+            .stages
+            .iter()
+            .any(|s| s.phase == crate::health::Phase::Headers));
+        assert!(report
+            .stages
+            .iter()
+            .any(|s| s.phase == crate::health::Phase::Retry));
+        assert!(
+            report.durable_completed_ms.is_none(),
+            "Receiving all parts does not prove catalog completion"
+        );
+        let safe = serde_json::to_string(&report).unwrap();
+        assert!(!safe.contains("127.0.0.1") && !safe.contains("file.bin"));
         verify_parts(&dir, &segments).await;
         let requests = server.requests.lock().unwrap().clone();
         for segment in segments.iter().skip(1) {
@@ -819,7 +991,17 @@ async fn changed_or_encoded_representations_are_rejected_before_writing() {
             &probe,
         )
         .await;
-        assert!(matches!(result, Err(EngineError::Message(_))));
+        if mode == "changed" {
+            assert!(matches!(
+                result,
+                Err(EngineError::Observed(
+                    crate::health::Cause::SourceChanged,
+                    _
+                ))
+            ));
+        } else {
+            assert!(matches!(result, Err(EngineError::Message(_))));
+        }
         assert!(
             !dir.join("0.part").exists(),
             "Unverified bytes must not enter the resume file"
@@ -843,6 +1025,7 @@ async fn redirect_credentials_are_origin_scoped_and_loops_fail_boundedly() {
         &client,
         request,
         &CancellationToken::new(),
+        None,
         #[cfg(feature = "test-tools")]
         None,
     )
@@ -856,6 +1039,7 @@ async fn redirect_credentials_are_origin_scoped_and_loops_fail_boundedly() {
         &client,
         client.get(looping.url.clone()),
         &CancellationToken::new(),
+        None,
         #[cfg(feature = "test-tools")]
         None,
     )
@@ -1384,7 +1568,10 @@ async fn ignored_and_invalid_ranges_stop_all_connections() {
         if mode == "ignore" {
             assert!(matches!(result, Err(EngineError::RangeUnsupported)));
         } else {
-            assert!(matches!(result, Err(EngineError::Message(_))));
+            assert!(matches!(
+                result,
+                Err(EngineError::Observed(crate::health::Cause::RangeInvalid, _))
+            ));
         }
         assert!(segments
             .iter()

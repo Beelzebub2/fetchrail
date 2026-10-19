@@ -304,6 +304,28 @@ mod audit_tests {
         .expect(
             "A missing known-good checkpoint must be recreated, never accepted as not-modified",
         );
+        let observation = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let poll = engine.call(json!({"op":"poll"})).await.unwrap();
+                if let Some(state) = poll["states"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|state| state["id"] == id.to_string())
+                {
+                    break serde_json::from_value::<crate::health::TorrentHealth>(
+                        state["health"].clone(),
+                    )
+                    .unwrap();
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(observation.checkpoint_errors >= 1);
+        let safe = serde_json::to_string(&observation).unwrap();
+        assert!(!safe.contains("127.0.0.1") && !safe.contains("fixture.torrent"));
         engine.call(json!({"op":"remove", "id":id})).await.unwrap();
         engine.call(json!({"op":"clean"})).await.unwrap();
         drop(engine);

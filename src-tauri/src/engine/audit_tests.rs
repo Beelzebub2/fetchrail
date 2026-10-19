@@ -1,5 +1,38 @@
 use super::*;
 
+#[tokio::test]
+async fn safe_health_observes_real_catalog_failure_and_hash_mismatch_without_source_text() {
+    let root = std::env::temp_dir().join(format!("fetchrail-health-fault-{}", Uuid::new_v4()));
+    fs::create_dir_all(&root).await.unwrap();
+    let blocked = root.join("blocked");
+    fs::write(&blocked, b"preserved").await.unwrap();
+    let health = crate::health::Health::default();
+    health.accepted();
+    let result = {
+        let span = health.guard(crate::health::Phase::Catalog);
+        let result = write_json_atomic(&blocked.join("catalog.json"), &vec![1u8]).await;
+        span.observe(&result);
+        result
+    };
+    let error = result.unwrap_err();
+    health.cause(error.health_cause(health.failed_phase()));
+    let report = health.snapshot(false);
+    assert!(report
+        .causes
+        .iter()
+        .any(|(cause, n)| *cause == crate::health::Cause::Catalog && *n == 1));
+    assert!(report.durable_completed_ms.is_none());
+    let path = root.join("signed-source-secret.bin");
+    fs::write(&path, b"payload").await.unwrap();
+    let error = verify_file_hash(&path, &"0".repeat(64), &CancellationToken::new()).unwrap_err();
+    health.cause(error.health_cause(None));
+    let json = serde_json::to_string(&health.snapshot(false)).unwrap();
+    assert!(json.contains("integrity"));
+    assert!(!json.contains("signed-source-secret"));
+    assert_eq!(fs::read(blocked).await.unwrap(), b"preserved");
+    fs::remove_dir_all(root).await.unwrap();
+}
+
 #[test]
 fn initial_checkpoints_spread_without_extending_the_recovery_window() {
     for workers in 1..=32 {
@@ -68,6 +101,8 @@ fn scan_overlap_observes_provider_changes_without_blocking_remediation() {
         "truncate",
         "delete",
         "reject",
+        "slow",
+        "cancel",
     ] {
         std::fs::write(&path, &bytes).unwrap();
         std::fs::OpenOptions::new()
@@ -79,6 +114,8 @@ fn scan_overlap_observes_provider_changes_without_blocking_remediation() {
         let (identity, total, inspected) = open_publication_file(&path).unwrap();
         drop(inspected);
         let trace = Arc::new(trace::Trace::default());
+        let health = crate::health::Health::default();
+        let cancel = CancellationToken::new();
         let result = verify_during_attachment(
             &path,
             &identity,
@@ -86,10 +123,13 @@ fn scan_overlap_observes_provider_changes_without_blocking_remediation() {
             b"",
             None,
             Some(&expected),
-            &CancellationToken::new(),
+            &cancel,
+            Some(&health),
             Some(trace.clone()),
             || {
                 match action {
+                    "slow" => std::thread::sleep(Duration::from_millis(120)),
+                    "cancel" => cancel.cancel(),
                     "ads" => std::fs::write(
                         format!("{}:Zone.Identifier", path.display()),
                         b"[ZoneTransfer]\r\nZoneId=3\r\n",
@@ -116,7 +156,24 @@ fn scan_overlap_observes_provider_changes_without_blocking_remediation() {
                 Ok(())
             },
         );
-        if ["unchanged", "ads", "restore"].contains(&action) {
+        let report = health.snapshot(false);
+        assert!(
+            report.durable_completed_ms.is_none(),
+            "Verification alone cannot acknowledge catalog durability"
+        );
+        assert!(report
+            .stages
+            .iter()
+            .any(|stage| stage.phase == crate::health::Phase::Attachment));
+        if action == "slow" {
+            assert!(report.stages.iter().any(|stage| stage.phase
+                == crate::health::Phase::Attachment
+                && stage.max_ms >= 100));
+        }
+        if action == "cancel" {
+            assert!(matches!(&result, Err(EngineError::Cancelled)));
+        }
+        if ["unchanged", "ads", "restore", "slow"].contains(&action) {
             let proof = result
                 .unwrap()
                 .expect("Local NTFS test must grant observation");
@@ -780,9 +837,16 @@ async fn benchmark_synthetic_windows_attachment_and_publish() {
     } else {
         format!("http://127.0.0.1/{filename}")
     };
-    crate::platform::mark_download(&staging, &source, &filename, true, Some(trace.clone()))
-        .await
-        .unwrap();
+    crate::platform::mark_download(
+        &staging,
+        &source,
+        &filename,
+        true,
+        None,
+        Some(trace.clone()),
+    )
+    .await
+    .unwrap();
     let attachment_ms = scan_started.elapsed().as_millis();
     let (_, actual, protected) =
         open_publication_file_with_access(&staging, PublicationAccess::Publish).unwrap();
@@ -795,6 +859,7 @@ async fn benchmark_synthetic_windows_attachment_and_publish() {
         &protected,
         &staging,
         &target,
+        None,
         Some(trace.as_ref()),
     )
     .unwrap();
@@ -827,6 +892,7 @@ async fn optional_attachment_check_still_marks_internet_origin() {
         "https://example.com/safe-test.bin",
         "safe-test.bin",
         false,
+        None,
         #[cfg(feature = "test-tools")]
         None,
     )
@@ -956,6 +1022,7 @@ async fn post_attachment_verification_rejects_mutations_and_keeps_provenance() {
                         &verified.file,
                         &temp,
                         &output,
+                        None,
                         #[cfg(feature = "test-tools")]
                         None,
                     )
@@ -966,6 +1033,7 @@ async fn post_attachment_verification_rejects_mutations_and_keeps_provenance() {
                         &verified.file,
                         &temp,
                         &output,
+                        None,
                         #[cfg(feature = "test-tools")]
                         None,
                     )

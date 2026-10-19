@@ -47,7 +47,20 @@ try{
   assert.equal(peak,1,'Configured simultaneous reception limit was exceeded');
   for(const row of done){assert.equal(createHash('sha256').update(await readFile(row.destination)).digest('hex'),expected);assert.match(await readFile(row.destination+':Zone.Identifier','utf8'),/ZoneId=3/);assert.equal(row.testTrace.spans.attachmentPin?.calls??0,0,'Test must use ordinary post-scan protection');}
   for(const name of ['downloads.json','downloads.json.backup']){const rows=parseStateSnapshot(await readFile(join(fixture.stateDir,name)));for(const id of ids){assert(rows.some(row=>row.id===id&&row.status==='completed'&&row.downloadedBytes===data.length));}}
-  verified=true;console.log(JSON.stringify({slotReusedBeforeFinalization:true,boundedOverlap:true,receivingPeak:peak,configuredLimit:1,bytesVerified:true,motw:true,bothCatalogs:true,prepinDisabled:true}));
+  const finalizing=await invoke('add_download',{request:{url:`http://127.0.0.1:${server.address().port}/finalization-controls.bin`,fileName:'finalization-controls.bin',directory:join(fixture.root,'output'),connections:1,expectedSha256:expected}});
+  await until(async()=>{const row=await invoke('get_download',{id:finalizing.id});return row.status==='merging'&&row.mergedBytes===data.length;},'Control fixture did not reach the pre-publication finalization delay');
+  const health=await invoke('download_health',{id:finalizing.id});
+  assert.equal(health.durableCompletedMs,null);
+  assert(health.stages.some(stage=>stage.phase==='assembly'&&stage.calls>0));
+  assert(!health.stages.some(stage=>stage.phase==='publish'&&stage.calls>0),'Pre-publication evidence cannot claim publication');
+  await assert.rejects(readFile(finalizing.destination),{code:'ENOENT'});
+  await assert.rejects(invoke('pause_download',{id:finalizing.id}),/cannot be paused/);
+  await assert.rejects(invoke('cancel_download',{id:finalizing.id}),/complete or being finalized/);
+  assert.equal(await invoke('quality_preview'),null,'Finalization evidence works without analytics');
+  const recovered=await until(async()=>{const row=await invoke('get_download',{id:finalizing.id});return row.status==='completed'&&row.testTrace?.catalogAcknowledged&&row;},'Guarded finalization did not complete safely');
+  assert.equal(createHash('sha256').update(await readFile(recovered.destination)).digest('hex'),expected);
+  assert((await invoke('download_health',{id:finalizing.id})).durableCompletedMs!==null);
+  verified=true;console.log(JSON.stringify({slotReusedBeforeFinalization:true,boundedOverlap:true,receivingPeak:peak,configuredLimit:1,bytesVerified:true,motw:true,bothCatalogs:true,prepinDisabled:true,finalizationControlsGuarded:true,noEarlyDurableCompletion:true}));
 }finally{
   if(browser)await browser.close();
   if(app){const stop=spawn(exe,['--quit'],{windowsHide:true,env:fixture.env,stdio:'ignore'});await new Promise(done=>stop.once('exit',done));const timer=new AbortController();try{await Promise.race([closed,delay(40000,undefined,{signal:timer.signal}).then(()=>{throw Error('Isolated preview did not quit');})]);}finally{timer.abort();}}

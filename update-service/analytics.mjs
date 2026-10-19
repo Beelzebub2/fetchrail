@@ -1,5 +1,6 @@
 import { DurableObject } from "cloudflare:workers";
 import { FeedError, readJson } from "./policy.mjs";
+import { validQuality } from "./quality-schema.mjs";
 
 export const METRICS = Object.freeze([
   "launch", "http_added", "torrent_added", "http_completed", "torrent_completed",
@@ -11,6 +12,11 @@ export const DIAGNOSTIC_METRICS = Object.freeze(["cpu", "drive", "memory", "netw
 const keys = (value, allowed) => value && typeof value === "object" && !Array.isArray(value)
   && Object.keys(value).every(key => allowed.includes(key));
 export function validateReport(report) {
+  if (report?.schema === 2) {
+    if (!validQuality(report) || typeof report.version !== "string" || !/^(0|[1-9]\d{0,2})\.(0|[1-9]\d{0,2})\.(0|[1-9]\d{0,2})$/.test(report.version)
+      || !["windows", "linux", "other"].includes(report.os) || !["x64", "arm64", "other"].includes(report.arch)) throw new FeedError(400, "Invalid reliability report.");
+    return report;
+  }
   const diagnostic = report?.purpose === "diagnostics-summary-v1";
   if (!keys(report, diagnostic ? ["schema", "purpose", "version", "os", "arch", "counters"] : ["schema", "version", "os", "arch", "counters"])
     || Object.keys(report).length !== (diagnostic ? 6 : 5) || report.schema !== 1
@@ -30,40 +36,67 @@ export class AnalyticsStore extends DurableObject {
   constructor(ctx, env) {
     super(ctx, env);
     this.ctx.storage.sql.exec("CREATE TABLE IF NOT EXISTS analytics_daily (day TEXT, version TEXT, os TEXT, arch TEXT, counters TEXT NOT NULL, reports INTEGER NOT NULL, PRIMARY KEY(day, version, os, arch))");
+    this.ctx.storage.sql.exec("CREATE TABLE IF NOT EXISTS quality_daily (day TEXT, version TEXT, os TEXT, arch TEXT, counters TEXT NOT NULL, histograms TEXT NOT NULL, reports INTEGER NOT NULL, PRIMARY KEY(day, version, os, arch))");
+    this.ctx.storage.sql.exec("CREATE TABLE IF NOT EXISTS analytics_day_budget (id INTEGER PRIMARY KEY, day TEXT NOT NULL, reports INTEGER NOT NULL)");
     this.ctx.storage.sql.exec("CREATE TABLE IF NOT EXISTS analytics_budget (id INTEGER PRIMARY KEY, hour INTEGER NOT NULL, reports INTEGER NOT NULL)");
   }
   prune(now = Date.now()) {
     this.ctx.storage.sql.exec("DELETE FROM analytics_daily WHERE day < ?", cutoffOf(now));
+    this.ctx.storage.sql.exec("DELETE FROM quality_daily WHERE day < ?", cutoffOf(now));
   }
   async collect(input) {
     const report = validateReport(input), now = Date.now(), day = dayOf(now), hour = Math.floor(now / 3600000);
-    this.prune(now);
-    // A shared hourly ceiling and daily dimension cap bound storage without tracking IPs.
-    // ponytail: one coordinator caps this small workload at 20k reports/hour; shard fixed platforms if volume requires it.
-    const budget = this.ctx.storage.sql.exec("SELECT hour, reports FROM analytics_budget WHERE id = 1").toArray()[0];
-    if (budget?.hour === hour && budget.reports >= 20000) return false;
-    const dimensions = [day, report.version, report.os, report.arch];
-    const prior = this.ctx.storage.sql.exec("SELECT counters, reports FROM analytics_daily WHERE day = ? AND version = ? AND os = ? AND arch = ?", ...dimensions).toArray()[0];
-    if (!prior && this.ctx.storage.sql.exec("SELECT COUNT(*) AS count FROM analytics_daily WHERE day = ?", day).one().count >= 64) return false;
-    const counters = prior ? JSON.parse(prior.counters) : {};
-    for (const [metric, count] of Object.entries(report.counters)) counters[metric] = (counters[metric] ?? 0) + count;
-    // No await between related SQLite statements, so admission and aggregation cannot race.
-    this.ctx.storage.sql.exec("INSERT INTO analytics_daily VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(day, version, os, arch) DO UPDATE SET counters = excluded.counters, reports = excluded.reports", ...dimensions, JSON.stringify(counters), (prior?.reports ?? 0) + 1);
-    this.ctx.storage.sql.exec("INSERT INTO analytics_budget VALUES (1, ?, ?) ON CONFLICT(id) DO UPDATE SET hour = excluded.hour, reports = excluded.reports", hour, budget?.hour === hour ? budget.reports + 1 : 1);
-    if (await this.ctx.storage.getAlarm() === null) await this.ctx.storage.setAlarm(now + 3600000);
-    return true;
+    const accepted = this.ctx.storage.transactionSync(() => {
+      this.prune(now);
+      // One coordinator and shared UTC-day budget across v1, diagnostics and v2. No caller identity.
+      const budget = this.ctx.storage.sql.exec("SELECT hour, reports FROM analytics_budget WHERE id = 1").toArray()[0];
+      const daily = this.ctx.storage.sql.exec("SELECT day, reports FROM analytics_day_budget WHERE id = 1").toArray()[0];
+      // Preserve today's already accepted v1 volume on first upgrade or budget recovery.
+      const dailyReports = daily?.day === day ? daily.reports : this.ctx.storage.sql.exec("SELECT COALESCE((SELECT SUM(reports) FROM analytics_daily WHERE day = ?), 0) + COALESCE((SELECT SUM(reports) FROM quality_daily WHERE day = ?), 0) AS reports", day, day).one().reports;
+      if ((budget?.hour === hour && budget.reports >= 2000) || dailyReports >= 20000) return false;
+      const quality = report.schema === 2;
+      const dimensions = [day, report.version, report.os, report.arch];
+      const prior = this.ctx.storage.sql.exec(quality
+        ? "SELECT counters, histograms, reports FROM quality_daily WHERE day = ? AND version = ? AND os = ? AND arch = ?"
+        : "SELECT counters, reports FROM analytics_daily WHERE day = ? AND version = ? AND os = ? AND arch = ?", ...dimensions).toArray()[0];
+      if (!prior) {
+        const count = this.ctx.storage.sql.exec("SELECT (SELECT COUNT(*) FROM analytics_daily WHERE day = ?) + (SELECT COUNT(*) FROM quality_daily WHERE day = ?) AS count", day, day).one().count;
+        if (count >= 64) return false;
+      }
+      const counters = prior ? JSON.parse(prior.counters) : {};
+      for (const [metric, count] of Object.entries(report.counters)) counters[metric] = (counters[metric] ?? 0) + count;
+      if (quality) {
+        const histograms = prior ? JSON.parse(prior.histograms) : {};
+        for (const [key, bins] of Object.entries(report.histograms)) histograms[key] = bins.map((n, i) => (histograms[key]?.[i] ?? 0) + n);
+        this.ctx.storage.sql.exec("INSERT INTO quality_daily VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(day, version, os, arch) DO UPDATE SET counters = excluded.counters, histograms = excluded.histograms, reports = excluded.reports", ...dimensions, JSON.stringify(counters), JSON.stringify(histograms), (prior?.reports ?? 0) + 1);
+      } else {
+        this.ctx.storage.sql.exec("INSERT INTO analytics_daily VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(day, version, os, arch) DO UPDATE SET counters = excluded.counters, reports = excluded.reports", ...dimensions, JSON.stringify(counters), (prior?.reports ?? 0) + 1);
+      }
+      this.ctx.storage.sql.exec("INSERT INTO analytics_budget VALUES (1, ?, ?) ON CONFLICT(id) DO UPDATE SET hour = excluded.hour, reports = excluded.reports", hour, budget?.hour === hour ? budget.reports + 1 : 1);
+      this.ctx.storage.sql.exec("INSERT INTO analytics_day_budget VALUES (1, ?, ?) ON CONFLICT(id) DO UPDATE SET day = excluded.day, reports = excluded.reports", day, dailyReports + 1);
+      return true;
+    });
+    if (accepted && await this.ctx.storage.getAlarm() === null) await this.ctx.storage.setAlarm(now + 3600000);
+    return accepted;
   }
   report() {
     this.prune();
-    return { schema: 1, retentionDays: 30, rows: this.ctx.storage.sql.exec("SELECT day, version, os, arch, counters, reports FROM analytics_daily ORDER BY day DESC, version, os, arch").toArray()
-      .map(row => ({ ...row, counters: JSON.parse(row.counters) })) };
+    const qualityRows = this.ctx.storage.sql.exec("SELECT day, version, os, arch, counters, histograms, reports FROM quality_daily ORDER BY day DESC, version, os, arch").toArray();
+    return { schema: 1, retentionDays: 30,
+      rows: this.ctx.storage.sql.exec("SELECT day, version, os, arch, counters, reports FROM analytics_daily ORDER BY day DESC, version, os, arch").toArray().map(row => ({ ...row, counters: JSON.parse(row.counters) })),
+      quality: { schema: 2, purpose: "product-quality-v2", minimumReports: 5,
+        suppressedGroups: qualityRows.filter(row => row.reports < 5).length,
+        rows: qualityRows.filter(row => row.reports >= 5).map(row => ({ ...row, counters: JSON.parse(row.counters), histograms: JSON.parse(row.histograms) })),
+        limitations: ["reports are not people", "voluntary and incomplete observations", "anonymous callers can forge or replay reports", "worker stage times overlap", "clipped counters may undercount", "no external root-cause inference"],
+      } };
   }
   async alarm() {
     this.prune();
-    if (this.ctx.storage.sql.exec("SELECT COUNT(*) AS count FROM analytics_daily").one().count > 0) {
+    if (this.ctx.storage.sql.exec("SELECT (SELECT COUNT(*) FROM analytics_daily) + (SELECT COUNT(*) FROM quality_daily) AS count").one().count > 0) {
       await this.ctx.storage.setAlarm(Date.now() + 3600000);
     } else {
       this.ctx.storage.sql.exec("DELETE FROM analytics_budget");
+      this.ctx.storage.sql.exec("DELETE FROM analytics_day_budget");
     }
   }
 }
@@ -90,8 +123,11 @@ export async function analyticsApi(request, env) {
     }
     if (request.method !== "POST") return fail(405, "Use POST.");
     if (!/^application\/json(?:\s*;|$)/i.test(request.headers.get("content-type") ?? "")) return fail(415, "Use application/json.");
-    if (request.headers.has("authorization") || request.headers.has("content-encoding")) return fail(400, "Unexpected analytics request headers.");
-    const { data } = await readJson(new Response(request.body, { headers: request.headers }), 2048, 5000);
+    if (["authorization", "content-encoding", "referer", "origin", "proxy-authorization"].some(name => request.headers.has(name))) return fail(400, "Unexpected analytics request headers.");
+    const { data, bytes } = await readJson(new Response(request.body, { headers: request.headers }), 4096, 5000);
+    if (data?.schema !== 2 && bytes.length > 2048) return fail(413, "Analytics report too large.");
+    validateReport(data);
+    if (data?.schema === 2 && env.QUALITY_ANALYTICS_ENABLED !== "true") return fail(503, "Reliability collection is not released.");
     const accepted = await env.ANALYTICS.getByName("daily-v1").collect(validateReport(data));
     return accepted ? new Response(null, { status: 204, headers }) : fail(429, "Analytics capacity reached.");
   } catch (error) {
