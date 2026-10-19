@@ -76,7 +76,8 @@ async function stop(child) {
   child.stdin?.destroy(); child.stdout?.destroy(); child.stderr?.destroy();
 }
 try {
-  const trials = (ui ? [10,100,1000,10000] : [10,100,1000]).flatMap((history,i) => (i%2 ? [true,false] : [false,true]).map(enabled => [history,enabled,64*1024**2,!!baselineBin&&!enabled]));
+  // Reversing the existing order also balances each small pair across repeated invocations.
+  const trials = (ui ? [10,100,1000,10000] : [10,100,1000]).flatMap((history,i) => ((i+Number(largeOrder==="BAAB"))%2 ? [true,false] : [false,true]).map(enabled => [history,enabled,64*1024**2,!!baselineBin&&!enabled]));
   if (large) trials.push(...[...largeOrder].map(group => {const enabled=group==="B";return [1000,enabled,21*1024**3,!!baselineBin&&!enabled];}));
   for (const [historyCount, qualityEnabled, bytes, baseline = false] of trials) {
     total = bytes;
@@ -172,7 +173,7 @@ try {
       assert.equal(outputSha256,expected.digest("hex"));
       latencies.sort((a,b)=>a-b);
       uiSamples.sort((a,b)=>a-b);
-      const measurement={historyCount,qualityEnabled,baseline,bytes,sourceRateBps,receivedBodyBytes:report?.receivedWireBytes??trace.networkBytes,checkpointBytesWritten:report?.checkpointBytesWritten??trace.durableBytes,debugBuild:report?.debugBuild??null,durableMs:report?.durableCompletedMs??null,catalogAcknowledgedMs,requestToCatalogMs,traceSnapshotMs:trace.elapsedMs,receiveMs:trace.receivingElapsedMs,receivingMBps:bytes/trace.receivingElapsedMs/1000,observedWallMs,
+      const measurement={historyCount,qualityEnabled,baseline,bytes,sourceRateBps,pairOrder:largeOrder,startedUtcMs,receivedBodyBytes:report?.receivedWireBytes??trace.networkBytes,checkpointBytesWritten:report?.checkpointBytesWritten??trace.durableBytes,debugBuild:report?.debugBuild??null,durableMs:report?.durableCompletedMs??null,catalogAcknowledgedMs,requestToCatalogMs,traceSnapshotMs:trace.elapsedMs,receiveMs:trace.receivingElapsedMs,receivingMBps:bytes/trace.receivingElapsedMs/1000,observedWallMs,
         uiInputToPaintP95Ms:uiSamples.length?uiSamples[Math.ceil(uiSamples.length*.95)-1]:null,uiSamples:uiSamples.length,
         bridgeP95Ms:latencies[Math.min(latencies.length-1,Math.ceil(latencies.length*.95)-1)],bridgeSamples:latencies.length,
         cpuSeconds:after&&before?after.cpuSeconds-before.cpuSeconds:null,peakWorkingSetBytes:after?.peakWorkingSetBytes??null,privateBytes:after?.privateBytes??null,

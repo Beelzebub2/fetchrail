@@ -3,6 +3,8 @@ Last updated: 19 October 2026.
 
 Project maintainer: RRMTools, Portugal. Privacy contact: support.fetchrail@rrmtools.uk.
 
+RRMTools is the Fetchrail project operator responsible for optional desktop analytics (the data controller).
+
 Optional desktop analytics and per-run summary sharing rely on consent, withdrawable at any time without affecting earlier lawful processing. You may request access, correction, erasure, restriction or portability where applicable, or object where applicable, using the privacy contact. An unidentified contribution cannot be isolated after aggregation. You may complain to Portugal's data protection authority, CNPD (https://www.cnpd.pt/cidadaos/participacoes/), or your competent supervisory authority. See the complete policy for the processing details and local controls.
 Canonical policy: https://fetchrail.rrmtools.uk/privacy
 
@@ -63,7 +65,7 @@ For questions, email support.fetchrail@rrmtools.uk or visit https://github.com/B
 
 Desktop reliability diagnostics and separately scoped analytics
 
-For analytics intake abuse protection, Cloudflare uses a temporary IP-derived rate-limiting key. Fetchrail does not copy it into analytics tables, reports or application logs. This security processing is separate from optional product analytics. Provider network/security metadata follows Cloudflare's purpose, sensitivity, security and legal retention criteria at https://www.cloudflare.com/privacypolicy/, rather than Fetchrail's aggregate deletion schedule.
+For analytics intake abuse protection, Cloudflare uses a temporary IP-derived rate-limiting key. Fetchrail does not copy it into analytics tables, reports or application logs. This separate security processing relies on our legitimate interest in protecting service availability and security, rather than analytics consent; contact the privacy address to object where applicable. Provider network/security metadata follows Cloudflare's purpose, sensitivity, security and legal retention criteria at https://www.cloudflare.com/privacypolicy/, rather than Fetchrail's aggregate deletion schedule.
 
 Desktop version 0.8.2 introduces private local download health with bounded numeric stage/attempt timelines, HTTP body and checkpoint counters, fixed cause classes, broad software version/platform, and safe torrent observations. No source, filename/path, credential, tracker, peer address, infohash or arbitrary message enters a safe incident report. This does not add extension instrumentation or browser permissions. A separate per-incident preview and review choice is required to copy/export JSON; there is no automatic incident upload. Exported files remain until you delete them. Public GitHub issues are public; agree a private recipient and retention before sharing.
 

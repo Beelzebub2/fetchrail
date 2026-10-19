@@ -50,10 +50,12 @@ async function download(context){
  const health=await waitFor(async()=>{const report=await context.page.evaluate(id=>window.__TAURI_INTERNALS__.invoke("download_health",{id}),added.ids[0]);return report.durableCompletedMs!==null&&report;},"native catalog acknowledgement");
  assert.equal(health.outputVerifiedBytes,bytes);assert.ok(!JSON.stringify(health).includes(sentinel));
 }
-const started=Date.now();
+const executableSha256=await hashFile(join(bin,executableName("fetchrail"))),started=Date.now();
 try{
  const baseline=readReport();
- assert.equal(baseline.quality.rows.filter(row=>row.version===version).length,0,"Use an unreported candidate version for attributable canary counts");
+ const day=new Date().toISOString().slice(0,10);
+ const selectRow=report=>report.quality.rows.find(row=>row.day===day&&row.version===version&&row.os==="windows"&&row.arch==="x64");
+ const before=selectRow(baseline),expectedReports=(before?.reports??0)+5;
  for(let index=0;index<5;index++){
   const fixture=await createFixture("production-analytics-canary");const context={fixture};contexts.push(context);
   await writeFile(join(fixture.stateDir,"settings.json"),JSON.stringify({analyticsConsent:{enabled:false,decided:true,schema:1,purpose:"product-improvement-v1"},autoUpdate:false,localCrashHistory:false,defaultDownloadDir:fixture.root,maxConcurrentDownloads:1,connectionsPerDownload:4,minSegmentSizeMb:1,launchOnStart:false,performanceAuto:false,torrent:localTorrentConfig}));
@@ -86,17 +88,20 @@ try{
   console.log(`Canary ${index+1}/5: fresh native consent, no preconsent backfill, verified 32 MiB output.`);
  }
  let report,row;
- await waitFor(async()=>{report=readReport();row=report.quality.rows.find(row=>row.version===version&&row.os==="windows"&&row.arch==="x64");return row?.reports===5;},"five real native 30-minute batches",35*60*1000,30000);
- assert.equal(row.counters.http_accepted,5);assert.equal(row.counters.http_verified_durable,5);
+ await waitFor(async()=>{report=readReport();row=selectRow(report);return row?.reports===expectedReports;},"five additional real native 30-minute batches",35*60*1000,30000);
+ assert.equal(new Date().toISOString().slice(0,10),day,"Repeat a canary spanning a UTC receipt-day boundary");
+ assert.equal(row.counters.http_accepted-(before?.counters.http_accepted??0),5);assert.equal(row.counters.http_verified_durable-(before?.counters.http_verified_durable??0),5);
  assert.ok(!JSON.stringify(report).includes(sentinel));
  for(const context of contexts){
-  assert.equal(await context.page.evaluate(()=>window.__TAURI_INTERNALS__.invoke("quality_preview")),null);
+  const empty=await context.page.evaluate(()=>window.__TAURI_INTERNALS__.invoke("quality_preview"));
+  assert.deepEqual(empty.counters,{});assert.deepEqual(empty.histograms,{});
   await context.page.getByLabel("Allow optional download reliability analytics").click();
   await context.page.getByText("Reliability analytics is off.",{exact:true}).waitFor();
   await download(context);
   assert.equal(await context.page.evaluate(()=>window.__TAURI_INTERNALS__.invoke("quality_preview")),null);
  }
- const evidence={time:new Date().toISOString(),version,notice,executableSha256:await hashFile(join(bin,executableName("fetchrail"))),elapsedSeconds:(Date.now()-started)/1000,isolatedApps:5,nativeBatches:5,admitted:5,verifiedDurable:5,preconsentExcluded:true,withdrawalStopsCollection:true,v1RemainsDeclined:true,sentinelAbsent:true,limitations:["Synthetic loopback downloads on Windows, not real-user/WAN performance validation","No unique-user or population-rate inference","No 1% throughput or 2% p95 overhead proof"]};
+ assert.equal(await hashFile(join(bin,executableName("fetchrail"))),executableSha256,"Canary executable changed during qualification");
+ const evidence={time:new Date().toISOString(),version,notice,executableSha256,elapsedSeconds:(Date.now()-started)/1000,isolatedApps:5,nativeBatches:5,admitted:5,verifiedDurable:5,preconsentExcluded:true,withdrawalStopsCollection:true,v1RemainsDeclined:true,sentinelAbsent:true,limitations:["Synthetic loopback downloads on Windows, not real-user/WAN performance validation","No unique-user or population-rate inference","No 1% throughput or 2% p95 overhead proof"]};
  await mkdir("artifacts/reliability",{recursive:true});await writeFile("artifacts/reliability/production-native-canary.json",JSON.stringify(evidence,null,2));
  console.log(JSON.stringify(evidence));
 }finally{
