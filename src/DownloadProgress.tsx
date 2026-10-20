@@ -114,7 +114,7 @@ export function DownloadProgress({ id }: { id: string }) {
   const parts = item ? partsOf(item) : [];
   const complete = item?.status === "completed";
   const canPause = item && ["queued", "scheduled", "connecting", "downloading"].includes(item.status);
-  const canResume = item && ["paused", "failed", "cancelled"].includes(item.status);
+  const canResume = item && !(item.handoffId && !item.handoffCommitted) && ["paused", "failed", "cancelled"].includes(item.status);
   const canCancel = item && !["completed", "cancelled", "merging"].includes(item.status);
 
   if (item?.torrent) {

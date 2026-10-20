@@ -87,6 +87,8 @@ jobs:
         run: npm run build
       - name: Check extension behaviour
         run: npm run browser:check
+      - name: Check companion panel behavior
+        run: npm run browser:ui
       - name: Test progress and torrent interfaces
         run: |
           npm run ui:test
@@ -163,7 +165,20 @@ jobs:
       - name: Test bounded HTTP transfer slot reuse
         run: node scripts/test-http-slot-reuse.mjs src-tauri/target/release/fetchrail.exe
       - name: Test retained Firefox companion handoffs
-        run: node scripts/test-local-companion.mjs
+        run: node scripts/test-local-companion.mjs src-tauri/target/release/fetchrail.exe --test-tools
+      - name: Install isolated browser qualification runtimes
+        run: npx playwright install chromium firefox
+      - name: Qualify actual Chromium normal-session capture
+        run: node scripts/test-extension-browser.mjs src-tauri/target/release/fetchrail.exe --chromium --normal-only
+      - name: Qualify actual Firefox regular, private and container capture
+        run: node scripts/test-extension-browser.mjs src-tauri/target/release/fetchrail.exe --firefox
+      - name: Retain actual browser qualification evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: qualification-browser-windows
+          path: artifacts/extension-browser/*
+          if-no-files-found: warn
       - name: Test real torrent swarms
         run: |
           npm run torrent:test

@@ -10,7 +10,7 @@ import "./Torrents.css";
 
 export type TorrentFile = { index: number; path: string; size: number; priority: number; downloaded: number };
 export type TorrentMetadata = { name: string; hashes: string[]; private: boolean; totalBytes: number; files: TorrentFile[]; fileCount: number; pieceLength: number; pieces: number };
-export type TorrentImport = { id: string; metadata: TorrentMetadata | null };
+export type TorrentImport = { id: string; metadata: TorrentMetadata | null; options?: { directory?: string; queue?: string; startPaused?: boolean; scheduledFor?: string; speedLimitBps?: number } };
 export type TorrentSummary = { hashes: string[]; uploadedBytes: number; allDownloadedBytes: number; uploadSpeedBps: number; peers: number; seeds: number; selectedReady: boolean; activeSeconds: number; seedSeconds: number; ratioLimit: number; seedTimeLimit: number; sequential: boolean };
 export type TorrentSettings = { uploadLimitBps: number; maxSeeds: number; ratioLimit: number; seedTimeLimit: number; dht: boolean; lsd: boolean; upnp: boolean; connections: number; listenInterfaces: string; outgoingInterfaces: string; encryption: number; protocol: number; proxyType: number; proxyHost: string; proxyPort: number; proxyUsername: string; proxyPassword: string };
 type Command = (name: string, id: string, extra?: Record<string, unknown>) => Promise<boolean>;
@@ -60,9 +60,9 @@ function PeerList({ peers }: { peers: Details["peers"] }) {
 export function TorrentImportDialog({ initial, defaultDirectory, queues, onClose, onAdded, onError }: { initial: TorrentImport; defaultDirectory: string; queues: string[]; onClose: () => void; onAdded: (record: DownloadRecord) => void; onError: (message: string) => void }) {
   const [metadata, setMetadata] = useState(initial.metadata);
   const [priorities, setPriorities] = useState<number[]>(() => initial.metadata ? initial.metadata.files.reduce((p, f) => { p[f.index] = 4; return p; }, Array(initial.metadata.fileCount).fill(0)) : []);
-  const [directory, setDirectory] = useState(defaultDirectory);
-  const [queue, setQueue] = useState(queues[0] ?? "Default");
-  const [paused, setPaused] = useState(false);
+  const [directory, setDirectory] = useState(initial.options?.directory ?? defaultDirectory);
+  const [queue, setQueue] = useState(initial.options?.queue ?? queues[0] ?? "Default");
+  const [paused, setPaused] = useState(initial.options?.startPaused ?? false);
   const [verifyExisting, setVerifyExisting] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
@@ -76,7 +76,7 @@ export function TorrentImportDialog({ initial, defaultDirectory, queues, onClose
     return () => { disposed = true; clearInterval(timer); };
   }, [initial.id, metadata]);
   const cancel = async () => { setBusy(true); try { await invoke("cancel_torrent_import", { id: initial.id }); onClose(); } catch (e) { setError(String(e)); } finally { setBusy(false); } };
-  const commit = async () => { setBusy(true); setError(""); try { const record = await invoke<DownloadRecord>("commit_torrent", { request: { id: initial.id, directory, priorities, queue, startPaused: paused, verifyExisting, scheduledFor: null } }); onAdded(record); onClose(); } catch (e) { setError(String(e)); } finally { setBusy(false); } };
+  const commit = async () => { setBusy(true); setError(""); try { const record = await invoke<DownloadRecord>("commit_torrent", { request: { id: initial.id, directory, priorities, queue, startPaused: paused, verifyExisting, scheduledFor: initial.options?.scheduledFor ?? null } }); onAdded(record); onClose(); } catch (e) { setError(String(e)); } finally { setBusy(false); } };
   return <Modal label="torrent-import-title" busy={busy} onClose={() => void cancel()}><section className="modal torrent-import">
     <div className="modal-head"><h2 id="torrent-import-title">{metadata?.name ?? "Resolving torrent metadata…"}</h2><button className="icon-button" aria-label="Cancel torrent import" disabled={busy} onClick={() => void cancel()}><X size={18} /></button></div>
     {metadata ? <><p>{formatBytes(metadata.totalBytes)} · {metadata.files.length} files · {metadata.private ? "Private torrent" : "Public torrent"}</p>

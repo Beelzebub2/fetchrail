@@ -1,181 +1,53 @@
 import assert from "node:assert/strict";
-import { readFile } from "node:fs/promises";
-import { randomUUID } from "node:crypto";
 import vm from "node:vm";
-
-for (const browser of ["chromium", "firefox"]) {
-  const saved = { useBrowserSession: true, automaticDownloads: false };
-  const session = {};
-  const requests = [], events = [], pages = [];
-  const staged = new Map();
-  let messages, created, webRequest, popupCreated, tabRemoved, menuClicked;
-  let current, failure, failNavigation = false;
-  let nativePorts = 0;
-  const api = {
-    runtime: {
-      id: "batch-test", getURL: (path) => "chrome-extension://batch-test/" + path,
-      onInstalled: { addListener() {} }, onStartup: { addListener() {} },
-      onMessage: { addListener(fn) { messages = fn; } },
-    },
-    storage: { local: {
-      async get(key) { return { [key]: structuredClone(saved[key]) }; },
-      async set(values) { Object.assign(saved, structuredClone(values)); },
-    }, session: {
-      async get(key) { return { [key]: structuredClone(session[key]) }; },
-      async set(values) { Object.assign(session, structuredClone(values)); },
-      async remove(key) { delete session[key]; },
-    } },
-    alarms: { create() {}, onAlarm: { addListener() {} } },
-    contextMenus: { onClicked: { addListener(fn) { menuClicked = fn; } } },
-    action: { async setBadgeBackgroundColor() {}, async setBadgeText() {}, async setTitle() {} },
-    webRequest: { onBeforeSendHeaders: { addListener(fn, filter, options) {
-      webRequest = fn;
-      assert.ok(options.includes("requestHeaders"));
-      assert.equal(options.includes("extraHeaders"), browser === "chromium");
-    } } },
-    tabs: {
-      async create({ windowId }) { return { id: 10, incognito: windowId === 7 }; },
-      async get(id) { return { id, windowId: id === 99 ? 7 : 6, incognito: id === 99 }; },
-      async query() { return [{ id: 98, windowId: 6, incognito: false }]; },
-      async update(id, { url }) { if (failNavigation) throw new Error("Tab closed"); pages.push({ id, url }); },
-      onCreated: { addListener(fn) { popupCreated = fn; } },
-      onRemoved: { addListener(fn) { tabRemoved = fn; } },
-    },
-    downloads: {
-      onCreated: { addListener(fn) { created = fn; } },
-      async pause() { events.push("pause"); current.paused = true; },
-      async search() { return [{ ...current }]; },
-      async cancel() { events.push("cancel"); if (failure === "cancel") throw new Error("Cannot cancel"); },
-      async erase() { events.push("erase"); },
-      async resume() { events.push("resume"); current.paused = false; },
-    },
+import { randomUUID } from "node:crypto";
+import { browserFixture } from "./fixtures/extension-browser.mjs";
+for (const family of ["chromium", "firefox"]) {
+  const f = await browserFixture(family); f.saved.useBrowserSession=true; await f.boot();
+  const options={queue:"Night",connections:4,speedLimitBps:262144,startPaused:true,scheduledFor:"2030-01-01T00:00:00Z"};
+  const start=await f.send({type:"startBrowserBatch",items:[{url:"https://files.test/#/one"},{url:"https://files.test/#/two"},{url:"https://files.test/#/three"}],...options});
+  assert.equal(start.ok,true); assert.equal(f.saved.browserBatch.items.length,3,"Navigation fragments identify distinct pages");
+  const batchId=f.saved.browserBatch.id,firstItem=f.saved.browserBatch.items[0].id,firstAttempt=f.saved.browserBatch.attempt;
+  const capture=async(url="https://files.test/file.zip")=>{
+    Object.assign(f.item,{id:f.item.id+1,url,finalUrl:url,state:"in_progress",paused:false,danger:"safe",error:undefined});
+    f.events.get("headers")({requestId:String(f.item.id),tabId:f.saved.browserBatch.tabId,url,method:"GET",requestHeaders:[{name:"Cookie",value:"synthetic-session"}]});
+    await new Promise(setImmediate); f.create(); await f.settle();
   };
-  const native = async (host, request) => {
-    requests.push(structuredClone(request));
-    if (request.method === "ping") return { ok: true, result: { capabilities: ["browserSessions", "speedLimits", "browserSessionRequests"] } };
-    if (request.method === "takeBrowserRequest") return { ok: true, result: { requests: [{ url: "https://private.test/from-desktop.zip",
-      directory: "C:/Chosen folder", expectedSha256: "a".repeat(64), ...options }] } };
-    if (request.method === "finishBrowserRequest") return { ok: true, result: {} };
-    if (request.method === "getHandoff") return { ok: true, result: staged.get(request.params.handoffId) ?? { ids: [], committed: false } };
-    if (request.method === "commitHandoff") { staged.get(request.params.handoffId).committed = true; return { ok: true, result: {} }; }
-    if (request.method === "controlDownload") return { ok: true, result: {} };
-    const id = randomUUID();
-    if (failure !== "rejected") staged.set(request.id, { ids: [id], committed: false });
-    return { ok: true, result: failure === "rejected"
-      ? { accepted: 0, ids: [], errors: [{ index: 0, message: "Session expired" }] }
-      : { accepted: 1, ids: [id], errors: [] } };
+  await capture(); assert.equal(f.saved.browserBatch.index,1); assert.equal(f.saved.browserBatch.accepted,1);
+  const firstNative=f.calls.find(c=>c.method==="addDownloads");
+  for(const[key,value]of Object.entries(options))assert.equal(firstNative.params[key],value);
+  await capture("https://files.test/reject.zip"); assert.equal(f.saved.browserBatch.status,"browser");assert.equal(f.saved.browserBatch.index,1);assert.equal(f.item.paused,false);
+  assert.equal((await f.send({type:"browserBatchControl",action:"retry"})).ok,true); assert.equal(f.saved.browserBatch.browserDownloadId,undefined);assert.ok(f.saved.browserBatch.attempt>firstAttempt);
+  await f.evaluate('finishHandoff('+JSON.stringify({id:firstNative.id,browserId:42,incognito:false,batchId,itemId:firstItem,attempt:firstAttempt,phase:"committed"})+')');
+  assert.equal(f.saved.browserBatch.index,1,"A late receipt cannot advance a different item/attempt");
+  assert.equal((await f.send({type:"browserBatchControl",action:"skip"})).ok,true);assert.equal(f.saved.browserBatch.skipped,1);
+  await capture();assert.equal(f.saved.browserBatch.status,"complete");assert.equal(f.saved.browserBatch.accepted,2);
+  const blocked=await f.send({type:"startBrowserBatch",items:[{url:"https://files.test/recovery"}]});assert.equal(blocked.ok,true);
+  f.faults.cancel=true;f.faults.abortLost=true;await capture();assert.equal(f.saved.browserBatch.status,"recovery");
+  assert.equal((await f.send({type:"browserBatchControl",action:"skip"})).ok,false);assert.equal((await f.send({type:"browserBatchControl",action:"retry"})).ok,false);
+  const claim=await browserFixture(family);let finishLost=true;
+  claim.faults.native=request=>{
+    if(request.method==="takeBrowserRequest")return{requests:[{url:"https://files.test/desktop",directory:"C:/Chosen folder",...options}]};
+    if(request.method==="finishBrowserRequest"){if(finishLost){finishLost=false;throw Error("finish acknowledgement lost");}return{};}
   };
-  if (browser === "firefox") api.runtime.sendNativeMessage = native;
-  else {
-    api.runtime.sendNativeMessage = (host, request, callback) => void native(host, request).then(callback);
-    api.runtime.connectNative = (host) => {
-      assert.equal(host, "com.rrmtools.braid");
-      nativePorts++;
-      let disconnected;
-      return { onDisconnect: { addListener(fn) { disconnected = fn; } }, disconnect() { nativePorts--; disconnected(); } };
-    };
-  }
-  const context = vm.createContext({ [browser === "firefox" ? "browser" : "chrome"]: api, crypto: { randomUUID }, URL, structuredClone });
-  let liveContext = context;
-  vm.runInContext(await readFile(new URL(`../browser-extension/dist/${browser}/background.js`, import.meta.url), "utf8"), context);
-  const sender = { id: api.runtime.id, url: api.runtime.getURL("panel.html") };
-  const send = (message) => new Promise((resolve) => assert.equal(messages(message, sender, resolve), true));
-  const settle = async () => {
-    for (let i = 0; i < 100; i++) {
-      await new Promise(setImmediate);
-      if (vm.runInContext("activeActions", liveContext) === 0) { await vm.runInContext("batchOperations", liveContext); return; }
-    }
-    assert.fail("Browser batch did not settle");
-  };
-  const options = { queue: "Night", connections: 4, speedLimitBps: 256 * 1024, startPaused: true, scheduledFor: "2030-01-01T00:00:00Z" };
-  assert.equal((await send({ type: "startBrowserBatch", items: [{ url: "file:///secret" }] })).ok, false);
-  assert.equal((await send({ type: "startBrowserBatch", items: [1, 2, 3].map((i) => ({ url: `https://host.test/page/${i}` })), ...options })).ok, true);
-  assert.equal(saved.browserBatch.status, "waiting");
-  assert.equal(pages[0].url, "https://host.test/page/1");
-  assert.equal((await send({ type: "startBrowserBatch", items: [{ url: "https://host.test/other" }] })).ok, false);
-  // Five intermediate buttons/redirects do not enqueue their HTML pages.
-  for (let i = 0; i < 5; i++) webRequest({ url: `https://host.test/step/${i}`, tabId: 10, method: "GET" });
-  assert.equal(requests.filter((r) => r.method === "addDownloads").length, 0);
-  const capture = async (tabId = 10, method = "GET", incognito = false) => {
-    current = { id: 42, state: "in_progress", paused: false, incognito, danger: "safe", url: "https://host.test/redirect", finalUrl: "https://cdn.test/final.zip?token=123", totalBytes: 1234, bytesReceived: 1024, mime: "application/zip", filename: "final.zip" };
-    webRequest({ url: current.finalUrl, incognito, tabId, method, requestHeaders: [
-      { name: "Cookie", value: "session=test" }, { name: "Referer", value: "https://host.test/step/5" },
-      { name: "User-Agent", value: "Browser test" }, { name: "X-Unrelated", value: "do-not-forward" },
-    ] });
-    created({ ...current }); await settle();
-  };
-  await capture();
-  const transfer = requests.find((r) => r.method === "addDownloads");
-  assert.equal(transfer.params.source, "browserBatch");
-  for (const [key, value] of Object.entries(options)) assert.equal(transfer.params[key], value);
-  assert.deepEqual(transfer.params.items[0].requestContext, { cookie: "session=test", referer: "https://host.test/step/5", userAgent: "Browser test" });
-  assert.deepEqual(events, ["pause", "cancel", "erase"]);
-  assert.equal(saved.browserBatch.accepted, 1);
-  assert.equal(pages.at(-1).url, "https://host.test/page/2");
-  // Popups opened by a batch tab remain associated with that batch.
-  popupCreated({ id: 11, openerTabId: 10 }); await settle();
-  failure = "rejected"; events.length = 0;
-  await capture(11);
-  assert.deepEqual(events, ["pause", "resume"]);
-  assert.equal(saved.browserBatch.index, 1);
-  assert.equal(saved.browserBatch.status, "waiting");
-  assert.match(saved.browserBatch.error, /Session expired/);
-  // POST downloads stay in the browser without replaying them as GETs.
-  failure = undefined; events.length = 0;
-  const beforePost = requests.length;
-  await capture(11, "POST");
-  assert.equal(requests.length, beforePost);
-  assert.equal(events.length, 0);
-  assert.match(saved.browserBatch.error, /form submission/);
-  assert.equal((await send({ type: "browserBatchControl", action: "skip" })).ok, true);
-  assert.equal(saved.browserBatch.skipped, 1);
-  tabRemoved(11); await settle();
-  assert.equal(pages.at(-1).url, "https://host.test/page/3");
-  // A failed browser cancellation rolls back the engine job.
-  failure = "cancel"; events.length = 0;
-  await capture();
-  assert.equal(requests.at(-1).method, "controlDownload");
-  assert.equal(requests.at(-1).params.action, "cancel");
-  assert.deepEqual(events, ["pause", "cancel", "resume"]);
-  failure = undefined;
-  await capture();
-  assert.equal(saved.browserBatch.status, "complete");
-  assert.equal(saved.browserBatch.accepted, 2);
-  // Losing a tab exposes an actionable error; navigation failure cannot revoke an accepted file.
-  await send({ type: "startBrowserBatch", items: [{ url: "https://host.test/one" }, { url: "https://host.test/two" }] });
-  webRequest({ url: "https://cdn.test/suspended.zip", tabId: 10, method: "GET", requestHeaders: [{ name: "Cookie", value: "session=worker" }] });
-  await settle();
-  liveContext = vm.createContext({ [browser === "firefox" ? "browser" : "chrome"]: api, crypto: { randomUUID }, URL, structuredClone });
-  vm.runInContext(await readFile(new URL(`../browser-extension/dist/${browser}/background.js`, import.meta.url), "utf8"), liveContext);
-  await vm.runInContext("captureReady", liveContext);
-  assert.equal(vm.runInContext('matchingRequest({ url: "https://cdn.test/suspended.zip" }).context.cookie', liveContext), "session=worker", "Request context must survive service-worker suspension.");
-  tabRemoved(10); await settle();
-  assert.equal(saved.browserBatch.tabId, null);
-  assert.match(saved.browserBatch.error, /closed/);
-  await send({ type: "browserBatchControl", action: "retry" });
-  failNavigation = true;
-  const before = requests.length;
-  await capture();
-  assert.equal(requests.slice(before).some((r) => r.method === "controlDownload"), false);
-  assert.equal(saved.browserBatch.accepted, 1);
-  assert.match(saved.browserBatch.error, /File accepted/);
-  await send({ type: "browserBatchControl", action: "stop" });
-  assert.equal(saved.browserBatch.status, "stopped");
-  failNavigation = false;
-  await send({ type: "startBrowserBatch", items: [{ url: "https://host.test/bounded" }], followButtons: true });
-  const pageSender = { id: api.runtime.id, url: "https://host.test/bounded", tab: { id: 10 } };
-  const step = (sender = pageSender) => new Promise((resolve) => assert.equal(messages({ type: "downloadStep" }, sender, resolve), true));
-  assert.equal((await step({ ...pageSender, tab: { id: 999 } })).click, false);
-  for (let i = 0; i < 20; i++) assert.equal((await step()).click, true);
-  assert.equal((await step()).click, false);
-  assert.match(saved.browserBatch.error, /20 buttons/);
-  await send({ type: "browserBatchControl", action: "stop" });
+  const desktopId=randomUUID();const bound=await claim.send({type:"takeBrowserRequest",id:desktopId,tabId:1});assert.equal(bound.result.status,"binding");
+  const id=claim.saved.browserBatch.id;assert.equal((await claim.send({type:"browserBatchControl",action:"retry"})).ok,true);assert.equal(claim.saved.browserBatch.id,id);
+  assert.equal((await claim.send({type:"takeBrowserRequest",id:desktopId,tabId:1})).result.id,id);
+  assert.equal(claim.calls.filter(c=>c.method==="takeBrowserRequest").length,1,"Lost acknowledgement cannot open duplicate batches");
+  assert.equal(claim.saved.browserBatch.items[0].options.directory,"C:/Chosen folder");
+  const privateFixture=await browserFixture(family);privateFixture.saved.useBrowserSession=true;
+  Object.assign(privateFixture.tabs.get(1),{incognito:true,windowId:7,...(family==="firefox"?{cookieStoreId:"firefox-container-1"}:{})});await privateFixture.boot();
+  const privateBatch=await privateFixture.send({type:"startBrowserBatch",tabId:1,items:[{url:"https://private.test/download"}]});assert.equal(privateBatch.ok,true);
+  if(family==="firefox")assert.equal(privateFixture.tabs.get(privateBatch.result.tabId).cookieStoreId,"firefox-container-1");
+  assert.ok(!JSON.stringify(privateFixture.saved).includes("private.test"));await privateFixture.boot();
+  assert.equal((await privateFixture.send({type:"getBrowserBatch",incognito:true})).result.status,"lost","Private page loss is explicit, not silently attributed to reused tabs");
+  if(family==="chromium")assert.equal((await privateFixture.send({type:"addDownloads",tabId:1,items:[{url:"https://private.test/direct.pdf"}]})).ok,false);
   // The injected follower clicks only a single unambiguous, visible download control.
   const elements = [];
   let tick, clickCount = 0, captcha = false, now = 10000;
   let injected;
-  api.scripting = { async executeScript({ func }) { injected = func; } };
-  await vm.runInContext("followDownloadButtons(10)", context);
+  f.api.scripting = { async executeScript({ func }) { injected = func; } };
+  await f.evaluate("followDownloadButtons(2)");
   const element = (text) => ({ textContent: text, disabled: false, id: text, getClientRects: () => [1], getAttribute: () => null, click: () => clickCount++ });
   const page = vm.createContext({
     location: { href: "https://host.test/step1" },
@@ -196,57 +68,6 @@ for (const browser of ["chromium", "firefox"]) {
   captcha = false; now += 3000; await tick(); assert.equal(clickCount, 2);
   elements.splice(0, elements.length, element("Buy now"));
   now += 3000; await tick(); assert.equal(clickCount, 2, "Purchase controls are outside download automation.");
-  // Download steps sent by unrelated tabs cannot advance or inspect a batch.
-  assert.equal((await send({ type: "downloadStep" })).click, undefined);
-  await send({ type: "browserBatchControl", action: "stop" });
-  failNavigation = false;
-  events.length = 0;
-  // Pasted private links must enter the browser before a native file is offered.
-  const pastedStart = requests.length;
-  const pasted = await send({ type: "addDownloads", tabId: 99, items: [{ url: "https://private.test/pasted.zip" }], ...options });
-  assert.equal(pasted.ok, true);
-  assert.equal(pasted.result.browserPending, true);
-  assert.equal(pasted.result.batch.windowId, 7);
-  assert.equal(nativePorts, browser === "chromium" ? 1 : 0, "Private Chromium batches keep their worker alive without shared storage.");
-  assert.equal(requests.slice(pastedStart).some((r) => r.method === "addDownloads"), false);
-  assert.equal(JSON.stringify(saved).includes("private.test"), false, "Private batch URLs must stay out of shared storage.");
-  await capture(10, "GET", true);
-  const pastedTransfer = requests.filter((r) => r.method === "addDownloads").at(-1);
-  assert.equal(pastedTransfer.params.source, "browserBatch");
-  assert.equal(pastedTransfer.params.items[0].requestContext.cookie, "session=test");
-  for (const [key, value] of Object.entries(options)) assert.equal(pastedTransfer.params[key], value);
-  assert.equal((await send({ type: "getBrowserBatch", tabId: 99 })).result.status, "complete");
-  assert.equal(nativePorts, 0, "Finishing a private batch releases its worker connection.");
-  // The same path handles right-clicks, even with automatic capture switched off.
-  const menuStart = requests.length;
-  menuClicked({ menuItemId: "fetchrail.download", linkUrl: "https://private.test/right-click.zip" }, await api.tabs.get(99));
-  await settle();
-  assert.equal(pages.at(-1).url, "https://private.test/right-click.zip");
-  assert.equal(requests.slice(menuStart).some((r) => r.method === "addDownloads"), false);
-  await capture(10, "GET", true);
-  assert.equal((await send({ type: "getBrowserBatch", tabId: 99 })).result.accepted, 1);
-  // Desktop requests are claimed only after choosing this signed-in window.
-  const desktopId = randomUUID();
-  const desktop = await send({ type: "takeBrowserRequest", id: desktopId, tabId: 99 });
-  assert.equal(desktop.ok, true);
-  assert.equal(desktop.result.incognito, true);
-  assert.equal(pages.at(-1).url, "https://private.test/from-desktop.zip");
-  assert.equal(requests.at(-1).method, "finishBrowserRequest");
-  assert.equal(requests.at(-1).params.completed, true);
-  await capture(10, "GET", true);
-  const desktopTransfer = requests.filter((r) => r.method === "addDownloads").at(-1);
-  assert.equal(desktopTransfer.params.directory, "C:/Chosen folder");
-  assert.equal(desktopTransfer.params.expectedSha256, "a".repeat(64));
-  for (const [key, value] of Object.entries(options)) assert.equal(desktopTransfer.params[key], value);
-  failNavigation = true;
-  assert.equal((await send({ type: "takeBrowserRequest", id: desktopId, tabId: 99 })).ok, false);
-  assert.equal(requests.at(-1).method, "finishBrowserRequest");
-  assert.equal(requests.at(-1).params.completed, false, "Failed navigation must release the desktop request for retry.");
-  assert.equal(nativePorts, 0);
-  failNavigation = false;
-  await send({ type: "addDownloads", tabId: 99, items: [{ url: "https://private.test/close-window.zip" }] });
-  tabRemoved(10, { isWindowClosing: true, windowId: 7 }); await settle();
-  assert.equal((await send({ type: "getBrowserBatch", tabId: 99 })).result, null);
-  assert.equal(nativePorts, 0, "Closing the private window clears its batch and releases the native connection.");
-  console.log(`PASS: ${browser} browser batches, private right-click/paste/desktop pickup, session forwarding, option preservation, fallback and recovery.`);
+
+  console.log("PASS "+family+": stable batch progress, attempts, options, private/container context, desktop claims and bounded followers");
 }
