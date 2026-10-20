@@ -29,6 +29,7 @@ pub enum NativeMethod {
     AddTorrents,
     GetHandoff,
     CommitHandoff,
+    AbortHandoff,
     GetDownloads,
     TakeBrowserRequest,
     FinishBrowserRequest,
@@ -40,6 +41,8 @@ pub enum NativeMethod {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct NativeParams {
     pub completed: Option<bool>,
+    pub consumer_id: Option<Uuid>,
+    pub batch_id: Option<Uuid>,
     pub directory: Option<String>,
     pub expected_sha256: Option<String>,
     pub handoff_id: Option<String>,
@@ -84,6 +87,7 @@ pub struct BrowserDownloadItem {
     pub suggested_file_name: Option<String>,
     pub expected_bytes: Option<u64>,
     pub expected_mime: Option<String>,
+    pub expected_etag: Option<String>,
     pub request_context: Option<BrowserRequestContext>,
 }
 
@@ -150,12 +154,15 @@ impl NativeResponse {
 }
 
 pub fn validate_request(request: &NativeRequest) -> Result<(), String> {
+    if serde_json::to_vec(request).map_or(true, |bytes| bytes.len() > MAX_NATIVE_REQUEST_BYTES) {
+        return Err("Native request exceeds the encoded byte limit.".into());
+    }
     if request.v != NATIVE_PROTOCOL_VERSION {
         return Err("Unsupported native messaging protocol version.".into());
     }
     Uuid::parse_str(&request.id).map_err(|_| "Request id must be a UUID.".to_string())?;
     match request.method {
-        NativeMethod::GetHandoff | NativeMethod::CommitHandoff => {
+        NativeMethod::GetHandoff | NativeMethod::CommitHandoff | NativeMethod::AbortHandoff => {
             Uuid::parse_str(
                 request
                     .params
@@ -169,8 +176,11 @@ pub fn validate_request(request: &NativeRequest) -> Result<(), String> {
             if request.params.download_id.is_none() {
                 return Err("Browser request id is required.".into());
             }
+            if request.params.consumer_id.is_none() {
+                return Err("Browser claim consumer id is required.".into());
+            }
             if matches!(request.method, NativeMethod::FinishBrowserRequest)
-                && request.params.completed.is_none()
+                && (request.params.completed.is_none() || request.params.batch_id.is_none())
             {
                 return Err("Browser request completion status is required.".into());
             }
@@ -203,6 +213,18 @@ pub fn validate_request(request: &NativeRequest) -> Result<(), String> {
                 return Err("Invalid queue name.".into());
             }
             for item in &request.params.items {
+                if item.expected_sha256.as_ref().is_some_and(|hash| {
+                    hash.len() != 64 || !hash.bytes().all(|byte| byte.is_ascii_hexdigit())
+                }) {
+                    return Err("Invalid item SHA-256.".into());
+                }
+                if item
+                    .expected_etag
+                    .as_ref()
+                    .is_some_and(|value| value.len() > 1024 || value.chars().any(char::is_control))
+                {
+                    return Err("Invalid browser entity tag.".into());
+                }
                 if let Some(headers) = &item.request_headers {
                     if !matches!(
                         request.params.source,
@@ -260,14 +282,15 @@ pub fn validate_request(request: &NativeRequest) -> Result<(), String> {
                 let parsed =
                     Url::parse(&item.url).map_err(|_| "Invalid download URL.".to_string())?;
                 if request.method == NativeMethod::AddTorrents {
-                    if item.request_context.is_some() {
-                        return Err(
-                            "Torrent handoff does not accept browser session headers.".into()
-                        );
-                    }
                     if parsed.scheme() != "magnet"
                         && !(matches!(parsed.scheme(), "http" | "https")
-                            && parsed.path().to_lowercase().ends_with(".torrent"))
+                            && (parsed.path().to_lowercase().ends_with(".torrent")
+                                || item.expected_mime.as_deref().is_some_and(|mime| {
+                                    mime.to_ascii_lowercase().contains("bittorrent")
+                                })
+                                || item.suggested_file_name.as_deref().is_some_and(|name| {
+                                    name.to_ascii_lowercase().ends_with(".torrent")
+                                })))
                     {
                         return Err(
                             "Torrent handoff requires a magnet or an HTTP(S) .torrent URL.".into(),
@@ -319,8 +342,19 @@ pub fn validate_request(request: &NativeRequest) -> Result<(), String> {
     if request.params.completed.is_some() && request.method != NativeMethod::FinishBrowserRequest {
         return Err("Completion status is only accepted by finishBrowserRequest.".into());
     }
+    if (request.params.consumer_id.is_some() || request.params.batch_id.is_some())
+        && !matches!(
+            request.method,
+            NativeMethod::TakeBrowserRequest | NativeMethod::FinishBrowserRequest
+        )
+    {
+        return Err("Browser claim identifiers require a browser request control.".into());
+    }
     if request.params.directory.is_some() || request.params.expected_sha256.is_some() {
-        if request.method != NativeMethod::AddDownloads {
+        if !matches!(
+            request.method,
+            NativeMethod::AddDownloads | NativeMethod::AddTorrents
+        ) {
             return Err("File options are only accepted by addDownloads.".into());
         }
         if request
@@ -339,14 +373,17 @@ pub fn validate_request(request: &NativeRequest) -> Result<(), String> {
     }
     if request.params.handoff_protocol.is_some()
         && (request.params.handoff_protocol != Some(2)
-            || request.method != NativeMethod::AddDownloads)
+            || !matches!(
+                request.method,
+                NativeMethod::AddDownloads | NativeMethod::AddTorrents
+            ))
     {
         return Err("Unsupported handoff protocol.".into());
     }
     if request.params.handoff_id.is_some()
         && !matches!(
             request.method,
-            NativeMethod::GetHandoff | NativeMethod::CommitHandoff
+            NativeMethod::GetHandoff | NativeMethod::CommitHandoff | NativeMethod::AbortHandoff
         )
     {
         return Err("Handoff id is only accepted by handoff controls.".into());
@@ -371,13 +408,18 @@ mod tests {
         assert!(validate_request(&req).is_err());
         req.params = NativeParams {
             download_id: Some(Uuid::new_v4()),
+            consumer_id: Some(Uuid::new_v4()),
             ..Default::default()
         };
         req.method = NativeMethod::TakeBrowserRequest;
         assert!(validate_request(&req).is_ok());
+        let consumer = req.params.consumer_id.take();
+        assert!(validate_request(&req).is_err());
+        req.params.consumer_id = consumer;
         req.method = NativeMethod::FinishBrowserRequest;
         assert!(validate_request(&req).is_err());
         req.params.completed = Some(false);
+        req.params.batch_id = Some(Uuid::new_v4());
         assert!(validate_request(&req).is_ok());
         req.method = NativeMethod::GetDownloads;
         assert!(validate_request(&req).is_err());
@@ -423,6 +465,7 @@ mod tests {
                     suggested_file_name: None,
                     expected_bytes: None,
                     expected_mime: None,
+                    expected_etag: None,
                     request_context: None,
                 }],
                 ..NativeParams::default()

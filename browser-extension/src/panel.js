@@ -12,6 +12,8 @@ let selected = new Set();
 let tabId = Number(query.get("tab")) || null;
 let sourceIncognito;
 let busy = false;
+const draftItems = new Map();
+let lastCapabilitiesAt = 0;
 let connected = false;
 let checked = false;
 let connecting = null;
@@ -288,7 +290,8 @@ function renderDownloads(arrived = new Set(), instant = false) {
     toggle.title = split ? (open ? "Hide" : "Show") + " connections for " + item.fileName : item.fileName;
     reveal(card.querySelector(".lanes-reveal"), open);
     if (open) renderLanes(card.querySelector(".lanes"), parts);
-    const label = item.status === "queued" ? "Waiting" : item.status[0].toUpperCase() + item.status.slice(1);
+    const provisional = !!item.handoffId && !item.handoffCommitted;
+    const label = provisional ? "Waiting for browser handoff" : item.status === "queued" ? "Waiting" : item.status[0].toUpperCase() + item.status.slice(1);
     const status = merging ? (percent < 100 ? "Joining parts" : "Saving file…") : label;
     const schedule = item.status === "scheduled" && item.scheduledFor ? " · " + new Date(item.scheduledFor).toLocaleString() : "";
     const downloading = item.status === "downloading";
@@ -300,18 +303,19 @@ function renderDownloads(arrived = new Set(), instant = false) {
     error.hidden = !item.error;
     error.textContent = item.error ?? "";
     const actions = card.querySelector(".transfer-actions");
-    const action = ["paused", "failed", "cancelled"].includes(item.status) ? "resume" : ["connecting", "downloading", "queued", "scheduled"].includes(item.status) ? "pause" : "";
-    if (actions.dataset.action !== item.status) {
+    const action = provisional ? "" : ["paused", "failed", "cancelled"].includes(item.status) ? "resume" : ["connecting", "downloading", "queued", "scheduled"].includes(item.status) ? "pause" : "";
+    const actionKey = item.status + (provisional ? ":handoff" : "");
+    if (actions.dataset.action !== actionKey) {
       // The check mark only pops for a download seen finishing, not for one that was already done.
       const finished = item.status === "completed" && !!actions.dataset.action;
-      actions.dataset.action = item.status;
+      actions.dataset.action = actionKey;
       actions.replaceChildren();
       if (item.status === "completed") {
         const mark = $("#icon-done").content.firstElementChild.cloneNode(true);
         mark.classList.toggle("pop", finished);
         actions.append(mark);
       }
-      for (const name of action ? [action, ...(item.status === "cancelled" ? [] : ["cancel"])] : []) {
+      for (const name of provisional ? ["cancel"] : action ? [action, ...(item.status === "cancelled" ? [] : ["cancel"])] : []) {
         const retry = name === "resume" && item.status === "failed";
         const button = document.createElement("button");
         button.className = "icon-button";
@@ -371,6 +375,11 @@ async function refresh() {
   $("#list-note").textContent = `Showing the latest ${downloads.length} of ${result.total}`;
   renderDownloads(arrived);
   renderDesktopRequests(result.browserRequests ?? []);
+  renderRecovery(await request("recoveryState"));
+  if (Date.now() - lastCapabilitiesAt > 30000) {
+    const current = await request("ping");
+    app.capabilities = current.capabilities; renderQueues(current.queues ?? []); lastCapabilitiesAt = Date.now();
+  }
   loaded = true;
   renderBrowserBatch(await request("getBrowserBatch"), first);
 }
@@ -407,13 +416,13 @@ function renderDesktopRequests(requests) {
 function renderBrowserBatch(batch, instant = false) {
   reveal($("#browser-batch"), !!batch, instant);
   if (!batch) return;
-  const active = ["waiting", "capturing"].includes(batch.status);
-  $("#batch-status").textContent = active ? `Page ${batch.index + 1} of ${batch.items.length}` : batch.status === "complete" ? "Batch complete" : "Batch stopped";
+  const active = ["waiting", "capturing", "browser", "recovery", "binding", "lost"].includes(batch.status);
+  $("#batch-status").textContent = batch.status === "recovery" ? "Ownership needs recovery" : active ? `Page ${batch.index + 1} of ${batch.items.length}` : batch.status === "complete" ? "Batch complete" : "Batch stopped";
   $("#batch-count").textContent = `${batch.accepted} handed over · ${batch.skipped} skipped`;
   $("#batch-error").textContent = batch.error || (active ? "Finish the steps in the opened tab. The batch moves on by itself." : "");
   $("#batch-error").classList.toggle("error", !!batch.error);
   $(".batch-actions").hidden = !active;
-  for (const id of ["retry", "skip", "stop"]) $("#batch-" + id).disabled = batch.status === "capturing";
+  for (const id of ["retry", "skip", "stop"]) $("#batch-" + id).disabled = ["capturing", "recovery"].includes(batch.status) || (batch.status === "binding" && id !== "retry") || (batch.status === "lost" && id !== "stop");
 }
 
 function renderQueues(queues) {
@@ -440,7 +449,7 @@ function connect({ quiet = false } = {}) {
     app = null;
     try {
       const result = await request("ping");
-      app = { version: result.appVersion, outdated: !result.capabilities.includes("getDownloads") };
+      app = { capabilities: result.capabilities, version: result.appVersion, outdated: !result.capabilities.includes("getDownloads") };
       if (app.outdated) throw new Error("Update the Fetchrail app and native host to use this companion.");
       for (const key of ["theme", "accent"]) {
         if (result[key]) localStorage.setItem(key, result[key]);
@@ -546,7 +555,9 @@ async function scan() {
       tabId = tab?.id;
     }
     if (tabId == null) throw new Error("Open the companion on a web page to scan its links.");
-    links = await request("collectLinks", { tabId });
+    const scan = await request("collectLinks", { tabId });
+    links = scan.items; sourceIncognito = scan.source.incognito;
+    if (scan.warnings.length) notice(scan.warnings.join(" "), true);
     selected = new Set([...selected].filter((url) => links.some((item) => item.url === url)));
     renderLinks();
   } catch (error) { notice("Could not scan this page. Open the extension on an HTTP or HTTPS page. " + error.message, true); }
@@ -568,6 +579,9 @@ function transferOptions() {
 }
 
 async function browsePages(items, fromSelection = false) {
+  if (busy) return;
+  busy = true; $("#add").disabled = true; updateSelection();
+  const submittedText = $("#urls").value;
   clearError();
   try {
     const options = transferOptions();
@@ -575,27 +589,35 @@ async function browsePages(items, fromSelection = false) {
     const batch = await request("startBrowserBatch", { items, ...options, followButtons: $("#follow-buttons").checked });
     renderBrowserBatch(batch);
     if (fromSelection) { selected.clear(); renderLinks(); setView("downloads"); }
-    else setUrls("");
+    else if ($("#urls").value === submittedText) setUrls("");
     notice("Batch started. Finish the steps in its tab.");
   } catch (error) { notice(error.message, true); }
+  finally { busy = false; $("#add").disabled = false; updateSelection(); }
 }
 
 async function add(items, fromSelection = false) {
-  clearError();
-  busy = true;
-  $("#add").disabled = true;
-  updateSelection();
+  if (busy) return;
+  const submittedText = $("#urls").value;
+  clearError(); busy = true; $("#add").disabled = true; updateSelection();
   try {
-    const result = await request("addDownloads", { items, ...transferOptions() });
-    const added = result.browserPending ? "Downloads opened in your signed-in browser. Fetchrail will capture the files." : `${result.accepted} download${result.accepted === 1 ? "" : "s"} added to Fetchrail`;
+    const options = transferOptions();
+    items = items.map(item => {
+      const key = JSON.stringify([item.url, item.suggestedFileName, options]);
+      if (!draftItems.has(key)) draftItems.set(key, crypto.randomUUID());
+      return { ...item, id: draftItems.get(key) };
+    });
+    const result = await request("addDownloads", { items, ...options });
     if (result.batch) renderBrowserBatch(result.batch);
-    const refused = `${result.rejected} link${result.rejected === 1 ? "" : "s"} rejected: ${result.errors[0]?.message}`;
-    notice(result.rejected ? (result.accepted ? added + ". " : "") + refused : added, !!result.rejected);
+    const added = result.browserPending ? "Downloads opened in your signed-in browser." : result.accepted + " downloads added to Fetchrail.";
+    if (result.pending && !result.browserPending) notice(result.pending + " submissions need recovery. Use Retry recovery before resubmitting.", true);
+    else notice(added + (result.rejected ? " " + result.rejected + " rejected: " + result.errors[0]?.message : ""), !!result.rejected);
+    const accepted = new Set((result.outcomes ?? []).filter(o => ["accepted", "duplicate"].includes(o.state)).map(o => o.id));
     if (fromSelection) {
-      const rejected = new Set(result.errors.map((error) => error.url));
-      for (const item of items) if (!rejected.has(item.url)) selected.delete(item.url);
+      for (const item of items) if (accepted.has(item.id)) selected.delete(item.url);
       renderLinks();
-    } else setUrls(result.errors.map((error) => error.url).join("\n"));
+    } else if ($("#urls").value === submittedText && !result.browserPending) {
+      setUrls(items.filter(item => !accepted.has(item.id)).map(item => item.url).join("\n"));
+    }
     await refresh();
   } catch (error) { notice(error.message, true); }
   finally { busy = false; $("#add").disabled = false; updateSelection(); }
@@ -677,10 +699,11 @@ for (const action of ["retry", "skip", "stop"]) $("#batch-" + action).addEventLi
 });
 $("#browser-session").addEventListener("change", async () => {
   const input = $("#browser-session");
+  const previous = (await api.storage.local.get("useBrowserSession")).useBrowserSession === true;
   try {
     if (input.checked && !await api.permissions.request({ origins: ["http://*/*", "https://*/*"] })) throw new Error("Browser access was not granted.");
     await api.storage.local.set({ useBrowserSession: input.checked });
-  } catch (error) { input.checked = false; notice(error.message, true); }
+  } catch (error) { input.checked = previous; notice(error.message, true); }
 });
 $("#download-selected").addEventListener("click", () => void add(links.filter((item) => selected.has(item.url)).map(({ url, suggestedFileName }) => ({ url, suggestedFileName })), true));
 $("#connection").addEventListener("click", () => void connect());
@@ -696,14 +719,14 @@ $("#status-filter").addEventListener("change", () => renderDownloads(new Set(), 
 $("#link-filter").addEventListener("change", renderLinks);
 $("#link-search").addEventListener("input", renderLinks);
 $("#select-all").addEventListener("change", () => { for (const item of visibleLinks()) $("#select-all").checked ? selected.add(item.url) : selected.delete(item.url); renderLinks(); });
-$("#connections").addEventListener("change", () => {
+for (const [selector, key] of [["#connections", "connections"], ["#queue", "queue"]]) $(selector).addEventListener("change", async () => {
+  const previous = (await api.storage.local.get(key))[key];
+  try {
+    const value = key === "connections" ? Number($(selector).dataset.value) : $(selector).dataset.value;
+    await api.storage.local.set({ [key]: value });
+    if (key === "queue") preferredQueue = value;
+  } catch (error) { choose($(selector), String(previous ?? (key === "queue" ? "Default" : 0))); notice(error.message, true); }
   optionsSummary();
-  void api.storage.local.set({ connections: Number($("#connections").dataset.value) }).catch((error) => notice(error.message, true));
-});
-$("#queue").addEventListener("change", () => {
-  preferredQueue = $("#queue").dataset.value;
-  optionsSummary();
-  void api.storage.local.set({ queue: preferredQueue }).catch((error) => notice(error.message, true));
 });
 $("#start").addEventListener("change", () => { reveal($("#schedule-row"), $("#start").dataset.value === "scheduled"); optionsSummary(); });
 $("#options-reset").addEventListener("click", () => {
@@ -754,7 +777,7 @@ async function initialize() {
     optionsSummary();
     const [tab] = await api.tabs.query({ active: true, currentWindow: true });
     const ownTab = await api.tabs.getCurrent?.();
-    if (!tabId) tabId = ownTab?.id ?? tab?.id;
+    if (!tabId && /^https?:/i.test(tab?.url ?? "")) tabId = tab.id;
     sourceIncognito = tabId != null ? (await api.tabs.get?.(tabId))?.incognito : undefined;
     if (ownTab || tab?.url?.startsWith(api.runtime.getURL("")) || !api?.runtime) {
       document.body.classList.add("expanded");
@@ -768,3 +791,53 @@ async function initialize() {
   if (!polling) { polling = true; setTimeout(() => void poll(), connected ? pollInterval : 5000); }
 }
 void initialize();
+
+const sourcePicker = document.createElement("select");
+sourcePicker.setAttribute("aria-label", "Source page");
+$(".link-tools").before(sourcePicker);
+async function refreshSourcePages() {
+  const tabs = await request("sourceTabs");
+  sourcePicker.replaceChildren(...tabs.map(tab => { const option = document.createElement("option"); option.value = tab.id; option.textContent = tab.title; return option; }));
+  if (tabs.some(tab => tab.id === tabId)) sourcePicker.value = String(tabId);
+  else if (tabs.length) { tabId = tabs[0].id; sourceIncognito = tabs[0].incognito; }
+}
+sourcePicker.addEventListener("focus", () => void refreshSourcePages().catch(error => notice(error.message, true)));
+sourcePicker.addEventListener("change", () => { tabId = Number(sourcePicker.value); selected.clear(); void scan(); });
+void refreshSourcePages().catch(() => {});
+const recovery = document.createElement("section"); recovery.className = "capture-recovery batch-card"; recovery.setAttribute("aria-label", "Browser capture recovery");
+$("#desktop-requests").after(recovery);
+function renderRecovery(state) {
+  recovery.replaceChildren();
+  if (!state.handoffs.length && !state.outcomes.length) return;
+  const heading = document.createElement("h3"); heading.textContent = "Browser capture"; recovery.append(heading);
+  const exportButton = document.createElement("button"); exportButton.textContent = "Export diagnostics";
+  exportButton.addEventListener("click", () => {
+    const data = { version: 1, outcomes: state.outcomes.map(({state,code,time}) => ({state,code,time})), handoffs: state.handoffs.map(({phase,incognito}) => ({phase,private:!!incognito})) };
+    const url = URL.createObjectURL(new Blob([JSON.stringify(data,null,2)], {type:"application/json"}));
+    const link = document.createElement("a"); link.href = url; link.download = "fetchrail-browser-diagnostics.json"; link.click(); setTimeout(() => URL.revokeObjectURL(url),1000);
+  }); recovery.append(exportButton);
+  if (state.handoffs.length) {
+    const retry = document.createElement("button"); retry.textContent = "Retry recovery";
+    retry.addEventListener("click", async () => { retry.disabled = true; try { await request("recoverHandoffs"); await refresh(); } catch (e) { notice(e.message, true); } finally { retry.disabled = false; } }); recovery.append(retry);
+  }
+  for (const ticket of state.handoffs) {
+    const row = document.createElement("p"); row.textContent = ticket.phase === "committed" ? "File accepted; cleanup pending. " : "Transfer needs ownership recovery. ";
+    if (ticket.phase !== "committed") { const button = document.createElement("button"); button.textContent = ticket.phase === "manual" ? "Stop pending submission" : "Return to browser";
+      button.addEventListener("click", async () => { button.disabled = true; try { await request("returnToBrowser", { id: ticket.id }); await refresh(); } catch (e) { notice(e.message, true); } finally { button.disabled = false; } }); row.append(button); }
+    recovery.append(row);
+  }
+  for (const outcome of state.outcomes.slice(0,8)) {
+    const reasons = { BROWSER_COMPLETE: "File and history preserved", COMMITTED: "Handoff completed", STAGE_REJECTED: "The app could not verify this file", SESSION_PERMISSION_REQUIRED: "Browser session access needs permission", SESSION_UNAVAILABLE: "A matching signed-in request was unavailable", CANCEL_UNCONFIRMED: "Browser cancellation needs checking", BROWSER_CHANGED: "The browser download changed", UNSUPPORTED_METHOD: "This form download needs the browser", STORAGE_UNAVAILABLE: "Recovery storage is unavailable" };
+    const row = document.createElement("p"); row.textContent = ({ accepted: "Accepted by Fetchrail", browser: "Continues in the browser", rejected: "Submission rejected", recovery: "Recovery required" }[outcome.state] ?? outcome.state) + " · " + (reasons[outcome.code] ?? (outcome.state === "accepted" ? "Handoff completed" : "Review this transfer in its browser window")) + " ";
+    if (outcome.state !== "recovery") { const dismiss = document.createElement("button"); dismiss.textContent = "Dismiss"; dismiss.addEventListener("click", async () => { await request("dismissOutcome", { id: outcome.id }); await refresh(); }); row.append(dismiss); }
+    recovery.append(row);
+  }
+}
+api.storage.onChanged?.addListener((changes, area) => {
+  if (area !== "local") return;
+  if (changes.useBrowserSession) $("#browser-session").checked = changes.useBrowserSession.newValue === true;
+  if (changes.automaticDownloads) $("#automatic-downloads").checked = changes.automaticDownloads.newValue !== false;
+  if (changes.connections) choose($("#connections"), String(changes.connections.newValue ?? 0));
+  if (changes.queue) { preferredQueue = changes.queue.newValue ?? "Default"; choose($("#queue"), preferredQueue); }
+  optionsSummary();
+});

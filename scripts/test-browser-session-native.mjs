@@ -14,9 +14,11 @@ const end = model.lastIndexOf("#[derive", model.indexOf("pub struct QueueRecord"
 assert.ok(start >= 0 && end > start);
 const path = (name) => JSON.stringify(join(root, "src-tauri/src", name).replaceAll("\\", "/"));
 await writeFile(join(out, "src/lib.rs"), `#![allow(dead_code)]
+mod platform { pub fn write_private_atomic(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> { std::fs::write(path,bytes) } }
 mod model { use chrono::{DateTime,Utc}; use serde::{Serialize,Deserialize}; ${model.slice(start, end)} }
 #[path = ${path("browser_session.rs")}] mod browser_session;
 #[path = ${path("native_protocol.rs")}] mod native_protocol;
+#[path = ${path("browser_handoff.rs")}] mod browser_handoff;
 `);
 await writeFile(join(out, "Cargo.toml"), `[package]
 name = "fetchrail-browser-session-check"
@@ -28,6 +30,7 @@ serde_json = "1"
 chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1", features = ["serde", "v4"] }
 url = "2"
+tokio = { version = "1", features = ["sync", "macros", "rt"] }
 `);
 const child = spawn("cargo", ["test", "--manifest-path", join(out, "Cargo.toml"), "--offline"], { cwd: root, stdio: "inherit", windowsHide: true });
 child.on("error", (error) => { console.error(error.message); process.exitCode = 1; });

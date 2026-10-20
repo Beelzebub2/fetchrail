@@ -4,6 +4,7 @@ compile_error!("Release builds must embed the frontend: enable --features tauri/
 mod analytics;
 mod browser_bridge;
 mod browser_extension;
+mod browser_handoff;
 mod browser_session;
 mod diagnostics;
 mod download_window;
@@ -872,7 +873,14 @@ pub fn run() {
                 *ready.1.lock().expect("frontend URL poisoned") = Some(payload.url().to_string());
             }
         })
-        .manage(browser_session::Requests::default())
+        .manage(
+            browser_session::Requests::load(
+                platform::app_data_dir()
+                    .expect("app data path")
+                    .join("browser-requests.json"),
+            )
+            .expect("browser request journal"),
+        )
         .manage(ShuttingDown(AtomicBool::new(false)))
         .manage(TrayReady(AtomicBool::new(false)))
         .manage(BrowserIntegration(std::sync::Mutex::new(

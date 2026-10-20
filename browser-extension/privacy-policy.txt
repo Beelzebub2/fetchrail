@@ -1,5 +1,5 @@
 Fetchrail Browser Integration Privacy Policy
-Last updated: 19 October 2026.
+Last updated: 20 October 2026.
 
 Project maintainer: RRMTools, Portugal. Privacy contact: support.fetchrail@rrmtools.uk.
 
@@ -18,7 +18,7 @@ Page content: When you choose to scan a page or process a page batch, the compan
 
 Browsing activity: With optional website access, the companion temporarily observes HTTP(S) request URLs, methods and tab identifiers to associate downloads with pages, including redirects and popups.
 
-Authentication information: Only if you explicitly enable Use browser session for captured files, the companion may forward the final GET request's Cookie, Authorization, Referer and User-Agent headers to the local Fetchrail application to support downloads that need your existing website session. Session support is disabled by default.
+Authentication information: Only if you explicitly enable Use browser session for captured files, the companion may forward the final GET request's Cookie, Authorization, Origin, Referer and User-Agent headers to the local Fetchrail application to support downloads that need your existing website session. Session support is disabled by default.
 
 Local preferences: Browser download routing, session setting, queues, connection limits, speed limits, schedules and page-batch state.
 
@@ -32,11 +32,11 @@ The desktop app offers user-started hardware and connection tests with explicit 
 
 Storage and retention
 
-Preferences and page-batch state are stored locally in browser extension storage. Temporary request observations use browser session storage, are bounded in size and ignored after two minutes. Turning off session support clears captured observations.
+Preferences and regular page-batch state are stored locally in browser extension storage. Regular request observations use browser session storage, bounded to 500 entries/512 KiB: background traffic expires after five minutes and attachment evidence after thirty minutes. Turning off session support or revoking website access clears captured observations.
 
-Private-window request observations are kept separately in extension memory, never written to shared browser storage, and cleared when their tab closes. They expire after two minutes and are discarded if the extension restarts. Accepted private downloads appear in the desktop application's local history and follow the desktop retention rules below.
+Private-window observations and raw private batch links/options stay in extension memory, never shared browser storage. They have the same bounded observation lifetime and are discarded if the extension restarts. Closing a popup can retain bounded evidence for an in-flight download. Opaque ownership and item IDs, phases and counts persist locally for recovery, without private URLs or headers. Recent outcomes contain IDs, fixed reason codes and times; private outcomes stay in memory. Diagnostics export occurs only on request and excludes source links, credentials and paths. Accepted private downloads appear in the desktop application's local history and follow the desktop retention rules below.
 
-With session support enabled, right-clicked links and links pasted into the companion open in the chosen browser window before capture. Private browser batches stay in extension memory. Desktop links submitted with Use browser session wait in desktop memory for up to 15 minutes or until the app closes. Connected companions see only pending request identifiers and counts until you choose Use this window, which passes those links and download options to that browser for processing.
+With session support enabled, direct links use the browser download API where it can preserve the selected context; download pages open in that window. Desktop links submitted with Use browser session and their claims use a protected local journal with a fifteen-minute lifetime across app restarts. Connected companions see only pending identifiers/counts until you choose Use this window. Native ownership receipts contain opaque IDs and digests, capped at 4,096, with terminal entries pruned after seven days on journal writes. Durable torrent confirmation offers cache validated descriptors and options locally; owned cached descriptors are removed after import, decline or abort. Captured credentials apply only to descriptor fetching, never to peers or trackers.
 
 Fetchrail stores download history and unfinished transfer details locally. When session support is enabled, unfinished downloads may include sensitive request headers in the desktop application's local downloads.json file for resuming downloads after restart. These headers are deleted on transfer completion or removal, and are excluded from extension status responses and interface events. Downloaded files remain on your computer until you delete them.
 

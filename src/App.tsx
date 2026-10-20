@@ -75,6 +75,9 @@ type SegmentProgress = {
 };
 
 export type DownloadRecord = {
+  handoffId?: string;
+  handoffCommitted?: boolean;
+  handoffDisposition?: string;
   autoRetry?: boolean;
   nextRetryAt?: string | null;
   failureCategory?: string;
@@ -611,7 +614,7 @@ function App() {
     const stop = getCurrentWindow().onDragDropEvent(event => {
       if (event.payload.type === "drop") { const paths = event.payload.paths; setTorrentSources(current => [...current, ...paths.filter(path => path.toLowerCase().endsWith(".torrent"))]); }
     });
-    const handoff = listen<string[]>("fetchrail://torrent-sources", event => setTorrentSources(current => [...current, ...event.payload]));
+    const handoff = listen<string[]>("fetchrail://torrent-sources", event => setTorrentSources(current => [...new Set([...current, ...event.payload])]));
     return () => { void stop.then(fn => fn()); void handoff.then(fn => fn()); };
   }, []);
   const torrentSelected = downloads.find(item => item.id === selectedTorrent && item.torrent);
@@ -1648,8 +1651,9 @@ function DownloadRow({
   const [sourceDraft, setSourceDraft] = useState("");
   const running = runningStatuses.has(item.status);
   const canPause = ["queued", "scheduled", "connecting", "downloading"].includes(item.status);
-  const canResume = ["paused", "failed", "cancelled"].includes(item.status);
-  const canSchedule = ["queued", "scheduled", "paused", "failed", "cancelled"].includes(item.status);
+  const provisional = !!item.handoffId && !item.handoffCommitted;
+  const canResume = !provisional && ["paused", "failed", "cancelled"].includes(item.status);
+  const canSchedule = !provisional && ["queued", "scheduled", "paused", "failed", "cancelled"].includes(item.status);
   // Longer endings would be cut mid-word in the badge.
   const ending = item.fileName.includes(".") ? item.fileName.split(".").pop() ?? "" : "";
   const extension = ending && ending.length <= 4 ? ending.toUpperCase() : "FILE";
@@ -1827,7 +1831,7 @@ function DownloadRow({
             <Ellipsis size={16} />
           </button>
           <div className="menu" popover="auto" id={menuId} style={{ positionAnchor: anchor }}>
-            {["paused", "failed"].includes(item.status) && <button popoverTarget={menuId} popoverTargetAction="hide" onClick={() => { setSourceDraft(""); setEditingSource(true); }}>Update download link…</button>}
+            {!provisional && ["paused", "failed"].includes(item.status) && <button popoverTarget={menuId} popoverTargetAction="hide" onClick={() => { setSourceDraft(""); setEditingSource(true); }}>Update download link…</button>}
             <button popoverTarget={menuId} popoverTargetAction="hide" onClick={() => void command("set_download_retry", item.id, { enabled: item.autoRetry === false })}>Automatic retry: {item.autoRetry === false ? "off" : "on"}</button>
             {item.nextRetryAt && <button popoverTarget={menuId} popoverTargetAction="hide" onClick={() => void command("resume_download", item.id)}>Retry now · planned {formatDateTime(item.nextRetryAt)}</button>}
             <button popoverTarget={menuId} popoverTargetAction="hide" onClick={() => { setLimitDraft(item.speedLimitBps / 1024); setEditingLimit(true); }}>

@@ -409,13 +409,23 @@ fn failure_category(error: &EngineError) -> (&'static str, bool) {
     }
 }
 
-#[derive(Debug, Clone)]
-struct ProbeResult {
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub(crate) struct ProbeResult {
     total_bytes: Option<u64>,
     accepts_ranges: bool,
-    suggested_file_name: Option<String>,
+    pub(crate) suggested_file_name: Option<String>,
     validator: Option<StrongEtag>,
     final_url: Option<Url>,
+}
+
+type VerifiedResponse = (
+    reqwest::Response,
+    crate::network::OriginPermit,
+    tokio::sync::SemaphorePermit<'static>,
+);
+pub(crate) struct BrowserVerification {
+    pub(crate) probe: ProbeResult,
+    response: VerifiedResponse,
 }
 
 #[derive(Clone, Copy)]
@@ -1165,6 +1175,8 @@ struct DownloadTask {
     cancel_token: Mutex<CancellationToken>,
     running: AtomicBool,
     request_context: Option<BrowserRequestContext>,
+    browser_verification: Mutex<Option<ProbeResult>>,
+    prefetched: Mutex<Option<VerifiedResponse>>,
     limiter: RateLimiter,
     performance: Mutex<Option<Arc<crate::performance::LivePolicy>>>,
     received_sha256: Mutex<Option<String>>,
@@ -1179,6 +1191,8 @@ pub(crate) struct StoredDownload {
     record: DownloadRecord,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     request_context: Option<BrowserRequestContext>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    browser_verification: Option<ProbeResult>,
 }
 
 impl DownloadTask {
@@ -1198,6 +1212,8 @@ impl DownloadTask {
             performance: Mutex::new(None),
             received_sha256: Mutex::new(None),
             request_context,
+            browser_verification: Mutex::new(None),
+            prefetched: Mutex::new(None),
             paused: AtomicBool::new(record.status == DownloadStatus::Paused),
             power_resume: AtomicBool::new(false),
             record: RwLock::new(record),
@@ -1249,7 +1265,7 @@ pub struct DownloadManager {
     torrent_configuration: tokio::sync::Mutex<serde_json::Value>,
     #[allow(clippy::type_complexity)] // This shared budget is updated under one lock.
     bandwidth_broker: Mutex<(Instant, u64, (bool, bool), (u64, u64))>,
-    pending_torrent_sources: Mutex<Vec<String>>,
+    pending_torrent_sources: Mutex<Vec<BrowserTorrentOffer>>,
     app: AppHandle,
     client: Client,
     tasks: RwLock<HashMap<Uuid, Arc<DownloadTask>>>,
@@ -1281,6 +1297,14 @@ impl ProgressEvents {
             self.dirty.insert(record.id, record.clone().public_view());
         }
     }
+}
+
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+struct BrowserTorrentOffer {
+    id: String,
+    source: String,
+    state: String,
+    options: serde_json::Value,
 }
 
 #[derive(Clone)]
@@ -1364,6 +1388,7 @@ impl DownloadManager {
         let _dispatch = self.dispatch_lock.lock().await;
         let task = self.task(id).await?;
         let mut record = task.record.read().await.clone();
+        require_committed_handoff(&record)?;
         if record.torrent.is_some()
             || !matches!(
                 record.status,
@@ -1545,15 +1570,20 @@ impl DownloadManager {
                     segment.speed_bps = 0;
                     segment.active = false;
                 }
-                task_map.insert(
-                    record.id,
-                    Arc::new(DownloadTask::new(
-                        record,
-                        stored.request_context,
-                        None,
-                        None,
-                    )),
-                );
+                let id = record.id;
+                if stored.browser_verification.is_some()
+                    && record
+                        .extra
+                        .get("handoffCommitted")
+                        .and_then(|v| v.as_bool())
+                        != Some(true)
+                {
+                    record.extra.insert("handoffQualified".into(), json!(false));
+                    record.error = Some("Verification stream was interrupted before ownership committed. Return this file to the browser.".into());
+                }
+                let task = DownloadTask::new(record, stored.request_context, None, None);
+                *task.browser_verification.lock().unwrap() = stored.browser_verification;
+                task_map.insert(id, Arc::new(task));
             }
         }
 
@@ -1578,7 +1608,12 @@ impl DownloadManager {
             torrent_imports: RwLock::new(HashMap::new()),
             torrent_checkpoint: Mutex::new(Instant::now()),
             torrent_configuration: tokio::sync::Mutex::new(serde_json::Value::Null),
-            pending_torrent_sources: Mutex::new(Vec::new()),
+            pending_torrent_sources: Mutex::new(
+                read_saved_json::<Vec<BrowserTorrentOffer>>(&data_dir.join("torrent-offers.json"))
+                    .await
+                    .map_err(|e| e.to_string())?
+                    .unwrap_or_default(),
+            ),
             app,
             client,
             tasks: RwLock::new(task_map),
@@ -1657,6 +1692,21 @@ impl DownloadManager {
                     record.status = DownloadStatus::Failed;
                     record.error = Some(error);
                 }
+            }
+        }
+        for record in manager.list().await {
+            if record
+                .extra
+                .get("handoffActivationPending")
+                .and_then(|v| v.as_bool())
+                == Some(true)
+            {
+                let _ = manager.activate_handoff_record(record.id).await;
+            }
+        }
+        for record in manager.list().await {
+            if record.torrent.is_some() {
+                let _ = manager.acknowledge_torrent_offer(&record.url, "imported");
             }
         }
         manager.start_scheduler();
@@ -1770,6 +1820,7 @@ impl DownloadManager {
         self: &Arc<Self>,
         key: &str,
         auto_start: bool,
+        confirm: bool,
     ) -> Result<Vec<DownloadRecord>, String> {
         let operation = self
             .operation_health
@@ -1777,7 +1828,7 @@ impl DownloadManager {
         let result = {
             let span = operation.health.guard(crate::health::Phase::Probe);
             let result = self
-                .commit_handoff_observed(key, auto_start, &operation.health)
+                .commit_handoff_observed(key, auto_start, confirm, &operation.health)
                 .await;
             span.observe(&result);
             result
@@ -1789,6 +1840,7 @@ impl DownloadManager {
         self: &Arc<Self>,
         key: &str,
         auto_start: bool,
+        confirm: bool,
         health: &crate::health::Health,
     ) -> Result<Vec<DownloadRecord>, String> {
         self.reject_diagnostics()?;
@@ -1815,15 +1867,51 @@ impl DownloadManager {
         {
             return Err("Handoff was rolled back.".into());
         }
+        if records
+            .iter()
+            .any(|r| r.extra.get("handoffQualified").and_then(|v| v.as_bool()) != Some(true))
+        {
+            return Err(
+                "Handoff validation was interrupted. Return this file to the browser.".into(),
+            );
+        }
         let previous = records
             .iter()
-            .map(|r| (r.id, r.extra.get("handoffCommitted").cloned()))
+            .map(|r| (r.id, r.clone()))
             .collect::<Vec<_>>();
         // Background saves must not publish provisional handoff flags.
         let persist = self.persist_lock.lock().await;
         for record in &mut records {
             let task = self.task(record.id).await?;
             let mut saved = task.record.write().await;
+            if saved
+                .extra
+                .get("handoffCommitted")
+                .and_then(|v| v.as_bool())
+                != Some(true)
+            {
+                saved.extra.insert(
+                    "handoffDisposition".into(),
+                    json!(if auto_start {
+                        "activate"
+                    } else if confirm {
+                        "confirm"
+                    } else {
+                        "paused"
+                    }),
+                );
+                saved
+                    .extra
+                    .insert("handoffActivationPending".into(), json!(auto_start));
+                if confirm {
+                    saved.error = Some(
+                        "Browser handoff accepted. Review the file and choose Resume to start."
+                            .into(),
+                    );
+                } else {
+                    saved.error = None;
+                }
+            }
             saved.extra.insert("handoffCommitted".into(), json!(true));
             *record = saved.clone();
         }
@@ -1838,29 +1926,75 @@ impl DownloadManager {
             for (id, value) in previous {
                 let task = self.task(id).await?;
                 let mut saved = task.record.write().await;
-                match value {
-                    Some(value) => {
-                        saved.extra.insert("handoffCommitted".into(), value);
-                    }
-                    None => {
-                        saved.extra.remove("handoffCommitted");
-                    }
-                }
+                *saved = value;
             }
             return Err(error.to_string());
         }
         drop(persist);
         drop(dispatch);
         for record in &records {
-            if auto_start && record.status == DownloadStatus::Paused {
-                if record.scheduled_for.is_some_and(|when| when > Utc::now()) {
-                    self.schedule(record.id, record.scheduled_for).await?;
-                } else {
-                    self.resume(record.id).await?;
-                }
-            }
+            let _ = self.activate_handoff_record(record.id).await;
         }
         Ok(records)
+    }
+
+    async fn activate_handoff_record(self: &Arc<Self>, id: Uuid) -> Result<(), String> {
+        #[cfg(feature = "test-tools")]
+        if crate::platform::test_root()?
+            .is_some_and(|root| root.join("hold-browser-activation").exists())
+        {
+            return Err("Injected interruption before handoff activation.".into());
+        }
+        let _dispatch = self.dispatch_lock.lock().await;
+        let task = self.task(id).await?;
+        let previous = task.record.read().await.clone();
+        if previous
+            .extra
+            .get("handoffActivationPending")
+            .and_then(|v| v.as_bool())
+            != Some(true)
+        {
+            return Ok(());
+        }
+        require_committed_handoff(&previous)?;
+        let _persist = self.persist_lock.lock().await;
+        {
+            let mut record = task.record.write().await;
+            record.status = if record.scheduled_for.is_some_and(|when| when > Utc::now()) {
+                DownloadStatus::Scheduled
+            } else {
+                record.scheduled_for = None;
+                DownloadStatus::Queued
+            };
+            record.extra.remove("handoffActivationPending");
+            record.extra.remove("handoffDisposition");
+            record.error = None;
+        }
+        if let Err(error) = self.persist_records_locked().await {
+            let mut record = task.record.write().await;
+            *record = previous;
+            record.error = Some(format!(
+                "Browser handoff accepted; activation needs retry: {error}"
+            ));
+            return Err(error.to_string());
+        }
+        task.paused.store(false, Ordering::Release);
+        task.cancelled.store(false, Ordering::Release);
+        self.emit_record(&*task.record.read().await);
+        Ok(())
+    }
+
+    pub(crate) async fn retry_browser_activations(self: &Arc<Self>) {
+        for record in self.list().await {
+            if record
+                .extra
+                .get("handoffActivationPending")
+                .and_then(|v| v.as_bool())
+                == Some(true)
+            {
+                let _ = self.activate_handoff_record(record.id).await;
+            }
+        }
     }
 
     pub async fn import_torrent(
@@ -1880,6 +2014,14 @@ impl DownloadManager {
         }
         let id = Uuid::new_v4();
         let source = request.source.trim().to_owned();
+        let options = self
+            .pending_torrent_sources
+            .lock()
+            .map_err(|e| e.to_string())?
+            .iter()
+            .find(|o| o.source == source && o.state == "offered")
+            .map(|o| o.options.clone())
+            .unwrap_or(json!({}));
         let cancel = CancellationToken::new();
         imports.insert(
             id,
@@ -1945,7 +2087,7 @@ impl DownloadManager {
             }
         });
         // Return the reserved ID before networking, so cancellation exists from the first byte.
-        Ok(json!({"id":id, "metadata":null}))
+        Ok(json!({"id":id, "metadata":null, "options":options}))
     }
 
     async fn resolve_torrent_import(
@@ -2082,6 +2224,11 @@ impl DownloadManager {
         Ok(metadata)
     }
 
+    fn persist_torrent_offers(&self, offers: &[BrowserTorrentOffer]) -> Result<(), String> {
+        let bytes = serde_json::to_vec(offers).map_err(|e| e.to_string())?;
+        crate::platform::write_private_atomic(&self.data_dir.join("torrent-offers.json"), &bytes)
+            .map_err(|e| e.to_string())
+    }
     pub fn offer_torrent_sources(
         &self,
         sources: Vec<String>,
@@ -2091,15 +2238,236 @@ impl DownloadManager {
             .pending_torrent_sources
             .lock()
             .map_err(|e| e.to_string())?;
-        if sources.len() + pending.len() > 100 {
-            return Err("At most 100 torrent sources can wait for import.".into());
+        if sources.len()
+            + pending
+                .iter()
+                .filter(|o| matches!(o.state.as_str(), "staged" | "offered"))
+                .count()
+            > 100
+        {
+            return Err("Finish pending torrent offers before adding more.".into());
         }
-        pending.extend(sources);
-        if frontend_ready && !pending.is_empty() {
-            self.app
-                .emit("fetchrail://torrent-sources", &*pending)
-                .map_err(|e| e.to_string())?;
-            pending.clear();
+        let old = pending.clone();
+        if pending.len() > 400 {
+            pending.retain(|o| matches!(o.state.as_str(), "staged" | "offered"));
+        }
+        for source in sources {
+            if !pending
+                .iter()
+                .any(|o| o.source == source && o.state == "offered")
+            {
+                pending.push(BrowserTorrentOffer {
+                    id: Uuid::new_v4().to_string(),
+                    source,
+                    state: "offered".into(),
+                    options: json!({}),
+                });
+            }
+        }
+        if let Err(error) = self.persist_torrent_offers(&pending) {
+            *pending = old;
+            return Err(error);
+        }
+        if frontend_ready {
+            let sources = pending
+                .iter()
+                .filter(|o| o.state == "offered")
+                .map(|o| &o.source)
+                .collect::<Vec<_>>();
+            if !sources.is_empty() {
+                self.app
+                    .emit("fetchrail://torrent-sources", sources)
+                    .map_err(|e| e.to_string())?;
+            }
+        }
+        Ok(())
+    }
+    pub(crate) fn torrent_offer_receipt(&self, id: &str) -> Option<serde_json::Value> {
+        let offers = self.pending_torrent_sources.lock().ok()?;
+        let offer = offers.iter().find(|o| o.id == id)?;
+        let committed = matches!(offer.state.as_str(), "offered" | "imported" | "declined");
+        Some(
+            json!({"state":if committed { "committed" } else if offer.state == "aborted" { "aborted" } else { "staged" }, "ids":[id], "committed":committed, "statuses":[offer.state]}),
+        )
+    }
+    pub(crate) fn transition_torrent_offer(
+        &self,
+        id: &str,
+        commit: bool,
+    ) -> Result<serde_json::Value, String> {
+        let mut offers = self
+            .pending_torrent_sources
+            .lock()
+            .map_err(|e| e.to_string())?;
+        let old = offers.clone();
+        let offer = offers
+            .iter_mut()
+            .find(|o| o.id == id)
+            .ok_or("Torrent offer not found.")?;
+        if offer.state == "staged" {
+            offer.state = if commit { "offered" } else { "aborted" }.into();
+        }
+        if let Err(error) = self.persist_torrent_offers(&offers) {
+            *offers = old;
+            return Err(error);
+        }
+        drop(offers);
+        if !commit {
+            self.discard_browser_torrent(id);
+        }
+        if commit {
+            let _ = self.offer_torrent_sources(Vec::new(), true);
+        }
+        Ok(self.torrent_offer_receipt(id).unwrap())
+    }
+    pub(crate) fn discard_browser_torrent(&self, id: &str) {
+        if Uuid::parse_str(id).is_ok() {
+            let _ = std::fs::remove_file(
+                self.data_dir
+                    .join("browser-offers")
+                    .join(format!("{id}.torrent")),
+            );
+        }
+    }
+    fn acknowledge_torrent_offer(&self, source: &str, state: &str) -> Result<(), String> {
+        let mut offers = self
+            .pending_torrent_sources
+            .lock()
+            .map_err(|e| e.to_string())?;
+        let old = offers.clone();
+        for offer in offers
+            .iter_mut()
+            .filter(|o| o.source == source && o.state == "offered")
+        {
+            offer.state = state.into();
+        }
+        if let Err(error) = self.persist_torrent_offers(&offers) {
+            *offers = old;
+            return Err(error);
+        }
+        if offers.iter().any(|o| {
+            o.source == source
+                && o.state == state
+                && Path::new(source).parent()
+                    == Some(self.data_dir.join("browser-offers").as_path())
+                && Path::new(source).file_stem().and_then(|s| s.to_str()) == Some(o.id.as_str())
+        }) {
+            let _ = std::fs::remove_file(source);
+        }
+        Ok(())
+    }
+    pub(crate) async fn prepare_browser_torrent(
+        &self,
+        id: &str,
+        url: &str,
+        context: Option<&BrowserRequestContext>,
+        expected_sha256: Option<&str>,
+    ) -> Result<String, String> {
+        if self
+            .pending_torrent_sources
+            .lock()
+            .map_err(|e| e.to_string())?
+            .iter()
+            .filter(|o| matches!(o.state.as_str(), "staged" | "offered"))
+            .count()
+            >= 100
+        {
+            return Err("Finish pending torrent confirmations before adding more.".into());
+        }
+        if url.starts_with("magnet:") {
+            if expected_sha256.is_some() {
+                return Err("A magnet has no HTTP descriptor to verify with SHA-256.".into());
+            }
+            return Ok(url.to_owned());
+        }
+        let root = self.data_dir.join("browser-offers");
+        crate::platform::private_dir(&root).map_err(|e| e.to_string())?;
+        let path = root.join(format!("{id}.torrent"));
+        let cancel = CancellationToken::new();
+        let (mut response, _origin, _global) = tokio::time::timeout(
+            Duration::from_secs(20),
+            send_admitted(
+                &self.client,
+                self.client
+                    .get(url)
+                    .headers(context_headers(context).map_err(|e| e.to_string())?),
+                &cancel,
+                None,
+                #[cfg(feature = "test-tools")]
+                None,
+            ),
+        )
+        .await
+        .map_err(|_| "Torrent descriptor timed out.")?
+        .map_err(|e| e.to_string())?;
+        if !response.status().is_success() {
+            return Err(
+                "Torrent descriptor could not be fetched. Save it in the browser instead.".into(),
+            );
+        }
+        let mut bytes = Vec::new();
+        tokio::time::timeout(Duration::from_secs(30), async {
+            while let Some(chunk) = response
+                .chunk()
+                .await
+                .map_err(|e| e.without_url().to_string())?
+            {
+                if bytes.len() + chunk.len() > 32 * 1024 * 1024 {
+                    return Err("Torrent metadata exceeds 32 MiB.".to_string());
+                }
+                bytes.extend_from_slice(&chunk);
+            }
+            Ok(())
+        })
+        .await
+        .map_err(|_| "Torrent descriptor timed out.")??;
+        if let Some(expected) = normalize_sha256(expected_sha256)? {
+            if format!("{:x}", Sha256::digest(&bytes)) != expected {
+                return Err(
+                    "Torrent descriptor SHA-256 did not match. Finish it in the browser.".into(),
+                );
+            }
+        }
+        crate::platform::write_private_atomic(&path, &bytes).map_err(|e| e.to_string())?;
+        self.torrent_engine
+            .call(json!({"op":"inspect", "path":path}))
+            .await?;
+        Ok(path.to_string_lossy().into_owned())
+    }
+    pub(crate) fn stage_browser_torrent(
+        &self,
+        id: &str,
+        source: String,
+        options: serde_json::Value,
+    ) -> Result<(), String> {
+        let mut offers = self
+            .pending_torrent_sources
+            .lock()
+            .map_err(|e| e.to_string())?;
+        if offers.iter().any(|o| o.id == id) {
+            return Ok(());
+        }
+        if offers
+            .iter()
+            .filter(|o| matches!(o.state.as_str(), "staged" | "offered"))
+            .count()
+            >= 100
+        {
+            return Err("Finish pending torrent offers before adding more.".into());
+        }
+        let old = offers.clone();
+        if offers.len() > 400 {
+            offers.retain(|o| matches!(o.state.as_str(), "staged" | "offered"));
+        }
+        offers.push(BrowserTorrentOffer {
+            id: id.into(),
+            source,
+            options,
+            state: "staged".into(),
+        });
+        if let Err(error) = self.persist_torrent_offers(&offers) {
+            *offers = old;
+            return Err(error);
         }
         Ok(())
     }
@@ -2143,6 +2511,7 @@ impl DownloadManager {
             return Ok(());
         };
         entry.cancel.cancel();
+        self.acknowledge_torrent_offer(&entry.source, "declined")?;
         if entry.source.starts_with("magnet:") {
             self.torrent_engine
                 .call(json!({"op":"remove", "id":id}))
@@ -2169,6 +2538,15 @@ impl DownloadManager {
             .cloned()
             .ok_or("Torrent import is not available.")?;
         let source = import.source;
+        let offered_source = source.clone();
+        let browser_options = self
+            .pending_torrent_sources
+            .lock()
+            .map_err(|e| e.to_string())?
+            .iter()
+            .find(|o| o.source == source)
+            .map(|o| o.options.clone())
+            .unwrap_or(json!({}));
         if let Some(error) = import.error {
             return Err(error);
         }
@@ -2246,7 +2624,7 @@ impl DownloadManager {
             scheduled_for: request.scheduled_for,
             segments: Vec::new(),
             name_locked: true,
-            speed_limit_bps: 0,
+            speed_limit_bps: browser_options["speedLimitBps"].as_u64().unwrap_or(0),
             resume_supported: Some(true),
             completion_options: Default::default(),
             progress_requested: false,
@@ -2282,6 +2660,7 @@ impl DownloadManager {
         }
         self.register_analytics(&record).await;
         self.torrent_imports.write().await.remove(&id);
+        let _ = self.acknowledge_torrent_offer(&offered_source, "imported");
         // The durable row is committed. Configuration failure must not turn success into a ghost job.
         if let Err(error) = self.apply_torrent_budget().await {
             let task = self.task(id).await?;
@@ -3007,6 +3386,7 @@ impl DownloadManager {
         self.check_torrent_path(&destination).await?;
         let id = Uuid::new_v4();
         let start_paused = request.start_paused.unwrap_or(false);
+        let provisional = request.handoff_id.is_some();
         let scheduled_for = request.scheduled_for;
         let status = if start_paused {
             DownloadStatus::Paused
@@ -3050,7 +3430,7 @@ impl DownloadManager {
                     .unwrap_or(settings.connections_per_download),
             ),
             connections_manual: request.connections.is_some(),
-            error: None,
+            error: provisional.then(|| "Waiting for browser ownership. Recover or return this transfer using the browser companion.".into()),
             created_at: Utc::now(),
             finished_at: None,
             queue,
@@ -3163,8 +3543,9 @@ impl DownloadManager {
         url: &str,
         expected_bytes: Option<u64>,
         expected_mime: Option<&str>,
+        expected_etag: Option<&str>,
         context: Option<&BrowserRequestContext>,
-    ) -> Result<Option<String>, String> {
+    ) -> Result<BrowserVerification, String> {
         let operation = self
             .operation_health
             .start(crate::health::Context::BrowserVerification);
@@ -3175,6 +3556,7 @@ impl DownloadManager {
                     url,
                     expected_bytes,
                     expected_mime,
+                    expected_etag,
                     context,
                     &operation.health,
                 )
@@ -3190,58 +3572,52 @@ impl DownloadManager {
         url: &str,
         expected_bytes: Option<u64>,
         expected_mime: Option<&str>,
+        expected_etag: Option<&str>,
         context: Option<&BrowserRequestContext>,
         health: &crate::health::Health,
-    ) -> Result<Option<String>, String> {
+    ) -> Result<BrowserVerification, String> {
         // Verify a replayable GET before the extension gives up its browser transfer.
         let _headers = health.guard(crate::health::Phase::Headers);
+        let cancel = CancellationToken::new();
+        // Retain the verified GET and admission permits for the actual transfer.
+        // Never probe and discard a single-use response body.
         let response = tokio::time::timeout(
             Duration::from_secs(15),
-            self.client
-                .get(url)
-                .headers(context_headers(context).map_err(|error| error.to_string())?)
-                .header(RANGE, "bytes=0-0")
-                .header(ACCEPT_ENCODING, "identity")
-                .send(),
+            send_admitted(
+                &self.client,
+                self.client
+                    .get(url)
+                    .headers(context_headers(context).map_err(|e| e.to_string())?)
+                    .header(ACCEPT_ENCODING, "identity"),
+                &cancel,
+                Some(health),
+                #[cfg(feature = "test-tools")]
+                None,
+            ),
         )
         .await
-        .map_err(|_| {
-            health.failure(crate::health::Phase::Headers);
-            health.cause(crate::health::Cause::Timeout);
-            "Browser download verification timed out.".to_string()
-        })?
-        .map_err(|error| {
-            health.failure(crate::health::Phase::Headers);
-            health.cause(if error.is_timeout() {
-                crate::health::Cause::Timeout
-            } else if error.is_connect() {
-                crate::health::Cause::DnsOrConnect
-            } else {
-                crate::health::Cause::Request
-            });
-            error.to_string()
-        })?;
+        .map_err(|_| "Browser download verification timed out.")?
+        .map_err(|e| e.to_string())?;
+        let (response, origin, global) = response;
         drop(_headers);
         health.protocol(response.version());
-        let total = match response.status() {
-            StatusCode::PARTIAL_CONTENT => {
-                let (start, end, total) = parse_content_range(response.headers())
-                    .ok_or("Invalid browser verification range.")?;
-                if start != 0 || end != 0 {
-                    return Err("Invalid browser verification range.".into());
-                }
-                total
-            }
-            StatusCode::OK => content_length_from_headers(response.headers()),
-            status => {
-                health.failure(crate::health::Phase::Headers);
-                health.cause(EngineError::Http(status).health_cause(None));
-                return Err(format!(
-                    "Browser download requires an unsupported session or returned HTTP {status}."
-                ));
-            }
-        };
-        if expected_bytes.is_some() && expected_bytes != total {
+        if response.status() != StatusCode::OK {
+            return Err("This source could not be verified. Finish it in the browser.".into());
+        }
+        reject_html_page(response.headers()).map_err(|e| e.to_string())?;
+        if response
+            .headers()
+            .get(header::CONTENT_ENCODING)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|v| !v.is_empty() && !v.eq_ignore_ascii_case("identity"))
+        {
+            return Err(
+                "Encoded responses must finish in the browser to preserve the decoded bytes."
+                    .into(),
+            );
+        }
+        let total = content_length_from_headers(response.headers());
+        if expected_bytes.is_some_and(|n| n > 0) && total.is_some() && expected_bytes != total {
             return Err(
                 "The server returned a different file size outside the browser session.".into(),
             );
@@ -3250,7 +3626,9 @@ impl DownloadManager {
             .headers()
             .get(header::CONTENT_TYPE)
             .and_then(|value| value.to_str().ok());
-        if let Some(expected) = expected_mime.filter(|value| !value.is_empty()) {
+        if let Some(expected) = expected_mime.filter(|value| {
+            !value.is_empty() && !value.eq_ignore_ascii_case("application/octet-stream")
+        }) {
             if !mime.is_some_and(|actual| {
                 actual
                     .split(';')
@@ -3265,7 +3643,48 @@ impl DownloadManager {
                 );
             }
         }
-        Ok(file_name_from_headers(response.headers()))
+        let validator = representation_validator(response.headers());
+        if let Some(expected) = expected_etag.filter(|value| !value.starts_with("W/")) {
+            if validator.as_ref().map(|value| value.as_str()) != Some(expected) {
+                return Err("The file identity changed outside the browser session. Finish it in the browser.".into());
+            }
+        }
+        let suggested_file_name = file_name_from_headers(response.headers());
+        if validator.is_none()
+            && !(total.is_some() && total == expected_bytes && suggested_file_name.is_some())
+        {
+            return Err(
+                "This source has no stable file identity. Finish it in the browser.".into(),
+            );
+        }
+        Ok(BrowserVerification {
+            probe: ProbeResult {
+                total_bytes: total.filter(|n| *n > 0),
+                accepts_ranges: false,
+                suggested_file_name,
+                validator,
+                final_url: Some(response.url().clone()),
+            },
+            response: (response, origin, global),
+        })
+    }
+
+    pub(crate) async fn pin_browser_verification(
+        &self,
+        id: Uuid,
+        verification: Option<BrowserVerification>,
+    ) -> Result<(), String> {
+        let task = self.task(id).await?;
+        if let Some(verification) = verification {
+            *task.browser_verification.lock().unwrap() = Some(verification.probe);
+            *task.prefetched.lock().unwrap() = Some(verification.response);
+        }
+        task.record
+            .write()
+            .await
+            .extra
+            .insert("handoffQualified".into(), json!(true));
+        self.persist_records().await.map_err(|e| e.to_string())
     }
 
     pub async fn list(&self) -> Vec<DownloadRecord> {
@@ -3340,6 +3759,13 @@ impl DownloadManager {
 
     pub async fn pause(&self, id: Uuid) -> Result<DownloadRecord, String> {
         let _dispatch = self.dispatch_lock.lock().await;
+        let task = self.task(id).await?;
+        {
+            let mut record = task.record.write().await;
+            require_committed_handoff(&record)?;
+            record.extra.remove("handoffActivationPending");
+            record.extra.remove("handoffDisposition");
+        }
         self.task(id)
             .await?
             .power_resume
@@ -3386,8 +3812,11 @@ impl DownloadManager {
         let _dispatch = self.dispatch_lock.lock().await;
         self.reject_diagnostics()?;
         let task = self.task(id).await?;
+        let persist = self.persist_lock.lock().await;
+        let previous = task.record.read().await.clone();
         let snapshot = {
             let mut record = task.record.write().await;
+            require_committed_handoff(&record)?;
             if !(matches!(
                 record.status,
                 DownloadStatus::Paused | DownloadStatus::Failed | DownloadStatus::Cancelled
@@ -3407,11 +3836,21 @@ impl DownloadManager {
             record.extra.remove("retryAttempts");
             record.extra.remove("nextRetryAt");
             record.extra.remove("failureCategory");
+            record.extra.remove("handoffActivationPending");
+            record.extra.remove("handoffDisposition");
             record.clone()
         };
-        self.persist_records()
-            .await
-            .map_err(|error| error.to_string())?;
+        if let Err(error) = self.persist_records_locked().await {
+            task.paused
+                .store(previous.status == DownloadStatus::Paused, Ordering::Release);
+            task.cancelled.store(
+                previous.status == DownloadStatus::Cancelled,
+                Ordering::Release,
+            );
+            *task.record.write().await = previous;
+            return Err(error.to_string());
+        }
+        drop(persist);
         self.analytics.feature("resume");
         self.emit_record(&snapshot);
         Ok(snapshot)
@@ -3420,6 +3859,7 @@ impl DownloadManager {
     pub async fn cancel(&self, id: Uuid) -> Result<DownloadRecord, String> {
         let _dispatch = self.dispatch_lock.lock().await;
         let task = self.task(id).await?;
+        task.prefetched.lock().unwrap().take();
         if task.record.read().await.torrent.is_some() {
             self.torrent_engine
                 .call(json!({"op":"pause", "id":id}))
@@ -3438,6 +3878,8 @@ impl DownloadManager {
             task.paused.store(false, Ordering::Release);
             task.cancel();
             record.status = DownloadStatus::Cancelled;
+            record.extra.remove("handoffActivationPending");
+            record.extra.remove("handoffDisposition");
             record.speed_bps = 0;
             record.eta_seconds = None;
             if let Some(torrent) = &mut record.torrent {
@@ -3807,6 +4249,9 @@ impl DownloadManager {
     ) -> Result<DownloadRecord, String> {
         let _dispatch = self.dispatch_lock.lock().await;
         let task = self.task(id).await?;
+        let persist = self.persist_lock.lock().await;
+        let previous = task.record.read().await.clone();
+        require_committed_handoff(&previous)?;
         if task.running.load(Ordering::Acquire) {
             return Err("Pause the download before changing its schedule.".into());
         }
@@ -3814,6 +4259,7 @@ impl DownloadManager {
         task.paused.store(false, Ordering::Release);
         let snapshot = {
             let mut record = task.record.write().await;
+            require_committed_handoff(&record)?;
             if record.status == DownloadStatus::Completed {
                 return Err("Completed downloads cannot be scheduled.".into());
             }
@@ -3825,11 +4271,21 @@ impl DownloadManager {
             };
             record.error = None;
             record.finished_at = None;
+            record.extra.remove("handoffActivationPending");
+            record.extra.remove("handoffDisposition");
             record.clone()
         };
-        self.persist_records()
-            .await
-            .map_err(|error| error.to_string())?;
+        if let Err(error) = self.persist_records_locked().await {
+            task.paused
+                .store(previous.status == DownloadStatus::Paused, Ordering::Release);
+            task.cancelled.store(
+                previous.status == DownloadStatus::Cancelled,
+                Ordering::Release,
+            );
+            *task.record.write().await = previous;
+            return Err(error.to_string());
+        }
+        drop(persist);
         self.emit_record(&snapshot);
         Ok(snapshot)
     }
@@ -4631,14 +5087,19 @@ impl DownloadManager {
         if let Some(trace) = &task.trace {
             trace.phase(trace::Phase::Probe);
         }
-        let probe = transfer_span!(
-            task.trace.as_deref(),
-            Probe,
-            tokio::select! {
-                result = self.probe(&url, task.request_context.as_ref(), Some(&task.health)) => result,
-                _ = cancel.cancelled() => Err(EngineError::Cancelled),
-            }
-        )?;
+        let verified = task.browser_verification.lock().unwrap().clone();
+        let probe = if let Some(verified) = verified {
+            verified
+        } else {
+            transfer_span!(
+                task.trace.as_deref(),
+                Probe,
+                tokio::select! {
+                    result = self.probe(&url, task.request_context.as_ref(), Some(&task.health)) => result,
+                    _ = cancel.cancelled() => Err(EngineError::Cancelled),
+                }
+            )?
+        };
 
         let settings = self.settings.read().await.clone();
         let snapshot = task.record.read().await.clone();
@@ -5431,15 +5892,24 @@ impl DownloadManager {
         if let Some(trace) = &task.trace {
             trace.requests.fetch_add(1, Ordering::Relaxed);
         }
-        let response = send_admitted(
-            client,
-            request,
-            cancel,
-            Some(&task.health),
-            #[cfg(feature = "test-tools")]
-            task.trace.as_deref(),
-        )
-        .await;
+        let prefetched = if existing == 0 && !requested_range {
+            task.prefetched.lock().unwrap().take()
+        } else {
+            None
+        };
+        let response = if let Some(response) = prefetched {
+            Ok(response)
+        } else {
+            send_admitted(
+                client,
+                request,
+                cancel,
+                Some(&task.health),
+                #[cfg(feature = "test-tools")]
+                task.trace.as_deref(),
+            )
+            .await
+        };
         segment.waiting.store(true, Ordering::Relaxed);
         let (response, _origin_permit, _global_permit) = response?;
         #[cfg(feature = "test-tools")]
@@ -6612,6 +7082,7 @@ impl DownloadManager {
                 torrent_priorities: record.torrent.as_ref().map(|t| t.priorities.clone()),
                 record,
                 request_context,
+                browser_verification: task.browser_verification.lock().unwrap().clone(),
             });
         }
         records.sort_by_key(|task| task.record.created_at);
@@ -7171,15 +7642,30 @@ fn record_uses_transfer_slot(record: &DownloadRecord) -> bool {
         )
 }
 
+fn require_committed_handoff(record: &DownloadRecord) -> Result<(), String> {
+    if record.extra.contains_key("handoffId")
+        && record
+            .extra
+            .get("handoffCommitted")
+            .and_then(|v| v.as_bool())
+            != Some(true)
+    {
+        return Err("Browser ownership is not committed. Use the browser companion to recover or return this file to the browser.".into());
+    }
+    Ok(())
+}
+
 fn record_is_dispatch_ready(
     record: &DownloadRecord,
     paused_queues: &[String],
     now: DateTime<Utc>,
 ) -> bool {
-    if !matches!(
-        record.status,
-        DownloadStatus::Queued | DownloadStatus::Scheduled
-    ) {
+    if require_committed_handoff(record).is_err()
+        || !matches!(
+            record.status,
+            DownloadStatus::Queued | DownloadStatus::Scheduled
+        )
+    {
         return false;
     }
     if paused_queues.iter().any(|name| name == &record.queue) {
@@ -8218,6 +8704,7 @@ mod tests {
             torrent_priorities: None,
             record,
             request_context: Some(context),
+            browser_verification: None,
         };
         let disk = serde_json::to_string(&stored).unwrap();
         assert!(disk.contains("session=secret"));
@@ -8432,6 +8919,21 @@ mod tests {
         let queued = queued_record(DownloadStatus::Queued, "Default", None);
         assert!(!record_is_dispatch_ready(&paused, &[], now));
         assert!(record_is_dispatch_ready(&queued, &[], now));
+    }
+
+    #[test]
+    fn provisional_browser_records_never_dispatch_even_with_runnable_status() {
+        let now = Utc::now();
+        for status in [DownloadStatus::Queued, DownloadStatus::Scheduled] {
+            let mut record = queued_record(status, "Default", None);
+            record.extra.insert("handoffId".into(), json!("opaque:0"));
+            record.extra.insert("handoffCommitted".into(), json!(false));
+            assert!(super::require_committed_handoff(&record).is_err());
+            assert!(!record_is_dispatch_ready(&record, &[], now));
+            record.extra.insert("handoffCommitted".into(), json!(true));
+            assert!(super::require_committed_handoff(&record).is_ok());
+            assert!(record_is_dispatch_ready(&record, &[], now));
+        }
     }
 
     #[tokio::test]
