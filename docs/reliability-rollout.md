@@ -1,6 +1,6 @@
 # Reliability rollout and rollback runbook
 
-Runbook updated 19 October 2026. Commands in documentation are not authorization by themselves. See the [processing review](reliability-privacy-review.md), [metric catalogue](reliability-metrics.md) and [coverage matrix](reliability-coverage.md).
+Runbook updated 20 October 2026. Commands in documentation are not authorization by themselves. See the [processing review](reliability-privacy-review.md), [metric catalogue](reliability-metrics.md) and [coverage matrix](reliability-coverage.md).
 
 The owner authorized release preparation/publication conditional on readiness on 18 October. The [18 October validation record](reliability-validation-2026-10-18.md) records synthetic provider qualification and protected read-access provisioning. The [19 October record](reliability-validation-2026-10-19.md) records the subsequently enabled final-notice receiver and controlled native canary. The original source-task restriction is not an additional permission requirement after that authorization; unresolved facts and demonstrated readiness still determine publication.
 
@@ -13,6 +13,8 @@ On 19 October the owner clarified that publication must include the full analyti
 3. Approve the final schema and separate purpose. Replace native `NOTICE_REVISION` with the approved notice revision; draft grants must cease to qualify. Keep v1 consent and semantics intact. Assign a new app release version before publication so new and historical observations cannot be confused.
 4. Native delivery uses `REMOTE_RELEASE_APPROVED`; Worker intake independently requires `QUALITY_ANALYTICS_ENABLED` to equal `"true"`. Both are deliberately enabled for the owner-authorized final-notice canary. This does not replace each user's fresh v2 consent or qualify an unfinished public release. Downloads and local troubleshooting also work with either gate closed.
 5. Review source/build provenance, current account workloads, read authorization, expiry and quota alerts. Choose stop thresholds before canary; inspect aggregates only through the private CLI with the existing environment-based token. Do not put tokens in command lines, artifacts, public issues or logs.
+
+20 October qualification checkpoint: the final-notice native canary and corrected cross-platform preflight passed. The complete controlled small/large/UI comparison also finished with successful cleanup; all original and repeated observations are retained. The large median guardrail is narrowly met and is not proof of causal recorder overhead or representative WAN behavior. Remaining physical/network limits and ongoing operator/legal/provider assurance are recorded explicitly. Recheck the final PR head and security checks, merge provenance, then use a new v0.8.2 tag for the signed publication workflow. Its nine native signatures, twelve public assets, actual updater and store-submission outcomes must be verified separately; unsigned manual preflight packages do not satisfy those steps.
 
 ## Source artifacts and local validation
 

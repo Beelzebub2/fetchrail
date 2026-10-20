@@ -115,3 +115,29 @@ The subsequent UI log contains four completed cases, but no final proof/PASS lin
 The 20 October configuration recheck restored the existing management connector by starting its saved application; no Cloudflare account setting was changed. Fresh provider reads confirmed both original namespaces, the read secret, enabled final-notice intake and rate binding, with invocation logs/traces/Logpush off and no tail consumers. workers.dev and preview endpoints remain disabled. Actual protected operator reads, unauthenticated-read rejection, the final public notice and existing v0.8.0 updater also passed. Administrator security details remain in ignored Windows-account-encrypted evidence (`operator-security-recheck-20261020.dpapi`), with a verified decrypt/compare check; they are not published here.
 
 PR #60 was closed while qualification continues, preserving its branch and all commits. It can be reopened when the remaining evidence is ready for merge. No PR was left open by this checkpoint, and no app release or installed-app update was performed.
+
+## 20 October final controlled qualification
+
+The unchanged candidate completed the reverse-order BAAB comparison and the complete UI recheck. The sequential qualification process exited **zero** at 00:12 UTC after its final PASS and fixture cleanup; no Fetchrail test process remained. The large and UI proofs are ignored `workload-c3fa00fa-5f03-4b6a-b20b-a4a69138d4e4.json` and `workload-266f44c6-6448-4c55-b663-d9ad4eb416e3.json`. The assert-based final analyzer checked both original and repeated large proofs, all output/checkpoint bytes, expected SHA-256 values, executable hashes, source pacing, run order, consent/counter assertions and all 120 small-case results. No observations were excluded. Its combined record is `final-qualification-20261020.json`.
+
+| Reverse-order run | Receiving MB/s | Request-to-catalog seconds |
+| --- | --- | --- |
+| Candidate B1 | 52.383 | 443.241 |
+| Baseline A1 | 52.241 | 450.482 |
+| Baseline A2 | 52.205 | 448.838 |
+| Candidate B2 | 51.209 | 456.001 |
+
+Across all eight 21 GiB transfers (four per build), baseline/candidate median receiving rates were **52.267 / 51.754 MB/s**, a **0.9816%** loss, just inside the provisional 1% median guardrail. Median request-to-catalog times were **447.543 / 449.791 seconds**, a 0.5024% increase. Median app-process CPU was 119.836 / 118.500 seconds and median peak working set 199,462,912 / 199,374,848 bytes; these exclude WebView, scanner and service processes. Four large observations per build do **not** establish a reliable large-transfer p95. The 2% p95 end-to-end guardrail is qualified by the separate twenty-per-build small comparisons above, not by substituting the large median for a percentile.
+
+The original ABBA subset's 1.2065% miss remains part of the combined evidence; the BAAB subset measured 0.8181% loss. Both slower candidate observations recorded multi-second write/flush/sync boundaries, while baseline observations also showed variable I/O waits. The evidence does not identify the cause of that variation or isolate recorder cost. The combined result is close to the target, with no statistical margin or uncapped-throughput claim. The baseline is an older whole app, and a 50 MiB/s generated source can mask higher-rate costs. This accepts the stated controlled comparison, not universal negligible overhead or representative WAN performance.
+
+The complete UI mode verified eight outputs and **800 search-input-to-render/two-frame observations**, 100 per case, all collected while the transfer was active under the 2 MiB/s app cap:
+
+| History records | Baseline p95 ms | Candidate p95 ms |
+| --- | --- | --- |
+| 10 | 15.4 | 14.5 |
+| 100 | 15.0 | 14.6 |
+| 1,000 | 14.8 | 15.7 |
+| 10,000 | 13.5 | 14.4 |
+
+These are application frame timings, not hardware input/presentation measurements or evidence that WebView subprocess resources were profiled. The earlier incomplete UI run is retained without being counted as a full pass. No native runtime source or candidate binary changed during these tests. A fresh fetch again found `origin/main` at `96c29fd`, with no new upstream commits to incorporate. Final PR checks, merge provenance, signed tag-build assets, public updater announcement and store-submission outcomes remain separate publication checks.
