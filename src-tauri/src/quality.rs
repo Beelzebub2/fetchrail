@@ -4,9 +4,9 @@ use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, sync::Mutex};
 use tokio_util::sync::CancellationToken;
 pub const PURPOSE: &str = "product-quality-v2";
-// Requires the documented legal/configuration review and a separately authorized release.
-pub const REMOTE_RELEASE_APPROVED: bool = false;
-pub const NOTICE_REVISION: &str = "reliability-draft-20261016";
+// Owner-authorized rollout after processing review; this is no compliance certification.
+pub const REMOTE_RELEASE_APPROVED: bool = true;
+pub const NOTICE_REVISION: &str = "reliability-v2-20261019";
 pub const BOUNDS_MS: [u64; 7] = [10, 100, 1000, 10_000, 60_000, 300_000, 1_800_000];
 const MAX: u32 = 1000;
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -387,6 +387,10 @@ mod tests {
         let mut stale = Consent::choice(true);
         stale.purpose = "product-improvement-v1".into();
         quality.configure(&stale);
+        assert!(quality.prepare().is_none());
+        let mut stale_notice = Consent::choice(true);
+        stale_notice.notice_revision = "reliability-draft-old".into();
+        quality.configure(&stale_notice);
         assert!(quality.prepare().is_none());
         quality.configure(&Consent::choice(true));
         assert!(quality.take_report().is_none());

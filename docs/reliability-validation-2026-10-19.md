@@ -1,0 +1,143 @@
+# Full analytics release preparation — 19 October 2026
+
+The owner requires a full analytics release and explicitly rejected publishing the application with expanded cloud analytics disabled. MFA enrollment is deferred until later. Neither this document nor that deferral establishes regulatory certification or acceptance of unfinished production checks.
+
+## Publication state
+
+The attempted staged v0.8.1 publication was a scope error. Workflow [39187074995](https://github.com/Beelzebub2/fetchrail/actions/runs/39187074995) completed as cancelled, including publication and updater announcement. The release API returned no v0.8.1 release. Its existing annotated tag is preserved; the next full candidate is **0.8.2**. PR #59 restored the full release scope and passed GitGuardian. No PR was left open by that correction.
+
+Native delivery remains gated off, with a draft notice revision; the production Worker has no v2 enable flag. Candidate versions and release notes are preparation, not publication. Before enabling delivery, change the notice revision together with the release gate so no saved draft choice silently becomes permission to send.
+
+## Verified implementation increments
+
+* `743d51a`: Privacy obtains the current notice and delivery status from the native application. An old v2 grant is displayed as expired rather than on, and loading it does not silently save a new choice. The existing independent v1 choice remains intact. Frontend build and actual Privacy UI regression pass. All five native quality tests pass, including old-notice rejection, scope epochs, no backfill, first-outcome counting, pre-admission exclusion and bounded serialization. These focused checks preceded the 0.8.2 version/notice-only preparation; final candidate qualification is separate.
+* `9a3a36c`: analytics intake uses Cloudflare's per-location rate binding before reading report bodies. Both purposes share the burst allowance; missing protection fails closed. IP-derived provider keys are never copied into application aggregates, receipts or logs. Runtime tests prove burst rejection, separate key allowance, no key in protected output, missing-binding rejection and continued updater operation. The full update-service suite passes.
+
+## Actual Cloudflare qualification
+
+An independent Worker, `fetchrail-reliability-rate-check-20261019`, used its own SQLite namespace `a515fd9ddca64ae18354bd2cc128243a`, a separate rate namespace and an ephemeral random read credential. It had no production analytics/feed/assets binding and observability was disabled. Analytics source SHA-256: `0EB7A3EE26E92240E0E2B17747167599719F8876071ECD8D2EA18E6B4EFB83F6`.
+
+Actual requests proved missing/incorrect read authorization returns 401, four batches stay suppressed and the fifth becomes visible, and protected responses have `no-store` and no permissive CORS. After six setup batches, a 60-request burst accepted 15 and rejected 45. The provider limit is approximate and local to a Cloudflare location; this is not a strict global 20-request proof. Protected reads and the independent health route remained available. The signed updater was exercised separately in the full runtime tests; this temporary Worker did not implement that route.
+
+The temporary Worker and its implemented namespace were then deleted. Cloudflare confirmed the namespace was absent and both production namespace identities were still present. Detailed synthetic evidence is ignored at `artifacts/reliability/provider-rate-qualification.json`. The new limiter does not change the SQL aggregation path qualified on 18 October and does not cap Worker invocation billing or defeat every distributed attack. It also does not bypass or modify the zone's existing GitHub Actions skip rule.
+
+Production settings were read successfully: existing analytics and release-feed namespaces, protected read secret, assets and disabled invocation logs/traces remain present. Billing/subscription inspection was denied, but account-wide aggregate Worker request/error metrics were available through GraphQL. Adaptive metrics are not a billing guarantee; private production traffic totals are not published in this record. Continue budgeting conservatively against the documented Free allowances and account-wide workloads.
+
+## Legal and deployment findings
+
+Cloudflare's [self-serve agreement](https://www.cloudflare.com/terms/), section 6.1, incorporates its DPA where applicable personal data is processed; the agreement states acceptance can arise through using the service. A separate DPA signature is therefore not automatically required for the standard self-serve arrangement. This corrects an overly broad earlier signature/approval assumption. It does not prove the content of a different bespoke agreement, the controller's transfer assessment or every account entitlement. The live [DPA 6.4](https://www.cloudflare.com/cloudflare-customer-dpa/) covers processor duties and restricted-transfer SCCs. Its DPF representations are not an independently verified registry check by this project.
+
+[GDPR Article 32](https://eur-lex.europa.eu/eli/reg/2016/679/oj/eng#art_32) requires security appropriate to the risk, not universal MFA as a condition of publishing software. The owner has deferred administrator enrollment; do not mark it completed, enable enforcement before enrollment/recovery, or present it as the sole technical barrier. Keep the owner's chosen RRMTools designation and contact rather than repeatedly requesting the same naming decision. Processing/transparency, audience/necessity and transfer decisions must be recorded against actual behavior, without inventing a registered-company status, mandatory external lawyer or EU-only hosting rule.
+
+The full production rollout is still unfinished: updated receiver and disclosures, final current-notice delivery activation, an explicitly opted-in native-client production canary and final distribution qualification remain. The existing 21 GiB trials establish integrity, not the provisional 1% throughput / 2% latency overhead target; that uncertainty remains explicit. Do not claim these checks completed or publish another disabled partial release as a substitute.
+
+The complete local native 0.8.2 run subsequently finished with **162 passed, one failed, three ignored**. `shared_http2_failures_keep_validated_prefixes_and_the_three_attempt_budget` timed out at its 30-second join deadline (`transfer_tests.rs:415`) after correlated HTTP/2 resets/BrokenPipe and one retry TLS `InvalidContentType`. The fixture and engine recovery need diagnosis and reproduction; this is not an accepted pass or evidence of a proven cause. Cross-platform preflight [39190738834](https://github.com/Beelzebub2/fetchrail/actions/runs/39190738834) runs on candidate `1205cad` without publication. No full-release readiness is claimed.
+
+## Follow-up qualification
+
+The exact unchanged HTTP/2 test passed once through Cargo and in eight subsequent executions of the same native test executable. Both recovery and three-attempt exhaustion paths retained their range-count, validated-prefix, concurrency and integrity assertions. This does not establish the cause of the earlier retry TLS error.
+
+The harness joined the transfer with an interruption driver that waits for every range to receive another prefix. A separate connection failure can consume a retry before that prefix and leave the driver waiting after the transfer has already failed. The harness now stops that driver when the real transfer finishes; the original 30-second deadline and all success/exhaustion assertions remain. No production retry policy, TLS validation or engine timeout was changed.
+
+The complete native test-tools suite then passed: **163 passed, zero failed, three ignored**, in 64.18 seconds. Formatting checks passed. Cross-platform preflight `39190738834` also completed successfully on `1205cad`: Windows x64, Linux x64/ARM64, update-service checks and installed Kali, Fedora 44, Mint 22.3 and Arch qualification. Publication and store jobs were skipped by that manual preflight. The earlier failed run remains part of the evidence; these passes do not convert its unknown TLS cause into a claimed fix.
+
+## Compatible production receiver and disclosures
+
+The restored Cloudflare connection was used for an authorized compatible receiver deployment, first retaining existing assets. Upload result `e2b234e07d1f44968a173eaad0f1ffa0` retained migration tag `analytics-v1`, original analytics and release-feed namespaces and existing read secret. The reviewed bundle SHA-256 remained `EEA1D2AEC7EC5AA644407E38BC553458AC6A27C60B99A023EDA50F46DBBFB72D`. The rate binding is now present in production; v2 intake stayed unset/closed. Actual tests passed for old website assets, protected-read rejection, existing protected credential, v1 synthetic `0.0.0` intake and the v0.8.0 release route. A v2 synthetic request returned 503 as intended. No real-user source data was submitted by these probes.
+
+The 21 public website assets were then uploaded through Cloudflare's documented one-hour scoped direct-upload session, retaining `_headers`, `_redirects`, worker routing and 404 configuration. Completion credentials were passed privately, never committed or printed. Upload result `bdf1efb6e56d4a53bad6b9fec0f3b83c` retained the same code ETag and storage migration. Live expanded privacy content, nonce CSP, no-store HTML, DENY/nosniff headers, immutable font/type, original GitHub redirect, 404 behavior and v0.8.0 feed all passed. Two earlier probe assertions incorrectly expected new text in retained old assets or used wording differing from the document; corrected assertions used the actual staged disclosure. Neither was evidence of a broken production route.
+
+The final-notice candidate prepares `reliability-v2-20261019`, paired native/server gates and the security-key disclosure. The owner confirmed a general-user audience not aimed at under-13s. The [processing review](reliability-privacy-review.md) records the official Cloudflare DPF participant status read in the rendered government registry and current Commission adequacy list, DPA incorporation, subprocessor/retention criteria and remaining assurance limits. No regulatory certification, account-plan proof, completed production canary, final signed publication or installed-app change is claimed by this preparation.
+
+The final-notice candidate's frontend build, actual Privacy UI, complete Worker suite, Chromium/Firefox integrations and synchronized release metadata passed. The optimized isolated test binary compiled successfully and contains the explicit test-delivery safeguard. A second complete native run passed **164 tests, zero failed, three ignored** in 64.09 seconds, including the new assertion that a normal test build with active fixture grants exits before starting background delivery and retains its local batches. The canary script refuses an ordinary invocation and is syntax-checked; its end-to-end production result remains pending.
+
+Final-notice server activation returned upload result `b213a3dc852e43528bf8c155a67d5cb8`, retaining `analytics-v1`, both namespace identities, the protected read secret and provider rate binding. A fresh settings read confirmed `QUALITY_ANALYTICS_ENABLED=true`, invocation logs/traces/Logpush off and no tail consumers. The live notice contains `reliability-v2-20261019` and the temporary security-key disclosure. No ordinary client release was published by that activation.
+
+The initial canary driver used a deliberately omitted browser-API destination and then assumed a native-persisted checkbox changed synchronously. Those driver errors were corrected without expanding browser output or weakening consent. It now reads only fixture-owned output through the existing protected catalog decoder, verifies SHA-256 and native catalog acknowledgement, and waits for authoritative consent status after a real click. All five profiles have passed preconsent exclusion, explicit final-notice grant and verified output. Their normal 30-minute batches and withdrawal checks remain pending. The canary executable SHA-256 is `19B7310225F323D2788EDD5E1812FFF2F964ED72831D168F924E94596130F97D` (isolated test-tools build, not an installer).
+
+A source-paced benchmark option was added to the existing isolated workload, sharing one scheduling budget across all response streams. Six 64 MiB baseline/candidate cases at 10/100/1000 history records passed complete bytes, SHA-256, catalog, privacy, counter and bounded-evidence checks at a configured 50 MiB/s source ceiling. Evidence: ignored `artifacts/reliability/workload-ab1e4145-7a40-4da6-8201-716ac2e3e93b.json`. These small checks validate the paced fixture, not the overhead target; matched large trials remain separate.
+
+## Final distribution test follow-up
+
+Preflight [39225523834](https://github.com/Beelzebub2/fetchrail/actions/runs/39225523834), on `2328303`, passed Windows, Linux x64/ARM64, Worker checks and installed Fedora 44, Kali and Arch tests. Mint 22.3 passed its X11 desktop checks but failed Wayland when reading the autostart entry immediately after the desired setting became visible. This run failed overall; it is not a release qualification pass. The separate Opera authentication dry run `39226436769` passed without uploading.
+
+The native implementation publishes desired settings before applying startup registration and returns from the save command after applying it. The desktop acceptance driver previously polled only the desired value. It now waits for the real UI's completed-save result, checks the returned preference and rejects a runtime warning before asserting the entry exists or was removed. No production startup behavior or timeout was changed. Linux requalification remains required.
+
+The first five-profile production canary delivered exactly five new native v2 batches through the normal 30-minute timer. All five contained the expected newly admitted and verified-durable outcome, without preconsent backfill or sentinel text. The driver subsequently failed because it expected a disabled (`null`) preview after flushing an enabled batch; the documented enabled preview instead contains empty counters and histograms. That driver assertion is corrected. This partial run did not reach withdrawal checks and does not count as a complete canary. A fresh five-profile run uses counter deltas, checks executable identity throughout, and must complete withdrawal before being accepted.
+
+The public operator/security-purpose wording was subsequently clarified and deployed with the same reviewed Worker ETag `0490b36abe464c89ddb9c0dcf3a6ba39904aac8da47d66d162f6705c5819a426` and migration `analytics-v1`. An initial multipart request was rejected as malformed; the corrected documented request succeeded. Fresh checks passed for the final notice, controller designation, separate security legitimate-interest disclosure, CSP/no-store, unauthenticated read rejection and unchanged v0.8.0 updater. Both original namespaces, read secret, enabled v2 gate, rate binding and disabled invocation logs/traces/Logpush were verified after deployment. Existing workers.dev and preview endpoints are disabled; source configuration now pins those settings.
+
+## Completed native production canary
+
+The corrected canary completed with exit code zero at **09:46:58 UTC**, in 1,865.692 seconds. Five isolated optimized Windows applications used actual native Privacy controls and the unchanged 30-minute sender. Exactly five additional reports contributed five accepted and five verified-durable new transfers. Preconsent transfers were excluded, v1 remained declined, the current notice was required, and safe output contained no poisoned source sentinel. After collection flushed to empty, every profile withdrew consent, completed another SHA-256-verified download with native durable-catalog acknowledgement, and returned a disabled/null aggregate preview. Executable identity was unchanged throughout; all five owned applications and profiles were cleaned up before successful exit. Ignored evidence: `artifacts/reliability/production-native-canary.json`.
+
+This qualifies real native delivery and withdrawal for controlled Windows loopback downloads, not representative WAN behavior, unique-user statistics or recorder overhead. The first partial run and this complete run together intentionally contributed **ten synthetic batches** to the 19 October `0.8.2 / windows / x64` receipt group. That group must not be described as ten people or entirely real-user observations; after aggregation those individual contributions cannot be selectively removed. Routine isolated test builds remain unable to send without the explicit canary flag and valid test root.
+
+Performance qualification uses this PC's Windows 11 Pro build 26200, Core i5-13400F and Lexar NM620 NVMe system drive, with a generated 50 MiB/s shared loopback source. Local hardware evidence omits serial numbers and network identity. Twenty balanced small-workload repetitions are still running; the sustained large and final UI comparisons remain pending. No performance guardrail is marked passed by the canary.
+
+## Completed balanced small-workload comparison
+
+All **120 cases** completed successfully: twenty baseline and twenty candidate observations at each of 10/100/1,000 history records, alternating ABBA/BAAB pair order across invocations. Every case checked 64 MiB of actual received/checkpoint bytes, SHA-256 output, catalog acknowledgement, bounded evidence and consent behavior. Analysis validates every proof path, binary hash, pair order and sample count, using all twenty repetitions without excluding slow observations. Evidence: ignored `paced-repeat-1.log` through `paced-repeat-20.log`, their linked proofs and `paced-summary-20.json`.
+
+| History records | Baseline / candidate median receiving MB/s | Baseline / candidate p95 request-to-catalog ms | Candidate p95 change |
+| --- | --- | --- | --- |
+| 10 | 51.228 / 51.365 | 1,949.087 / 1,955.287 | +0.318% |
+| 100 | 51.033 / 51.053 | 2,000.391 / 1,980.746 | -0.982% |
+| 1,000 | 49.895 / 49.895 | 2,346.869 / 2,291.215 | -2.371% |
+
+Medians average the two middle values; p95 is the nearest-rank nineteenth observation of twenty. The provisional ≤1% median receiving loss and ≤2% p95 end-to-end increase are met **for this paced small-workload comparison**. Completion ends at the actual catalog span acknowledgement, using a checked common host clock, rather than the later polling or diagnostic-file write. Baseline/candidate whole-process median CPU at 1,000 records was 1.891/1.961 seconds; median peak working set was 70.109/72.475 MB. These exclude WebView/scanner/service processes and do not isolate causal recorder cost.
+
+The executable baseline predates the observer and also differs in intervening app repairs. A constrained source can hide limits that arise at higher rates. Canary withdrawal activity around 09:46 UTC overlapped part of this set and was not selectively excluded. Do not infer an uncapped, representative WAN, statistical speedup or universal negligible-overhead claim. Earlier noisy unpaced large trials remain documented; the new paced sustained large and current-candidate UI tests are separate and still running.
+
+## Corrected cross-platform preflight
+
+Full nonpublishing preflight [39230795782](https://github.com/Beelzebub2/fetchrail/actions/runs/39230795782), source `34523dd`, completed **successfully**. Windows x64, Linux x64/ARM64, Worker security/runtime and installed Fedora 44, Mint 22.3, Kali and Arch package/HTTP/torrent/native X11/Wayland checks all passed. This includes production executables built without test tools. The earlier failed Mint run is retained above; the corrected test waits for actual native save completion without changing startup implementation or deadlines.
+
+Publication, updater announcement and browser-store submission jobs were deliberately skipped in this manual preflight. Its development packages are unsigned; this does not establish signed release assets, store approval or app publication. Commits after `34523dd` so far only record the verified evidence and rollout state; runtime source remains the same as the completed canary. Sustained large and final UI comparisons remain in progress.
+
+## 20 October continuation: commits and sustained evidence
+
+A fresh upstream fetch found no new `main` commits beyond `96c29fd`. The candidate is clean at `706127e`, fifteen commits ahead and zero behind `origin/main`. The additional commits after the successful preflight contain evidence/runbook updates and final privacy wording; native runtime and receiver source remain unchanged. GitGuardian and the PR checks pass. No v0.8.2 tag/release exists; v0.8.0 remains published and the cancelled v0.8.1 tag remains intact.
+
+The paced ABBA workload finished all four **21 GiB** outputs with correct received/checkpoint bytes, SHA-256 and catalog acknowledgement. Evidence: ignored `workload-078e89fd-91e2-48d0-973d-7f7fffb694f7.json`, using the unchanged baseline/candidate executable hashes above.
+
+| Run | Receiving MB/s | Request-to-catalog seconds |
+| --- | --- | --- |
+| Baseline A1 | 52.415 | 441.362 |
+| Candidate B1 | 51.145 | 458.434 |
+| Candidate B2 | 52.300 | 443.581 |
+| Baseline A2 | 52.294 | 446.247 |
+
+The candidate's median receiving loss is **1.2065%**, outside the provisional 1% target for this comparison; median completion time increased 1.6231%. Two observations per build do not establish a reliable p95. This is an integrity pass, not an accepted large-workload overhead pass. The slow candidate recorded individual write/flush/sync waits up to 2.965/3.172/3.639 seconds and a 1.020-second catalog call. The next candidate was materially faster; the final baseline also showed write/sync waits up to 0.826/1.272 seconds. These are observed API boundaries. They support investigating variable local I/O, without proving storage firmware, antivirus, external network or recorder causation. Concurrent worker totals cannot be added as wall time.
+
+The subsequent UI log contains four completed cases, but no final proof/PASS line. Its execution session is no longer available and no owned qualification process remains. The stop cause is unknown; the incomplete run is not counted as a full UI pass. A reverse-order BAAB large comparison and complete UI rerun were started on 20 October using unchanged binaries and source pacing, without increasing timeouts or weakening any assertion. Both original and repeated observations must be retained in the final assessment.
+
+The 20 October configuration recheck restored the existing management connector by starting its saved application; no Cloudflare account setting was changed. Fresh provider reads confirmed both original namespaces, the read secret, enabled final-notice intake and rate binding, with invocation logs/traces/Logpush off and no tail consumers. workers.dev and preview endpoints remain disabled. Actual protected operator reads, unauthenticated-read rejection, the final public notice and existing v0.8.0 updater also passed. Administrator security details remain in ignored Windows-account-encrypted evidence (`operator-security-recheck-20261020.dpapi`), with a verified decrypt/compare check; they are not published here.
+
+PR #60 was closed while qualification continues, preserving its branch and all commits. It can be reopened when the remaining evidence is ready for merge. No PR was left open by this checkpoint, and no app release or installed-app update was performed.
+
+## 20 October final controlled qualification
+
+The unchanged candidate completed the reverse-order BAAB comparison and the complete UI recheck. The sequential qualification process exited **zero** at 00:12 UTC after its final PASS and fixture cleanup; no Fetchrail test process remained. The large and UI proofs are ignored `workload-c3fa00fa-5f03-4b6a-b20b-a4a69138d4e4.json` and `workload-266f44c6-6448-4c55-b663-d9ad4eb416e3.json`. The assert-based final analyzer checked both original and repeated large proofs, all output/checkpoint bytes, expected SHA-256 values, executable hashes, source pacing, run order, consent/counter assertions and all 120 small-case results. No observations were excluded. Its combined record is `final-qualification-20261020.json`.
+
+| Reverse-order run | Receiving MB/s | Request-to-catalog seconds |
+| --- | --- | --- |
+| Candidate B1 | 52.383 | 443.241 |
+| Baseline A1 | 52.241 | 450.482 |
+| Baseline A2 | 52.205 | 448.838 |
+| Candidate B2 | 51.209 | 456.001 |
+
+Across all eight 21 GiB transfers (four per build), baseline/candidate median receiving rates were **52.267 / 51.754 MB/s**, a **0.9816%** loss, just inside the provisional 1% median guardrail. Median request-to-catalog times were **447.543 / 449.791 seconds**, a 0.5024% increase. Median app-process CPU was 119.836 / 118.500 seconds and median peak working set 199,462,912 / 199,374,848 bytes; these exclude WebView, scanner and service processes. Four large observations per build do **not** establish a reliable large-transfer p95. The 2% p95 end-to-end guardrail is qualified by the separate twenty-per-build small comparisons above, not by substituting the large median for a percentile.
+
+The original ABBA subset's 1.2065% miss remains part of the combined evidence; the BAAB subset measured 0.8181% loss. Both slower candidate observations recorded multi-second write/flush/sync boundaries, while baseline observations also showed variable I/O waits. The evidence does not identify the cause of that variation or isolate recorder cost. The combined result is close to the target, with no statistical margin or uncapped-throughput claim. The baseline is an older whole app, and a 50 MiB/s generated source can mask higher-rate costs. This accepts the stated controlled comparison, not universal negligible overhead or representative WAN performance.
+
+The complete UI mode verified eight outputs and **800 search-input-to-render/two-frame observations**, 100 per case, all collected while the transfer was active under the 2 MiB/s app cap:
+
+| History records | Baseline p95 ms | Candidate p95 ms |
+| --- | --- | --- |
+| 10 | 15.4 | 14.5 |
+| 100 | 15.0 | 14.6 |
+| 1,000 | 14.8 | 15.7 |
+| 10,000 | 13.5 | 14.4 |
+
+These are application frame timings, not hardware input/presentation measurements or evidence that WebView subprocess resources were profiled. The earlier incomplete UI run is retained without being counted as a full pass. No native runtime source or candidate binary changed during these tests. A fresh fetch again found `origin/main` at `96c29fd`, with no new upstream commits to incorporate. Final PR checks, merge provenance, signed tag-build assets, public updater announcement and store-submission outcomes remain separate publication checks.

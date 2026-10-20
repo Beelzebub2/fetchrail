@@ -408,8 +408,13 @@ async fn shared_http2_failures_keep_validated_prefixes_and_the_three_attempt_bud
                 tokio::time::sleep(Duration::from_millis(40)).await;
             }
         };
-        let (result, _) = tokio::time::timeout(Duration::from_secs(30), async {
-            tokio::join!(transfer, interrupt)
+        let result = tokio::time::timeout(Duration::from_secs(30), async {
+            tokio::pin!(transfer);
+            // A failed connection can exhaust retries before the next prefix arrives.
+            tokio::select! {
+                result = &mut transfer => result,
+                _ = interrupt => transfer.await,
+            }
         })
         .await
         .expect("Correlated HTTP/2 failures must recover or exhaust the existing budget");

@@ -479,6 +479,13 @@ async fn set_quality_consent(
     manager.set_quality_consent(enabled).await
 }
 #[tauri::command]
+fn quality_release_status() -> serde_json::Value {
+    serde_json::json!({
+        "approved": quality::REMOTE_RELEASE_APPROVED,
+        "noticeRevision": quality::NOTICE_REVISION,
+    })
+}
+#[tauri::command]
 fn quality_preview(manager: State<'_, Arc<DownloadManager>>) -> Option<quality::Report> {
     manager.quality_preview()
 }
@@ -1151,6 +1158,7 @@ pub fn run() {
             remember_download_folder,
             set_analytics_consent,
             set_quality_consent,
+            quality_release_status,
             quality_preview,
             recent_operation_health,
             download_health,

@@ -222,6 +222,13 @@ impl Analytics {
         ))
     }
     pub async fn run(self: std::sync::Arc<Self>) {
+        // Isolated QA grants must not turn routine test workloads into production traffic.
+        #[cfg(feature = "test-tools")]
+        if std::env::var("FETCHRAIL_TEST_ANALYTICS_CANARY").as_deref() != Ok("1")
+            || !matches!(crate::platform::test_root(), Ok(Some(_)))
+        {
+            return;
+        }
         let Ok(client) = report_client() else {
             return;
         };
@@ -254,6 +261,25 @@ impl Analytics {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "test-tools")]
+    #[tokio::test]
+    async fn test_build_keeps_granted_batches_local_without_an_isolated_canary() {
+        assert!(crate::platform::test_root().unwrap().is_none());
+        let analytics = std::sync::Arc::new(Analytics::new(&Consent::choice(true)));
+        analytics
+            .quality
+            .configure(&crate::quality::Consent::choice(true));
+        let mut sample = analytics.quality.prepare().unwrap();
+        analytics.quality.added(&mut sample, false);
+        tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            analytics.clone().run(),
+        )
+        .await
+        .expect("A normal test build must exit before constructing a sender or starting its timer");
+        assert!(analytics.quality.preview().is_some());
+        assert!(analytics.take_report().is_some());
+    }
     #[tokio::test]
     async fn actual_transport_has_no_source_credentials_and_cancelled_batches_open_no_socket() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};

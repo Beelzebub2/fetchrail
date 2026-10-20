@@ -4,6 +4,18 @@
   "main": "worker.mjs",
   "account_id": "ceb32a583d11c6cc5b64455c2db4a174",
   "compatibility_date": "2026-10-09",
+  "workers_dev": false,
+  "preview_urls": false,
+  "vars": {
+    "QUALITY_ANALYTICS_ENABLED": "true"
+  },
+  "ratelimits": [
+    {
+      "name": "ANALYTICS_RATE_LIMITER",
+      "namespace_id": "814215390227",
+      "simple": { "limit": 20, "period": 60 }
+    }
+  ],
   "assets": {
     "directory": "../website/public",
     "binding": "ASSETS",

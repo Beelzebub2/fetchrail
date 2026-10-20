@@ -123,7 +123,11 @@ try {
     // The save bar slides in once something has changed; saving keeps Settings open, the gear closes it.
     await until(() => evaluate('const bar = document.querySelector(".save-dock.shown"); return Boolean(bar && new DOMMatrix(getComputedStyle(bar).transform).m42 === 0)'), "save bar");
     await click(".save-dock .primary-button");
-    await until(async () => (await invoke("get_settings")).launchOnStart === enabled, "saved startup preference");
+    // Desired settings become readable before native startup registration finishes.
+    await until(() => evaluate('return document.querySelector(".save-dock span")?.textContent === "Settings saved"'), "completed native settings save");
+    const saved = await invoke("get_settings");
+    assert.equal(saved.launchOnStart, enabled, "Saved startup preference");
+    assert.equal(saved.runtimeWarning, undefined, "Startup registration must succeed");
     if (enabled) assert.match(await readFile(startup, "utf8"), /Exec=\/usr\/bin\/env .+ --background/);
     else await assert.rejects(access(startup), { code: "ENOENT" });
     await click('button[aria-label="Settings"]');
