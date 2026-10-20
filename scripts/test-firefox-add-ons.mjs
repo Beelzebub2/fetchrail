@@ -94,6 +94,17 @@ assert.deepEqual(methods, ["GET", "PATCH", "GET", "GET"]);
 const linkedPolicy = policy.replace("https://fetchrail.rrmtools.uk/privacy", '<a href="https://prod.outgoing.example/?url=1">https://fetchrail.rrmtools.uk/privacy</a>');
 assert.equal(await syncPrivacyPolicy({ ...args, fetcher: async () => new Response(JSON.stringify({ privacy_policy: { "en-US": linkedPolicy } }), { status: 200 }) }), false,
   "Mozilla's display-only links must not force repeat privacy policy updates");
+assert.equal(await syncPrivacyPolicy({ ...args, fetcher: async (_url, request) => {
+  assert.equal(request.method, "GET", "AMO blank-line normalization must not trigger another policy write");
+  return Response.json({ privacy_policy: { "en-US": linkedPolicy.replace(/\r\n/g, "\n").replace(/\n{3,}/g, "\n\n") } });
+} }), false);
+let normalizedPolicy = "previous policy";
+assert.equal(await syncPrivacyPolicy({ ...args, fetcher: async (_url, request) => {
+  if (request.method === "PATCH") normalizedPolicy = JSON.parse(request.body).privacy_policy["en-US"].replace(/\r\n/g, "\n").replace(/\n{3,}/g, "\n\n");
+  return Response.json({ privacy_policy: { "en-US": normalizedPolicy } });
+} }), true, "A new policy must verify after AMO normalizes its blank lines");
+await assert.rejects(syncPrivacyPolicy({ ...args, fetcher: async () => Response.json({ privacy_policy: { "en-US": policy.replace("RRMTools", "Different operator") } }) }),
+  /did not return the submitted privacy policy/, "Blank-line normalization must not hide changed policy text");
 await assert.rejects(syncPrivacyPolicy({ ...args, fetcher: async (_url, req) => new Response(JSON.stringify({ privacy_policy: { "en-US": req.method === "GET" ? "a different policy" : policy } }), { status: 200 }) }), /did not return the submitted privacy policy/);
 await assert.rejects(syncPrivacyPolicy({ ...args, fetcher: async () => new Response("{}", { status: 403 }) }), /HTTP 403/);
 const icon = await readFile(new URL("../browser-extension/src/icons/128.png", import.meta.url));
