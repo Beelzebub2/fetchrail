@@ -20,6 +20,8 @@ pub use linux::{
 #[cfg(windows)]
 pub(crate) use windows_attachment::mark_download;
 #[cfg(windows)]
+pub use windows_attachment::run_attachment_worker;
+#[cfg(windows)]
 pub(crate) use windows_scan_watch::ScanWatch;
 
 pub const APP_ID: &str = "com.rrmtools.braid";

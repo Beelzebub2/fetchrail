@@ -94,13 +94,23 @@ pub fn read<T: DeserializeOwned>(path: &Path) -> Result<T, String> {
 
 pub fn write<T: Serialize + DeserializeOwned>(path: &Path, value: &T) -> Result<(), String> {
     // Never replace the last known-good backup with corrupted or unvalidated state.
-    if let Ok(previous) = read::<T>(path) {
-        let bytes = serde_json::to_vec(&previous).map_err(|e| e.to_string())?;
-        crate::platform::write_private_atomic(
-            &path.with_extension("json.backup"),
-            &encode(&bytes)?,
-        )
-        .map_err(|e| e.to_string())?;
+    if let Ok(previous) = std::fs::read(path) {
+        if let Ok(decoded) = decode(&previous) {
+            if serde_json::from_slice::<T>(&decoded).is_ok() {
+                // Reuse validated ciphertext; reserializing and encrypting an unchanged
+                // previous generation costs O(history) work at every catalog update.
+                let protected = serde_json::from_slice::<serde_json::Value>(&previous)
+                    .ok()
+                    .is_some_and(|v| v["fetchrail_state"] == 1 && v["protected"] == true);
+                let backup = if cfg!(windows) && !protected {
+                    encode(&decoded)?
+                } else {
+                    previous
+                };
+                crate::platform::write_private_atomic(&path.with_extension("json.backup"), &backup)
+                    .map_err(|e| e.to_string())?;
+            }
+        }
     }
     let bytes = serde_json::to_vec(value).map_err(|e| e.to_string())?;
     crate::platform::write_private_atomic(path, &encode(&bytes)?).map_err(|e| e.to_string())
@@ -142,6 +152,99 @@ pub fn acknowledge<T: DeserializeOwned>(path: &Path) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn validated_previous_encoding_is_preserved_byte_for_byte_in_backup() {
+        let dir =
+            std::env::temp_dir().join(format!("fetchrail-state-copy-{}", uuid::Uuid::new_v4()));
+        let path = dir.join("downloads.json");
+        let previous = vec!["synthetic-previous-generation".to_string()];
+        let encoded = encode(&serde_json::to_vec(&previous).unwrap()).unwrap();
+        // Noncanonical whitespace also makes needless re-encoding observable off Windows.
+        let envelope: Envelope = serde_json::from_slice(&encoded).unwrap();
+        let stored = serde_json::to_vec_pretty(&envelope).unwrap();
+        crate::platform::write_private_atomic(&path, &stored).unwrap();
+        let next = vec!["replacement-generation".to_string()];
+
+        write(&path, &next).unwrap();
+
+        let backup = std::fs::read(path.with_extension("json.backup")).unwrap();
+        assert_eq!(backup, stored);
+        assert_eq!(
+            read::<Vec<String>>(&path.with_extension("json.backup")).unwrap(),
+            previous
+        );
+        assert_eq!(read::<Vec<String>>(&path).unwrap(), next);
+        #[cfg(windows)]
+        assert!(
+            serde_json::from_slice::<Envelope>(&backup)
+                .unwrap()
+                .protected
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn damaged_or_wrong_typed_primary_never_replaces_a_valid_backup() {
+        let dir =
+            std::env::temp_dir().join(format!("fetchrail-state-valid-{}", uuid::Uuid::new_v4()));
+        let path = dir.join("downloads.json");
+        write(&path, &vec!["known-good-backup".to_string()]).unwrap();
+        write(&path, &vec!["current".to_string()]).unwrap();
+        let backup_path = path.with_extension("json.backup");
+        let known_good = std::fs::read(&backup_path).unwrap();
+        let mut damaged: Envelope =
+            serde_json::from_slice(&encode(br#"["damaged-generation"]"#).unwrap()).unwrap();
+        damaged.sha256 = "0".repeat(64);
+        let invalid_generations = [
+            b"{".to_vec(),
+            serde_json::to_vec(&damaged).unwrap(),
+            encode(br#"{"wrongType":true}"#).unwrap(),
+        ];
+        for invalid in invalid_generations {
+            std::fs::write(&path, invalid).unwrap();
+            let replacement = vec!["valid-replacement".to_string()];
+            write(&path, &replacement).unwrap();
+            assert_eq!(std::fs::read(&backup_path).unwrap(), known_good);
+            assert_eq!(read::<Vec<String>>(&path).unwrap(), replacement);
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[cfg(windows)]
+    #[test]
+    fn legacy_plaintext_generations_are_protected_before_becoming_backups() {
+        let previous = vec!["synthetic-legacy-secret".to_string()];
+        let plaintext = serde_json::to_vec(&previous).unwrap();
+        let unprotected = serde_json::to_vec(&Envelope {
+            fetchrail_state: 1,
+            sha256: format!("{:x}", Sha256::digest(&plaintext)),
+            protected: false,
+            payload: STANDARD.encode(&plaintext),
+        })
+        .unwrap();
+        for legacy in [plaintext.clone(), unprotected] {
+            let dir = std::env::temp_dir().join(format!(
+                "fetchrail-state-migration-{}",
+                uuid::Uuid::new_v4()
+            ));
+            let path = dir.join("downloads.json");
+            crate::platform::write_private_atomic(&path, &legacy).unwrap();
+
+            write(&path, &vec!["new-generation".to_string()]).unwrap();
+
+            let backup = std::fs::read(path.with_extension("json.backup")).unwrap();
+            let envelope: Envelope = serde_json::from_slice(&backup).unwrap();
+            assert!(envelope.protected);
+            assert_ne!(backup, legacy);
+            assert_eq!(decode(&backup).unwrap(), plaintext);
+            assert_eq!(
+                read::<Vec<String>>(&path.with_extension("json.backup")).unwrap(),
+                previous
+            );
+            assert!(!String::from_utf8(backup)
+                .unwrap()
+                .contains("synthetic-legacy-secret"));
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
     #[test]
     fn checksum_covers_stored_payload_without_exposing_plaintext_digest() {
         let plain = br#"{"password":"synthetic-test-password"}"#;

@@ -1,4 +1,4 @@
-//! Optional, first-party counters. No identifiers or transfer details leave this module.
+//! Optional first-party summaries. No caller identifiers or transfer details leave this module.
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, sync::Mutex};
 use tokio_util::sync::CancellationToken;
@@ -32,6 +32,52 @@ async fn post_once(
     tokio::select! { biased;
         _ = cancel.cancelled() => false,
         result = client.post(endpoint).header(reqwest::header::CONTENT_TYPE, "application/json").body(body).send() => result.is_ok_and(|response| response.status().is_success()),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct BatchAck {
+    schema: u32,
+    batch_id: String,
+    accepted: bool,
+    duplicate: bool,
+}
+#[derive(Debug, PartialEq, Eq)]
+enum DeliveryResult {
+    Acknowledged,
+    Retry,
+    Rejected,
+}
+async fn post_acknowledged(
+    client: &reqwest::Client,
+    endpoint: &str,
+    body: Vec<u8>,
+    batch_id: &str,
+    cancel: CancellationToken,
+) -> DeliveryResult {
+    tokio::select! { biased;
+        _ = cancel.cancelled() => DeliveryResult::Retry,
+        result = async {
+            let Ok(mut response) = client.post(endpoint).header(reqwest::header::CONTENT_TYPE, "application/json").body(body).send().await else { return DeliveryResult::Retry; };
+            if response.status().is_client_error() && !matches!(response.status().as_u16(), 408 | 429) { return DeliveryResult::Rejected; }
+            if response.status().as_u16() != 200 { return DeliveryResult::Retry; }
+            let mut bytes = Vec::new();
+            loop {
+                match response.chunk().await {
+                    Ok(Some(chunk)) if bytes.len() + chunk.len() <= 512 => bytes.extend_from_slice(&chunk),
+                    Ok(None) => break,
+                    _ => return DeliveryResult::Retry,
+                }
+            }
+            match serde_json::from_slice::<BatchAck>(&bytes) {
+                Ok(ack) if ack.schema == crate::quality::SCHEMA && ack.batch_id == batch_id && ack.accepted => {
+                    let _ = ack.duplicate;
+                    DeliveryResult::Acknowledged
+                }
+                _ => DeliveryResult::Retry,
+            }
+        } => result,
     }
 }
 
@@ -232,35 +278,178 @@ impl Analytics {
         let Ok(client) = report_client() else {
             return;
         };
-        // RAM-only best effort: loss on exit/failure is preferable to a tracking queue.
-        let mut timer = tokio::time::interval(std::time::Duration::from_secs(1800));
-        timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        timer.tick().await;
-        loop {
+        // Legacy consent never authorizes the separately renewed v3 scope/outbox.
+        let legacy = async {
+            let mut timer = tokio::time::interval(std::time::Duration::from_secs(1800));
+            timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             timer.tick().await;
-            if let Some((report, cancel)) = self.take_report() {
-                if let Ok(body) = serde_json::to_vec(&report) {
-                    let _ = post_once(&client, ENDPOINT, body, cancel).await;
-                }
-            }
-            if let Some((report, cancel)) = self
-                .quality
-                .take_report()
-                .filter(|_| crate::quality::REMOTE_RELEASE_APPROVED)
-            {
-                if let Ok(body) = serde_json::to_vec(&report) {
-                    if body.len() <= 4096 {
+            loop {
+                timer.tick().await;
+                if let Some((report, cancel)) = self.take_report() {
+                    if let Ok(body) = serde_json::to_vec(&report) {
                         let _ = post_once(&client, ENDPOINT, body, cancel).await;
                     }
                 }
             }
-        }
+        };
+        let quality = async {
+            let mut timer = tokio::time::interval(std::time::Duration::from_secs(30));
+            timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                timer.tick().await;
+                if !crate::quality::REMOTE_RELEASE_APPROVED {
+                    continue;
+                }
+                if self.quality.checkpoint_delivery().is_err() {
+                    continue;
+                }
+                if let Some((report, cancel)) = self.quality.next_delivery() {
+                    let id = report.batch_id().to_owned();
+                    if let Ok(body) = serde_json::to_vec(&report) {
+                        match post_acknowledged(&client, ENDPOINT, body, &id, cancel).await {
+                            DeliveryResult::Acknowledged => {
+                                self.quality.finish_delivery(&id, true, false)
+                            }
+                            DeliveryResult::Rejected => {
+                                self.quality.finish_delivery(&id, false, true)
+                            }
+                            DeliveryResult::Retry => (),
+                        }
+                    }
+                }
+            }
+        };
+        tokio::join!(legacy, quality);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn acknowledged_delivery_requires_exact_bounded_ack_and_retries_transient_failures() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let id = "0123456789abcdef0123456789abcdef";
+        let client = report_client().unwrap();
+        let ack = serde_json::json!({"schema":3,"batchId":id,"accepted":true,"duplicate":false})
+            .to_string();
+        let duplicate =
+            serde_json::json!({"schema":3,"batchId":id,"accepted":true,"duplicate":true})
+                .to_string();
+        let wrong = serde_json::json!({"schema":3,"batchId":"00000000000000000000000000000000","accepted":true,"duplicate":false}).to_string();
+        for (status, body, expected) in [
+            (200, ack, DeliveryResult::Acknowledged),
+            (200, duplicate, DeliveryResult::Acknowledged),
+            (200, wrong, DeliveryResult::Retry),
+            (
+                200,
+                "malformed acknowledgement".into(),
+                DeliveryResult::Retry,
+            ),
+            (200, "x".repeat(513), DeliveryResult::Retry),
+            (204, String::new(), DeliveryResult::Retry),
+            (302, String::new(), DeliveryResult::Retry),
+            (408, String::new(), DeliveryResult::Retry),
+            (429, String::new(), DeliveryResult::Retry),
+            (503, String::new(), DeliveryResult::Retry),
+            (400, String::new(), DeliveryResult::Rejected),
+            (409, String::new(), DeliveryResult::Rejected),
+            (413, String::new(), DeliveryResult::Rejected),
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let endpoint = format!("http://{}/api/analytics", listener.local_addr().unwrap());
+            let server = async {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                // Consume the complete fixture POST before closing the socket. On
+                // Windows, closing with unread body bytes can reset the connection
+                // and discard a valid ACK independently of the client behavior.
+                while !request
+                    .windows(4)
+                    .position(|part| part == b"\r\n\r\n")
+                    .is_some_and(|end| request.len() >= end + 4 + 2)
+                {
+                    let mut bytes = [0u8; 1024];
+                    let read = stream.read(&mut bytes).await.unwrap();
+                    assert!(read > 0);
+                    request.extend_from_slice(&bytes[..read]);
+                    assert!(request.len() < 4096);
+                }
+                let headers = String::from_utf8_lossy(&request)
+                    .split("\r\n\r\n")
+                    .next()
+                    .unwrap()
+                    .to_ascii_lowercase();
+                for forbidden in ["cookie:", "authorization:", "referer:", "origin:"] {
+                    assert!(!headers.contains(forbidden));
+                }
+                let response = format!("HTTP/1.1 {status} Test\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+                stream.write_all(response.as_bytes()).await.unwrap();
+            };
+            let (actual, _) = tokio::join!(
+                post_acknowledged(
+                    &client,
+                    &endpoint,
+                    b"{}".to_vec(),
+                    id,
+                    CancellationToken::new()
+                ),
+                server
+            );
+            assert_eq!(
+                actual, expected,
+                "HTTP {status} must not acknowledge an unverified batch"
+            );
+        }
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}/api/analytics", listener.local_addr().unwrap());
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        assert_eq!(
+            post_acknowledged(&client, &endpoint, b"{}".to_vec(), id, cancel).await,
+            DeliveryResult::Retry
+        );
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(30), listener.accept())
+                .await
+                .is_err()
+        );
+    }
+    #[tokio::test]
+    async fn withdrawal_cancels_waiting_for_an_ack_body() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}/api/analytics", listener.local_addr().unwrap());
+        let client = report_client().unwrap();
+        let quality = crate::quality::Quality::default();
+        quality.configure(&crate::quality::Consent::choice(true));
+        let mut sample = quality.prepare().unwrap();
+        quality.added(&mut sample, false);
+        let (report, cancel) = quality.take_report().unwrap();
+        let server = async {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut bytes = [0u8; 1024];
+            assert!(stream.read(&mut bytes).await.unwrap() > 0);
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n{")
+                .await
+                .unwrap();
+            quality.configure(&crate::quality::Consent::choice(false));
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        };
+        let (actual, _) = tokio::join!(
+            post_acknowledged(
+                &client,
+                &endpoint,
+                b"{}".to_vec(),
+                report.batch_id(),
+                cancel
+            ),
+            server
+        );
+        assert_eq!(actual, DeliveryResult::Retry);
+        assert!(quality.preview().is_none());
+    }
     #[cfg(feature = "test-tools")]
     #[tokio::test]
     async fn test_build_keeps_granted_batches_local_without_an_isolated_canary() {
@@ -329,7 +518,7 @@ mod tests {
             for sensitive in ["cookie:", "authorization:", "referer:", "origin:"] {
                 assert!(!headers.contains(sensitive));
             }
-            assert!(request.contains("product-quality-v2"));
+            assert!(request.contains("product-quality-v3"));
             assert!(!request.contains("decidedAt"));
             stream
                 .write_all(b"HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n")

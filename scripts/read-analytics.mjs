@@ -11,4 +11,13 @@ const response = await fetch(new URL("/api/analytics/report", origin), {
 });
 if (!response.ok) throw new Error(`Analytics readout failed (HTTP ${response.status}).`);
 const report = await response.json();
-console.log(JSON.stringify({ ...report, qualitySummary: qualitySummary(report.quality) }, null, 2));
+console.log(JSON.stringify({ ...report,
+  operatorReadAt: new Date().toISOString(),
+  qualitySummary: qualitySummary(report.quality),
+  qualityV3Summary: qualitySummary(report.qualityV3),
+  coverage: {
+    observed: ["Protected application aggregates by server receipt day", "Visible quality cohorts and number of suppressed groups", "Application admission/duplicate/rejection counters where supplied"],
+    unobserved: ["Unique users, individual transfer joins and unreported client failures", "Cloudflare account billing, SQL metering, CPU/request tails, provider-wide rate rejections or storage headroom", "Source servers, ISP/route saturation and other apps' network load"],
+    architecture: "Cloudflare hosts Fetchrail website/update/telemetry control paths; ordinary download payloads travel directly from their selected source",
+  },
+}, null, 2));

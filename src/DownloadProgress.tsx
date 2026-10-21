@@ -163,7 +163,7 @@ export function DownloadProgress({ id }: { id: string }) {
               <dt>File size</dt><dd>{formatBytes(item.totalBytes ?? (complete ? item.downloadedBytes : null), true)}</dd>
               <dt>Downloaded</dt><dd>{formatBytes(item.downloadedBytes, true)}{item.totalBytes ? ` (${Math.min(100, item.downloadedBytes / item.totalBytes * 100).toFixed(2)}%)` : ""}</dd>
               <dt>Transfer rate</dt><dd>{formatSpeed(item.speedBps)}</dd>
-              <dt>Time left</dt><dd>{complete ? "Done" : formatEta(item.etaSeconds)}</dd>
+              <dt>{item.torrent ? "Time left" : "Time to receive bytes"}</dt><dd>{complete ? "Done" : formatEta(item.etaSeconds)}{!item.torrent && !complete && <small> · verification and final save follow</small>}</dd>
               <dt>Resume capability</dt><dd>{item.resumeSupported == null ? "Checking…" : item.resumeSupported ? "Yes" : "No"}</dd>
               <dt>Save to</dt><dd className="transfer-destination" title={item.destination}>{item.destination}</dd>
             </dl>

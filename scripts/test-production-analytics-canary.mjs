@@ -1,10 +1,10 @@
-// Explicit operator QA only: five isolated apps, real consent UI and the unchanged 30-minute sender.
+// Explicit operator QA only: five isolated apps, real v3 consent and ordinary acknowledged delivery.
 import assert from "node:assert/strict";
 import {createServer} from "node:http";
 import {createServer as tcpServer} from "node:net";
 import {spawn,spawnSync} from "node:child_process";
 import {randomUUID,createHash} from "node:crypto";
-import {readFile,writeFile,mkdir} from "node:fs/promises";
+import {readFile,writeFile,mkdir,stat} from "node:fs/promises";
 import {createReadStream} from "node:fs";
 import {join,resolve,sep} from "node:path";
 import {setTimeout as delay} from "node:timers/promises";
@@ -53,9 +53,11 @@ async function download(context){
 const executableSha256=await hashFile(join(bin,executableName("fetchrail"))),started=Date.now();
 try{
  const baseline=readReport();
- const day=new Date().toISOString().slice(0,10);
- const selectRow=report=>report.quality.rows.find(row=>row.day===day&&row.version===version&&row.os==="windows"&&row.arch==="x64");
- const before=selectRow(baseline),expectedReports=(before?.reports??0)+5;
+ assert.equal(baseline.qualityV3?.schema,3,"Deploy the compatible receiver before this canary");
+ assert.equal(baseline.collection?.qualityV3,true,"Explicitly activate the reviewed v3 receiver before this canary");
+ const day=baseline.generatedAt.slice(0,10);
+ const selectRow=report=>report.qualityV3.rows.find(row=>row.day===day&&row.version===version&&row.os==="windows"&&row.arch==="x64"&&row.provenance==="controlled");
+ const before=selectRow(baseline),exactBaseline=!!before||baseline.qualityV3.suppressedGroups===0;
  for(let index=0;index<5;index++){
   const fixture=await createFixture("production-analytics-canary");const context={fixture};contexts.push(context);
   await writeFile(join(fixture.stateDir,"settings.json"),JSON.stringify({analyticsConsent:{enabled:false,decided:true,schema:1,purpose:"product-improvement-v1"},autoUpdate:false,localCrashHistory:false,defaultDownloadDir:fixture.root,maxConcurrentDownloads:1,connectionsPerDownload:4,minSegmentSizeMb:1,launchOnStart:false,performanceAuto:false,torrent:localTorrentConfig}));
@@ -81,27 +83,46 @@ try{
   await context.page.getByText("Reliability analytics is on.",{exact:true}).waitFor();
   await download(context);
   const preview=await context.page.evaluate(()=>window.__TAURI_INTERNALS__.invoke("quality_preview"));
-  assert.equal(preview.counters.http_accepted,1);assert.equal(preview.counters.http_verified_durable,1);
+  assert.equal(preview.schema,3);assert.equal(preview.purpose,"product-quality-v3");assert.equal(preview.provenance,"controlled");
+  for(const key of ["http_accepted","http_verified_durable"]) if(preview.counters[key]!==undefined) assert.equal(preview.counters[key],1);
   assert.ok(!JSON.stringify(preview).includes(sentinel));
   const settings=await context.page.evaluate(()=>window.__TAURI_INTERNALS__.invoke("get_settings"));
-  assert.equal(settings.analyticsConsent.enabled,false);assert.equal(settings.qualityConsent.noticeRevision,notice);
+  assert.equal(settings.analyticsConsent.enabled,false);assert.equal(settings.qualityConsent.schema,3);assert.equal(settings.qualityConsent.noticeRevision,notice);
   console.log(`Canary ${index+1}/5: fresh native consent, no preconsent backfill, verified 32 MiB output.`);
  }
+ let nativeBatches=0;
+ for(const context of contexts){
+  const delivered=await waitFor(async()=>{
+   const status=await context.page.evaluate(()=>window.__TAURI_INTERNALS__.invoke("quality_delivery_status"));
+   assert.equal(status.storageError,null,"Private queue must remain writable throughout the canary");
+   assert.equal(status.expiredBatches+status.overflowDroppedBatches+status.rejectedBatches,0);
+   const preview=await context.page.evaluate(()=>window.__TAURI_INTERNALS__.invoke("quality_preview"));
+   return status.acknowledgedBatches>0&&status.pendingBatches===0&&Object.keys(preview.counters).length===0&&status;
+  },"ordinary native v3 delivery and exact acknowledgment",10*60*1000,1000);
+  nativeBatches+=delivered.acknowledgedBatches;
+ }
+ assert.ok(nativeBatches>=5&&nativeBatches<=10,"Each profile sends admission and completion in one or two natural batches");
  let report,row;
- await waitFor(async()=>{report=readReport();row=selectRow(report);return row?.reports===expectedReports;},"five additional real native 30-minute batches",35*60*1000,30000);
- assert.equal(new Date().toISOString().slice(0,10),day,"Repeat a canary spanning a UTC receipt-day boundary");
- assert.equal(row.counters.http_accepted-(before?.counters.http_accepted??0),5);assert.equal(row.counters.http_verified_durable-(before?.counters.http_verified_durable??0),5);
+ await waitFor(async()=>{report=readReport();row=selectRow(report);return row&&row.reports>=(before?.reports??0)+nativeBatches;},"visible controlled v3 aggregate",60000,5000);
+ assert.equal(report.generatedAt.slice(0,10),day,"Repeat a canary spanning a server UTC receipt-day boundary");
+ if(exactBaseline){
+  assert.equal(row.reports-(before?.reports??0),nativeBatches,"Repeat if concurrent controlled traffic changes this cohort");
+  assert.equal(row.counters.http_accepted-(before?.counters.http_accepted??0),5);assert.equal(row.counters.http_verified_durable-(before?.counters.http_verified_durable??0),5);
+ }else console.log("Baseline quality suppression prevents an exact cohort delta; local exact ACKs and visible controlled aggregate are verified.");
  assert.ok(!JSON.stringify(report).includes(sentinel));
  for(const context of contexts){
   const empty=await context.page.evaluate(()=>window.__TAURI_INTERNALS__.invoke("quality_preview"));
   assert.deepEqual(empty.counters,{});assert.deepEqual(empty.histograms,{});
   await context.page.getByLabel("Allow optional download reliability analytics").click();
   await context.page.getByText("Reliability analytics is off.",{exact:true}).waitFor();
+  const status=await context.page.evaluate(()=>window.__TAURI_INTERNALS__.invoke("quality_delivery_status"));
+  assert.equal(status.collecting,false);assert.equal(status.pendingBatches,0);assert.equal(status.storageError,null);
+  assert.equal(await stat(join(context.fixture.stateDir,"quality-outbox.json")).then(()=>true,error=>{assert.equal(error.code,"ENOENT");return false;}),false,"Withdrawal deletes the owned private queue");
   await download(context);
   assert.equal(await context.page.evaluate(()=>window.__TAURI_INTERNALS__.invoke("quality_preview")),null);
  }
  assert.equal(await hashFile(join(bin,executableName("fetchrail"))),executableSha256,"Canary executable changed during qualification");
- const evidence={time:new Date().toISOString(),version,notice,executableSha256,elapsedSeconds:(Date.now()-started)/1000,isolatedApps:5,nativeBatches:5,admitted:5,verifiedDurable:5,preconsentExcluded:true,withdrawalStopsCollection:true,v1RemainsDeclined:true,sentinelAbsent:true,limitations:["Synthetic loopback downloads on Windows, not real-user/WAN performance validation","No unique-user or population-rate inference","No 1% throughput or 2% p95 overhead proof"]};
+ const evidence={time:new Date().toISOString(),serverReceiptDay:day,schema:3,provenance:"controlled",version,notice,executableSha256,elapsedSeconds:(Date.now()-started)/1000,isolatedApps:5,nativeBatches,admitted:5,verifiedDurable:5,exactAggregateBaseline:exactBaseline,matchingAcknowledgments:true,preconsentExcluded:true,withdrawalStopsCollection:true,withdrawalDeletesQueue:true,v1RemainsDeclined:true,sentinelAbsent:true,limitations:["Synthetic loopback downloads on Windows, not real-user/WAN performance validation","Provenance is self-declared; anonymous callers remain unauthenticated","A suppressed baseline prevents exact cohort deltas","No unique-user or population-rate inference","No 1% throughput or 2% p95 overhead proof"]};
  await mkdir("artifacts/reliability",{recursive:true});await writeFile("artifacts/reliability/production-native-canary.json",JSON.stringify(evidence,null,2));
  console.log(JSON.stringify(evidence));
 }finally{

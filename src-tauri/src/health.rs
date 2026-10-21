@@ -1,7 +1,9 @@
 //! Source-free, bounded local operational evidence. Never serialize a download or an error.
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::VecDeque,
+    collections::{HashSet, VecDeque},
+    hash::BuildHasher,
+    net::SocketAddr,
     sync::{
         atomic::{AtomicU64, AtomicUsize, Ordering::Relaxed},
         Mutex,
@@ -9,8 +11,11 @@ use std::{
     time::{Duration, Instant},
 };
 
-pub const PHASE_COUNT: usize = 26;
+pub const PHASE_COUNT: usize = 29;
 pub const EVENT_LIMIT: usize = 64;
+// Full bounded histories, policy changes and retries must remain exportable.
+// This is a reviewed local file, separate from the 8 KiB anonymous envelope.
+const MAX_EXPORT_BYTES: usize = 128 * 1024;
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 #[repr(usize)]
@@ -41,6 +46,9 @@ pub enum Phase {
     PublishSync,
     ScanOverlap,
     BodyProcessing,
+    PrefixHash,
+    DispatchLock,
+    CatalogLock,
 }
 pub const PHASES: [Phase; PHASE_COUNT] = [
     Phase::Probe,
@@ -69,6 +77,9 @@ pub const PHASES: [Phase; PHASE_COUNT] = [
     Phase::PublishSync,
     Phase::ScanOverlap,
     Phase::BodyProcessing,
+    Phase::PrefixHash,
+    Phase::DispatchLock,
+    Phase::CatalogLock,
 ];
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -178,6 +189,12 @@ struct Sampling {
     stalled_ms: u64,
     windows: VecDeque<ReceiveWindow>,
     missing_windows: u64,
+    history: Vec<ReceiveWindow>,
+    baseline_bps: u64,
+    previous_bps: u64,
+    low_windows: u64,
+    low_ms: u64,
+    low_streak: u64,
 }
 impl Default for Sampling {
     fn default() -> Self {
@@ -193,6 +210,12 @@ impl Default for Sampling {
             stalled_ms: 0,
             windows: VecDeque::new(),
             missing_windows: 0,
+            history: Vec::new(),
+            baseline_bps: 0,
+            previous_bps: 0,
+            low_windows: 0,
+            low_ms: 0,
+            low_streak: 0,
         }
     }
 }
@@ -226,6 +249,7 @@ pub enum Confidence {
 #[derive(Clone, Serialize, Deserialize, Debug)]
 pub enum Finding {
     StageDurationObserved,
+    TransferActivityObserved,
     ReceiveWait,
     CauseObserved,
     DurableCompleted,
@@ -265,6 +289,44 @@ pub enum Architecture {
 #[derive(Clone, Serialize, Deserialize, Debug)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct TorrentHealth {
+    #[serde(default)]
+    pub status_age_ms: u64,
+    #[serde(default)]
+    pub no_payload_progress_ms: u64,
+    #[serde(default)]
+    pub checkpoint_age_ms: Option<u64>,
+    #[serde(default)]
+    pub checkpoint_pending: bool,
+    #[serde(default)]
+    pub connected_without_payload: bool,
+    #[serde(default)]
+    pub distributed_full_copies: Option<u64>,
+    #[serde(default)]
+    pub distributed_fraction: Option<u64>,
+    #[serde(default)]
+    pub incoming_observed: bool,
+    #[serde(default)]
+    pub download_limit_bps: u64,
+    #[serde(default)]
+    pub upload_limit_bps: u64,
+    #[serde(default)]
+    pub session_download_limit_bps: u64,
+    #[serde(default)]
+    pub session_upload_limit_bps: u64,
+    #[serde(default)]
+    pub connection_limit: u64,
+    #[serde(default)]
+    pub session_connection_limit: u64,
+    #[serde(default)]
+    pub alert_drops: u64,
+    #[serde(default)]
+    pub down_bandwidth_queue: u64,
+    #[serde(default)]
+    pub up_bandwidth_queue: u64,
+    #[serde(default)]
+    pub connect_candidates: u64,
+    #[serde(default)]
+    pub announcing_to_dht: bool,
     pub payload_received_bytes: u64,
     pub failed_piece_bytes: u64,
     pub redundant_bytes: u64,
@@ -273,15 +335,143 @@ pub struct TorrentHealth {
     pub engine_errors: u64,
     pub metadata_failures: u64,
     pub checkpoint_errors: u64,
+    #[serde(default)]
+    pub checkpoint_submission_errors: u64,
     pub peers: u64,
     pub seeds: u64,
     pub selected_ready: bool,
     pub checking: bool,
     pub metadata: bool,
 }
+#[derive(Clone, Copy, Serialize, Deserialize, Debug, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum AssemblyMode {
+    HardLink,
+    Copy,
+    Recovered,
+}
+#[derive(Clone, Copy, Serialize, Deserialize, Debug, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum VerificationRoute {
+    ExpectedWholeFile,
+    ReceivedWholeFile,
+    RangeHashes,
+    LegacyBeforeAndAfter,
+}
+#[derive(Clone, Default, Serialize, Deserialize, Debug, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct EffectivePolicy {
+    pub connections: usize,
+    pub pools: usize,
+    pub ranges: usize,
+    pub max_requests_per_origin: usize,
+    pub minimum_range_bytes: u64,
+    pub file_limit_bps: u64,
+    pub global_limit_bps: u64,
+    pub automatic: bool,
+    pub attachment_check: bool,
+    pub expected_hash: bool,
+}
+#[derive(Clone, Serialize, Deserialize, Debug)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PolicyChange {
+    pub elapsed_ms: u64,
+    pub policy: EffectivePolicy,
+}
+#[derive(Clone, Default, Serialize, Deserialize, Debug)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct TransferProgress {
+    pub total_bytes: Option<u64>,
+    pub downloaded_bytes: u64,
+    pub receiving_ranges: usize,
+    /// Relative times at which logical progress first crossed 95%, 99%, and 99.9%.
+    pub milestone_ms: [Option<u64>; 3],
+}
+#[derive(Clone, Serialize, Deserialize, Debug)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RetryEvidence {
+    pub elapsed_ms: u64,
+    pub range_index: usize,
+    pub attempt: u8,
+    pub before_bps: u64,
+    pub after_bps: Option<u64>,
+    pub rehashed_bytes: u64,
+}
+#[derive(Default)]
+struct Topology {
+    pools: [u64; 32],
+    pool_ids: HashSet<usize>,
+    pool_overflow: bool,
+    unlisted_pool_responses: u64,
+    endpoints: HashSet<u64>,
+    hasher: std::collections::hash_map::RandomState,
+    endpoint_overflow: bool,
+    endpoint_unknown: u64,
+}
+/// Local, source-free tail scheduling evidence. Child requests are a separate
+/// grain from canonical range attempts; these counters do not establish a gain.
+#[derive(Clone, Default, Serialize, Deserialize, Debug)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct TailSummary {
+    pub redistributions: u64,
+    pub waves: u64,
+    pub child_requests: u64,
+    pub child_retries: u64,
+    pub child_failures: u64,
+    pub ordinary_fallbacks: u64,
+    pub promoted_bytes: u64,
+    pub discarded_bytes: u64,
+    pub uncommitted_limit_bytes: u64,
+}
 #[derive(Clone, Serialize, Deserialize, Debug)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Report {
+    #[serde(default)]
+    pub tail: TailSummary,
+    #[serde(default)]
+    pub assembly_mode: Option<AssemblyMode>,
+    #[serde(default)]
+    pub assembly_copied_bytes: u64,
+    #[serde(default)]
+    pub verification_route: Option<VerificationRoute>,
+    #[serde(default)]
+    pub engine_build: String,
+    #[serde(default)]
+    pub transfer_activity_ms: Option<u64>,
+    /// A positive configured file/global cap was observed during this local record.
+    /// This does not establish that the limiter constrained any received bytes.
+    #[serde(default)]
+    pub configured_cap_observed: bool,
+    #[serde(default)]
+    pub receive_history: Vec<ReceiveWindow>,
+    #[serde(default)]
+    pub baseline_delivery_bps: u64,
+    #[serde(default)]
+    pub low_delivery_windows: u64,
+    #[serde(default)]
+    pub low_delivery_ms: u64,
+    #[serde(default)]
+    pub transfer_progress: TransferProgress,
+    #[serde(default)]
+    pub pool_responses: Vec<(usize, u64)>,
+    #[serde(default)]
+    pub distinct_response_pools: usize,
+    #[serde(default)]
+    pub pool_count_lower_bound: bool,
+    #[serde(default)]
+    pub unlisted_pool_responses: u64,
+    #[serde(default = "default_timing_enabled")]
+    pub timing_enabled: bool,
+    #[serde(default)]
+    pub distinct_response_endpoints: usize,
+    #[serde(default)]
+    pub endpoint_count_lower_bound: bool,
+    #[serde(default)]
+    pub unknown_response_endpoints: u64,
+    #[serde(default)]
+    pub policy_changes: Vec<PolicyChange>,
+    #[serde(default)]
+    pub retry_evidence: Vec<RetryEvidence>,
     pub schema: u32,
     #[serde(default)]
     pub context: Context,
@@ -386,6 +576,9 @@ pub enum Limitation {
 
 pub struct Health {
     started: Instant,
+    timing_enabled: bool,
+    assembly: Mutex<Option<(AssemblyMode, u64)>>,
+    verification_route: Mutex<Option<VerificationRoute>>,
     accepted: std::sync::atomic::AtomicBool,
     spans: [Span; PHASE_COUNT],
     causes: [AtomicU64; CAUSES.len()],
@@ -399,11 +592,23 @@ pub struct Health {
     sampling: Mutex<Sampling>,
     protocols: [AtomicU64; 3],
     torrent: Mutex<Option<TorrentHealth>>,
+    transfer_ms: AtomicU64,
+    configured_cap_observed: std::sync::atomic::AtomicBool,
+    checkpoint_submission_errors: AtomicU64,
+    progress: Mutex<TransferProgress>,
+    topology: Mutex<Topology>,
+    policy_changes: Mutex<VecDeque<PolicyChange>>,
+    retry_evidence: Mutex<VecDeque<RetryEvidence>>,
+    tail: Mutex<TailSummary>,
 }
 impl Default for Health {
     fn default() -> Self {
         Self {
             started: Instant::now(),
+            timing_enabled: !(cfg!(feature = "test-tools")
+                && std::env::var_os("FETCHRAIL_TEST_DISABLE_HEALTH_TIMING").is_some()),
+            assembly: Mutex::new(None),
+            verification_route: Mutex::new(None),
             accepted: false.into(),
             spans: std::array::from_fn(|_| Span::default()),
             causes: std::array::from_fn(|_| AtomicU64::new(0)),
@@ -417,6 +622,14 @@ impl Default for Health {
             sampling: Mutex::new(Sampling::default()),
             protocols: std::array::from_fn(|_| AtomicU64::new(0)),
             torrent: Mutex::new(None),
+            transfer_ms: 0.into(),
+            configured_cap_observed: false.into(),
+            checkpoint_submission_errors: 0.into(),
+            progress: Mutex::new(TransferProgress::default()),
+            topology: Mutex::new(Topology::default()),
+            policy_changes: Mutex::new(VecDeque::new()),
+            retry_evidence: Mutex::new(VecDeque::new()),
+            tail: Mutex::new(TailSummary::default()),
         }
     }
 }
@@ -440,12 +653,20 @@ pub fn export(path: &std::path::Path, report: &Report, permission: bool) -> Resu
         || report.stages.len() > PHASE_COUNT
         || report.causes.len() > CAUSES.len()
         || report.receive_windows.len() > 120
+        || report.receive_history.len() > 64
+        || report.policy_changes.len() > 32
+        || report.retry_evidence.len() > 32
+        || report.pool_responses.len() > 32
+        || report.distinct_response_endpoints > 64
+        || report.distinct_response_pools > 128
+        || report.engine_build.len() > 64
+        || !report.engine_build.bytes().all(|b| b.is_ascii_hexdigit())
         || report.protocols.len() > 3
     {
         return Err("Invalid safe report structure.".into());
     }
     let bytes = serde_json::to_vec_pretty(report).map_err(|_| "Cannot encode safe report.")?;
-    if bytes.len() > 64 * 1024 {
+    if bytes.len() > MAX_EXPORT_BYTES {
         return Err("Safe report exceeds the export limit.".into());
     }
     let mut options = std::fs::OpenOptions::new();
@@ -479,8 +700,144 @@ impl Health {
     pub fn observed_from_accept(&self) -> bool {
         self.accepted.load(Relaxed)
     }
-    pub fn torrent(&self, observation: Option<TorrentHealth>) {
+    pub fn assembly(&self, mode: AssemblyMode, copied_bytes: u64) {
+        *self.assembly.lock().unwrap() = Some((mode, copied_bytes));
+    }
+    pub fn verification(&self, route: VerificationRoute) {
+        *self.verification_route.lock().unwrap() = Some(route);
+    }
+    pub fn response_identity(&self, pool_index: usize, endpoint: Option<SocketAddr>) {
+        let mut topology = self.topology.lock().unwrap();
+        if let Some(count) = topology.pools.get_mut(pool_index) {
+            *count = count.saturating_add(1);
+        } else {
+            topology.unlisted_pool_responses = topology.unlisted_pool_responses.saturating_add(1);
+        }
+        if topology.pool_ids.len() < 128 {
+            topology.pool_ids.insert(pool_index);
+        } else if !topology.pool_ids.contains(&pool_index) {
+            topology.pool_overflow = true;
+        }
+        if let Some(endpoint) = endpoint {
+            // Retain only per-transfer salted hashes in memory; reports contain counts only.
+            let key = topology.hasher.hash_one(endpoint);
+            if topology.endpoints.len() < 64 {
+                topology.endpoints.insert(key);
+            } else if !topology.endpoints.contains(&key) {
+                topology.endpoint_overflow = true;
+            }
+        } else {
+            topology.endpoint_unknown = topology.endpoint_unknown.saturating_add(1);
+        }
+    }
+    pub fn transfer_progress(&self, downloaded: u64, total: Option<u64>, receiving: usize) {
+        let mut p = self.progress.lock().unwrap();
+        if p.total_bytes != total || downloaded < p.downloaded_bytes {
+            p.milestone_ms = [None; 3];
+        }
+        p.total_bytes = total;
+        p.downloaded_bytes = downloaded;
+        p.receiving_ranges = receiving;
+        if let Some(total) = total.filter(|&t| t > 0) {
+            for (i, threshold) in [950u128, 990, 999].into_iter().enumerate() {
+                if downloaded as u128 * 1000 >= total as u128 * threshold {
+                    p.milestone_ms[i].get_or_insert(ms(self.started.elapsed()));
+                }
+            }
+        }
+    }
+    pub fn policy(&self, policy: EffectivePolicy) {
+        if policy.file_limit_bps > 0 || policy.global_limit_bps > 0 {
+            self.configured_cap_observed.store(true, Relaxed);
+        }
+        let mut changes = self.policy_changes.lock().unwrap();
+        if changes.back().is_some_and(|last| last.policy == policy) {
+            return;
+        }
+        if changes.len() == 32 {
+            changes.pop_front();
+        }
+        changes.push_back(PolicyChange {
+            elapsed_ms: ms(self.started.elapsed()),
+            policy,
+        });
+    }
+    pub fn retry_evidence(
+        &self,
+        range_index: usize,
+        attempt: u8,
+        before_bps: u64,
+        after_bps: Option<u64>,
+        rehashed_bytes: u64,
+    ) {
+        let mut evidence = self.retry_evidence.lock().unwrap();
+        if evidence.len() == 32 {
+            evidence.pop_front();
+        }
+        evidence.push_back(RetryEvidence {
+            elapsed_ms: ms(self.started.elapsed()),
+            range_index,
+            attempt,
+            before_bps,
+            after_bps,
+            rehashed_bytes,
+        });
+    }
+    pub fn checkpoint_submission_failed(&self) {
+        add(&self.checkpoint_submission_errors, 1);
+        self.failure(Phase::Checkpoint);
+        self.cause(Cause::Unknown);
+    }
+    pub fn torrent(&self, mut observation: Option<TorrentHealth>) {
+        if let Some(torrent) = observation.as_mut() {
+            torrent.checkpoint_submission_errors = self.checkpoint_submission_errors.load(Relaxed);
+        }
         *self.torrent.lock().unwrap() = observation;
+    }
+    pub fn attachment_check(&self) -> Option<bool> {
+        self.policy_changes
+            .lock()
+            .unwrap()
+            .back()
+            .map(|change| change.policy.attachment_check)
+    }
+    pub fn runtime_policy(
+        &self,
+        connections: usize,
+        file_limit_bps: u64,
+        global_limit_bps: u64,
+        attachment_check: bool,
+    ) {
+        if file_limit_bps > 0 || global_limit_bps > 0 {
+            self.configured_cap_observed.store(true, Relaxed);
+        }
+        let last = self
+            .policy_changes
+            .lock()
+            .unwrap()
+            .back()
+            .map(|change| change.policy.clone());
+        if let Some(mut policy) = last {
+            policy.connections = connections;
+            policy.file_limit_bps = file_limit_bps;
+            policy.global_limit_bps = global_limit_bps;
+            policy.attachment_check = attachment_check;
+            self.policy(policy);
+        }
+    }
+    pub fn range_layout(&self, connections: usize, pools: usize, ranges: usize) {
+        let last = self
+            .policy_changes
+            .lock()
+            .unwrap()
+            .back()
+            .map(|change| change.policy.clone());
+        if let Some(mut policy) = last {
+            policy.connections = connections;
+            policy.pools = pools;
+            policy.ranges = ranges;
+            self.policy(policy);
+        }
     }
     pub fn protocol(&self, version: reqwest::Version) {
         let index = match version {
@@ -491,6 +848,13 @@ impl Health {
         add(&self.protocols[index], 1);
     }
     pub fn guard(&self, phase: Phase) -> Guard<'_> {
+        if !self.timing_enabled {
+            return Guard {
+                health: self,
+                phase,
+                started: None,
+            };
+        }
         let span = &self.spans[phase as usize];
         if span.active.fetch_add(1, Relaxed) == 0 {
             span.active_since_ms
@@ -499,17 +863,22 @@ impl Health {
         Guard {
             health: self,
             phase,
-            started: Instant::now(),
+            started: Some(Instant::now()),
         }
     }
     pub fn activity(&self, activity: Activity) {
-        let now = ms(self.started.elapsed());
+        self.activity_at(activity, ms(self.started.elapsed()));
+    }
+    fn activity_at(&self, activity: Activity, now: u64) {
         let mut spans = self.activities.lock().unwrap();
         if let Some(last) = spans.back_mut() {
             if last.activity == activity {
                 return;
             }
             last.duration_ms = now.saturating_sub(last.elapsed_ms);
+            if last.activity == Activity::Transferring {
+                add(&self.transfer_ms, last.duration_ms);
+            }
         }
         if spans.len() == EVENT_LIMIT {
             spans.pop_front();
@@ -569,28 +938,71 @@ impl Health {
         }
         let duration = now.duration_since(s.window_at);
         if duration >= Duration::from_secs(5) {
-            if duration <= Duration::from_secs(6) {
-                if s.windows.len() == 120 {
-                    s.windows.pop_front();
-                    s.missing_windows += 1;
-                }
-                let window = ReceiveWindow {
-                    elapsed_ms: ms(s.window_at.duration_since(self.started)),
-                    duration_ms: ms(duration),
-                    bytes: bytes.saturating_sub(s.window_bytes),
-                };
-                s.windows.push_back(window);
-            } else {
+            let window = ReceiveWindow {
+                elapsed_ms: ms(s.window_at.duration_since(self.started)),
+                duration_ms: ms(duration),
+                bytes: bytes.saturating_sub(s.window_bytes),
+            };
+            if duration > Duration::from_secs(6) {
                 s.missing_windows += 1;
             }
+            let speed = (window.bytes as u128 * 1000 / window.duration_ms.max(1) as u128)
+                .min(u64::MAX as u128) as u64;
+            if eligible && duration <= Duration::from_secs(6) {
+                // Two consecutive windows establish a within-transfer reference, never a NIC promise.
+                let sustained = speed.min(s.previous_bps);
+                s.baseline_bps = s.baseline_bps.max(sustained);
+                if s.baseline_bps > 0 && speed < s.baseline_bps / 2 {
+                    s.low_streak += 1;
+                    if s.low_streak >= 3 {
+                        s.low_windows += 1;
+                        s.low_ms = s.low_ms.saturating_add(window.duration_ms);
+                    }
+                } else {
+                    s.low_streak = 0;
+                }
+                s.previous_bps = speed;
+            } else {
+                s.previous_bps = 0;
+                s.low_streak = 0;
+            }
+            if s.windows.len() == 120 {
+                if let Some(old) = s.windows.pop_front() {
+                    s.history.push(old);
+                }
+                if s.history.len() > 64 {
+                    s.history = s
+                        .history
+                        .chunks(2)
+                        .map(|pair| ReceiveWindow {
+                            elapsed_ms: pair[0].elapsed_ms,
+                            duration_ms: pair.iter().map(|w| w.duration_ms).sum(),
+                            bytes: pair.iter().map(|w| w.bytes).sum(),
+                        })
+                        .collect();
+                }
+            }
+            s.windows.push_back(window);
             s.window_at = now;
             s.window_bytes = bytes;
         }
     }
+
     fn event(&self, event: Event) {
         let mut events = self.events.lock().unwrap();
         if events.len() == EVENT_LIMIT {
-            events.pop_front();
+            // Routine waits must not erase all retry/failure evidence during a long transfer.
+            if let Some(index) = events
+                .iter()
+                .position(|e| e.cause.is_none() && e.attempt.is_none())
+            {
+                events.remove(index);
+            } else if event.cause.is_some() || event.attempt.is_some() {
+                events.pop_front();
+            } else {
+                add(&self.evicted, 1);
+                return;
+            }
             add(&self.evicted, 1);
         }
         events.push_back(event);
@@ -635,6 +1047,9 @@ impl Health {
     pub fn failed_phase(&self) -> Option<Phase> {
         PHASES.get(self.failed_phase.load(Relaxed)).copied()
     }
+    pub(crate) fn tail_update(&self, update: impl FnOnce(&mut TailSummary)) {
+        update(&mut self.tail.lock().unwrap());
+    }
     pub fn failure(&self, phase: Phase) {
         let _ = self
             .failed_phase
@@ -645,6 +1060,15 @@ impl Health {
         self.activities.lock().unwrap().clear();
         *self.sampling.lock().unwrap() = Sampling::default();
         self.evicted.store(0, Relaxed);
+        self.transfer_ms.store(0, Relaxed);
+        self.configured_cap_observed.store(false, Relaxed);
+        *self.progress.lock().unwrap() = TransferProgress::default();
+        *self.topology.lock().unwrap() = Topology::default();
+        self.policy_changes.lock().unwrap().clear();
+        self.retry_evidence.lock().unwrap().clear();
+        *self.tail.lock().unwrap() = TailSummary::default();
+        *self.assembly.lock().unwrap() = None;
+        *self.verification_route.lock().unwrap() = None;
         // Counters support the current operation; clearing makes historical coverage explicitly incomplete.
         self.accepted.store(false, Relaxed);
     }
@@ -677,6 +1101,20 @@ impl Health {
             })
             .collect();
         let completed = *self.completed.lock().unwrap();
+        let (activities, transfer_ms) = {
+            let held = self.activities.lock().unwrap();
+            let mut activities = held.clone();
+            if let Some(last) = activities.back_mut() {
+                last.duration_ms = ms(self.started.elapsed()).saturating_sub(last.elapsed_ms);
+            }
+            let transfer_ms = self.transfer_ms.load(Relaxed).saturating_add(
+                activities
+                    .back()
+                    .filter(|a| a.activity == Activity::Transferring)
+                    .map_or(0, |a| a.duration_ms),
+            );
+            (activities, transfer_ms)
+        };
         let delayed = stages
             .iter()
             .filter(|s| {
@@ -714,6 +1152,17 @@ impl Health {
                 stage: phase,
                 duration_ms: None,
                 cause: Some(cause),
+            }
+        } else if transfer_ms >= 1000
+            && delayed.is_none_or(|stage| transfer_ms > stage.max_ms.max(stage.active_elapsed_ms))
+        {
+            Diagnosis {
+                confidence: Confidence::Observed,
+                observation: Finding::TransferActivityObserved,
+                next: NextDiagnostic::CompareStageSpans,
+                stage: None,
+                duration_ms: Some(transfer_ms),
+                cause: None,
             }
         } else if let Some(stage) = delayed {
             Diagnosis {
@@ -774,11 +1223,8 @@ impl Health {
         if !self.accepted.load(Relaxed) {
             limitations.push(Limitation::EarlierEvidenceUnavailable);
         }
-        let mut activities = self.activities.lock().unwrap().clone();
-        if let Some(last) = activities.back_mut() {
-            last.duration_ms = ms(self.started.elapsed()).saturating_sub(last.elapsed_ms);
-        }
         let sampling = self.sampling.lock().unwrap();
+        let topology = self.topology.lock().unwrap();
         let mut events = self
             .events
             .lock()
@@ -787,7 +1233,55 @@ impl Health {
             .cloned()
             .collect::<Vec<_>>();
         events.sort_by_key(|event| event.elapsed_ms);
+        let assembly = *self.assembly.lock().unwrap();
+        let policy_changes = self
+            .policy_changes
+            .lock()
+            .unwrap()
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        let file_limit_bps = policy_changes
+            .last()
+            .map(|change| change.policy.file_limit_bps);
+        let global_limit_bps = policy_changes
+            .last()
+            .map(|change| change.policy.global_limit_bps);
         Report {
+            tail: self.tail.lock().unwrap().clone(),
+            assembly_mode: assembly.map(|a| a.0),
+            assembly_copied_bytes: assembly.map_or(0, |a| a.1),
+            verification_route: *self.verification_route.lock().unwrap(),
+            engine_build: env!("FETCHRAIL_ENGINE_BUILD").into(),
+            transfer_activity_ms: self.accepted.load(Relaxed).then_some(transfer_ms),
+            configured_cap_observed: self.configured_cap_observed.load(Relaxed),
+            receive_history: sampling.history.clone(),
+            baseline_delivery_bps: sampling.baseline_bps,
+            low_delivery_windows: sampling.low_windows,
+            low_delivery_ms: sampling.low_ms,
+            transfer_progress: self.progress.lock().unwrap().clone(),
+            pool_responses: topology
+                .pools
+                .iter()
+                .copied()
+                .enumerate()
+                .filter(|(_, n)| *n > 0)
+                .collect(),
+            distinct_response_pools: topology.pool_ids.len(),
+            pool_count_lower_bound: topology.pool_overflow,
+            unlisted_pool_responses: topology.unlisted_pool_responses,
+            timing_enabled: self.timing_enabled,
+            distinct_response_endpoints: topology.endpoints.len(),
+            endpoint_count_lower_bound: topology.endpoint_overflow,
+            unknown_response_endpoints: topology.endpoint_unknown,
+            policy_changes,
+            retry_evidence: self
+                .retry_evidence
+                .lock()
+                .unwrap()
+                .iter()
+                .cloned()
+                .collect(),
             schema: 1,
             context: Context::Transfer,
             version: env!("CARGO_PKG_VERSION").into(),
@@ -808,8 +1302,8 @@ impl Health {
             output_verified_bytes: completed.map(|c| c.1),
             received_wire_bytes: self.received.load(Relaxed),
             checkpoint_bytes_written: self.checkpoint_written.load(Relaxed),
-            file_limit_bps: None,
-            global_limit_bps: None,
+            file_limit_bps,
+            global_limit_bps,
             activities: activities.into_iter().collect(),
             receive_windows: sampling.windows.iter().cloned().collect(),
             missing_receive_windows: sampling.missing_windows,
@@ -859,7 +1353,7 @@ impl Outcome for () {
 pub struct Guard<'a> {
     health: &'a Health,
     phase: Phase,
-    started: Instant,
+    started: Option<Instant>,
 }
 impl Guard<'_> {
     pub fn observe<T: Outcome>(&self, result: &T) {
@@ -870,7 +1364,10 @@ impl Guard<'_> {
 }
 impl Drop for Guard<'_> {
     fn drop(&mut self) {
-        let duration = self.started.elapsed();
+        let Some(started) = self.started else {
+            return;
+        };
+        let duration = started.elapsed();
         let ns = duration.as_nanos().min(u64::MAX as u128) as u64;
         let span = &self.health.spans[self.phase as usize];
         add(&span.calls, 1);
@@ -883,7 +1380,7 @@ impl Drop for Guard<'_> {
                 && self.phase as usize <= Phase::Catalog as usize)
         {
             self.health.event(Event {
-                elapsed_ms: ms(self.started.duration_since(self.health.started)),
+                elapsed_ms: ms(started.duration_since(self.health.started)),
                 duration_ms: ms(duration),
                 phase: Some(self.phase),
                 cause: None,
@@ -898,6 +1395,186 @@ impl Drop for Guard<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn full_bounded_evidence_exports_without_dropping_history() {
+        let mut report = Health::default().snapshot(false);
+        let maximum = u64::MAX;
+        report.engine_build = "f".repeat(64);
+        report.receive_windows = vec![
+            ReceiveWindow {
+                elapsed_ms: maximum,
+                duration_ms: maximum,
+                bytes: maximum
+            };
+            120
+        ];
+        report.receive_history = report.receive_windows[..64].to_vec();
+        report.activities = vec![
+            ActivitySpan {
+                activity: Activity::Transferring,
+                elapsed_ms: maximum,
+                duration_ms: maximum
+            };
+            EVENT_LIMIT
+        ];
+        report.events = vec![
+            Event {
+                elapsed_ms: maximum,
+                duration_ms: maximum,
+                phase: Some(Phase::Checkpoint),
+                cause: Some(Cause::SlowPeer),
+                range_index: Some(u32::MAX),
+                attempt: Some(u8::MAX),
+                progressed_bytes: Some(maximum)
+            };
+            EVENT_LIMIT
+        ];
+        report.stages = PHASES
+            .iter()
+            .map(|&phase| Stage {
+                phase,
+                calls: maximum,
+                worker_ms: maximum,
+                max_ms: maximum,
+                active: 32,
+                active_elapsed_ms: maximum,
+            })
+            .collect();
+        report.causes = CAUSES.iter().map(|&cause| (cause, maximum)).collect();
+        report.policy_changes = vec![
+            PolicyChange {
+                elapsed_ms: maximum,
+                policy: EffectivePolicy {
+                    connections: 32,
+                    pools: 128,
+                    ranges: 512,
+                    max_requests_per_origin: 64,
+                    minimum_range_bytes: maximum,
+                    file_limit_bps: maximum,
+                    global_limit_bps: maximum,
+                    automatic: true,
+                    attachment_check: true,
+                    expected_hash: true
+                }
+            };
+            32
+        ];
+        report.retry_evidence = vec![
+            RetryEvidence {
+                elapsed_ms: maximum,
+                range_index: 511,
+                attempt: 3,
+                before_bps: maximum,
+                after_bps: Some(maximum),
+                rehashed_bytes: maximum
+            };
+            32
+        ];
+        report.pool_responses = (0..32).map(|index| (index, maximum)).collect();
+        let root = std::env::temp_dir().join(format!(
+            "fetchrail-full-safe-export-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("incident.json");
+        export(&path, &report, true).unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        assert!(bytes.len() <= MAX_EXPORT_BYTES);
+        let restored: Report = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(restored.receive_windows.len(), 120);
+        assert_eq!(restored.receive_history.len(), 64);
+        assert_eq!(restored.events.len(), EVENT_LIMIT);
+        assert_eq!(restored.policy_changes.len(), 32);
+        assert_eq!(restored.retry_evidence.len(), 32);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn cumulative_transfer_time_survives_ring_eviction_and_clear_is_incomplete() {
+        let health = Health::default();
+        health.accepted();
+        for i in 0..200u64 {
+            health.activity_at(Activity::Transferring, i * 20_000);
+            health.activity_at(Activity::Backoff, i * 20_000 + 10_000);
+        }
+        let report = health.snapshot(false);
+        assert_eq!(report.transfer_activity_ms, Some(2_000_000));
+        assert_eq!(report.activities.len(), EVENT_LIMIT);
+        assert_eq!(report.diagnosis.stage, None);
+        assert!(matches!(
+            report.diagnosis.observation,
+            Finding::TransferActivityObserved
+        ));
+        health.clear();
+        assert_eq!(health.snapshot(false).transfer_activity_ms, None);
+    }
+    #[test]
+    fn long_runs_preserve_bytes_and_duration_and_slow_positive_delivery() {
+        let health = Health::default();
+        let start = Instant::now();
+        let _body = health.guard(Phase::Body);
+        health.sample_at(start, true);
+        for i in 1..=400u64 {
+            health.received.store(i * 50_000, Relaxed);
+            health.sample_at(start + Duration::from_secs(i * 5), true);
+        }
+        let report = health.snapshot(false);
+        let windows = report.receive_history.iter().chain(&report.receive_windows);
+        assert_eq!(windows.clone().map(|w| w.bytes).sum::<u64>(), 20_000_000);
+        assert_eq!(windows.map(|w| w.duration_ms).sum::<u64>(), 2_000_000);
+        assert_eq!(report.receive_windows.len(), 120);
+        assert!(report.receive_history.len() <= 64 && !report.receive_history.is_empty());
+        assert_eq!(report.missing_receive_windows, 0);
+        for i in 1..=5u64 {
+            health.received.store(20_000_000 + i * 500, Relaxed);
+            health.sample_at(start + Duration::from_secs((400 + i) * 5), true);
+        }
+        assert_eq!(health.snapshot(false).low_delivery_windows, 3);
+        assert_eq!(health.snapshot(false).receive_stalls, 0);
+    }
+    #[test]
+    fn routine_events_do_not_erase_retries_and_topology_overflow_is_explicit() {
+        let health = Health::default();
+        health.cause(Cause::SlowPeer);
+        for i in 0..1000 {
+            health.event(Event {
+                elapsed_ms: i,
+                duration_ms: 100,
+                phase: Some(Phase::Body),
+                cause: None,
+                range_index: None,
+                attempt: None,
+                progressed_bytes: None,
+            });
+            health.response_identity(i as usize, Some("192.0.2.1:443".parse().unwrap()));
+        }
+        let report = health.snapshot(false);
+        assert_eq!(report.diagnosis.cause, Some(Cause::SlowPeer));
+        assert_eq!(report.events.len(), EVENT_LIMIT);
+        assert_eq!(report.distinct_response_pools, 128);
+        assert!(report.pool_count_lower_bound);
+        assert_eq!(report.unlisted_pool_responses, 968);
+        assert_eq!(report.distinct_response_endpoints, 1);
+        assert!(!serde_json::to_string(&report).unwrap().contains("192.0.2"));
+    }
+    #[test]
+    fn milestones_use_logical_progress_and_reset_with_a_replan() {
+        let health = Health::default();
+        health.received.store(1_000_000, Relaxed);
+        health.transfer_progress(940, Some(1000), 8);
+        assert_eq!(
+            health.snapshot(false).transfer_progress.milestone_ms,
+            [None; 3]
+        );
+        health.transfer_progress(995, Some(1000), 1);
+        assert!(health.snapshot(false).transfer_progress.milestone_ms[..2]
+            .iter()
+            .all(Option::is_some));
+        health.transfer_progress(500, Some(1000), 8);
+        assert_eq!(
+            health.snapshot(false).transfer_progress.milestone_ms,
+            [None; 3]
+        );
+    }
     #[test]
     fn pre_admission_operations_are_bounded_separate_and_clear_invalidates_pending_work() {
         let operations = Operations::default();
@@ -1042,4 +1719,8 @@ mod tests {
             Confidence::Unknown
         ));
     }
+}
+
+fn default_timing_enabled() -> bool {
+    true
 }

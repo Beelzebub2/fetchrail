@@ -43,6 +43,9 @@ fn progress_size(details: bool) -> [f64; 4] {
 }
 
 async fn show_progress(app: &AppHandle, record: &DownloadRecord) -> Result<(), String> {
+    if crate::shutdown_started(app) {
+        return Err("The app is shutting down.".into());
+    }
     let id = record.id;
     let label = format!("{PROGRESS_WINDOW}{id}");
     if let Some(window) = app.get_webview_window(&label) {
@@ -61,7 +64,9 @@ async fn show_progress(app: &AppHandle, record: &DownloadRecord) -> Result<(), S
                 .progress_details,
         )
     };
-    tauri::WebviewWindowBuilder::new(
+    let _creation =
+        crate::begin_window_creation(app).ok_or_else(|| "The app is shutting down.".to_string())?;
+    let window = tauri::WebviewWindowBuilder::new(
         app,
         label,
         tauri::WebviewUrl::App(format!("index.html?progress={id}").into()),
@@ -71,8 +76,12 @@ async fn show_progress(app: &AppHandle, record: &DownloadRecord) -> Result<(), S
     .min_inner_size(min_width, min_height)
     .center()
     .build()
-    .map(|_| ())
-    .map_err(|error| error.to_string())
+    .map_err(|error| error.to_string())?;
+    if crate::shutdown_started(app) {
+        window.destroy().map_err(|error| error.to_string())?;
+        return Err("The app is shutting down.".into());
+    }
+    Ok(())
 }
 
 /// Grows or shrinks the calling progress window for its details, and opens later ones the same way.

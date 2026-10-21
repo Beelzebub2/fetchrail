@@ -7,7 +7,8 @@
   "workers_dev": false,
   "preview_urls": false,
   "vars": {
-    "QUALITY_ANALYTICS_ENABLED": "true"
+    "QUALITY_ANALYTICS_ENABLED": "true",
+    "QUALITY_V3_ANALYTICS_ENABLED": "false"
   },
   "ratelimits": [
     {

@@ -23,6 +23,23 @@ assert.equal(mixed.releases.length,3,"Platform mixes must not manufacture a rele
 assert.ok(mixed.releases.every(row=>row.distributions.http_e2e_large_ms_v1.p95.upperBoundMs===null));
 assert.equal(mixed.releases[0].protocols[0].failed,0);
 assert.equal(qualitySummary({schema: 1}), null);
+const rateBins=Array(15).fill(0);rateBins[8]=20;
+const durationBins=Array(15).fill(0);durationBins[8]=20;
+const v3=qualitySummary({schema:3,purpose:"product-quality-v3",minimumReports:5,suppressedGroups:2,rows:[
+  {day:"2026-10-20",version:"0.8.2",os:"windows",arch:"x64",provenance:"production",reports:5,counters:{http_verified_durable:20,throughput_unobserved:1,clipped:2},histograms:{http_delivery_16g64g_mbps_v1:rateBins,http_e2e_16g64g_ms_v2:durationBins}},
+  {day:"2026-10-21",version:"0.8.2",os:"windows",arch:"x64",provenance:"controlled",reports:10,counters:{http_verified_durable:200},histograms:{http_delivery_16g64g_mbps_v1:Array(15).fill(0).map((n,i)=>i===13?200:n)}},
+]});
+assert.deepEqual(v3.grouping,["version","os","arch","provenance"]);
+assert.equal(v3.releases.length,2,"Controlled fast samples cannot inflate the production declaration cohort");
+assert.equal(v3.latestVisibleReceiptDay,"2026-10-21");assert.equal(v3.suppressedGroups,2);
+assert.equal(v3.releases[0].distributions.http_delivery_16g64g_mbps_v1.p95.upperBoundMBps,110);
+assert.equal(v3.releases[0].distributions.http_delivery_16g64g_mbps_v1.p95.upperBoundMs,undefined,"Rate bounds must never be labelled milliseconds");
+assert.equal(v3.releases[0].distributions.http_delivery_16g64g_mbps_v1.unit,"decimal MB/s");
+assert.equal(v3.releases[0].distributions.http_e2e_16g64g_ms_v2.p95.upperBoundMs,180000);
+assert.equal(v3.releases[0].clippedReportBatches,2);assert.equal(v3.releases[0].missingObservations.deliveryThroughput,1);
+assert.equal(mixed.releases[0].provenance,"legacy_unclassified");
+assert.equal(qualitySummary({schema:3,purpose:"product-quality-v3",suppressedGroups:1,rows:[]}).latestVisibleReceiptDay,null);
+assert.ok(v3.limits.some(limit=>limit.includes("these aggregates cannot prove a release caused a slowdown")));
 const credentialOrigin = new URL("https://fetchrail.rrmtools.uk");
 credentialOrigin.username = "fixture";
 credentialOrigin.password = randomUUID();

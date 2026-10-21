@@ -168,6 +168,17 @@ struct HostResult {
     completion_bps: u64,
     samples: usize,
     recent_completion_bps: Vec<u64>,
+    engine_build: String,
+    network_key: String,
+    drive_key: String,
+    completion_policy_key: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct CompletionPolicy {
+    pub attachment_check: bool,
+    pub expected_sha256: bool,
+    pub staging_volume_key: String,
 }
 
 #[derive(Default, Serialize, Deserialize)]
@@ -191,6 +202,8 @@ pub struct Status {
     pub latest: Option<Report>,
     pub applied: Option<Uuid>,
     pub learned_hosts: usize,
+    pub repeatable_hosts: usize,
+    pub storage_error: Option<String>,
     pub latest_issue: Option<&'static str>,
     pub applied_active: bool,
 }
@@ -202,18 +215,27 @@ pub struct Performance {
     status: Mutex<(String, usize, Option<String>)>,
     finished: Notify,
     hardware_cache: Mutex<Option<(Instant, PathBuf, Hardware)>>,
+    storage_error: Mutex<Option<String>>,
+    inventory_gate: tokio::sync::Mutex<()>,
 }
 
 impl Performance {
     pub fn load(data: &Path) -> Arc<Self> {
         let path = data.join("performance.json");
-        let store = std::fs::metadata(&path)
-            .ok()
-            .filter(|m| m.len() <= MAX_STATE_BYTES)
-            .and_then(|_| std::fs::read(&path).ok())
-            .and_then(|bytes| serde_json::from_slice::<Store>(&bytes).ok())
-            .filter(|store| store.schema == 1)
-            .unwrap_or_default();
+        fn read_store(path: &Path) -> Result<Option<Store>, ()> {
+            let Some(bytes) = read_state_bytes(path).map_err(|_| ())? else {
+                return Ok(None);
+            };
+            let store = serde_json::from_slice::<Store>(&bytes).map_err(|_| ())?;
+            (store.schema == 1).then_some(Some(store)).ok_or(())
+        }
+        let (store, storage_error) = match read_store(&path) {
+            Ok(Some(store)) => (store, None),
+            primary => match read_store(&path.with_extension("json.bak")) {
+                Ok(Some(store)) => (store, Some("Recovered the previous saved performance results; the latest file could not be read.".into())),
+                backup => (Store::default(), (primary.is_err() || backup.is_err()).then(|| "Saved performance results could not be read. The original file is preserved; defaults are in use.".into())),
+            },
+        };
         Arc::new(Self {
             path,
             store: Mutex::new(store),
@@ -221,18 +243,74 @@ impl Performance {
             status: Mutex::new(("idle".into(), 0, None)),
             finished: Notify::new(),
             hardware_cache: Mutex::new(None),
+            storage_error: Mutex::new(storage_error),
+            inventory_gate: tokio::sync::Mutex::new(()),
         })
     }
     pub fn hardware(&self, path: &Path) -> Hardware {
-        let mut cache = self.hardware_cache.lock().expect("hardware cache poisoned");
-        if let Some((time, prior, hardware)) = cache.as_ref() {
-            if prior == path && time.elapsed() < Duration::from_secs(30) {
-                return hardware.clone();
-            }
+        if let Some(hardware) = self.cached_hardware(path) {
+            return hardware;
         }
+        // Slow platform inventory never holds the shared cache lock.
         let hardware = platform::inventory(path).0;
-        *cache = Some((Instant::now(), path.to_owned(), hardware.clone()));
+        *self.hardware_cache.lock().expect("hardware cache poisoned") =
+            Some((Instant::now(), path.to_owned(), hardware.clone()));
         hardware
+    }
+    fn cached_hardware(&self, path: &Path) -> Option<Hardware> {
+        self.hardware_cache
+            .lock()
+            .expect("hardware cache poisoned")
+            .as_ref()
+            .filter(|(time, prior, _)| prior == path && time.elapsed() < Duration::from_secs(30))
+            .map(|(_, _, hardware)| hardware.clone())
+    }
+    pub async fn hardware_async(self: &Arc<Self>, path: &Path) -> Hardware {
+        if let Some(hardware) = self.cached_hardware(path) {
+            return hardware;
+        }
+        let _gate = self.inventory_gate.lock().await;
+        if let Some(hardware) = self.cached_hardware(path) {
+            return hardware;
+        }
+        let owner = self.clone();
+        let path = path.to_owned();
+        tokio::task::spawn_blocking(move || owner.hardware(&path))
+            .await
+            .unwrap_or_default()
+    }
+    pub fn repeatable_hosts(&self, hardware: &Hardware) -> usize {
+        let now = Utc::now();
+        self.store
+            .lock()
+            .expect("performance store poisoned")
+            .hosts
+            .iter()
+            .filter(|r| usable_host(r, hardware, &now))
+            .map(|r| r.key.as_str())
+            .collect::<std::collections::BTreeSet<_>>()
+            .len()
+    }
+    #[cfg(test)]
+    pub fn repeatable_hosts_with_policy(
+        &self,
+        hardware: &Hardware,
+        policy: &CompletionPolicy,
+    ) -> usize {
+        if policy.staging_volume_key.is_empty() {
+            return 0;
+        }
+        let now = Utc::now();
+        let policy_key = completion_policy_key(policy);
+        self.store
+            .lock()
+            .expect("performance store poisoned")
+            .hosts
+            .iter()
+            .filter(|r| usable_host(r, hardware, &now) && r.completion_policy_key == policy_key)
+            .map(|r| r.key.as_str())
+            .collect::<std::collections::BTreeSet<_>>()
+            .len()
     }
     pub fn running(&self) -> bool {
         self.job.lock().expect("calibration job poisoned").is_some()
@@ -266,23 +344,57 @@ impl Performance {
                 .flatten(),
             applied: store.applied,
             learned_hosts: store.hosts.len(),
+            repeatable_hosts: 0,
+            storage_error: self.storage_error.lock().unwrap().clone(),
             latest_issue: None,
             applied_active: false,
         }
     }
     fn save(&self, store: &mut Store) -> Result<(), String> {
+        let result = self.save_store(store);
+        *self.storage_error.lock().unwrap() = result.as_ref().err().cloned();
+        result
+    }
+    fn save_store(&self, store: &mut Store) -> Result<(), String> {
         store.schema = 1;
         store.reports.truncate(4);
-        store
-            .hosts
-            .retain(|h| Utc::now().signed_duration_since(h.completed_at).num_days() < EXPIRY_DAYS);
+        let now = Utc::now();
+        store.hosts.retain(|h| {
+            h.completed_at <= now
+                && now.signed_duration_since(h.completed_at).num_days() < EXPIRY_DAYS
+        });
         store.hosts.truncate(128);
         let bytes = serde_json::to_vec(store).map_err(|e| e.to_string())?;
         if bytes.len() as u64 > MAX_STATE_BYTES {
             return Err("Performance history exceeded its local size limit.".into());
         }
-        crate::platform::write_private_atomic(&self.path, &bytes)
-            .map_err(|_| "Could not save local performance results.".into())
+        (|| {
+            if let Some(previous) = read_state_bytes(&self.path)? {
+                if serde_json::from_slice::<Store>(&previous).is_ok_and(|store| store.schema == 1) {
+                    crate::platform::write_private_atomic(
+                        &self.path.with_extension("json.bak"),
+                        &previous,
+                    )?;
+                } else {
+                    // Preserve a damaged generation once, before any replacement.
+                    let damaged = self.path.with_extension("json.unreadable");
+                    match read_state_bytes(&damaged)? {
+                        None => crate::platform::write_private_atomic(&damaged, &previous)?,
+                        Some(existing) if existing == previous => {}
+                        Some(_) => {
+                            return Err(std::io::Error::other(
+                                "A distinct unreadable performance generation was preserved",
+                            ))
+                        }
+                    }
+                }
+            }
+            crate::platform::write_private_atomic(&self.path, &bytes)
+        })()
+        .map_err(|_: std::io::Error| {
+            "Could not save local performance results; current observations remain in memory."
+                .to_string()
+        })
     }
     pub fn dismiss(&self) -> Result<(), String> {
         let mut store = self.store.lock().expect("performance store poisoned");
@@ -299,7 +411,21 @@ impl Performance {
             dismissed: true,
             ..Default::default()
         };
-        self.save(&mut store)
+        self.save(&mut store)?;
+        for path in [
+            self.path.with_extension("json.bak"),
+            self.path.with_extension("json.unreadable"),
+        ] {
+            match std::fs::remove_file(path) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(_) => return Err(
+                    "Current calibration was reset, but an older local copy could not be removed."
+                        .into(),
+                ),
+            }
+        }
+        Ok(())
     }
     pub fn cancel(&self) {
         if let Some(token) = self.job.lock().expect("calibration job poisoned").as_ref() {
@@ -419,23 +545,51 @@ impl Performance {
             .clone();
         actual == Some(expected)
     }
+    #[cfg(test)]
     pub fn connections(&self, host: &str, hardware: &Hardware, size: u64, ceiling: usize) -> usize {
         let key = host_key(host, hardware, size);
+        self.connections_for_key(&key, hardware, size, ceiling)
+    }
+    pub fn connections_with_policy(
+        &self,
+        host: &str,
+        hardware: &Hardware,
+        size: u64,
+        ceiling: usize,
+        policy: &CompletionPolicy,
+    ) -> usize {
+        let key = if policy.staging_volume_key.is_empty() {
+            // Unknown storage context may use defaults/calibration, but cannot
+            // select observations from a different unidentified volume.
+            String::new()
+        } else {
+            host_key_with_policy(host, hardware, size, policy)
+        };
+        self.connections_for_key(&key, hardware, size, ceiling)
+    }
+    fn connections_for_key(
+        &self,
+        key: &str,
+        hardware: &Hardware,
+        size: u64,
+        ceiling: usize,
+    ) -> usize {
+        let ceiling = ceiling.clamp(1, 32);
+        let now = Utc::now();
         let store = self.store.lock().expect("performance store poisoned");
         let best = store
             .hosts
             .iter()
             .filter(|r| {
-                r.key == key
-                    && r.samples >= 2
+                !key.is_empty()
+                    && r.key == key
+                    && usable_host(r, hardware, &now)
                     && r.connections <= ceiling
-                    && r.completed_at <= Utc::now()
-                    && Utc::now().signed_duration_since(r.completed_at).num_days() < EXPIRY_DAYS
             })
             .filter_map(|r| {
                 repeated_floor(&r.recent_completion_bps).map(|bps| (r.connections, bps))
             })
-            .max_by_key(|(_, bps)| *bps);
+            .max_by(|a, b| a.1.cmp(&b.1).then_with(|| b.0.cmp(&a.0)));
         best.map(|(connections, _)| connections)
             .or_else(|| {
                 store
@@ -463,6 +617,7 @@ impl Performance {
             })
             .clamp(1, ceiling.max(1))
     }
+    #[cfg(test)]
     pub fn learn(
         &self,
         host: &str,
@@ -472,38 +627,100 @@ impl Performance {
         bps: u64,
         elapsed: Duration,
     ) {
-        if size < 16 * MIB || elapsed < Duration::from_secs(10) || bps == 0 {
+        self.learn_for_key(
+            host_key(host, hardware, size),
+            String::new(),
+            hardware,
+            size,
+            connections,
+            bps,
+            elapsed,
+        );
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub fn learn_with_policy(
+        &self,
+        host: &str,
+        hardware: &Hardware,
+        size: u64,
+        connections: usize,
+        bps: u64,
+        elapsed: Duration,
+        policy: &CompletionPolicy,
+    ) {
+        if policy.staging_volume_key.is_empty() {
             return;
         }
-        let key = host_key(host, hardware, size);
+        self.learn_for_key(
+            host_key_with_policy(host, hardware, size, policy),
+            completion_policy_key(policy),
+            hardware,
+            size,
+            connections,
+            bps,
+            elapsed,
+        );
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn learn_for_key(
+        &self,
+        key: String,
+        policy_key: String,
+        hardware: &Hardware,
+        size: u64,
+        connections: usize,
+        bps: u64,
+        elapsed: Duration,
+    ) {
+        if size < 16 * MIB
+            || elapsed < Duration::from_secs(10)
+            || bps == 0
+            || !(1..=32).contains(&connections)
+            || hardware.network_key.is_empty()
+            || hardware.drive_key.is_empty()
+        {
+            return;
+        }
+        let now = Utc::now();
         let mut store = self.store.lock().expect("performance store poisoned");
         let completion = rate(size, elapsed);
+        let fresh_result = || HostResult {
+            key: key.clone(),
+            connections,
+            completed_at: now,
+            throughput_bps: bps,
+            completion_bps: completion,
+            samples: 1,
+            recent_completion_bps: vec![completion],
+            engine_build: env!("FETCHRAIL_ENGINE_BUILD").into(),
+            network_key: hardware.network_key.clone(),
+            drive_key: hardware.drive_key.clone(),
+            completion_policy_key: policy_key.clone(),
+        };
         if let Some(result) = store
             .hosts
             .iter_mut()
             .find(|r| r.key == key && r.connections == connections)
         {
-            result.throughput_bps = (result.throughput_bps / 2).saturating_add(bps / 2);
-            result.completion_bps = (result.completion_bps / 2).saturating_add(completion / 2);
-            result.samples = result.samples.saturating_add(1).min(1000);
-            result.completed_at = Utc::now();
-            result.recent_completion_bps.push(completion);
-            if result.recent_completion_bps.len() > 4 {
-                result.recent_completion_bps.remove(0);
+            if current_host_context(result, hardware, &now)
+                && result.completion_policy_key == policy_key
+            {
+                result.throughput_bps = (result.throughput_bps / 2).saturating_add(bps / 2);
+                result.completion_bps = (result.completion_bps / 2).saturating_add(completion / 2);
+                result.samples = result.samples.saturating_add(1).min(1000);
+                result.completed_at = now;
+                result.recent_completion_bps.push(completion);
+                if result.recent_completion_bps.len() > 4 {
+                    let discard = result.recent_completion_bps.len() - 4;
+                    result.recent_completion_bps.drain(..discard);
+                }
+            } else {
+                // A new observation must not revive a stale/future generation
+                // into an apparently repeatable result.
+                *result = fresh_result();
             }
         } else {
-            store.hosts.insert(
-                0,
-                HostResult {
-                    key,
-                    connections,
-                    completed_at: Utc::now(),
-                    throughput_bps: bps,
-                    completion_bps: completion,
-                    samples: 1,
-                    recent_completion_bps: vec![completion],
-                },
-            );
+            store.hosts.insert(0, fresh_result());
         }
         let _ = self.save(&mut store);
     }
@@ -512,6 +729,31 @@ impl Performance {
         status.0 = name.into();
         status.1 = progress;
     }
+}
+
+fn read_state_bytes(path: &Path) -> std::io::Result<Option<Vec<u8>>> {
+    use std::io::Read;
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    if !metadata.is_file() || metadata.file_type().is_symlink() || metadata.len() > MAX_STATE_BYTES
+    {
+        return Err(std::io::Error::other(
+            "Unrecognized performance state was preserved",
+        ));
+    }
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    std::fs::File::open(path)?
+        .take(MAX_STATE_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_STATE_BYTES {
+        return Err(std::io::Error::other(
+            "Performance state exceeded its local size limit",
+        ));
+    }
+    Ok(Some(bytes))
 }
 
 fn fresh(report: &Report, h: &Hardware) -> bool {
@@ -533,6 +775,43 @@ fn host_key(host: &str, h: &Hardware, size: u64) -> String {
         h.drive_key,
         if size < 256 * MIB { "medium" } else { "large" }
     ))
+}
+fn completion_policy_key(policy: &CompletionPolicy) -> String {
+    platform::key(
+        &serde_json::to_string(&(
+            "completion-policy-v1",
+            policy.attachment_check,
+            policy.expected_sha256,
+            &policy.staging_volume_key,
+        ))
+        .expect("Completion policy contains serializable values"),
+    )
+}
+fn host_key_with_policy(host: &str, h: &Hardware, size: u64, policy: &CompletionPolicy) -> String {
+    platform::key(&format!(
+        "policy-aware-host-v1:{}:{}",
+        host_key(host, h, size),
+        completion_policy_key(policy),
+    ))
+}
+fn current_host_context(result: &HostResult, hardware: &Hardware, now: &DateTime<Utc>) -> bool {
+    !result.key.is_empty()
+        && result.engine_build == env!("FETCHRAIL_ENGINE_BUILD")
+        && !hardware.network_key.is_empty()
+        && !hardware.drive_key.is_empty()
+        && result.network_key == hardware.network_key
+        && result.drive_key == hardware.drive_key
+        && (1..=32).contains(&result.connections)
+        && (1..=4).contains(&result.recent_completion_bps.len())
+        && result.samples >= result.recent_completion_bps.len()
+        && result.recent_completion_bps.iter().all(|rate| *rate > 0)
+        && result.completed_at <= *now
+        && now.signed_duration_since(result.completed_at).num_days() < EXPIRY_DAYS
+}
+fn usable_host(result: &HostResult, hardware: &Hardware, now: &DateTime<Utc>) -> bool {
+    current_host_context(result, hardware, now)
+        && result.samples >= 2
+        && repeated_floor(&result.recent_completion_bps).is_some()
 }
 fn rate(bytes: u64, elapsed: Duration) -> u64 {
     (bytes as f64 / elapsed.as_secs_f64().max(0.001)) as u64
@@ -562,7 +841,14 @@ struct Control {
     best_target: usize,
     settled: bool,
     changed_count: bool,
+    downward_trial: bool,
+    downward_tested: bool,
+    preferred_lower: bool,
+    recheck_windows: usize,
+    trial_elapsed: Duration,
 }
+const CONTROL_RECHECK_WINDOWS: usize = 30;
+const CONTROL_TRIAL_MAX_AGE: Duration = Duration::from_secs(120);
 pub struct RangePermit(Arc<LivePolicy>);
 impl Drop for RangePermit {
     fn drop(&mut self) {
@@ -597,6 +883,11 @@ impl LivePolicy {
                 best_target: start,
                 settled: false,
                 changed_count: false,
+                downward_trial: false,
+                downward_tested: false,
+                preferred_lower: false,
+                recheck_windows: 6,
+                trial_elapsed: Duration::ZERO,
             }),
         })
     }
@@ -639,9 +930,18 @@ impl LivePolicy {
         let eligible = eligible && self.eligible.load(Ordering::Relaxed);
         if !eligible {
             self.contaminated.store(true, Ordering::Relaxed);
+            self.discard_trial(&mut c);
+            return;
         }
-        if !eligible
-            || receiving != target
+        if c.baseline > 0 {
+            c.trial_elapsed = c.trial_elapsed.saturating_add(elapsed);
+            if c.trial_elapsed > CONTROL_TRIAL_MAX_AGE {
+                // A long drain or tail cannot be compared with an old baseline.
+                self.discard_trial(&mut c);
+                return;
+            }
+        }
+        if receiving != target
             || self.active.load(Ordering::Acquire) != target
             || generation != self.generation.load(Ordering::Acquire)
             || elapsed < Duration::from_secs(3)
@@ -653,9 +953,11 @@ impl LivePolicy {
         let speed = rate(bytes, elapsed);
         let hint = self.capacity_hint_bps.load(Ordering::Relaxed);
         if c.windows == 0
+            && c.baseline == 0
+            && !c.changed_count
             && target < self.ceiling
             && hint > 0
-            && speed < hint * 7 / 10
+            && speed < hint.saturating_mul(7) / 10
             && writes / (receiving.max(1) as u64) < millis(elapsed).saturating_mul(1_000_000) / 4
         {
             self.target.store(self.ceiling, Ordering::Release);
@@ -670,16 +972,16 @@ impl LivePolicy {
         c.previous = speed;
         c.windows += 1;
         if writes / receiving.max(1) as u64 > millis(elapsed).saturating_mul(1_000_000) / 2 {
-            c.settled = true;
-            c.baseline = 0;
-            c.windows = 0;
+            // A storage-limited candidate has not established a network benefit.
+            self.discard_trial(&mut c);
             return;
         }
         if c.windows < 3 || sustained == 0 {
             return;
         }
         if c.baseline > 0 {
-            if sustained < c.baseline.saturating_mul(110) / 100 {
+            let required = if c.downward_trial { 100 } else { 110 };
+            if sustained < c.baseline.saturating_mul(required) / 100 {
                 self.target.store(c.previous_target, Ordering::Release);
                 c.changed_count = true;
                 self.generation.fetch_add(1, Ordering::AcqRel);
@@ -687,11 +989,34 @@ impl LivePolicy {
                 c.windows = 0;
                 c.previous = 0;
                 c.settled = true;
+                c.recheck_windows = if c.downward_trial || c.preferred_lower {
+                    CONTROL_RECHECK_WINDOWS
+                } else {
+                    6
+                };
+                c.downward_trial = false;
+                c.trial_elapsed = Duration::ZERO;
+                self.changed.notify_waiters();
                 return;
             } else {
                 c.best = sustained;
                 c.best_target = target;
                 c.baseline = 0;
+                c.trial_elapsed = Duration::ZERO;
+                if c.downward_trial {
+                    c.preferred_lower = true;
+                    c.downward_tested = false;
+                    c.settled = true;
+                    c.recheck_windows = CONTROL_RECHECK_WINDOWS;
+                    c.windows = 0;
+                    c.previous = 0;
+                    c.downward_trial = false;
+                    return;
+                }
+                c.preferred_lower = false;
+                c.recheck_windows = 6;
+                c.downward_tested = false;
+                c.downward_trial = false;
             }
         } else if sustained > c.best {
             c.best = sustained;
@@ -700,20 +1025,60 @@ impl LivePolicy {
         // A test server's throughput is a weak prior, not the ceiling of another route.
         // Drain naturally rather than cancelling healthy ranges or discarding verified bytes.
         // Stable work can re-probe after a transient disk/server condition; no permanent low target.
-        if c.settled && c.windows >= 6 {
+        if target > 1
+            && c.windows >= 6
+            && !c.downward_tested
+            && (target == self.ceiling || (c.settled && (target >= 4 || c.preferred_lower)))
+        {
+            // Compare a lower count only after sustained full-worker evidence; drain at range boundaries.
+            c.baseline = sustained;
+            c.previous_target = target;
+            c.downward_trial = true;
+            c.downward_tested = true;
+            c.changed_count = true;
+            c.windows = 0;
+            c.previous = 0;
+            c.trial_elapsed = Duration::ZERO;
+            self.target.store((target / 2).max(1), Ordering::Release);
+            self.generation.fetch_add(1, Ordering::AcqRel);
+            self.changed.notify_waiters();
+            return;
+        }
+        if c.settled && c.windows >= c.recheck_windows {
             c.settled = false;
+            c.downward_tested = false;
         }
         if !c.settled && target < self.ceiling {
             c.baseline = sustained;
             c.previous_target = target;
             c.windows = 0;
             c.previous = 0;
+            c.trial_elapsed = Duration::ZERO;
             self.target
                 .store((target * 2).min(self.ceiling), Ordering::Release);
             c.changed_count = true;
             self.generation.fetch_add(1, Ordering::AcqRel);
         }
         self.changed.notify_waiters();
+    }
+    fn discard_trial(&self, c: &mut Control) {
+        if c.baseline > 0 {
+            self.target.store(c.previous_target, Ordering::Release);
+            self.generation.fetch_add(1, Ordering::AcqRel);
+            self.changed.notify_waiters();
+        }
+        c.settled = true;
+        c.baseline = 0;
+        c.windows = 0;
+        c.previous = 0;
+        c.downward_trial = false;
+        c.downward_tested = false;
+        c.recheck_windows = if c.preferred_lower {
+            CONTROL_RECHECK_WINDOWS
+        } else {
+            6
+        };
+        c.trial_elapsed = Duration::ZERO;
     }
     pub fn throttled(&self) {
         let mut c = self
@@ -725,6 +1090,11 @@ impl LivePolicy {
         c.windows = 0;
         c.previous = 0;
         c.baseline = 0;
+        c.downward_trial = false;
+        c.downward_tested = false;
+        c.preferred_lower = false;
+        c.recheck_windows = 6;
+        c.trial_elapsed = Duration::ZERO;
         self.contaminated.store(true, Ordering::Relaxed);
         self.target
             .fetch_update(Ordering::AcqRel, Ordering::Relaxed, |v| {
@@ -737,10 +1107,16 @@ impl LivePolicy {
     pub fn disable(&self) {
         self.contaminated.store(true, Ordering::Relaxed);
         self.eligible.store(false, Ordering::Relaxed);
-        self.control
+        let mut c = self
+            .control
             .lock()
-            .expect("performance controller poisoned")
-            .settled = true;
+            .expect("performance controller poisoned");
+        c.settled = true;
+        c.baseline = 0;
+        c.windows = 0;
+        c.previous = 0;
+        c.downward_trial = false;
+        c.trial_elapsed = Duration::ZERO;
         self.target.store(self.ceiling, Ordering::Release);
         self.generation.fetch_add(1, Ordering::AcqRel);
         self.changed.notify_waiters();
@@ -753,9 +1129,7 @@ impl LivePolicy {
                 .control
                 .lock()
                 .expect("performance controller poisoned");
-            control.windows = 0;
-            control.previous = 0;
-            control.baseline = 0;
+            self.discard_trial(&mut control);
         }
     }
     pub fn best(&self) -> (usize, u64) {
@@ -1885,6 +2259,478 @@ mod tests {
         policy.throttled();
         assert!(policy.contaminated.load(Ordering::Acquire));
         assert_eq!(policy.best().1, 0);
+    }
+
+    #[tokio::test]
+    async fn lower_count_trials_drain_before_comparing_and_keep_a_measured_benefit() {
+        let policy = LivePolicy::new(16, 16, 1024 * 1024);
+        let mut permits = lanes(&policy, 16).await;
+        for _ in 0..6 {
+            observe(&policy, 80 * MIB, 16, true);
+        }
+        assert_eq!(policy.target.load(Ordering::Acquire), 8);
+        assert!(policy.should_drain());
+        for _ in 0..3 {
+            observe(&policy, 200 * MIB, 16, true);
+        }
+        assert_eq!(
+            policy.control.lock().unwrap().best_target,
+            16,
+            "Bytes from draining workers cannot establish an eight-worker result"
+        );
+        permits.truncate(8);
+        assert!(!policy.should_drain());
+        for _ in 0..3 {
+            observe(&policy, 100 * MIB, 8, true);
+        }
+        assert_eq!(policy.target.load(Ordering::Acquire), 8);
+        assert_eq!(policy.control.lock().unwrap().best_target, 8);
+        for _ in 0..6 {
+            observe(&policy, 100 * MIB, 8, true);
+        }
+        assert_eq!(
+            policy.target.load(Ordering::Acquire),
+            4,
+            "An accepted lower count can test further descent instead of immediately regrowing"
+        );
+        permits.truncate(4);
+        for _ in 0..3 {
+            observe(&policy, 100 * MIB, 4, true);
+        }
+        assert_eq!(policy.control.lock().unwrap().best_target, 4);
+        assert_eq!(policy.target.load(Ordering::Acquire), 4);
+        assert_eq!(
+            policy.best().1,
+            0,
+            "Mixed-count completions are not host-count training"
+        );
+    }
+
+    #[tokio::test]
+    async fn even_a_small_lower_count_loss_rolls_back_and_observes_a_recheck_interval() {
+        let policy = LivePolicy::new(16, 16, 1024 * 1024);
+        let mut permits = lanes(&policy, 16).await;
+        for _ in 0..6 {
+            observe(&policy, 100 * MIB, 16, true);
+        }
+        permits.truncate(8);
+        for _ in 0..3 {
+            observe(&policy, 100 * MIB, 8, true);
+        }
+        for _ in 0..6 {
+            observe(&policy, 100 * MIB, 8, true);
+        }
+        permits.truncate(4);
+        for _ in 0..3 {
+            observe(&policy, 99 * MIB, 4, true);
+        }
+        assert_eq!(
+            policy.target.load(Ordering::Acquire),
+            8,
+            "Reducing count must not knowingly give up sampled throughput"
+        );
+        permits.extend(lanes(&policy, 4).await);
+        for _ in 0..(CONTROL_RECHECK_WINDOWS - 1) {
+            observe(&policy, 100 * MIB, 8, true);
+            assert_eq!(
+                policy.target.load(Ordering::Acquire),
+                8,
+                "A rejected candidate does not immediately undo the known-good lower count"
+            );
+        }
+        observe(&policy, 100 * MIB, 8, true);
+        assert_eq!(
+            policy.target.load(Ordering::Acquire),
+            16,
+            "A later bounded probe still allows a changed route to use more workers"
+        );
+    }
+
+    #[tokio::test]
+    async fn interrupted_or_expired_trials_restore_the_measured_baseline() {
+        for interruption in ["cap", "write", "expired", "eligibility"] {
+            let policy = LivePolicy::new(8, 8, 1024 * 1024);
+            let mut permits = lanes(&policy, 8).await;
+            for _ in 0..6 {
+                observe(&policy, 80 * MIB, 8, true);
+            }
+            permits.truncate(4);
+            match interruption {
+                "cap" => observe(&policy, 40 * MIB, 4, false),
+                "write" => {
+                    policy
+                        .write_wait_ns
+                        .store(12_000_000_000, Ordering::Release);
+                    observe(&policy, 80 * MIB, 4, true);
+                }
+                "expired" => policy.observe(
+                    80 * MIB,
+                    CONTROL_TRIAL_MAX_AGE + Duration::from_secs(1),
+                    4,
+                    true,
+                    policy.generation.load(Ordering::Acquire),
+                ),
+                _ => policy.set_eligible(false),
+            }
+            assert_eq!(policy.target.load(Ordering::Acquire), 8, "{interruption}");
+            assert_eq!(
+                policy.control.lock().unwrap().best_target,
+                8,
+                "{interruption}"
+            );
+            assert_eq!(policy.control.lock().unwrap().baseline, 0, "{interruption}");
+        }
+    }
+
+    #[tokio::test]
+    async fn changed_worker_generations_do_not_finish_a_lower_count_trial() {
+        let policy = LivePolicy::new(8, 8, 1024 * 1024);
+        let mut permits = lanes(&policy, 8).await;
+        for _ in 0..6 {
+            observe(&policy, 80 * MIB, 8, true);
+        }
+        let draining_generation = policy.generation.load(Ordering::Acquire);
+        permits.truncate(4);
+        for _ in 0..3 {
+            policy.observe(
+                100 * MIB,
+                Duration::from_secs(4),
+                4,
+                true,
+                draining_generation,
+            );
+        }
+        assert_eq!(policy.control.lock().unwrap().best_target, 8);
+        for _ in 0..2 {
+            observe(&policy, 100 * MIB, 4, true);
+        }
+        assert_eq!(
+            policy.control.lock().unwrap().best_target,
+            8,
+            "The candidate needs fresh complete windows after draining"
+        );
+        observe(&policy, 100 * MIB, 4, true);
+        assert_eq!(policy.control.lock().unwrap().best_target, 4);
+    }
+
+    fn test_performance() -> (Temporary, Arc<Performance>) {
+        let directory =
+            std::env::temp_dir().join(format!("fetchrail-performance-state-{}", Uuid::new_v4()));
+        std::fs::create_dir(&directory).unwrap();
+        let owner = Performance::load(&directory);
+        (Temporary(directory), owner)
+    }
+    fn test_hardware() -> Hardware {
+        Hardware {
+            network_key: "test-network-key".into(),
+            drive_key: "test-drive-key".into(),
+            ..Default::default()
+        }
+    }
+    fn test_completion_policy() -> CompletionPolicy {
+        CompletionPolicy {
+            attachment_check: true,
+            expected_sha256: false,
+            staging_volume_key: "private-test-staging-volume".into(),
+        }
+    }
+    fn learn_twice(
+        owner: &Performance,
+        hardware: &Hardware,
+        policy: &CompletionPolicy,
+        count: usize,
+        seconds: u64,
+    ) {
+        for _ in 0..2 {
+            owner.learn_with_policy(
+                "https://private-test-host.invalid",
+                hardware,
+                512 * MIB,
+                count,
+                50 * MIB,
+                Duration::from_secs(seconds),
+                policy,
+            );
+        }
+    }
+
+    #[test]
+    fn completion_learning_is_repeatable_private_and_scoped_to_the_completion_policy() {
+        let (_directory, owner) = test_performance();
+        let hardware = test_hardware();
+        let policy = test_completion_policy();
+        let host = "https://private-test-host.invalid";
+        let selected = |policy: &CompletionPolicy| {
+            owner.connections_with_policy(host, &hardware, 512 * MIB, 32, policy)
+        };
+        for _ in 0..2 {
+            owner.learn(
+                host,
+                &hardware,
+                512 * MIB,
+                4,
+                50 * MIB,
+                Duration::from_secs(30),
+            );
+        }
+        assert_eq!(owner.connections(host, &hardware, 512 * MIB, 32), 4);
+        assert_eq!(
+            selected(&policy),
+            16,
+            "Legacy results cannot match a policy-aware key"
+        );
+        owner.learn_with_policy(
+            host,
+            &hardware,
+            512 * MIB,
+            4,
+            50 * MIB,
+            Duration::from_secs(30),
+            &policy,
+        );
+        assert_eq!(
+            selected(&policy),
+            16,
+            "One completion does not establish repeatability"
+        );
+        owner.learn_with_policy(
+            host,
+            &hardware,
+            512 * MIB,
+            4,
+            50 * MIB,
+            Duration::from_secs(30),
+            &policy,
+        );
+        assert_eq!(selected(&policy), 4);
+        assert_eq!(owner.repeatable_hosts_with_policy(&hardware, &policy), 1);
+        for changed in [
+            CompletionPolicy {
+                attachment_check: false,
+                ..policy.clone()
+            },
+            CompletionPolicy {
+                expected_sha256: true,
+                ..policy.clone()
+            },
+            CompletionPolicy {
+                staging_volume_key: "other-staging-volume".into(),
+                ..policy.clone()
+            },
+        ] {
+            assert_eq!(selected(&changed), 16);
+            assert_eq!(owner.repeatable_hosts_with_policy(&hardware, &changed), 0);
+        }
+        learn_twice(&owner, &hardware, &policy, 8, 20);
+        assert_eq!(
+            selected(&policy),
+            8,
+            "Choose repeated completion speed, including finalization"
+        );
+        owner.learn_with_policy(
+            host,
+            &hardware,
+            512 * MIB,
+            2,
+            200 * MIB,
+            Duration::from_secs(10),
+            &policy,
+        );
+        assert_eq!(
+            selected(&policy),
+            8,
+            "A single faster result is still insufficient"
+        );
+        assert_eq!(
+            owner.repeatable_hosts_with_policy(&hardware, &policy),
+            1,
+            "Different counts for the same server/size are one applicable profile"
+        );
+        let unknown = CompletionPolicy {
+            staging_volume_key: String::new(),
+            ..policy.clone()
+        };
+        learn_twice(&owner, &hardware, &unknown, 2, 10);
+        assert_eq!(selected(&unknown), 16);
+        assert_eq!(owner.repeatable_hosts_with_policy(&hardware, &unknown), 0);
+        let saved = std::fs::read_to_string(&owner.path).unwrap();
+        assert!(!saved.contains("private-test-host.invalid"));
+        assert!(!saved.contains(&policy.staging_volume_key));
+    }
+
+    #[test]
+    fn stale_future_and_wrong_build_host_results_require_new_repeated_evidence() {
+        for invalid in ["expired", "future", "build", "network", "drive"] {
+            let (_directory, owner) = test_performance();
+            let hardware = test_hardware();
+            let policy = test_completion_policy();
+            learn_twice(&owner, &hardware, &policy, 4, 20);
+            {
+                let mut store = owner.store.lock().unwrap();
+                let result = &mut store.hosts[0];
+                match invalid {
+                    "expired" => {
+                        result.completed_at = Utc::now() - chrono::Duration::days(EXPIRY_DAYS + 1)
+                    }
+                    "future" => result.completed_at = Utc::now() + chrono::Duration::days(1),
+                    "build" => result.engine_build = "previous-engine-build".into(),
+                    "network" => result.network_key = "previous-network".into(),
+                    _ => result.drive_key = "previous-drive".into(),
+                }
+            }
+            let selected = || {
+                owner.connections_with_policy(
+                    "https://private-test-host.invalid",
+                    &hardware,
+                    512 * MIB,
+                    32,
+                    &policy,
+                )
+            };
+            assert_eq!(selected(), 16, "{invalid}");
+            assert_eq!(
+                owner.repeatable_hosts_with_policy(&hardware, &policy),
+                0,
+                "{invalid}"
+            );
+            owner.learn_with_policy(
+                "https://private-test-host.invalid",
+                &hardware,
+                512 * MIB,
+                4,
+                50 * MIB,
+                Duration::from_secs(20),
+                &policy,
+            );
+            assert_eq!(owner.store.lock().unwrap().hosts[0].samples, 1, "{invalid}");
+            assert_eq!(
+                selected(),
+                16,
+                "A fresh observation must not revive stale history: {invalid}"
+            );
+            owner.learn_with_policy(
+                "https://private-test-host.invalid",
+                &hardware,
+                512 * MIB,
+                4,
+                50 * MIB,
+                Duration::from_secs(20),
+                &policy,
+            );
+            assert_eq!(selected(), 4, "{invalid}");
+        }
+    }
+
+    #[test]
+    fn a_damaged_primary_recovers_a_known_good_generation_and_reset_cannot_resurrect_it() {
+        let (directory, owner) = test_performance();
+        let old_applied = Uuid::new_v4();
+        {
+            let mut store = owner.store.lock().unwrap();
+            store.applied = Some(old_applied);
+            owner.save(&mut store).unwrap();
+            store.applied = None;
+            owner.save(&mut store).unwrap();
+        }
+        let backup = owner.path.with_extension("json.bak");
+        let known_good = std::fs::read(&backup).unwrap();
+        let damaged = b"interrupted performance generation";
+        std::fs::write(&owner.path, damaged).unwrap();
+        let recovered = Performance::load(&directory.0);
+        assert_eq!(recovered.status().applied, Some(old_applied));
+        assert!(recovered.status().storage_error.is_some());
+        recovered.dismiss().unwrap();
+        assert_eq!(
+            std::fs::read(owner.path.with_extension("json.unreadable")).unwrap(),
+            damaged
+        );
+        assert_eq!(
+            std::fs::read(&backup).unwrap(),
+            known_good,
+            "The unreadable primary must not replace the known-good backup"
+        );
+        assert!(recovered.status().storage_error.is_none());
+        recovered.reset().unwrap();
+        assert!(!backup.exists());
+        assert!(!owner.path.with_extension("json.unreadable").exists());
+        std::fs::write(&owner.path, b"damaged after explicit reset").unwrap();
+        assert!(Performance::load(&directory.0).status().applied.is_none());
+    }
+
+    #[test]
+    fn a_second_damaged_generation_is_preserved_and_save_failure_is_visible() {
+        let (directory, owner) = test_performance();
+        owner.dismiss().unwrap();
+        owner.dismiss().unwrap();
+        let backup = owner.path.with_extension("json.bak");
+        let known_good = std::fs::read(&backup).unwrap();
+        std::fs::write(&owner.path, b"first damaged generation").unwrap();
+        let recovered = Performance::load(&directory.0);
+        recovered.dismiss().unwrap();
+        std::fs::write(&owner.path, b"second damaged generation").unwrap();
+        assert!(recovered.dismiss().is_err());
+        assert!(recovered.status().storage_error.is_some());
+        assert_eq!(
+            std::fs::read(&owner.path).unwrap(),
+            b"second damaged generation"
+        );
+        assert_eq!(
+            std::fs::read(owner.path.with_extension("json.unreadable")).unwrap(),
+            b"first damaged generation"
+        );
+        assert_eq!(std::fs::read(&backup).unwrap(), known_good);
+    }
+
+    #[test]
+    fn bounded_or_failed_saves_leave_the_previous_state_and_expose_the_error() {
+        let (_directory, owner) = test_performance();
+        owner.dismiss().unwrap();
+        let previous = std::fs::read(&owner.path).unwrap();
+        {
+            let mut store = owner.store.lock().unwrap();
+            store.hosts.push(HostResult {
+                key: "x".repeat(MAX_STATE_BYTES as usize),
+                completed_at: Utc::now(),
+                ..Default::default()
+            });
+            assert!(owner.save(&mut store).is_err());
+            store.hosts.clear();
+        }
+        assert!(owner.status().storage_error.is_some());
+        assert_eq!(std::fs::read(&owner.path).unwrap(), previous);
+        std::fs::create_dir(owner.path.with_extension("json.bak")).unwrap();
+        assert!(
+            owner.dismiss().is_err(),
+            "A failed backup must stop replacement of the primary"
+        );
+        assert!(owner.status().storage_error.is_some());
+        assert_eq!(std::fs::read(&owner.path).unwrap(), previous);
+    }
+
+    #[test]
+    fn an_unreadable_backup_is_reported_even_when_the_primary_is_missing() {
+        let (directory, owner) = test_performance();
+        std::fs::write(owner.path.with_extension("json.bak"), b"unreadable backup").unwrap();
+        let recovered = Performance::load(&directory.0);
+        assert!(recovered.status().storage_error.is_some());
+        assert!(recovered.status().latest.is_none());
+    }
+
+    #[tokio::test]
+    async fn cached_inventory_returns_without_waiting_for_a_different_inventory() {
+        let (directory, owner) = test_performance();
+        let hardware = test_hardware();
+        *owner.hardware_cache.lock().unwrap() =
+            Some((Instant::now(), directory.0.clone(), hardware.clone()));
+        let _other_inventory = owner.inventory_gate.lock().await;
+        let cached = tokio::time::timeout(
+            Duration::from_millis(250),
+            owner.hardware_async(&directory.0),
+        )
+        .await
+        .expect("An existing cached result does not need the slow inventory gate");
+        assert_eq!(cached.drive_key, hardware.drive_key);
+        assert_eq!(cached.network_key, hardware.network_key);
     }
 
     fn measurement(kind: &str, count: usize, buffer: usize, bps: u64) -> Trial {

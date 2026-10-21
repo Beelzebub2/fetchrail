@@ -76,7 +76,11 @@ try {
     if (corrupt) assert.ok(requests > 0, "A real peer must supply the corrupt bytes");
     assert.equal(state.health.selectedReady, false);
     if (corrupt) assert.ok(state.health.failedPieceBytes >= metadata.pieceLength);
-    assert.ok(Object.values(state.health).every(value => typeof value === "boolean" || (Number.isSafeInteger(value) && value >= 0)));
+    const nullableHealth = new Set(["checkpointAgeMs", "distributedFullCopies", "distributedFraction"]);
+    for (const field of nullableHealth) assert.ok(Object.hasOwn(state.health, field), "Missing typed health field: " + field);
+    for (const [field, value] of Object.entries(state.health)) {
+      assert.ok((value === null && nullableHealth.has(field)) || typeof value === "boolean" || (Number.isSafeInteger(value) && value >= 0), "Invalid health value: " + field);
+    }
     for (const privateText of [root, metadata.hashes[0], "PRIVATE-TORRENT-SENTINEL"]) assert.ok(!JSON.stringify(state.health).includes(privateText));
     evidence.push({ fault, requests, health: state.health });
     await harness.call({ op: "remove", id });

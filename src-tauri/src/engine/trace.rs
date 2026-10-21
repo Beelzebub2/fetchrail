@@ -11,7 +11,7 @@ use std::{
 };
 
 pub(crate) use crate::health::Phase;
-const NAMES: [&str; 26] = [
+const NAMES: [&str; crate::health::PHASE_COUNT] = [
     "probe",
     "originAdmission",
     "globalAdmission",
@@ -38,6 +38,9 @@ const NAMES: [&str; 26] = [
     "publishSync",
     "scanHashOverlap",
     "bodyProcessing",
+    "prefixHash",
+    "dispatchLock",
+    "catalogLock",
 ];
 #[derive(Clone, Copy)]
 pub(crate) enum RetryCause {

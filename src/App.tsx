@@ -162,6 +162,7 @@ export type DownloadSettings = Appearance & {
   defaultDownloadDir: string;
   maxConcurrentDownloads: number;
   connectionsPerDownload: number;
+  maxRequestsPerOrigin: number;
   performanceAuto: boolean;
   minSegmentSizeMb: number;
   windowsAttachmentCheck: boolean;
@@ -375,7 +376,7 @@ function nameFromUrl(url: string) {
 export function formatBytes(value: number | null, fine = false) {
   if (value == null) return "Unknown";
   if (value < 1024) return String(value) + " B";
-  const units = ["KB", "MB", "GB", "TB"];
+  const units = ["KiB", "MiB", "GiB", "TiB"];
   let amount = value;
   let index = -1;
   do {
@@ -453,7 +454,7 @@ export function statusLabel(status: DownloadStatus) {
     scheduled: "Scheduled",
     connecting: "Connecting",
     downloading: "Downloading",
-    metadata: "Fetching metadata", checking: "Verifying files", stalled: "Waiting for peers", seeding: "Sharing",
+    metadata: "Fetching metadata", checking: "Verifying files", stalled: "Waiting for data", seeding: "Sharing",
     paused: "Paused",
     merging: "Joining parts",
     completed: "Completed",
@@ -1786,7 +1787,7 @@ function DownloadRow({
         </div>
         <div className="col-eta">
           {running && <span className="mono">{formatEta(item.etaSeconds)}</span>}
-          {running && item.etaSeconds != null && item.etaSeconds > 0 && <small>left</small>}
+          {running && item.etaSeconds != null && item.etaSeconds > 0 && <small>{item.torrent ? "left" : "to receive"}</small>}
         </div>
         <div className="row-actions">
           {canPause && (
@@ -2497,7 +2498,14 @@ function SettingsPage({
                       onChange={(value) => onChange({ connectionsPerDownload: value })}
                     />
                     <Stepper
-                      label="Minimum part size (MB)"
+                      label="Requests per server across downloads"
+                      min={1}
+                      max={64}
+                      value={draft.maxRequestsPerOrigin ?? 32}
+                      onChange={(value) => onChange({ maxRequestsPerOrigin: value })}
+                    />
+                    <Stepper
+                      label="Minimum part size (MiB)"
                       min={1}
                       max={128}
                       value={draft.minSegmentSizeMb}
@@ -2515,7 +2523,7 @@ function SettingsPage({
                     </div>
                     <p className="load-note">
                       <b className="mono">{files}</b> at once, <b className="mono">{parts}</b> {parts === 1 ? "connection" : "connections"} each:
-                      up to <b className="mono">{files * parts}</b> open connections.
+                      up to <b className="mono">{Math.min(64, files * parts)}</b> active HTTP requests, with a shared per-server limit of <b className="mono">{draft.maxRequestsPerOrigin ?? 32}</b>.
                     </p>
                     <p className="hint">A server that cannot send parts of a file gets a single connection.</p>
                   </div>

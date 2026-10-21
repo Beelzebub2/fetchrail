@@ -34,7 +34,12 @@ assert.equal(await normalizedSource(new URL("public/downloads.mjs", import.meta.
 assert.equal(await normalizedSource(new URL("public/release-feed.mjs", import.meta.url)), await normalizedSource(new URL("../update-service/website-release.mjs", import.meta.url)));
 const canonical = JSON.parse(await readFile(new URL("../update-service/wrangler.jsonc", import.meta.url), "utf8"));
 const mirrored = JSON.parse(await readFile(new URL("wrangler.jsonc", import.meta.url), "utf8"));
-assert.deepEqual(mirrored.assets.run_worker_first, canonical.assets.run_worker_first);
+assert.deepEqual(mirrored, {
+  ...canonical,
+  $schema: "./node_modules/wrangler/config-schema.json",
+  main: "../update-service/worker.mjs",
+  assets: { ...canonical.assets, directory: "./public" },
+}, "Website deployment must preserve canonical quality gates, abuse limits, routes, bindings and logging settings");
 // Feed failure keeps the prior valid release; malformed refreshes never replace links.
 let refresh, received = [];
 globalThis.document = { hidden: false, addEventListener: (_, callback) => { refresh = callback; }, removeEventListener() {} };

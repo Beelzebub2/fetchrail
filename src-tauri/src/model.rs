@@ -211,6 +211,9 @@ pub struct DownloadSettings {
     pub default_download_dir: String,
     pub max_concurrent_downloads: usize,
     pub connections_per_download: usize,
+    /// Shared admission ceiling across HTTP jobs targeting the same origin.
+    #[serde(default = "default_origin_requests")]
+    pub max_requests_per_origin: usize,
     /// Calibration and lightweight measured adaptation; old profiles retain manual behavior.
     #[serde(default)]
     pub performance_auto: bool,
@@ -303,6 +306,7 @@ impl DownloadSettings {
         }
         self.max_concurrent_downloads = self.max_concurrent_downloads.clamp(1, 12);
         self.connections_per_download = self.connections_per_download.clamp(1, 32);
+        self.max_requests_per_origin = self.max_requests_per_origin.clamp(1, 64);
         self.min_segment_size_mb = self.min_segment_size_mb.clamp(1, 128);
         self.torrent.max_seeds = self.torrent.max_seeds.clamp(1, 100);
         self.torrent.connections = self.torrent.connections.clamp(20, 2000);
@@ -569,6 +573,7 @@ mod tests {
             default_download_dir: download_root.into(),
             max_concurrent_downloads: 3,
             connections_per_download: 8,
+            max_requests_per_origin: 32,
             performance_auto: false,
             min_segment_size_mb: 4,
             windows_attachment_check: true,
@@ -646,4 +651,8 @@ mod tests {
             .any(|category| category.name == "Programs"
                 && category.extensions.contains(&"exe".to_string())));
     }
+}
+
+fn default_origin_requests() -> usize {
+    32
 }

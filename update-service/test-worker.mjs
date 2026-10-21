@@ -72,7 +72,8 @@ try {
     { ...reportFixture, arch: "machine fingerprint" }, { ...reportFixture, version: "0.6.1-user-name" },
     { ...reportFixture, schema: 2 }, null, [], "not json",
   ]) assert.equal((await collect(data)).status, 400);
-  assert.equal((await collect(" ".repeat(4097))).status, 413);
+  assert.equal((await collect(" ".repeat(8193))).status, 413);
+  assert.equal((await collect(JSON.stringify(reportFixture) + " ".repeat(2048))).status, 413, "The legacy v1 cap remains 2 KiB");
   assert.equal((await collect(reportFixture, { Cookie: "secret=value" })).status, 400);
   assert.equal((await collect(reportFixture, { Authorization: "Bearer credential" })).status, 400);
   assert.equal((await collect(reportFixture, {}, "/api/analytics?url=secret")).status, 400);

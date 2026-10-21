@@ -2,6 +2,10 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 fn main() {
+    #[cfg(windows)]
+    if let Some(code) = fetchrail_lib::platform::run_attachment_worker() {
+        std::process::exit(code);
+    }
     #[cfg(target_os = "linux")]
     {
         if let Err(error) = fetchrail_lib::wait_for_linux_restart() {

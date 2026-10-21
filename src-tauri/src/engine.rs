@@ -61,6 +61,10 @@ macro_rules! transfer_span {
     }};
 }
 
+mod tail;
+#[cfg(test)]
+mod tail_tests;
+
 use crate::model::{
     default_categories, default_queue_name, AddDownloadRequest, BatchDownloadError,
     BatchDownloadResult, BrowserRequestContext, DownloadRecord, DownloadSettings, DownloadStatus,
@@ -83,7 +87,8 @@ const REMOVED_EVENT: &str = "fetchrail://download-removed";
 const MERGE_BUFFER_SIZE: usize = 4 * 1024 * 1024;
 const TRANSFER_BUFFER_SIZE: usize = 1024 * 1024;
 const CHECKPOINT_INTERVAL: Duration = Duration::from_secs(5);
-const LARGE_TRANSFER_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+const QUEUED_RANGE_BYTES: u64 = 64 * 1024 * 1024;
+const FILENAME_PROBE_BUDGET: Duration = Duration::from_secs(1);
 
 fn initial_checkpoint_interval(index: usize, workers: usize, range_bytes: u64) -> Duration {
     if range_bytes < 64 * 1024 * 1024 {
@@ -133,9 +138,20 @@ fn global_budget() -> &'static tokio::sync::Semaphore {
     BUDGET.get_or_init(|| tokio::sync::Semaphore::new(64))
 }
 
+type Origins = Mutex<HashMap<String, Arc<crate::network::OriginGate>>>;
+static ORIGINS: std::sync::OnceLock<Origins> = std::sync::OnceLock::new();
+static ORIGIN_REQUEST_LIMIT: AtomicUsize = AtomicUsize::new(32);
+
+fn set_origin_request_limit(limit: usize) {
+    ORIGIN_REQUEST_LIMIT.store(limit.clamp(1, 64), Ordering::Release);
+    if let Some(origins) = ORIGINS.get() {
+        for origin in origins.lock().expect("origin budget poisoned").values() {
+            origin.admission_changed();
+        }
+    }
+}
+
 fn origin_budget(url: &Url) -> Arc<crate::network::OriginGate> {
-    type Origins = Mutex<HashMap<String, Arc<crate::network::OriginGate>>>;
-    static ORIGINS: std::sync::OnceLock<Origins> = std::sync::OnceLock::new();
     let mut origins = ORIGINS
         .get_or_init(Mutex::default)
         .lock()
@@ -164,6 +180,30 @@ async fn send_admitted(
     crate::network::OriginPermit,
     tokio::sync::SemaphorePermit<'static>,
 )> {
+    send_admitted_with_pool(
+        client,
+        request,
+        cancel,
+        0,
+        health,
+        #[cfg(feature = "test-tools")]
+        trace,
+    )
+    .await
+}
+
+async fn send_admitted_with_pool(
+    client: &Client,
+    request: reqwest::RequestBuilder,
+    cancel: &CancellationToken,
+    pool_index: usize,
+    health: Option<&crate::health::Health>,
+    #[cfg(feature = "test-tools")] trace: Option<&trace::Trace>,
+) -> EngineResult<(
+    reqwest::Response,
+    crate::network::OriginPermit,
+    tokio::sync::SemaphorePermit<'static>,
+)> {
     let mut request = request.build()?;
     let mut seen = HashSet::new();
     for _ in 0..=10 {
@@ -178,7 +218,7 @@ async fn send_admitted(
             health = health,
             trace,
             Origin,
-            origin.acquire(32, cancel).await
+            origin.acquire_current(&ORIGIN_REQUEST_LIMIT, cancel).await
         )
         .ok_or(EngineError::Cancelled)?;
         let global = transfer_span!(
@@ -204,6 +244,7 @@ async fn send_admitted(
         )?;
         if let Some(health) = health {
             health.protocol(response.version());
+            health.response_identity(pool_index, response.remote_addr());
         }
         if !matches!(
             response.status(),
@@ -418,11 +459,39 @@ struct ProbeResult {
     final_url: Option<Url>,
 }
 
+fn transfer_request_url<'a>(
+    original: &'a Url,
+    probe: &'a ProbeResult,
+    context: Option<&BrowserRequestContext>,
+) -> &'a Url {
+    // Reuse only anonymous routes. An intermediate cross-origin hop may have
+    // stripped credentials even when the final origin equals the first one;
+    // comparing just those two origins cannot safely reconstruct that history.
+    let anonymous = context.is_none_or(|context| {
+        context.cookie.is_none()
+            && context.authorization.is_none()
+            && context.origin.is_none()
+            && context.referer.is_none()
+    });
+    probe
+        .final_url
+        .as_ref()
+        .filter(|final_url| {
+            anonymous
+                && original.username().is_empty()
+                && original.password().is_none()
+                && final_url.username().is_empty()
+                && final_url.password().is_none()
+        })
+        .unwrap_or(original)
+}
+
 #[derive(Clone, Copy)]
 enum PeerRecovery {
     Disabled,
     Peers,
     Replacement(u64),
+    ObserveOnly(u64),
 }
 
 /// Dates are deliberately excluded: second-resolution timestamps cannot prove byte identity.
@@ -609,6 +678,123 @@ fn open_publication_file_with_access(
     Ok((identity, metadata.len(), file))
 }
 
+// A failed attachment check intentionally retains the assembled file for retry.
+// Removal may retire only that checkpoint-owned file, never a filename sweep.
+// The caller holds dispatch and has established that all task workers stopped.
+fn remove_prepared_output(part_dir: &Path, record: &DownloadRecord) -> std::io::Result<()> {
+    fn bounded_proof(path: &Path, limit: u64) -> std::io::Result<Vec<u8>> {
+        let (_, length, file) = open_publication_file_with_access(path, PublicationAccess::Verify)?;
+        if length > limit {
+            return Err(std::io::Error::other(
+                "Prepared-output checkpoint exceeds its size limit",
+            ));
+        }
+        let mut bytes = Vec::with_capacity(length as usize);
+        file.take(limit + 1).read_to_end(&mut bytes)?;
+        if bytes.len() as u64 > limit {
+            return Err(std::io::Error::other(
+                "Prepared-output checkpoint exceeds its size limit",
+            ));
+        }
+        Ok(bytes)
+    }
+    let bytes = match bounded_proof(&part_dir.join("merge.json"), 64 * 1024) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    let checkpoint: MergeCheckpoint = serde_json::from_slice(&bytes)
+        .map_err(|_| std::io::Error::other("Prepared-output checkpoint is damaged"))?;
+    let destination = Path::new(&record.destination);
+    let parent = destination
+        .parent()
+        .filter(|_| destination.is_absolute())
+        .ok_or_else(|| std::io::Error::other("Prepared-output destination is invalid"))?;
+    let name = destination
+        .file_name()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| std::io::Error::other("Prepared-output filename is invalid"))?;
+    let prefix = format!(".{}.{}.", safe_file_name(name), record.id);
+    let suffix = private_assembly_suffix(name);
+    let nonce = checkpoint
+        .file_name
+        .strip_prefix(&prefix)
+        .and_then(|value| {
+            value
+                .strip_suffix(&suffix)
+                .or_else(|| value.strip_suffix(".fetchrail-part"))
+        });
+    let owned_name = Path::new(&checkpoint.file_name).components().count() == 1
+        && nonce
+            .is_some_and(|value| Uuid::parse_str(value).is_ok_and(|id| id.to_string() == value));
+    if !owned_name
+        || checkpoint.total != record.total_bytes.unwrap_or(record.downloaded_bytes)
+        || checkpoint.expected_sha256 != record.expected_sha256
+    {
+        return Err(std::io::Error::other(
+            "Prepared-output checkpoint does not match this download's ownership",
+        ));
+    }
+    let candidate = parent.join(&checkpoint.file_name);
+    let (identity, length, file) =
+        match open_publication_file_with_access(&candidate, PublicationAccess::Publish) {
+            Ok(opened) => opened,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error),
+        };
+    let manifest = bounded_proof(&part_dir.join("transfer.json"), 1024 * 1024)?;
+    if checkpoint.fingerprint != format!("{:x}", Sha256::digest(&manifest)) {
+        return Err(std::io::Error::other(
+            "Prepared-output checkpoint does not match the saved transfer manifest",
+        ));
+    }
+    if checkpoint.identity.as_ref() != Some(&identity) || length != checkpoint.total {
+        return Err(std::io::Error::other(
+            "Prepared output changed identity or length; the file was preserved",
+        ));
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawHandle;
+        use windows::Win32::{
+            Foundation::HANDLE,
+            Storage::FileSystem::{
+                FileDispositionInfo, SetFileInformationByHandle, FILE_DISPOSITION_INFO,
+            },
+        };
+        // DELETE access and read-only sharing bind deletion to the same checked
+        // file. Reopening its pathname here would permit occupant substitution.
+        let disposition = FILE_DISPOSITION_INFO {
+            DeleteFile: true.into(),
+        };
+        unsafe {
+            SetFileInformationByHandle(
+                HANDLE(file.as_raw_handle()),
+                FileDispositionInfo,
+                (&disposition as *const FILE_DISPOSITION_INFO).cast(),
+                std::mem::size_of::<FILE_DISPOSITION_INFO>() as u32,
+            )
+        }
+        .map_err(std::io::Error::other)?;
+        drop(file);
+        Ok(())
+    }
+    #[cfg(not(windows))]
+    {
+        drop(file);
+        Err(std::io::Error::other(
+            "Automatic cleanup of a retained prepared file is unavailable on this platform. Resume the download, or remove its prepared file manually, then retry",
+        ))
+    }
+}
+
+async fn cleanup_prepared_output(part_dir: PathBuf, record: DownloadRecord) -> Result<(), String> {
+    tokio::task::spawn_blocking(move || remove_prepared_output(&part_dir, &record))
+        .await
+        .map_err(|_| "Prepared-output cleanup did not finish. The download and recovery checkpoints were kept; retry the operation.".to_string())?
+        .map_err(|error| format!("Could not remove the prepared output: {error}. The download and recovery checkpoints were kept; resolve the error and retry."))
+}
+
 // A version-2 journal commits the hashes calculated while receiving each verified
 // range. Both post-scan publication and crash recovery re-read their contents.
 // Version-1 publications retain their original full-file hash.
@@ -672,17 +858,21 @@ fn range_hashes_match(
         .last()
         .and_then(|range| range.end.checked_add(1))
         .ok_or_else(|| EngineError::Message("Invalid committed range length.".into()))?;
-    let check = |worker_file: &mut std::fs::File, index: usize| -> EngineResult<bool> {
+    let check = |worker_file: &mut std::fs::File,
+                 index: usize,
+                 lane: &crate::integrity::HashLane<'_>|
+     -> EngineResult<bool> {
         use std::io::{Seek, SeekFrom};
         let range = &ranges[index];
         worker_file.seek(SeekFrom::Start(range.start))?;
         let mut bounded = (&mut *worker_file).take(range.len());
-        let actual = crate::integrity::sha256_reader(&mut bounded, cancel)?;
+        let actual = crate::integrity::sha256_reader_in_lane(&mut bounded, cancel, lane)?;
         Ok(bounded.limit() == 0 && actual == hashes[index])
     };
     if workers <= 1 {
+        let lane = crate::integrity::verification_lane(cancel)?;
         for index in 0..ranges.len() {
-            if !check(&mut file, index)? {
+            if !check(&mut file, index, &lane)? {
                 return Ok(false);
             }
         }
@@ -696,9 +886,15 @@ fn range_hashes_match(
     let next = AtomicUsize::new(0);
     let rejected = AtomicBool::new(false);
     let results = std::thread::scope(|scope| {
-        let threads: Vec<_> = (0..workers.min(ranges.len()))
+        let next = &next;
+        let rejected = &rejected;
+        let check = &check;
+        let threads = (0..workers.min(ranges.len()))
             .map(|_| {
-                scope.spawn(|| -> EngineResult<bool> {
+                // Acquire and spawn together: never park an unbounded set of OS
+                // workers, and never reserve the entire budget before starting work.
+                let lane = crate::integrity::verification_lane(cancel)?;
+                Ok::<_, EngineError>(scope.spawn(move || -> EngineResult<bool> {
                     let (worker_identity, worker_length, mut worker_file) =
                         open_publication_file_with_access(path, PublicationAccess::ConcurrentRead)
                             .inspect_err(|_| rejected.store(true, Ordering::Release))?;
@@ -711,7 +907,7 @@ fn range_hashes_match(
                         if index >= ranges.len() {
                             return Ok(true);
                         }
-                        let valid = check(&mut worker_file, index).inspect_err(|_| {
+                        let valid = check(&mut worker_file, index, &lane).inspect_err(|_| {
                             rejected.store(true, Ordering::Release);
                         })?;
                         if !valid {
@@ -720,14 +916,16 @@ fn range_hashes_match(
                         }
                     }
                     Ok(false)
-                })
+                }))
             })
-            .collect();
-        threads
-            .into_iter()
-            .map(|thread| thread.join())
-            .collect::<Vec<_>>()
-    });
+            .collect::<EngineResult<Vec<_>>>()?;
+        Ok::<_, EngineError>(
+            threads
+                .into_iter()
+                .map(|thread| thread.join())
+                .collect::<Vec<_>>(),
+        )
+    })?;
     let mut matches = true;
     for result in results {
         matches &= result.map_err(|_| {
@@ -1153,6 +1351,8 @@ fn segment_progress(segments: &[SegmentCounter], speeds: &[f64]) -> Vec<SegmentP
 }
 
 struct DownloadTask {
+    #[cfg(test)]
+    checkpoint_test_delay: Duration,
     #[cfg(feature = "test-tools")]
     trace: Option<Arc<trace::Trace>>,
     analytics_sample: Mutex<Option<crate::analytics::Sample>>,
@@ -1168,6 +1368,7 @@ struct DownloadTask {
     limiter: RateLimiter,
     performance: Mutex<Option<Arc<crate::performance::LivePolicy>>>,
     received_sha256: Mutex<Option<String>>,
+    tail_progress: tail::Progress,
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -1189,6 +1390,8 @@ impl DownloadTask {
         quality_sample: Option<crate::quality::Sample>,
     ) -> Self {
         Self {
+            #[cfg(test)]
+            checkpoint_test_delay: Duration::ZERO,
             #[cfg(feature = "test-tools")]
             trace: trace::Trace::enabled(),
             analytics_sample: Mutex::new(analytics_sample),
@@ -1197,6 +1400,7 @@ impl DownloadTask {
             limiter: RateLimiter::new(record.speed_limit_bps),
             performance: Mutex::new(None),
             received_sha256: Mutex::new(None),
+            tail_progress: tail::Progress::default(),
             request_context,
             paused: AtomicBool::new(record.status == DownloadStatus::Paused),
             power_resume: AtomicBool::new(false),
@@ -1241,6 +1445,7 @@ pub struct DownloadManager {
     diagnostics: Arc<crate::diagnostics::Service>,
     analytics: Arc<crate::analytics::Analytics>,
     operation_health: crate::health::Operations,
+    history_save_status: Mutex<crate::health_history::SaveStatus>,
     settings_update_lock: tokio::sync::Mutex<()>,
     completion_lock: tokio::sync::Mutex<()>,
     torrent_engine: TorrentEngine,
@@ -1478,6 +1683,7 @@ impl DownloadManager {
             .map_err(|e| e.to_string())?
             .unwrap_or_else(|| default_settings(&default_download_dir))
             .normalized();
+        set_origin_request_limit(settings.max_requests_per_origin);
         apply_privacy_receipts(&mut settings, &data_dir);
         if !settings.local_crash_history {
             let _ = crate::health_history::clear(&data_dir);
@@ -1569,11 +1775,15 @@ impl DownloadManager {
                     &settings.analytics_consent,
                 ));
                 analytics.quality.configure(&settings.quality_consent);
+                if analytics.quality.set_storage(data_dir.clone()).is_err() {
+                    eprintln!("Quality delivery storage is unavailable; delivery is paused and downloads remain available.");
+                }
                 analytics
             },
             settings_update_lock: tokio::sync::Mutex::new(()),
             completion_lock: tokio::sync::Mutex::new(()),
             operation_health: Default::default(),
+            history_save_status: Default::default(),
             torrent_engine: TorrentEngine::new(&data_dir.join("torrents"))?,
             torrent_imports: RwLock::new(HashMap::new()),
             torrent_checkpoint: Mutex::new(Instant::now()),
@@ -2726,17 +2936,20 @@ impl DownloadManager {
                     .collect::<Vec<_>>(),
             );
         }
-        let checkpoint = {
-            let mut last = self.torrent_checkpoint.lock().unwrap();
-            if last.elapsed() > Duration::from_secs(30) {
-                *last = Instant::now();
-                true
-            } else {
-                false
-            }
-        };
+        let checkpoint =
+            self.torrent_checkpoint.lock().unwrap().elapsed() > Duration::from_secs(30);
         if checkpoint {
-            let _ = self.torrent_engine.call(json!({"op":"checkpoint"})).await;
+            match self.torrent_engine.call(json!({"op":"checkpoint"})).await {
+                Ok(_) => *self.torrent_checkpoint.lock().unwrap() = Instant::now(),
+                Err(error) => {
+                    for task in self.tasks.read().await.values() {
+                        if task.record.read().await.torrent.is_some() {
+                            task.health.checkpoint_submission_failed();
+                        }
+                    }
+                    return Err(format!("Torrent checkpoint submission failed; it will retry on the next poll: {error}"));
+                }
+            }
         }
         if structural || checkpoint {
             self.persist_records().await.map_err(|e| e.to_string())?;
@@ -2863,6 +3076,12 @@ impl DownloadManager {
     async fn shutdown_inner(&self) {
         self.dispatch_suspended.store(true, Ordering::Release);
         self.performance.stop().await;
+        let analytics = self.analytics.clone();
+        if let Ok(Err(error)) =
+            tokio::task::spawn_blocking(move || analytics.quality.checkpoint_delivery()).await
+        {
+            eprintln!("{error}");
+        }
         {
             let _dispatch = self.dispatch_lock.lock().await;
             self.diagnostics.cancel();
@@ -2884,7 +3103,7 @@ impl DownloadManager {
         for id in imports {
             let _ = self.cancel_torrent_import(id).await;
         }
-        let _dispatch = self.dispatch_lock.lock().await;
+        let dispatch = self.dispatch_lock.lock().await;
         let tasks = self
             .tasks
             .read()
@@ -2914,6 +3133,33 @@ impl DownloadManager {
                 record.eta_seconds = None;
             }
         }
+        // A merging task needs this lock to publish. Dispatch remains suspended
+        // and closing, so release admission serialization before waiting for it.
+        drop(dispatch);
+        #[cfg(feature = "test-tools")]
+        if active_http.iter().any(|task| task.trace.is_some())
+            && std::env::var("FETCHRAIL_TEST_HOLD_FINALIZATION").is_ok_and(|value| value == "1")
+        {
+            if let Ok(Some(root)) = crate::platform::test_root() {
+                if fs::try_exists(root.join("hold-finalization"))
+                    .await
+                    .unwrap_or(false)
+                {
+                    let result = async {
+                        let mut ready = fs::OpenOptions::new()
+                            .write(true)
+                            .create_new(true)
+                            .open(root.join("shutdown-drain-ready"))
+                            .await?;
+                        ready.write_all(b"ready").await
+                    }
+                    .await;
+                    if result.is_err() {
+                        eprintln!("Could not record isolated shutdown drain readiness.");
+                    }
+                }
+            }
+        }
         // Cancellation flushes buffered part bytes before the final persisted snapshot.
         let deadline = Instant::now() + Duration::from_secs(30);
         while active_http
@@ -2940,6 +3186,14 @@ impl DownloadManager {
         let _ = self.torrent_engine.call(json!({"op":"poll"})).await;
         if self.persist_records().await.is_ok() && checkpoint.is_ok() {
             let _ = self.torrent_engine.call(json!({"op":"clean"})).await;
+        }
+        // Merging HTTP work may complete while shutdown drains it. Persist its
+        // terminal counters after that drain, not just the earlier snapshot.
+        let analytics = self.analytics.clone();
+        if let Ok(Err(error)) =
+            tokio::task::spawn_blocking(move || analytics.quality.checkpoint_delivery()).await
+        {
+            eprintln!("{error}");
         }
     }
 
@@ -3487,6 +3741,23 @@ impl DownloadManager {
             if renamed || Path::new(&record.destination).parent() != Some(directory.as_path()) {
                 let destination = unique_destination(&directory, &name).await;
                 self.check_torrent_path(&destination).await?;
+                let part_dir = self.part_dir(id);
+                if fs::try_exists(part_dir.join("publication.json"))
+                    .await
+                    .map_err(|error| {
+                        format!("Could not check publication recovery state: {error}")
+                    })?
+                {
+                    return Err("Resume this download to finish publication recovery before changing its destination.".into());
+                }
+                // Retire the old destination's preparation before changing the
+                // record used to establish its ownership. Transfer parts remain.
+                cleanup_prepared_output(part_dir.clone(), record.clone()).await?;
+                if let Err(error) = fs::remove_file(part_dir.join("merge.json")).await {
+                    if error.kind() != std::io::ErrorKind::NotFound {
+                        return Err(format!("Could not retire the prepared-output checkpoint: {error}. The destination was kept; resolve the error and retry."));
+                    }
+                }
                 record.file_name = destination
                     .file_name()
                     .and_then(|value| value.to_str())
@@ -3515,6 +3786,9 @@ impl DownloadManager {
         }
         let record = task.record.read().await.clone();
         let part_dir = self.part_dir(id);
+        // Do this before discarding the only ownership proof. A failed cleanup
+        // leaves both the history entry and checkpoints available for retry.
+        cleanup_prepared_output(part_dir.clone(), record.clone()).await?;
         if let Err(error) = fs::remove_dir_all(&part_dir).await {
             if error.kind() != std::io::ErrorKind::NotFound {
                 return Err(format!("Could not remove staging files at {}: {error}. Retry removal after resolving the error.", part_dir.display()));
@@ -3872,42 +4146,88 @@ impl DownloadManager {
         result
     }
     pub async fn set_local_crash_history(&self, enabled: bool) -> Result<DownloadSettings, String> {
+        use crate::health_history::SaveError;
         let _update = self.settings_update_lock.lock().await;
         let mut settings = self.settings.read().await.clone();
+        let was_enabled = settings.local_crash_history;
         settings.local_crash_history = enabled;
         if !enabled {
             *self.settings.write().await = settings.clone();
         }
         let _persist = self.persist_lock.lock().await;
         let result = async {
-            write_json_atomic(&self.data_dir.join("local-history-choice.json"), &enabled).await.map_err(|_| "Cannot save local history choice. Local recording is off for this run; retry before restarting.")?;
-            write_settings_atomic(&self.data_dir.join(SETTINGS_FILE), &settings).await.map_err(|_| "Cannot save local history choice.")?;
-            if !enabled { crate::health_history::clear(&self.data_dir)?; }
-            Ok::<(), String>(())
-        }.await;
+            write_json_atomic(&self.data_dir.join("local-history-choice.json"), &enabled)
+                .await
+                .map_err(|_| SaveError::Choice)?;
+            write_settings_atomic(&self.data_dir.join(SETTINGS_FILE), &settings)
+                .await
+                .map_err(|_| SaveError::Choice)?;
+            if !enabled {
+                crate::health_history::clear(&self.data_dir).map_err(|_| SaveError::Delete)?;
+            }
+            Ok::<(), SaveError>(())
+        }
+        .await;
         if result.is_ok() {
             *self.settings.write().await = settings.clone();
+            if !enabled || !was_enabled {
+                self.history_save_status.lock().unwrap().cleared();
+            }
+        } else if let Err(error) = result {
+            self.history_save_status.lock().unwrap().failed(error);
         }
         let _ = self.app.emit(SETTINGS_EVENT, &*self.settings.read().await);
-        result?;
+        result.map_err(|error| error.message().to_string())?;
         Ok(settings)
     }
+    pub fn local_history_save_status(&self) -> crate::health_history::SaveStatus {
+        self.history_save_status.lock().unwrap().clone()
+    }
     pub async fn local_health_history(&self) -> Result<Vec<crate::health::Report>, String> {
+        use crate::health_history::SaveError;
         let _update = self.settings_update_lock.lock().await;
         let root = self.data_dir.clone();
-        tokio::task::spawn_blocking(move || {
-            let cases = crate::health_history::load(&root, Utc::now().timestamp())?;
-            if root.join("diagnostic-history.json").exists() {
-                crate::health_history::save(&root, &cases)?;
+        let result = tokio::task::spawn_blocking(move || {
+            let cases = crate::health_history::load(&root, Utc::now().timestamp())
+                .map_err(|_| SaveError::Read)?;
+            let saved = root.join("diagnostic-history.json").exists();
+            if saved {
+                crate::health_history::save(&root, &cases).map_err(|_| SaveError::Save)?;
             }
-            Ok(cases.into_iter().map(|c| c.report).collect())
+            Ok::<_, SaveError>((cases.into_iter().map(|c| c.report).collect(), saved))
         })
         .await
-        .map_err(|_| "Cannot read local history.")?
+        .unwrap_or(Err(SaveError::Worker));
+        let mut status = self.history_save_status.lock().unwrap();
+        match result {
+            Ok((reports, saved)) => {
+                if saved {
+                    status.saved(Utc::now().timestamp());
+                } else {
+                    status.read_succeeded();
+                }
+                Ok(reports)
+            }
+            Err(error) => {
+                status.failed(error);
+                Err(error.message().into())
+            }
+        }
     }
     pub async fn clear_local_health_history(&self) -> Result<(), String> {
+        use crate::health_history::SaveError;
         let _update = self.settings_update_lock.lock().await;
-        crate::health_history::clear(&self.data_dir)?;
+        let root = self.data_dir.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            crate::health_history::clear(&root).map_err(|_| SaveError::Delete)
+        })
+        .await
+        .unwrap_or(Err(SaveError::Worker));
+        if let Err(error) = result {
+            self.history_save_status.lock().unwrap().failed(error);
+            return Err(error.message().into());
+        }
+        self.history_save_status.lock().unwrap().cleared();
         self.operation_health.clear();
         for task in self.tasks.read().await.values() {
             task.health.clear();
@@ -3981,6 +4301,7 @@ impl DownloadManager {
                 .map_err(|error| error.to_string())?;
         }
         let prior_limit = self.settings.read().await.speed_limit_bps;
+        set_origin_request_limit(settings.max_requests_per_origin);
         *self.settings.write().await = settings.clone();
         if settings.speed_limit_bps > 0 {
             for task in self.tasks.read().await.values() {
@@ -4178,11 +4499,12 @@ impl DownloadManager {
                 #[cfg(feature = "test-tools")]
                 manager.save_test_trace(&task).await;
             }
-            task.running.store(false, Ordering::Release);
             if manager.persist_records().await.is_ok() {
                 let record = task.record.read().await;
                 manager.observe_quality(&task, &record);
             }
+            // Shutdown/removal wait for terminal accounting as well as writers.
+            task.running.store(false, Ordering::Release);
         });
     }
 
@@ -4272,21 +4594,31 @@ impl DownloadManager {
                         .map(|case| (case.id, case.report, case.saved_at)),
                 );
                 let root = breadcrumbs.data_dir.clone();
-                let _ = tokio::task::spawn_blocking(move || -> Result<(), String> {
-                    let mut cases = crate::health_history::load(&root, now)?;
-                    for (id, report, saved_at) in selected {
-                        cases.retain(|case| case.id != id);
-                        cases.push(crate::health_history::Case {
-                            id,
-                            saved_at,
-                            report,
-                        });
-                    }
-                    cases.sort_by_key(|c| std::cmp::Reverse(c.saved_at));
-                    cases.truncate(20);
-                    crate::health_history::save(&root, &cases)
-                })
+                let result = tokio::task::spawn_blocking(
+                    move || -> Result<(), crate::health_history::SaveError> {
+                        let mut cases = crate::health_history::load(&root, now)
+                            .map_err(|_| crate::health_history::SaveError::Read)?;
+                        for (id, report, saved_at) in selected {
+                            cases.retain(|case| case.id != id);
+                            cases.push(crate::health_history::Case {
+                                id,
+                                saved_at,
+                                report,
+                            });
+                        }
+                        cases.sort_by_key(|c| std::cmp::Reverse(c.saved_at));
+                        cases.truncate(20);
+                        crate::health_history::save(&root, &cases)
+                            .map_err(|_| crate::health_history::SaveError::Save)
+                    },
+                )
                 .await;
+                let mut status = breadcrumbs.history_save_status.lock().unwrap();
+                match result {
+                    Ok(Ok(())) => status.saved(Utc::now().timestamp()),
+                    Ok(Err(error)) => status.failed(error),
+                    Err(_) => status.failed(crate::health_history::SaveError::Worker),
+                }
             }
         });
         let progress = self.clone();
@@ -4357,7 +4689,8 @@ impl DownloadManager {
         let calibrated_volume = if settings.performance_auto {
             let hardware = self
                 .performance
-                .hardware(Path::new(&settings.default_download_dir));
+                .hardware_async(Path::new(&settings.default_download_dir))
+                .await;
             self.performance
                 .profile(&hardware)
                 .filter(|p| p.simultaneous_downloads < max_concurrent)
@@ -4635,7 +4968,7 @@ impl DownloadManager {
             task.trace.as_deref(),
             Probe,
             tokio::select! {
-                result = self.probe(&url, task.request_context.as_ref(), Some(&task.health)) => result,
+                result = Self::probe(&self.client, &url, task.request_context.as_ref(), Some(&task.health)) => result,
                 _ = cancel.cancelled() => Err(EngineError::Cancelled),
             }
         )?;
@@ -4779,14 +5112,22 @@ impl DownloadManager {
         let destination = PathBuf::from(task.record.read().await.destination.clone());
         let hardware = if settings.performance_auto && !snapshot.connections_manual {
             Some(
-                self.performance.hardware(
-                    destination
-                        .parent()
-                        .unwrap_or(Path::new(&settings.default_download_dir)),
-                ),
+                self.performance
+                    .hardware_async(
+                        destination
+                            .parent()
+                            .unwrap_or(Path::new(&settings.default_download_dir)),
+                    )
+                    .await,
             )
         } else {
             None
+        };
+        let completion_policy = crate::performance::CompletionPolicy {
+            attachment_check: cfg!(windows) && settings.windows_attachment_check,
+            expected_sha256: snapshot.expected_sha256.is_some(),
+            staging_volume_key: crate::performance_platform::volume_key(&part_dir)
+                .unwrap_or_default(),
         };
         let policy = hardware
             .as_ref()
@@ -4801,11 +5142,12 @@ impl DownloadManager {
                         32
                     },
                 );
-                let start = self.performance.connections(
+                let start = self.performance.connections_with_policy(
                     &url.origin().ascii_serialization(),
                     h,
                     total.unwrap_or(0),
                     ceiling,
+                    &completion_policy,
                 );
                 let profile = self.performance.profile(h);
                 let buffer = profile
@@ -4828,6 +5170,20 @@ impl DownloadManager {
                 policy
             });
         *task.performance.lock().expect("task performance poisoned") = policy.clone();
+        task.health.policy(crate::health::EffectivePolicy {
+            connections: policy
+                .as_ref()
+                .map_or(requested_connections, |p| p.target.load(Ordering::Relaxed)),
+            pools: 0,
+            ranges: ranges.len(),
+            max_requests_per_origin: settings.max_requests_per_origin,
+            minimum_range_bytes: settings.min_segment_size_mb * 1024 * 1024,
+            file_limit_bps: snapshot.speed_limit_bps,
+            global_limit_bps: settings.speed_limit_bps,
+            automatic: policy.is_some(),
+            attachment_check: cfg!(windows) && settings.windows_attachment_check,
+            expected_hash: snapshot.expected_sha256.is_some(),
+        });
 
         prepare_parts(&part_dir, &probe, &ranges).await?;
 
@@ -4836,6 +5192,9 @@ impl DownloadManager {
             &task,
             segment_progress(&current_segments(&segments), &[]),
             total,
+            0,
+            0,
+            0,
         )
         .await;
         let progress_stop = CancellationToken::new();
@@ -4901,6 +5260,11 @@ impl DownloadManager {
 
         progress_stop.cancel();
         let _ = progress_handle.await;
+        task.record
+            .write()
+            .await
+            .extra
+            .insert("tailUncommittedBytes".into(), json!(0));
         task.health.sample(false);
         // The reporter's last tick can trail the final bytes; settle the record before leaving.
         let settled = segment_progress(&current_segments(&segments), &[]);
@@ -4918,7 +5282,8 @@ impl DownloadManager {
             .iter()
             .map(|part| part.downloaded_bytes)
             .sum::<u64>();
-        self.update_progress_record(&task, settled, total).await;
+        self.update_progress_record(&task, settled, total, 0, 0, 0)
+            .await;
         transfer_result?;
         task.check_stopped(&cancel)?;
 
@@ -4967,20 +5332,30 @@ impl DownloadManager {
         task.health.completed(final_bytes);
         self.observe_quality(&task, &snapshot);
         drop(verified_file);
-        if initial_downloaded == 0 {
+        let final_completion_policy = crate::performance::CompletionPolicy {
+            attachment_check: task
+                .health
+                .attachment_check()
+                .unwrap_or(completion_policy.attachment_check),
+            expected_sha256: snapshot.expected_sha256.is_some(),
+            staging_volume_key: crate::performance_platform::volume_key(&part_dir)
+                .unwrap_or_default(),
+        };
+        if initial_downloaded == 0 && final_completion_policy == completion_policy {
             if let (Some(policy), Some(hardware)) = (policy, hardware) {
                 let (connections, bps) = policy.best();
                 if !policy.contaminated.load(Ordering::Relaxed)
                     && self.limiter.quantum() == usize::MAX
                     && task.limiter.quantum() == usize::MAX
                 {
-                    self.performance.learn(
+                    self.performance.learn_with_policy(
                         &url.origin().ascii_serialization(),
                         &hardware,
                         final_bytes,
                         connections,
                         bps,
                         run_started.elapsed(),
+                        &completion_policy,
                     );
                 }
             }
@@ -5006,6 +5381,7 @@ impl DownloadManager {
     ) -> EngineResult<()> {
         task.check_stopped(cancel)?;
         let batch_cancel = cancel.child_token();
+        task.record.write().await.extra.remove("slowSourceRetained");
         *task.received_sha256.lock().expect("received hash poisoned") = None;
         let peer_rate = AtomicU64::new(0);
         let live_peer_rate = AtomicU64::new(0);
@@ -5037,17 +5413,30 @@ impl DownloadManager {
         } else {
             pool_count
         };
+        task.health
+            .range_layout(workers, pool_count, segments.len());
         let mut clients = vec![client.clone()];
         for _ in 1..pool_count {
             clients.push(download_client_builder().build()?);
         }
+        let next_pool_index = AtomicUsize::new(clients.len());
+        // Each original worker owns one slot until its canonical queue is
+        // exhausted. Tail helpers can reserve only slots already released.
+        let worker_slots = Arc::new(tokio::sync::Semaphore::new(workers));
         let futures = (0..workers).map(|worker_index| {
             let worker_client = clients[worker_index % clients.len()].clone();
+            let mut pool_index = worker_index % clients.len();
             let batch_cancel = &batch_cancel;
             let peer_rate = &peer_rate;
             let live_peer_rate = &live_peer_rate;
             let next_range = &next_range;
+            let next_pool_index = &next_pool_index;
+            let worker_slots = worker_slots.clone();
             async move {
+                let _worker_slot = tokio::select! {
+                    permit = worker_slots.clone().acquire_owned() => permit.map_err(|_| EngineError::Cancelled)?,
+                    _ = batch_cancel.cancelled() => return Err(EngineError::Cancelled),
+                };
                 let mut client = worker_client;
                 let policy = task
                     .performance
@@ -5061,11 +5450,16 @@ impl DownloadManager {
                     let Some(segment) = segments.get(index) else {
                         return Ok(());
                     };
+                    let handoff = tail::Handoff::new(
+                        worker_slots.clone(), next_range, segments.len(),
+                        shared && probe.accepts_ranges && probe.validator.is_some() && probe.final_url.is_some(),
+                    );
                     // Retry only this range so healthy connections keep their throughput.
                     let result = async {
                         #[cfg(feature = "test-tools")]
                         let mut previous_retry_cause = None;
                         let mut recovery = PeerRecovery::Peers;
+                        let mut before_bps = 0;
                         for attempt in 0..3 {
                             #[cfg(feature = "test-tools")]
                             if attempt > 0 {
@@ -5099,8 +5493,10 @@ impl DownloadManager {
                             }
                             let attempt_at = Instant::now();
                             let before_attempt = segment.downloaded.load(Ordering::Relaxed);
+                            let rehashed_bytes = AtomicU64::new(0);
                             let result = Self::download_segment(
                                 &client,
+                                pool_index,
                                 limiter,
                                 task,
                                 batch_cancel,
@@ -5114,13 +5510,89 @@ impl DownloadManager {
                                 workers,
                                 shared,
                                 live_peer_rate,
-                                if attempt < 2 && probe.accepts_ranges && probe.validator.is_some() {
-                                    recovery
+                                if probe.accepts_ranges && probe.validator.is_some() {
+                                    if attempt < 2 {
+                                        recovery
+                                    } else {
+                                        PeerRecovery::ObserveOnly(before_bps)
+                                    }
                                 } else {
                                     PeerRecovery::Disabled
                                 },
+                                &rehashed_bytes,
+                                None,
+                                Some(&handoff),
                             )
                             .await;
+                            // Yielded acknowledges that the original writer and
+                            // its checkpoint have drained before helpers start.
+                            if matches!(result, Ok(tail::SegmentEnd::Yielded)) {
+                                let progressed = segment.downloaded.load(Ordering::Relaxed).saturating_sub(before_attempt);
+                                let yielded_bps = (progressed > 0).then(||
+                                    (progressed as f64 / attempt_at.elapsed().as_secs_f64().max(0.001)) as u64);
+                                task.health.attempt(index, attempt, attempt_at, progressed, None);
+                                if attempt > 0 {
+                                    task.health.retry_evidence(index, (attempt + 1) as u8, before_bps,
+                                        yielded_bps, rehashed_bytes.load(Ordering::Relaxed));
+                                }
+                                drop(range_permit.take());
+                                let cohort = handoff.run(limiter, task, batch_cancel, url,
+                                    part_dir, index, segment, probe, next_pool_index).await;
+                                return match cohort {
+                                    Ok(()) => Ok(()),
+                                    Err(error) if tail::transient(&error) && !batch_cancel.is_cancelled() => {
+                                        // A failed cohort gets one final ordinary
+                                        // response from the promoted prefix; it
+                                        // cannot reset a three-attempt loop.
+                                        task.health.cause(error.health_cause(task.health.failed_phase()));
+                                        task.health.tail_update(|tail| tail.ordinary_fallbacks = tail.ordinary_fallbacks.saturating_add(1));
+                                        task.record.write().await.extra.insert("tailOrdinaryFallback".into(), json!(true));
+                                        let delay = match &error {
+                                            EngineError::RetryAfter { delay, .. } => *delay,
+                                            _ => Duration::from_millis(500),
+                                        };
+                                        tokio::select! {
+                                            _ = tokio::time::sleep(delay) => {},
+                                            _ = batch_cancel.cancelled() => return Err(EngineError::Cancelled),
+                                        }
+                                        if let Some(policy) = &policy {
+                                            range_permit = Some(policy.acquire(batch_cancel).await.ok_or(EngineError::Cancelled)?);
+                                        }
+                                        let client = download_client_builder().build()?;
+                                        let pool = next_pool_index.fetch_add(1, Ordering::Relaxed);
+                                        let fallback_at = Instant::now();
+                                        let fallback_before = segment.downloaded.load(Ordering::Relaxed);
+                                        let fallback_rehashed = AtomicU64::new(0);
+                                        let result = Self::download_segment(&client, pool, limiter, task, batch_cancel,
+                                            url, part_dir, index, segment, probe, peer_rate, segments, workers,
+                                            shared, live_peer_rate, PeerRecovery::ObserveOnly(yielded_bps.unwrap_or(before_bps)),
+                                            &fallback_rehashed, None, None).await.map(|_| ());
+                                        let progressed = segment.downloaded.load(Ordering::Relaxed).saturating_sub(fallback_before);
+                                        let after_bps = (progressed > 0).then(||
+                                            (progressed as f64 / fallback_at.elapsed().as_secs_f64().max(0.001)) as u64);
+                                        task.health.attempt(index, attempt + 1, fallback_at, progressed,
+                                            result.as_ref().err().map(|error| error.health_cause(task.health.failed_phase())));
+                                        task.health.retry_evidence(index, (attempt + 2) as u8, yielded_bps.unwrap_or(before_bps),
+                                            after_bps, fallback_rehashed.load(Ordering::Relaxed));
+                                        result
+                                    }
+                                    Err(error) => Err(error),
+                                };
+                            }
+                            let result = result.map(|_| ());
+                            let attempt_bytes = segment.downloaded.load(Ordering::Relaxed).saturating_sub(before_attempt);
+                            let after_bps = (attempt_bytes > 0).then(|| {
+                                (attempt_bytes as f64 / attempt_at.elapsed().as_secs_f64().max(0.001)) as u64
+                            });
+                            if attempt > 0 {
+                                task.health.retry_evidence(
+                                    index,
+                                    (attempt + 1) as u8,
+                                    before_bps,
+                                    after_bps,
+                                    rehashed_bytes.load(Ordering::Relaxed),
+                                );
+                            }
                             task.health.attempt(index, attempt, attempt_at,
                                 segment.downloaded.load(Ordering::Relaxed).saturating_sub(before_attempt),
                                 result.as_ref().err().map(|error| error.health_cause(task.health.failed_phase())));
@@ -5160,7 +5632,12 @@ impl DownloadManager {
                                 recovery = PeerRecovery::Replacement(*previous_rate);
                                 // Other slow ranges still need the healthy peers' reference rate.
                                 client = download_client_builder().build()?;
+                                pool_index = next_pool_index.fetch_add(1, Ordering::Relaxed);
                             }
+                            before_bps = match &error {
+                                EngineError::Slow(rate) => *rate,
+                                _ => after_bps.unwrap_or(0),
+                            };
                             let delay = match &error {
                                 EngineError::RetryAfter { delay, .. } => *delay,
                                 _ => Duration::from_millis(
@@ -5238,7 +5715,9 @@ impl DownloadManager {
                         bytes,
                         Duration::from_secs_f64(elapsed),
                         receiving,
-                        limiter.quantum() == usize::MAX && task.limiter.quantum() == usize::MAX,
+                        limiter.quantum() == usize::MAX
+                            && task.limiter.quantum() == usize::MAX
+                            && !task.tail_progress.has_active(),
                         generation.unwrap_or(u64::MAX),
                     );
                     generation = Some(policy.generation.load(Ordering::Acquire));
@@ -5248,18 +5727,11 @@ impl DownloadManager {
             }
         };
         let results = tokio::select! { results = join_all(futures) => results, _ = receiving_rates => unreachable!() };
-        let mut errors = results
+        let errors = results
             .into_iter()
             .filter_map(Result::err)
             .collect::<Vec<_>>();
-        if errors.is_empty() {
-            return Ok(());
-        }
-        let index = errors
-            .iter()
-            .position(|error| !matches!(error, EngineError::Cancelled))
-            .unwrap_or(0);
-        Err(errors.swap_remove(index))
+        tail::cohort_error(errors).map_or(Ok(()), Err)
     }
 
     #[cfg(feature = "test-tools")]
@@ -5301,9 +5773,38 @@ impl DownloadManager {
         }
     }
 
+    async fn hash_received_prefix(
+        task: &DownloadTask,
+        path: &Path,
+        offset: u64,
+        bytes: u64,
+        cancel: &CancellationToken,
+        rehashed_bytes: &AtomicU64,
+    ) -> EngineResult<Sha256> {
+        if bytes == 0 {
+            return Ok(Sha256::new());
+        }
+        let span = task.health.guard(crate::health::Phase::PrefixHash);
+        let result = crate::staging::prefix_hasher(path, offset, bytes, cancel)
+            .await
+            .map_err(|error| {
+                if cancel.is_cancelled() {
+                    EngineError::Cancelled
+                } else {
+                    EngineError::Io(error)
+                }
+            });
+        span.observe(&result);
+        if result.is_ok() {
+            rehashed_bytes.fetch_add(bytes, Ordering::Relaxed);
+        }
+        result
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn download_segment(
         client: &Client,
+        pool_index: usize,
         limiter: &RateLimiter,
         task: &Arc<DownloadTask>,
         cancel: &CancellationToken,
@@ -5318,8 +5819,15 @@ impl DownloadManager {
         shared: bool,
         live_peer_rate: &AtomicU64,
         recovery: PeerRecovery,
-    ) -> EngineResult<()> {
+        rehashed_bytes: &AtomicU64,
+        ephemeral: Option<&tail::Ephemeral>,
+        handoff: Option<&tail::Handoff<'_>>,
+    ) -> EngineResult<tail::SegmentEnd> {
         let recover_peer = !matches!(recovery, PeerRecovery::Disabled);
+        let may_retry = !matches!(
+            recovery,
+            PeerRecovery::Disabled | PeerRecovery::ObserveOnly(_)
+        );
         let range = segment.range;
         let part_path = part_dir.join(format!("{}.part", if shared { 0 } else { index }));
         let expected_len = if range.end == u64::MAX {
@@ -5327,7 +5835,9 @@ impl DownloadManager {
         } else {
             Some(range.len())
         };
-        let saved = if shared || peers.len() == 1 {
+        let saved = if let Some(ephemeral) = ephemeral {
+            ephemeral.checkpoint(expected_len.unwrap_or(u64::MAX))
+        } else if shared || peers.len() == 1 {
             part_checkpoint(part_dir, index, expected_len.unwrap_or(u64::MAX)).await?
         } else {
             None
@@ -5353,15 +5863,15 @@ impl DownloadManager {
             existing
         };
         let mut part_hash = if shared {
-            let hash = crate::staging::prefix_hasher(&part_path, range.start, existing, cancel)
-                .await
-                .map_err(|error| {
-                    if cancel.is_cancelled() {
-                        EngineError::Cancelled
-                    } else {
-                        EngineError::Io(error)
-                    }
-                })?;
+            let hash = Self::hash_received_prefix(
+                task,
+                &part_path,
+                range.start,
+                existing,
+                cancel,
+                rehashed_bytes,
+            )
+            .await?;
             if saved
                 .as_ref()
                 .is_some_and(|saved| format!("{:x}", hash.clone().finalize()) != saved.sha256)
@@ -5375,11 +5885,9 @@ impl DownloadManager {
             existing = saved
                 .as_ref()
                 .map_or(existing, |saved| saved.bytes.min(existing));
-            let hash = if existing == 0 {
-                Sha256::new()
-            } else {
-                crate::staging::prefix_hasher(&part_path, 0, existing, cancel).await?
-            };
+            let hash =
+                Self::hash_received_prefix(task, &part_path, 0, existing, cancel, rehashed_bytes)
+                    .await?;
             Some(
                 if saved
                     .as_ref()
@@ -5400,7 +5908,7 @@ impl DownloadManager {
                 *task.received_sha256.lock().expect("received hash poisoned") =
                     part_hash.map(|hash| format!("{:x}", hash.finalize()));
             }
-            return Ok(());
+            return Ok(tail::SegmentEnd::Complete);
         }
 
         task.check_stopped(cancel)?;
@@ -5412,36 +5920,62 @@ impl DownloadManager {
         segment.waiting.store(false, Ordering::Relaxed);
         let absolute_start = range.start.saturating_add(existing);
         let requested_range = probe.accepts_ranges && (range.end != u64::MAX || existing > 0);
-        let mut request = client
-            .get(url.clone())
-            .headers(context_headers(task.request_context.as_ref())?)
-            .header(ACCEPT_ENCODING, "identity");
-        if probe.accepts_ranges && range.end != u64::MAX {
-            request = request.header(RANGE, format!("bytes={absolute_start}-{}", range.end));
-        } else if probe.accepts_ranges && existing > 0 {
-            request = request.header(RANGE, format!("bytes={absolute_start}-"));
-        }
-        if requested_range {
-            if let Some(validator) = &probe.validator {
-                request = request.header(IF_RANGE, &validator.0);
+        let request_for = |target: &Url| -> EngineResult<reqwest::RequestBuilder> {
+            let mut request = client
+                .get(target.clone())
+                .headers(context_headers(task.request_context.as_ref())?)
+                .header(ACCEPT_ENCODING, "identity");
+            if probe.accepts_ranges && range.end != u64::MAX {
+                request = request.header(RANGE, format!("bytes={absolute_start}-{}", range.end));
+            } else if probe.accepts_ranges && existing > 0 {
+                request = request.header(RANGE, format!("bytes={absolute_start}-"));
             }
-        }
+            if requested_range {
+                if let Some(validator) = &probe.validator {
+                    request = request.header(IF_RANGE, &validator.0);
+                }
+            }
+            Ok(request)
+        };
+        let request_url = transfer_request_url(url, probe, task.request_context.as_ref());
 
         #[cfg(feature = "test-tools")]
         if let Some(trace) = &task.trace {
             trace.requests.fetch_add(1, Ordering::Relaxed);
         }
-        let response = send_admitted(
+        let mut response = send_admitted_with_pool(
             client,
-            request,
+            request_for(request_url)?,
             cancel,
+            pool_index,
             Some(&task.health),
             #[cfg(feature = "test-tools")]
             task.trace.as_deref(),
         )
-        .await;
+        .await?;
+        if request_url != url && matches!(response.0.status().as_u16(), 400 | 401 | 403 | 404 | 410)
+        {
+            // The ephemeral route may have expired. Replay the original route
+            // once, with ordinary redirect stripping and exact representation
+            // checks below; no signed redirect URL is saved to the catalog.
+            drop(response);
+            #[cfg(feature = "test-tools")]
+            if let Some(trace) = &task.trace {
+                trace.requests.fetch_add(1, Ordering::Relaxed);
+            }
+            response = send_admitted_with_pool(
+                client,
+                request_for(url)?,
+                cancel,
+                pool_index,
+                Some(&task.health),
+                #[cfg(feature = "test-tools")]
+                task.trace.as_deref(),
+            )
+            .await?;
+        }
         segment.waiting.store(true, Ordering::Relaxed);
-        let (response, _origin_permit, _global_permit) = response?;
+        let (response, _origin_permit, _global_permit) = response;
         #[cfg(feature = "test-tools")]
         if let Some(trace) = &task.trace {
             trace.protocol(response.version());
@@ -5537,7 +6071,7 @@ impl DownloadManager {
             let result =
                 Self::receive_transport_only(response, expected_len.unwrap(), trace, cancel).await;
             segment.active.store(false, Ordering::Relaxed);
-            return result;
+            return result.map(|_| tail::SegmentEnd::Complete);
         }
 
         let mut output = fs::OpenOptions::new()
@@ -5578,9 +6112,19 @@ impl DownloadManager {
         {
             checkpoint_delay = CHECKPOINT_INTERVAL;
         }
+        #[cfg(test)]
+        if !task.checkpoint_test_delay.is_zero() {
+            checkpoint_delay = Duration::from_millis(100);
+        }
         let (mut response_wait, mut watched_bytes, mut weak_windows) =
             (Duration::ZERO, existing, 0usize);
         let mut tail_windows = 0;
+        let mut degradation_recorded = false;
+        let mut handoff_requested = false;
+        // Range workers are joined with join_all and are never aborted. Their owner
+        // keeps task.running true until every checkpoint is drained; restart,
+        // replan, removal and final publication must retain this invariant.
+        let mut checkpoint_job: Option<tokio::task::JoinHandle<EngineResult<u64>>> = None;
         let transfer = async {
             let mut written = existing;
             loop {
@@ -5593,23 +6137,67 @@ impl DownloadManager {
                 });
                 response_wait += waiting_at.elapsed();
                 if recover_peer && response_wait >= Duration::from_secs(5) {
-                    let peer = if matches!(recovery, PeerRecovery::Peers) && limiter.quantum() == usize::MAX && task.limiter.quantum() == usize::MAX { live_peer_rate.load(Ordering::Relaxed) } else { 0 };
+                    let peer = if limiter.quantum() == usize::MAX && task.limiter.quantum() == usize::MAX { live_peer_rate.load(Ordering::Relaxed) } else { 0 };
                     let waiting_rate = (written.saturating_sub(watched_bytes) as f64 / response_wait.as_secs_f64().max(0.001)) as u64;
-                    if crate::network::weak_peer(written.saturating_sub(watched_bytes), response_wait, peer, &mut weak_windows) { return Err(EngineError::Slow(waiting_rate)); }
+                    let weak = crate::network::weak_peer(written.saturating_sub(watched_bytes), response_wait, peer, &mut weak_windows);
                     // Require half the slots to drain so one fast outlier cannot restart steady peers.
                     let tail_workers = policy.as_ref().map_or(worker_count, |p| p.target.load(Ordering::Acquire)).min(worker_count);
                     let draining = expected_len.is_some() && peers.iter().filter(|p| p.downloaded.load(Ordering::Relaxed) < p.range.len()).count() <= (tail_workers / 2).max(1);
-                    // Back out a slower replacement, without retrying a steady slow source again.
+                    // A replacement must also be compared with healthy current
+                    // peers, or with demonstrated tail capacity after peers drain.
+                    // Comparing only with an already-slow predecessor accepts
+                    // an equally bad replacement regardless of remaining work.
                     let tail_peer = if limiter.quantum() == usize::MAX && task.limiter.quantum() == usize::MAX {
                         match recovery {
-                            PeerRecovery::Replacement(previous) => previous,
+                            PeerRecovery::Replacement(previous) | PeerRecovery::ObserveOnly(previous) => {
+                                crate::network::replacement_reference(
+                                    previous,
+                                    peer,
+                                    peer_rate.load(Ordering::Relaxed),
+                                    draining,
+                                )
+                            },
                             PeerRecovery::Peers if draining => peer_rate.load(Ordering::Relaxed),
                             _ => 0,
                         }
                     } else { 0 };
-                    if crate::network::slow_tail(written.saturating_sub(watched_bytes), response_wait, tail_peer, expected_len.unwrap_or(0).saturating_sub(written), &mut tail_windows) { return Err(EngineError::Slow(waiting_rate)); }
+                    let tail = crate::network::slow_tail(written.saturating_sub(watched_bytes), response_wait, tail_peer, expected_len.unwrap_or(0).saturating_sub(written), &mut tail_windows);
+                    if weak || tail {
+                        if handoff.is_some_and(|handoff| handoff.request(
+                            expected_len.unwrap_or(0).saturating_sub(written), waiting_rate,
+                            tail_peer.max(peer), tail_workers,
+                            limiter.quantum() == usize::MAX && task.limiter.quantum() == usize::MAX,
+                        )) {
+                            handoff_requested = true;
+                            break;
+                        }
+                        if may_retry {
+                            return Err(EngineError::Slow(waiting_rate));
+                        }
+                        if !degradation_recorded {
+                            // The retry budget is exhausted, not the diagnostic
+                            // budget. Preserve a valid progressing response and
+                            // expose that the slow source was retained.
+                            task.health.cause(crate::health::Cause::SlowPeer);
+                            task.health.retry_evidence(
+                                index,
+                                3,
+                                match recovery { PeerRecovery::ObserveOnly(before) => before, _ => 0 },
+                                Some(waiting_rate),
+                                rehashed_bytes.load(Ordering::Relaxed),
+                            );
+                            task.record.write().await.extra.insert("slowSourceRetained".into(), json!(true));
+                            degradation_recorded = true;
+                        }
+                    }
                     watched_bytes = written;
                     response_wait = Duration::ZERO;
+                }
+                if checkpoint_job.as_ref().is_some_and(|job| job.is_finished()) {
+                    let durable = checkpoint_job.take().unwrap().await
+                        .map_err(|e| EngineError::Message(e.to_string()))??;
+                    let previous = segment.durable.swap(durable, Ordering::Relaxed);
+                    task.health.checkpoint_written.fetch_add(durable.saturating_sub(previous), Ordering::Relaxed);
                 }
                 let Some(item) = item else { continue; };
                 let Some(chunk) = item else { break; };
@@ -5652,23 +6240,39 @@ impl DownloadManager {
                     segment.downloaded.fetch_add(size as u64, Ordering::Relaxed);
                     offset += size;
                 }
-                if let Some(hash) = part_hash.as_ref().filter(|_| checkpoint_at.elapsed() >= checkpoint_delay) {
-                    let durable_at = Instant::now();
-                    transfer_span!(task.trace.as_deref(),Flush,output.flush().await)?;
-                    transfer_span!(task.trace.as_deref(),Sync,output.get_ref().sync_data().await)?;
-                    transfer_span!(task.trace.as_deref(),Checkpoint,write_json_atomic(
-                        &part_dir.join(format!("{index}.progress.json")),
-                        &PartCheckpoint {
-                            bytes: segment.downloaded.load(Ordering::Relaxed),
-                            sha256: format!("{:x}", hash.clone().finalize()),
-                        },
-                    )
-                    .await)?;
-                    let durable = segment.downloaded.load(Ordering::Relaxed);
-                    let previous = segment.durable.swap(durable, Ordering::Relaxed);
-                    task.health.checkpoint_written.fetch_add(durable.saturating_sub(previous), Ordering::Relaxed);
+                if let Some(hash) = part_hash.as_ref().filter(|_| ephemeral.is_none() && checkpoint_job.is_none() && checkpoint_at.elapsed() >= checkpoint_delay) {
+                    let flush_started = Instant::now();
+                    transfer_span!(task.trace.as_deref(), Flush, output.flush().await)?;
+                    let file = output.get_ref().try_clone().await?;
+                    let checkpoint = PartCheckpoint {
+                        bytes: segment.downloaded.load(Ordering::Relaxed),
+                        sha256: format!("{:x}", hash.clone().finalize()),
+                    };
+                    let path = part_dir.join(format!("{index}.progress.json"));
+                    let health = task.health.clone();
+                    #[cfg(test)]
+                    let test_delay = task.checkpoint_test_delay;
+                    #[cfg(feature = "test-tools")]
+                    let trace = task.trace.clone();
+                    // A cloned handle only syncs. It never changes the shared seek
+                    // offset; later append-only writes cannot mutate this prefix.
+                    checkpoint_job = Some(tokio::spawn(async move {
+                        transfer_span!(health = Some(health.as_ref()), trace.as_deref(), Sync, async {
+                            #[cfg(test)]
+                            if !test_delay.is_zero() { tokio::time::sleep(test_delay).await; }
+                            #[cfg(feature = "test-tools")]
+                            if crate::platform::test_root().is_ok_and(|root| root.is_some()) {
+                                if let Some(delay) = std::env::var("FETCHRAIL_TEST_CHECKPOINT_DELAY_MS").ok().and_then(|v| v.parse::<u64>().ok()).filter(|&v| v <= 2000) {
+                                    tokio::time::sleep(Duration::from_millis(delay)).await;
+                                }
+                            }
+                            file.sync_data().await
+                        }.await)?;
+                        transfer_span!(health = Some(health.as_ref()), trace.as_deref(), Checkpoint, write_json_atomic(&path, &checkpoint).await)?;
+                        Ok(checkpoint.bytes)
+                    }));
                     if let Some(policy) = &policy {
-                        policy.write_wait_ns.fetch_add(durable_at.elapsed().as_nanos().min(u64::MAX as u128) as u64, Ordering::Relaxed);
+                        policy.write_wait_ns.fetch_add(flush_started.elapsed().as_nanos().min(u64::MAX as u128) as u64, Ordering::Relaxed);
                     }
                     checkpoint_at = Instant::now();
                     checkpoint_delay = CHECKPOINT_INTERVAL;
@@ -5716,6 +6320,26 @@ impl DownloadManager {
         .await;
         segment.active.store(false, Ordering::Relaxed);
         segment.waiting.store(true, Ordering::Relaxed);
+        // Drain even when receiving failed or was cancelled, before any newer
+        // checkpoint can use the same key. No background journal outlives a range.
+        let checkpoint_error = if let Some(job) = checkpoint_job.take() {
+            match job
+                .await
+                .map_err(|e| EngineError::Message(e.to_string()))
+                .and_then(|result| result)
+            {
+                Ok(durable) => {
+                    let previous = segment.durable.swap(durable, Ordering::Relaxed);
+                    task.health
+                        .checkpoint_written
+                        .fetch_add(durable.saturating_sub(previous), Ordering::Relaxed);
+                    None
+                }
+                Err(error) => Some(error),
+            }
+        } else {
+            None
+        };
         let durable_at = Instant::now();
         transfer_span!(task.trace.as_deref(), Flush, output.flush().await)?;
         if transfer.is_err() || part_hash.is_some() {
@@ -5727,23 +6351,31 @@ impl DownloadManager {
         }
         let received_digest = part_hash.map(|hash| format!("{:x}", hash.finalize()));
         if let Some(hash) = received_digest.as_ref() {
-            transfer_span!(
-                task.trace.as_deref(),
-                Checkpoint,
-                write_json_atomic(
-                    &part_dir.join(format!("{index}.progress.json")),
-                    &PartCheckpoint {
-                        bytes: segment.downloaded.load(Ordering::Relaxed),
-                        sha256: hash.clone(),
-                    },
-                )
-                .await
-            )?;
             let durable = segment.downloaded.load(Ordering::Relaxed);
+            if let Some(ephemeral) = ephemeral {
+                // Child proof belongs only to this joined wave. It must never
+                // overwrite the canonical parent's restart checkpoint.
+                ephemeral.commit(durable, hash.clone());
+            } else {
+                transfer_span!(
+                    task.trace.as_deref(),
+                    Checkpoint,
+                    write_json_atomic(
+                        &part_dir.join(format!("{index}.progress.json")),
+                        &PartCheckpoint {
+                            bytes: durable,
+                            sha256: hash.clone()
+                        },
+                    )
+                    .await
+                )?;
+            }
             let previous = segment.durable.swap(durable, Ordering::Relaxed);
-            task.health
-                .checkpoint_written
-                .fetch_add(durable.saturating_sub(previous), Ordering::Relaxed);
+            if ephemeral.is_none() {
+                task.health
+                    .checkpoint_written
+                    .fetch_add(durable.saturating_sub(previous), Ordering::Relaxed);
+            }
         }
         if let Some(policy) = &policy {
             policy.write_wait_ns.fetch_add(
@@ -5751,7 +6383,13 @@ impl DownloadManager {
                 Ordering::Relaxed,
             );
         }
+        if let Some(error) = checkpoint_error {
+            return Err(error);
+        }
         transfer?;
+        if handoff_requested {
+            return Ok(tail::SegmentEnd::Yielded);
+        }
 
         // Completed peers also establish sustained speed for a range slow from its first byte.
         let received = segment
@@ -5784,7 +6422,7 @@ impl DownloadManager {
         if !shared && peers.len() == 1 {
             *task.received_sha256.lock().expect("received hash poisoned") = received_digest;
         }
-        Ok(())
+        Ok(tail::SegmentEnd::Complete)
     }
 
     fn spawn_progress_reporter(
@@ -5818,10 +6456,28 @@ impl DownloadManager {
                                 .collect();
                             speeds = vec![0.0; current.len()];
                         }
+                        let mut raw_speed = 0.0;
+                        let mut receiving_ranges = 0;
+                        let mut connecting_ranges = 0;
+                        let tail_samples = task.tail_progress.sample();
+                        let mut logical_bytes = Vec::with_capacity(current.len());
                         for (index, segment) in current.iter().enumerate() {
-                            let bytes = segment.downloaded.load(Ordering::Relaxed);
+                            let tail = tail_samples.iter().find(|sample| sample.parent_index == index);
+                            let canonical = segment.downloaded.load(Ordering::Relaxed);
+                            let bytes = tail.map_or(canonical, |sample| sample.downloaded.max(canonical).min(segment.range.len()));
+                            logical_bytes.push(bytes);
+                            if bytes < last_bytes[index] { speeds[index] = 0.0; }
                             let instant_speed =
                                 bytes.saturating_sub(last_bytes[index]) as f64 / elapsed;
+                            raw_speed += instant_speed;
+                            if let Some(sample) = tail {
+                                receiving_ranges += sample.receiving;
+                                connecting_ranges += sample.connecting;
+                            } else {
+                                let active = segment.active.load(Ordering::Relaxed);
+                                if active && bytes > last_bytes[index] { receiving_ranges += 1; }
+                                if !active && !segment.waiting.load(Ordering::Relaxed) && bytes < segment.range.len() { connecting_ranges += 1; }
+                            }
                             speeds[index] = if speeds[index] == 0.0 {
                                 instant_speed
                             } else {
@@ -5829,8 +6485,18 @@ impl DownloadManager {
                             };
                             last_bytes[index] = bytes;
                         }
+                        task.health.transfer_progress(logical_bytes.iter().sum(), total, receiving_ranges);
+                        let mut progress = segment_progress(&current, &speeds);
+                        for sample in &tail_samples {
+                            if let Some(part) = progress.get_mut(sample.parent_index) {
+                                part.downloaded_bytes = logical_bytes[sample.parent_index];
+                                part.active = sample.active > 0;
+                                part.waiting = sample.active == 0 && sample.connecting == 0;
+                            }
+                        }
+                        task.record.write().await.extra.insert("tailUncommittedBytes".into(), json!(tail_samples.iter().map(|sample| sample.uncommitted_bytes).sum::<u64>()));
                         manager
-                            .update_progress_record(&task, segment_progress(&current, &speeds), total)
+                            .update_progress_record(&task, progress, total, raw_speed as u64, receiving_ranges, connecting_ranges)
                             .await;
                         last_instant = now;
                     }
@@ -5844,23 +6510,36 @@ impl DownloadManager {
         task: &Arc<DownloadTask>,
         segments: Vec<SegmentProgress>,
         total: Option<u64>,
+        raw_speed_bps: u64,
+        receiving: usize,
+        connecting: usize,
     ) {
         let downloaded = segments
             .iter()
             .map(|part| part.downloaded_bytes)
             .sum::<u64>();
         let speed = segments.iter().map(|part| part.speed_bps).sum::<u64>();
-        let receiving = segments.iter().filter(|part| part.active).count();
-        let connecting = segments
-            .iter()
-            .filter(|part| {
-                !part.waiting
-                    && !part.active
-                    && part
-                        .length
-                        .is_none_or(|length| part.downloaded_bytes < length)
-            })
-            .count();
+        let effective_settings = self.settings.read().await;
+        let connections = task
+            .performance
+            .lock()
+            .expect("task performance poisoned")
+            .as_ref()
+            .map(|p| p.target.load(Ordering::Relaxed));
+        let (file_limit, requested) = {
+            let record = task.record.read().await;
+            (
+                record.speed_limit_bps,
+                record.requested_connections.unwrap_or(record.connections),
+            )
+        };
+        task.health.runtime_policy(
+            connections.unwrap_or(requested),
+            file_limit,
+            effective_settings.speed_limit_bps,
+            cfg!(windows) && effective_settings.windows_attachment_check,
+        );
+        drop(effective_settings);
         let planned = segments.len();
         #[cfg(feature = "test-tools")]
         if let Some(trace) = &task.trace {
@@ -5889,6 +6568,15 @@ impl DownloadManager {
                 .extra
                 .insert("connectingConnections".into(), json!(connecting));
             record.extra.insert("plannedRanges".into(), json!(planned));
+            record.extra.insert(
+                "rawSpeedBps".into(),
+                json!(if task.paused.load(Ordering::Acquire) {
+                    0
+                } else {
+                    raw_speed_bps
+                }),
+            );
+            record.extra.insert("etaScope".into(), json!("receiving"));
             record.segments = compact_segments(segments);
             record.speed_bps = if task.paused.load(Ordering::Acquire) {
                 0
@@ -5908,7 +6596,7 @@ impl DownloadManager {
     }
 
     async fn probe(
-        &self,
+        client: &Client,
         url: &Url,
         context: Option<&BrowserRequestContext>,
         health: Option<&crate::health::Health>,
@@ -5919,16 +6607,16 @@ impl DownloadManager {
         let mut validator = None;
         let mut final_url = None;
 
-        let head = self
-            .metadata_request(
-                self.client
-                    .head(url.clone())
-                    .headers(context_headers(context)?)
-                    .header(ACCEPT_ENCODING, "identity"),
-                url,
-                health,
-            )
-            .await;
+        let head = Self::metadata_request(
+            client,
+            client
+                .head(url.clone())
+                .headers(context_headers(context)?)
+                .header(ACCEPT_ENCODING, "identity"),
+            url,
+            health,
+        )
+        .await;
         if matches!(&head, Err(EngineError::RetryAfter { .. })) {
             return Err(head.unwrap_err());
         }
@@ -5943,9 +6631,9 @@ impl DownloadManager {
             }
         }
 
-        if total_bytes.is_none() || total_bytes == Some(0) || !accepts_ranges {
-            let mut request = self
-                .client
+        if total_bytes.is_none() || total_bytes == Some(0) || !accepts_ranges || validator.is_none()
+        {
+            let mut request = client
                 .get(url.clone())
                 .headers(context_headers(context)?)
                 .header(ACCEPT_ENCODING, "identity");
@@ -5953,7 +6641,10 @@ impl DownloadManager {
             if total_bytes != Some(0) {
                 request = request.header(RANGE, "bytes=0-0");
             }
-            let response = self.metadata_request(request, url, health).await?;
+            let response = Self::metadata_request(client, request, url, health).await?;
+            let head_total = total_bytes;
+            let head_validator = validator.clone();
+            let head_url = final_url.clone();
             if response.status() == StatusCode::PARTIAL_CONTENT {
                 let (start, end, total) =
                     parse_content_range(response.headers()).ok_or_else(|| {
@@ -5965,12 +6656,13 @@ impl DownloadManager {
                     ));
                 }
                 accepts_ranges = true;
-                total_bytes = total.or(total_bytes.filter(|bytes| *bytes > 0));
+                // The GET representation must supply its own length and identity.
+                // Mixing a changed GET validator with a HEAD length can authorize
+                // the wrong ranges, even when both responses are individually valid.
+                total_bytes = total;
             } else if response.status().is_success() {
                 accepts_ranges = false;
-                if total_bytes.is_none_or(|bytes| bytes == 0) {
-                    total_bytes = content_length_from_headers(response.headers());
-                }
+                total_bytes = content_length_from_headers(response.headers());
             }
             if !response.status().is_success() {
                 return Err(EngineError::Http(response.status()));
@@ -5979,23 +6671,39 @@ impl DownloadManager {
             // Never inherit HEAD identity into a different GET representation.
             validator = representation_validator(response.headers());
             final_url = Some(response.url().clone());
-            suggested_file_name =
-                file_name_from_headers(response.headers()).or(suggested_file_name);
+            suggested_file_name = file_name_from_headers(response.headers()).or_else(|| {
+                (head_total == total_bytes && head_validator == validator && head_url == final_url)
+                    .then_some(suggested_file_name)
+                    .flatten()
+            });
         } else if suggested_file_name.is_none() {
-            // Some hosts include the filename only on GET; metadata already found by HEAD stays usable.
-            if let Ok(response) = self
-                .metadata_request(
-                    self.client
+            // Filename enrichment is optional. It must not inherit the full
+            // metadata retry/cooldown budget or replace an established identity.
+            if let Ok(Ok(response)) = tokio::time::timeout(
+                FILENAME_PROBE_BUDGET,
+                Self::metadata_request(
+                    client,
+                    client
                         .get(url.clone())
                         .headers(context_headers(context)?)
                         .header(RANGE, "bytes=0-0")
                         .header(ACCEPT_ENCODING, "identity"),
                     url,
                     health,
-                )
-                .await
+                ),
+            )
+            .await
             {
-                if response.status().is_success() {
+                let coherent_range =
+                    parse_content_range(response.headers()).is_some_and(|(start, end, total)| {
+                        start == 0 && end == 0 && total == total_bytes
+                    });
+                if response.status() == StatusCode::PARTIAL_CONTENT
+                    && coherent_range
+                    && representation_validator(response.headers()) == validator
+                    && final_url.as_ref() == Some(response.url())
+                    && reject_html_page(response.headers()).is_ok()
+                {
                     suggested_file_name = file_name_from_headers(response.headers());
                 }
             }
@@ -6012,14 +6720,14 @@ impl DownloadManager {
     }
 
     async fn metadata_request(
-        &self,
+        client: &Client,
         request: reqwest::RequestBuilder,
         _url: &Url,
         health: Option<&crate::health::Health>,
     ) -> EngineResult<reqwest::Response> {
         for attempt in 0..3 {
             let (response, origin_permit, global_permit) = send_admitted(
-                &self.client,
+                client,
                 request.try_clone().ok_or_else(|| {
                     EngineError::Message("Metadata request cannot be replayed.".into())
                 })?,
@@ -6201,10 +6909,20 @@ impl DownloadManager {
                     return Err(error);
                 }
             };
+            let linked =
+                open_publication_file(&part_dir.join("0.part")).is_ok_and(|v| v.0 == identity);
+            task.health.assembly(
+                if linked {
+                    crate::health::AssemblyMode::HardLink
+                } else {
+                    crate::health::AssemblyMode::Copy
+                },
+                if linked { 0 } else { total },
+            );
             #[cfg(feature = "test-tools")]
             if let Some(trace) = &task.trace {
                 trace.span(trace::Phase::Assembly, started.elapsed());
-                if open_publication_file(&part_dir.join("0.part")).is_ok_and(|v| v.0 == identity) {
+                if linked {
                     trace.linked.fetch_add(1, Ordering::Relaxed);
                 }
             }
@@ -6228,6 +6946,10 @@ impl DownloadManager {
         } else {
             None
         };
+        if recovered {
+            task.health
+                .assembly(crate::health::AssemblyMode::Recovered, 0);
+        }
         let scan_identity = match assembled_identity {
             Some(identity) => identity,
             None => {
@@ -6252,6 +6974,16 @@ impl DownloadManager {
                 None
             }
         });
+        task.health
+            .verification(if record.expected_sha256.is_some() {
+                crate::health::VerificationRoute::ExpectedWholeFile
+            } else if complete_hashes.is_some() {
+                crate::health::VerificationRoute::RangeHashes
+            } else if expected_sha256.is_some() {
+                crate::health::VerificationRoute::ReceivedWholeFile
+            } else {
+                crate::health::VerificationRoute::LegacyBeforeAndAfter
+            });
         if complete_hashes.is_none() && expected_sha256.is_none() {
             // Legacy assemblies have no receive-time proof; capture their content before scanning.
             let path = temp_path.clone();
@@ -6275,6 +7007,43 @@ impl DownloadManager {
         self.emit_record(&snapshot);
         #[cfg(feature = "test-tools")]
         if task.trace.is_some()
+            && std::env::var("FETCHRAIL_TEST_HOLD_FINALIZATION").is_ok_and(|value| value == "1")
+        {
+            let root = crate::platform::test_root()
+                .map_err(|_| EngineError::Message("Invalid isolated finalization fixture.".into()))?
+                .ok_or_else(|| {
+                    EngineError::Message("Finalization fixture requires an isolated root.".into())
+                })?;
+            let hold = root.join("hold-finalization");
+            let metadata = fs::symlink_metadata(&hold).await?;
+            if !metadata.file_type().is_file() || metadata.len() > 16 {
+                return Err(EngineError::Message(
+                    "Invalid finalization fixture control.".into(),
+                ));
+            }
+            let mut ready = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(root.join("finalization-ready"))
+                .await?;
+            ready.write_all(snapshot.id.to_string().as_bytes()).await?;
+            ready.flush().await?;
+            drop(ready);
+            let deadline = Instant::now() + Duration::from_secs(20);
+            while fs::try_exists(&hold).await? {
+                if Instant::now() >= deadline {
+                    return Err(EngineError::Message(
+                        "Isolated finalization fixture timed out.".into(),
+                    ));
+                }
+                tokio::select! {
+                    _ = tokio::time::sleep(Duration::from_millis(25)) => {},
+                    _ = cancel.cancelled() => return Err(EngineError::Cancelled),
+                }
+            }
+        }
+        #[cfg(feature = "test-tools")]
+        if task.trace.is_some()
             && std::env::var("FETCHRAIL_TEST_FINALIZE_DELAY").is_ok_and(|value| value == "1")
         {
             tokio::select! {
@@ -6286,8 +7055,19 @@ impl DownloadManager {
         if let Some(trace) = &task.trace {
             trace.phase(trace::Phase::Attachment);
         }
-        #[cfg(windows)]
-        let windows_attachment_check = self.settings.read().await.windows_attachment_check;
+        let windows_attachment_check = {
+            let settings = self.settings.read().await;
+            let check = cfg!(windows) && settings.windows_attachment_check;
+            task.health.runtime_policy(
+                record.requested_connections.unwrap_or(record.connections),
+                record.speed_limit_bps,
+                settings.speed_limit_bps,
+                check,
+            );
+            check
+        };
+        #[cfg(not(windows))]
+        let _ = windows_attachment_check;
         #[cfg(windows)]
         let overlapping = if windows_attachment_check && total >= 64 * 1024 * 1024 && {
             let enabled = true;
@@ -6331,6 +7111,7 @@ impl DownloadManager {
                                 &url,
                                 &name,
                                 true,
+                                &token,
                                 Some(scan_health.clone()),
                                 #[cfg(feature = "test-tools")]
                                 scan_trace,
@@ -6358,6 +7139,7 @@ impl DownloadManager {
                     &record.url,
                     desired_name,
                     windows_attachment_check,
+                    cancel,
                     Some(task.health.clone()),
                     #[cfg(feature = "test-tools")]
                     task.trace.clone(),
@@ -6389,11 +7171,18 @@ impl DownloadManager {
             )
             .map_err(|e| EngineError::Message(e.to_string()))??
         };
-        let _dispatch = self.dispatch_lock.lock().await;
-        let _lock = self.persist_lock.lock().await;
-        task.check_stopped(cancel)?;
         for _ in 0..1000 {
+            task.check_stopped(cancel)?;
             let destination = unique_destination(parent, desired_name).await;
+            let _dispatch = {
+                let _span = task.health.guard(crate::health::Phase::DispatchLock);
+                self.dispatch_lock.lock().await
+            };
+            let _lock = {
+                let _span = task.health.guard(crate::health::Phase::CatalogLock);
+                self.persist_lock.lock().await
+            };
+            task.check_stopped(cancel)?;
             self.check_torrent_path(&destination)
                 .await
                 .map_err(EngineError::Message)?;
@@ -6466,6 +7255,13 @@ impl DownloadManager {
     }
 
     async fn handle_run_error(&self, task: &Arc<DownloadTask>, error: EngineError) {
+        let error = if matches!(&error, EngineError::Io(io) if io.kind() == std::io::ErrorKind::Interrupted)
+            && task.cancel_token.lock().unwrap().is_cancelled()
+        {
+            EngineError::Cancelled
+        } else {
+            error
+        };
         task.health
             .cause(error.health_cause(task.health.failed_phase()));
         let snapshot = {
@@ -6714,6 +7510,10 @@ impl DownloadManager {
         self.analytics.quality.preview()
     }
 
+    pub fn quality_delivery_status(&self) -> crate::quality::DeliveryStatus {
+        self.analytics.quality.delivery_status()
+    }
+
     fn observe_analytics(&self, task: &DownloadTask, record: &DownloadRecord) {
         let outcome = match record.status {
             DownloadStatus::Completed | DownloadStatus::Seeding => "completed",
@@ -6945,6 +7745,7 @@ fn default_settings(download_dir: &Path) -> DownloadSettings {
         speed_limit_bps: 0,
         default_download_dir: download_dir.to_string_lossy().to_string(),
         max_concurrent_downloads: 3,
+        max_requests_per_origin: 32,
         connections_per_download: 8,
         performance_auto: false,
         min_segment_size_mb: 4,
@@ -7580,22 +8381,23 @@ fn valid_manifest_ranges(manifest: &PartManifest, total: u64) -> bool {
 }
 
 fn transfer_pool_count(total: u64, workers: usize) -> usize {
-    // A paced shared flow must not hold all of a large transfer's workers back.
-    if total < LARGE_TRANSFER_BYTES {
+    // Pool topology is independent of range geometry. Tiny transfers amortize
+    // one connection; larger jobs share each initial pool across four workers.
+    if total < 256 * 1024 * 1024 {
         1
     } else {
-        workers.clamp(1, 4)
+        workers.div_ceil(4).clamp(1, 4)
     }
 }
 
 fn queued_range_count(total: u64, workers: usize, min_segment: u64) -> usize {
     let workers = workers.clamp(1, 32);
     // Keep request/checkpoint overhead out of small and single-connection transfers.
-    if workers == 1 || total < LARGE_TRANSFER_BYTES {
+    if workers == 1 {
         return workers;
     }
     // Leave less work trapped on a slow receiver as other slots drain.
-    (total / min_segment.max(128 * 1024 * 1024)).clamp(workers as u64, 512) as usize
+    (total / min_segment.max(QUEUED_RANGE_BYTES)).clamp(workers as u64, 512) as usize
 }
 
 fn suggested_connection_count(total: u64, configured: usize, min_segment: u64) -> usize {
@@ -7651,6 +8453,14 @@ async fn segment_counters(part_dir: &Path, ranges: &[ByteRange]) -> EngineResult
 }
 
 async fn unique_destination(directory: &Path, file_name: &str) -> PathBuf {
+    let directory = directory.to_owned();
+    let file_name = file_name.to_owned();
+    let fallback = directory.join(format!("download-{}", Uuid::new_v4()));
+    tokio::task::spawn_blocking(move || unique_destination_blocking(&directory, &file_name))
+        .await
+        .unwrap_or(fallback)
+}
+fn unique_destination_blocking(directory: &Path, file_name: &str) -> PathBuf {
     let candidate = directory.join(file_name);
     if !candidate.exists() {
         return candidate;
@@ -7852,6 +8662,8 @@ fn verify_file_hash(path: &Path, expected: &str, cancel: &CancellationToken) -> 
 
 #[cfg(test)]
 mod audit_tests;
+#[cfg(test)]
+mod cleanup_tests;
 #[cfg(test)]
 mod transfer_tests;
 
@@ -8241,12 +9053,13 @@ mod tests {
     fn queued_ranges_preserve_small_transfers_limits_and_geometry() {
         let gib = 1024u64.pow(3);
         for (total, workers, minimum, expected, pools) in [
-            (2 * gib, 16, 4 * 1024 * 1024, 16, 1),
-            (8 * gib - 1, 32, 0, 32, 1),
-            (8 * gib, 2, 0, 64, 2),
-            (8 * gib, 3, 0, 64, 3),
-            (8 * gib, 16, 0, 64, 4),
-            (21_618_816_672, 16, 0, 161, 4),
+            (32 * 1024 * 1024, 4, 4 * 1024 * 1024, 4, 1),
+            (2 * gib, 16, 4 * 1024 * 1024, 32, 4),
+            (8 * gib - 1, 32, 0, 127, 4),
+            (8 * gib, 2, 0, 128, 1),
+            (8 * gib, 3, 0, 128, 1),
+            (8 * gib, 16, 0, 128, 4),
+            (21_618_816_672, 16, 0, 322, 4),
             (21_618_816_672, 1, 0, 1, 1),
             (21_618_816_672, 16, 512 * 1024 * 1024, 40, 4),
             (1024 * gib, 32, 0, 512, 4),

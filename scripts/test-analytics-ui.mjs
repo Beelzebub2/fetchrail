@@ -41,6 +41,8 @@ try {
     window.testSettings = { analyticsConsent: { enabled: false, decided: false, schema: 0, purpose: "" }, theme: "dark", accent: "ember", speedLimitBps: 0, autoUpdate: false, categories: [{ name: "Compressed", extensions: ["rar"], folder: "Compressed" }], sortIntoCategoryFolders: true, defaultDownloadDir: "C:\\Downloads", maxConcurrentDownloads: 3, connectionsPerDownload: 4, minSegmentSizeMb: 1, launchOnStart: false, minimizeToTray: true };
     window.testSettings.torrent = { uploadLimitBps: 0, maxSeeds: 3, ratioLimit: 1, seedTimeLimit: 86400, dht: true, lsd: true, upnp: true, connections: 200, listenInterfaces: "0.0.0.0:6881,[::]:6881", outgoingInterfaces: "", encryption: 1, proxyType: 0, proxyHost: "", proxyPort: 0, proxyUsername: "", proxyPassword: "" };
     window.testQualityRelease = { approved: true, noticeRevision: "reliability-test-current" };
+    window.testDelivery = { configured:true, collecting:false, pendingBatches:0, pendingBytes:0, oldestAgeSeconds:null, nextAttemptSeconds:null, acknowledgedBatches:0, attemptedBatches:0, expiredBatches:0, overflowDroppedBatches:0, rejectedBatches:0, storageError:null };
+    window.testHistoryStatus = { lastSuccessfulSaveAt:null, error:null };
     window.testEmit = (event, payload) => {
       for (const [id, name] of listeners) if (name === event) callbacks.get(id)?.({ event, payload });
     };
@@ -56,6 +58,7 @@ try {
         if (name === "list_downloads") return [structuredClone(window.testRecord)];
         if (name === "get_settings") return structuredClone(window.testSettings);
         if (name === "quality_release_status") return structuredClone(window.testQualityRelease);
+        if (name === "quality_delivery_status") return structuredClone(window.testDelivery);
         if (name === "set_analytics_consent") {
           if (window.testConsentFailure) {
             window.testSettings.analyticsConsent.enabled = false;
@@ -67,13 +70,35 @@ try {
           return structuredClone(window.testSettings);
         }
         if (name === "set_quality_consent") {
-          window.testSettings.qualityConsent = { enabled: args.enabled, decided: true, schema: 2, purpose: "product-quality-v2", noticeRevision: window.testQualityRelease.noticeRevision };
+          window.testSettings.qualityConsent = { enabled: args.enabled, decided: true, schema: 3, purpose: "product-quality-v3", noticeRevision: window.testQualityRelease.noticeRevision };
+          window.testDelivery = {...window.testDelivery, collecting:args.enabled, pendingBatches:0, pendingBytes:0, oldestAgeSeconds:null, nextAttemptSeconds:null};
           window.testEmit("fetchrail://settings-updated", structuredClone(window.testSettings)); return structuredClone(window.testSettings);
         }
-        if (name === "quality_preview") return window.testSettings.qualityConsent?.enabled ? { schema: 2, purpose: "product-quality-v2", version: "0.7.4", os: "windows", arch: "x64", counters: {http_accepted: 1}, histograms: {} } : null;
-        if (name === "set_local_crash_history") { window.testSettings.localCrashHistory = args.enabled; window.testEmit("fetchrail://settings-updated", structuredClone(window.testSettings)); return structuredClone(window.testSettings); }
-        if (name === "local_health_history") return [];
-        if (name === "clear_local_health_history" || name === "clear_download_health") return;
+        if (name === "quality_preview") return window.testSettings.qualityConsent?.enabled ? { schema: 3, purpose: "product-quality-v3", version: "0.7.4", os: "windows", arch: "x64", batchId:"0".repeat(32), provenance:"controlled", counters: {http_accepted: 1}, histograms: {} } : null;
+        if (name === "local_history_save_status") {
+          if (window.testHistoryStatusFailure) throw "Status unavailable";
+          return structuredClone(window.testHistoryStatus);
+        }
+        if (name === "set_local_crash_history") {
+          window.testSettings.localCrashHistory = args.enabled;
+          window.testHistoryStatus = {lastSuccessfulSaveAt:null,error:null};
+          window.testEmit("fetchrail://settings-updated", structuredClone(window.testSettings)); return structuredClone(window.testSettings);
+        }
+        if (name === "local_health_history") {
+          if (window.testHistoryReadFailure) {
+            window.testHistoryStatus.error = "read";
+            throw "Cannot read local diagnostic history. Existing files were preserved; inspect local storage and retry.";
+          }
+          return [];
+        }
+        if (name === "clear_local_health_history") {
+          if (window.testHistoryDeleteFailure) {
+            window.testHistoryStatus.error = "delete";
+            throw "Cannot delete all owned local diagnostic history. Some saved evidence may remain; inspect local storage and retry.";
+          }
+          window.testHistoryStatus = {lastSuccessfulSaveAt:null,error:null}; return;
+        }
+        if (name === "clear_download_health") return;
         if (name === "download_health" || name === "recent_operation_health") {
           const report = { schema: 1, version: "0.7.4", os: "windows", arch: "x64", debugBuild: false, elapsedMs: 9000, observedFromAccept: true, durableCompletedMs: null, receivedWireBytes: 123, checkpointBytesWritten: 100, outputVerifiedBytes: null, fileLimitBps: 0, globalLimitBps: 0, activities: [], receiveWindows: [], receiveStalls: 1, receiveStalledMs: 3000, missingReceiveWindows: 0,
           stages: [{phase: "body", calls: 1, workerMs: 3000, maxMs: 3000, active: 1, activeElapsedMs: 3000}], causes: [["http_503", 1]], events: [{elapsedMs: 1000, durationMs: 3000, phase: "body", cause: null}], evictedEvents: 0, diagnosis: {confidence: "Observed", observation: "ReceiveWait", next: "ReproduceSourceAndRoute"}, limitations: ["NoExternalRootCause"] };
@@ -134,7 +159,7 @@ try {
   await page.getByLabel("Allow optional improvement analytics").check();
   await page.getByText("Analytics is on.", { exact: true }).waitFor();
   await page.screenshot({ path: join(output, "analytics-settings.png"), fullPage: true });
-  assert.equal(await page.getByLabel("Allow optional download reliability analytics").isChecked(), false, "A v1 grant never enables v2");
+  assert.equal(await page.getByLabel("Allow optional download reliability analytics").isChecked(), false, "A v1 grant never enables v3");
   const qualityChoices = await page.evaluate(() => window.testCalls.filter(call => call.name === "set_quality_consent").length);
   await page.evaluate(() => {
     window.testSettings.qualityConsent = { enabled: true, decided: true, schema: 2, purpose: "product-quality-v2", noticeRevision: "reliability-draft-old" };
@@ -147,13 +172,44 @@ try {
   await page.getByText("Reliability analytics is on.", {exact: true}).waitFor();
   assert.equal(await page.evaluate(() => window.testSettings.analyticsConsent.enabled), true);
   await page.getByRole("button", {name: "Preview reliability payload"}).click();
-  assert.ok((await page.locator("pre.health-preview").textContent()).includes("product-quality-v2"));
+  assert.ok((await page.locator("pre.health-preview").textContent()).includes("product-quality-v3"));
+  await page.evaluate(() => { window.testDelivery = {...window.testDelivery,pendingBatches:2,pendingBytes:1024,oldestAgeSeconds:120,nextAttemptSeconds:60,acknowledgedBatches:3,attemptedBatches:5,expiredBatches:1,overflowDroppedBatches:2,rejectedBatches:1}; });
+  await page.getByRole("button",{name:"Refresh reliability delivery status"}).click();
+  const delivery = page.getByRole("region",{name:"Reliability delivery status"});
+  await delivery.getByText("2 batches pending (1 KiB); 3 acknowledged in this consent period.",{exact:true}).waitFor();
+  await delivery.getByText("5 delivery attempts; 1 expired, 2 dropped at the queue limit, 1 permanently rejected.",{exact:true}).waitFor();
   await page.getByLabel("Allow optional download reliability analytics").uncheck();
   await page.getByText("Reliability analytics is off.", {exact: true}).waitFor();
   await page.getByLabel("Keep optional local crash breadcrumbs").check();
   await page.waitForFunction(() => window.testSettings.localCrashHistory === true);
+  const historyStatus = page.getByRole("region", {name: "Local history save status"});
+  await historyStatus.getByText("Local crash breadcrumbs are on; waiting for the first successful save in this session.", {exact: true}).waitFor();
+  assert.equal(await historyStatus.getByText("Last successful local history save:", {exact: false}).count(), 0);
+  await page.evaluate(() => { window.testHistoryStatus = {lastSuccessfulSaveAt: 1792540800, error:null}; });
+  await historyStatus.getByRole("button", {name: "Refresh local history save status"}).click();
+  await historyStatus.getByText("Local crash breadcrumbs are on; a save has completed in this session.", {exact:true}).waitFor();
+  const lastSave = await historyStatus.getByText("Last successful local history save:", {exact:false}).textContent();
+  await page.evaluate(() => { window.testHistoryStatus.error = "save"; });
+  await historyStatus.getByRole("button", {name: "Refresh local history save status"}).click();
+  await historyStatus.getByRole("alert").filter({hasText: "Cannot save local diagnostic history."}).waitFor();
+  assert.equal(await historyStatus.getByText("Last successful local history save:", {exact:false}).textContent(), lastSave);
+  await page.evaluate(() => { window.testHistoryStatusFailure = true; });
+  await historyStatus.getByRole("button", {name: "Refresh local history save status"}).click();
+  await historyStatus.getByText("Could not confirm whether local history was saved. Refresh the status before relying on it.", {exact:true}).waitFor();
+  await page.evaluate(() => { window.testHistoryStatusFailure = false; window.testHistoryReadFailure = true; });
+  await page.getByRole("button", {name:"Inspect saved local history"}).click();
+  await historyStatus.getByRole("alert").filter({hasText: "Cannot read local diagnostic history."}).waitFor();
+  await page.evaluate(() => { window.testHistoryReadFailure = false; window.testHistoryDeleteFailure = true; });
+  await page.getByRole("button", {name:"Delete local diagnostic history"}).click();
+  await historyStatus.getByRole("alert").filter({hasText: "Cannot delete all owned local diagnostic history."}).waitFor();
+  assert.equal(await historyStatus.getByText("Last successful local history save:", {exact:false}).textContent(), lastSave);
+  await page.evaluate(() => { window.testHistoryDeleteFailure = false; });
+  await page.getByRole("button", {name:"Delete local diagnostic history"}).click();
+  await historyStatus.getByText("Local crash breadcrumbs are on; waiting for the first successful save in this session.", {exact:true}).waitFor();
+  assert.equal(await historyStatus.getByText("Last successful local history save:", {exact:false}).count(), 0);
   await page.getByLabel("Keep optional local crash breadcrumbs").uncheck();
   await page.waitForFunction(() => window.testSettings.localCrashHistory === false);
+  await historyStatus.getByText("Local crash breadcrumbs are off.", {exact:true}).waitFor();
   await page.getByLabel("Allow optional improvement analytics").uncheck();
   await page.getByText("Analytics is off.", { exact: true }).waitFor();
   // Reconsent is required for a new scope; saving failure emits undecided/off settings.

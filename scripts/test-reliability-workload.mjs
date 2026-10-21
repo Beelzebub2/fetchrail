@@ -19,6 +19,10 @@ const largeOrder = process.env.FETCHRAIL_RELIABILITY_LARGE_ORDER ?? "ABBA";
 assert.ok(["ABBA","BAAB"].includes(largeOrder), "Use the matched ABBA or BAAB large-trial order");
 const baselineBin = process.env.FETCHRAIL_RELIABILITY_BASELINE_BIN ? resolve(process.env.FETCHRAIL_RELIABILITY_BASELINE_BIN) : null;
 const ui = process.env.FETCHRAIL_RELIABILITY_UI === "1";
+const timingComparison = process.env.FETCHRAIL_RELIABILITY_TIMING === "1";
+const timingBytes = Number(process.env.FETCHRAIL_RELIABILITY_TIMING_BYTES ?? 1024 ** 3);
+assert.ok(!timingComparison || (!ui && !large && !baselineBin), "Timing comparison uses one unchanged executable and isolated ABBA trials.");
+assert.ok(Number.isSafeInteger(timingBytes) && timingBytes >= 64 * 1024 ** 2 && timingBytes <= 4 * 1024 ** 3, "Timing fixture payload must be 64 MiB to 4 GiB.");
 assert.ok(!(ui && large), "Run capped UI qualification and unlimited large-file qualification separately.");
 const sourceRateBps = Number(process.env.FETCHRAIL_RELIABILITY_SOURCE_BPS ?? 0);
 assert.ok(sourceRateBps === 0 || Number.isInteger(sourceRateBps) && sourceRateBps >= 1024**2 && sourceRateBps <= 1024**3, "Use an explicit shared source rate between 1 MiB/s and 1 GiB/s");
@@ -77,9 +81,9 @@ async function stop(child) {
 }
 try {
   // Reversing the existing order also balances each small pair across repeated invocations.
-  const trials = (ui ? [10,100,1000,10000] : [10,100,1000]).flatMap((history,i) => ((i+Number(largeOrder==="BAAB"))%2 ? [true,false] : [false,true]).map(enabled => [history,enabled,64*1024**2,!!baselineBin&&!enabled]));
+  const trials = timingComparison ? [...largeOrder].map(group => [1000, false, timingBytes, false, group === "A"]) : (ui ? [10,100,1000,10000] : [10,100,1000]).flatMap((history,i) => ((i+Number(largeOrder==="BAAB"))%2 ? [true,false] : [false,true]).map(enabled => [history,enabled,64*1024**2,!!baselineBin&&!enabled]));
   if (large) trials.push(...[...largeOrder].map(group => {const enabled=group==="B";return [1000,enabled,21*1024**3,!!baselineBin&&!enabled];}));
-  for (const [historyCount, qualityEnabled, bytes, baseline = false] of trials) {
+  for (const [historyCount, qualityEnabled, bytes, baseline = false, timingDisabled = false] of trials) {
     total = bytes;
     sourceNextAt = performance.now();
     const fixture = await createFixture("reliability-workload"); let app, host, browser, page;
@@ -87,7 +91,7 @@ try {
     const pending = new Map();
     try {
       const now = new Date().toISOString();
-      const consent = { enabled: qualityEnabled, decided: true, schema: 2, purpose: "product-quality-v2", decidedAt: now, appVersion: version, noticeRevision };
+      const consent = { enabled: qualityEnabled, decided: true, schema: 3, purpose: "product-quality-v3", decidedAt: now, appVersion: version, noticeRevision };
       const settings = { analyticsConsent: {enabled:false,decided:true,schema:1,purpose:"product-improvement-v1"}, qualityConsent: consent,
         autoUpdate: false, localCrashHistory: false, defaultDownloadDir: fixture.root, speedLimitBps: 0,
         maxConcurrentDownloads: 1, connectionsPerDownload: 8, minSegmentSizeMb: 1, launchOnStart: false, performanceAuto: false, torrent: localTorrentConfig };
@@ -96,12 +100,21 @@ try {
       const history = Array.from({length: historyCount}, (_,i) => ({id:randomUUID(),url:"http://127.0.0.1/unrequested-history",fileName:`fixture-history-${i}.bin`,destination:join(fixture.root,"unrequested-history.bin"),status:"completed",totalBytes:0,downloadedBytes:0,speedBps:0,etaSeconds:0,connections:1,error:null,createdAt:now,finishedAt:now}));
       await writeFile(join(fixture.stateDir,"downloads.json"), JSON.stringify(history));
       const env = {...fixture.env,FETCHRAIL_TEST_TRACE:"1",WEBVIEW2_USER_DATA_FOLDER:join(fixture.root,"webview")};
+      delete env.FETCHRAIL_TEST_DISABLE_HEALTH_TIMING;
+      if (timingDisabled) env.FETCHRAIL_TEST_DISABLE_HEALTH_TIMING = "1";
       const port = ui ? await freePort() : null;
       if(ui) env.WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS = `--remote-debugging-port=${port}`;
       app = spawn(join(trialBin,executableName("fetchrail")), ["--background"], {env,windowsHide:true,stdio:"ignore"});
       const config = await waitFor(async () => { try { return JSON.parse(await readFile(join(fixture.stateDir,"browser-bridge.json"))); } catch { return null; } },"isolated app startup");
       // Test the authenticated local bridge without printing its token.
-      await new Promise((done,reject) => { const socket=connect(config.port,"127.0.0.1"); socket.once("connect",()=>{socket.end();done();});socket.once("error",reject); });
+      await new Promise((done,reject) => {
+        const socket=connect(config.port,"127.0.0.1");
+        // This probe sends no bridge request. A half-close without consuming the
+        // read side can keep Node alive after every workload has already passed.
+        socket.once("connect",()=>{socket.destroy();done();});
+        socket.once("error",reject);
+        socket.setTimeout(5000,()=>{socket.destroy();reject(Error("Isolated bridge readiness timed out"));});
+      });
       host=spawn(join(trialBin,executableName("fetchrail")),["chrome-extension://fkmedfamaoejlhddajndhjemiedmnldh/"],{env,windowsHide:true,stdio:["pipe","pipe","ignore"]});
       let buffered=Buffer.alloc(0);
       host.stdout.on("data",chunk=>{buffered=Buffer.concat([buffered,chunk]);while(buffered.length>=4&&buffered.length>=4+buffered.readUInt32LE(0)){const n=buffered.readUInt32LE(0),reply=JSON.parse(buffered.subarray(4,n+4));buffered=buffered.subarray(n+4);pending.get(reply.id)?.(reply);pending.delete(reply.id);}});
@@ -138,7 +151,7 @@ try {
         assert.equal(during.total,historyCount+1);
         assert.ok(during.downloads.some(row=>row.id===id&&!["completed","failed","cancelled"].includes(row.status)),"All UI samples must finish during the active transfer");
       }
-      const record=await waitFor(async()=>{const start=performance.now(),reply=await native("getDownloads");latencies.push(performance.now()-start);const row=reply.downloads.find(row=>row.id===id);if(row?.status==="failed")throw Error(row.error);if(Date.now()-lastNotice>45000){console.log(`Workload: ${historyCount} history, v2=${qualityEnabled}, ${row?.downloadedBytes??0}/${bytes} body bytes, state=${row?.status}`);lastNotice=Date.now();}return row?.status==="completed"&&row;},"verified durable completion",900000);
+      const record=await waitFor(async()=>{const start=performance.now(),reply=await native("getDownloads");latencies.push(performance.now()-start);const row=reply.downloads.find(row=>row.id===id);if(row?.status==="failed")throw Error(row.error);if(Date.now()-lastNotice>45000){console.log(`Workload: ${historyCount} history, v3=${qualityEnabled}, ${row?.downloadedBytes??0}/${bytes} body bytes, state=${row?.status}`);lastNotice=Date.now();}return row?.status==="completed"&&row;},"verified durable completion",900000);
       assert.equal(record.downloadedBytes,bytes);
       const trace=await waitFor(async()=>{try {const data=JSON.parse(await readFile(join(fixture.stateDir,"dev-transfer-traces.json")));return data.captures.find(c=>c.downloadId===id&&c.metrics.catalogAcknowledged)?.metrics;}catch{return null;}},"isolated catalog acknowledgement");
       assert.equal(trace.networkBytes,bytes); assert.equal(trace.durableBytes,bytes);
@@ -152,7 +165,8 @@ try {
       assert.ok(requestToCatalogMs>0&&requestToCatalogMs<=observedWallMs+20);
       if(report) {
       assert.equal(report.outputVerifiedBytes,bytes); assert.ok(report.durableCompletedMs>0); assert.equal(report.observedFromAccept,true);
-      assert.equal(report.receivedWireBytes,bytes); assert.ok(report.stages.some(s=>s.phase==="catalog"&&s.calls>0));
+      assert.equal(report.receivedWireBytes,bytes); assert.equal(report.timingEnabled, !timingDisabled);
+      if (!timingDisabled) assert.ok(report.stages.some(s=>s.phase==="catalog"&&s.calls>0));
       assert.equal(report.checkpointBytesWritten,bytes,"Every new body byte reaches the acknowledged checkpoint boundary");
       assert.ok(!JSON.stringify(report).includes("FETCHRAIL-PRIVATE-SENTINEL"));
       assert.equal(report.events.length<=64,true);
@@ -160,8 +174,9 @@ try {
       const quality=baseline?{value:null}:await waitFor(async()=>{try{const value=JSON.parse(await readFile(join(fixture.stateDir,"dev-quality.json")));return {value};}catch{return null;}},"isolated native aggregate snapshot");
       if(qualityEnabled){
         assert.equal(quality.value.counters.http_accepted,1);assert.equal(quality.value.counters.http_verified_durable,1);
-        assert.equal(quality.value.histograms.http_e2e_large_ms_v1?.reduce((a,b)=>a+b,0)??quality.value.histograms.http_e2e_medium_ms_v1?.reduce((a,b)=>a+b,0),1);
-        assert.ok(Buffer.byteLength(JSON.stringify(quality.value))<=4096);
+        assert.equal(quality.value.schema,3);assert.equal(quality.value.purpose,"product-quality-v3");assert.equal(quality.value.provenance,"controlled");
+        assert.equal(Object.entries(quality.value.histograms).filter(([key])=>/^http_e2e_.*_ms_v2$/.test(key)).reduce((n,[,bins])=>n+bins.reduce((a,b)=>a+b,0),0),1);
+        assert.ok(Buffer.byteLength(JSON.stringify(quality.value))<=8192);
         assert.ok(!JSON.stringify(quality.value).includes("FETCHRAIL-PRIVATE-SENTINEL"));
       }else assert.equal(quality.value,null,"No unapproved aggregate exists");
       const after=processMetrics(app.pid);
@@ -173,7 +188,7 @@ try {
       assert.equal(outputSha256,expected.digest("hex"));
       latencies.sort((a,b)=>a-b);
       uiSamples.sort((a,b)=>a-b);
-      const measurement={historyCount,qualityEnabled,baseline,bytes,sourceRateBps,pairOrder:largeOrder,startedUtcMs,receivedBodyBytes:report?.receivedWireBytes??trace.networkBytes,checkpointBytesWritten:report?.checkpointBytesWritten??trace.durableBytes,debugBuild:report?.debugBuild??null,durableMs:report?.durableCompletedMs??null,catalogAcknowledgedMs,requestToCatalogMs,traceSnapshotMs:trace.elapsedMs,receiveMs:trace.receivingElapsedMs,receivingMBps:bytes/trace.receivingElapsedMs/1000,observedWallMs,
+      const measurement={historyCount,qualityEnabled,baseline,timingDisabled,bytes,sourceRateBps,pairOrder:largeOrder,startedUtcMs,receivedBodyBytes:report?.receivedWireBytes??trace.networkBytes,checkpointBytesWritten:report?.checkpointBytesWritten??trace.durableBytes,debugBuild:report?.debugBuild??null,durableMs:report?.durableCompletedMs??null,catalogAcknowledgedMs,requestToCatalogMs,traceSnapshotMs:trace.elapsedMs,receiveMs:trace.receivingElapsedMs,receivingMBps:bytes/trace.receivingElapsedMs/1000,observedWallMs,
         uiInputToPaintP95Ms:uiSamples.length?uiSamples[Math.ceil(uiSamples.length*.95)-1]:null,uiSamples:uiSamples.length,
         bridgeP95Ms:latencies[Math.min(latencies.length-1,Math.ceil(latencies.length*.95)-1)],bridgeSamples:latencies.length,
         cpuSeconds:after&&before?after.cpuSeconds-before.cpuSeconds:null,peakWorkingSetBytes:after?.peakWorkingSetBytes??null,privateBytes:after?.privateBytes??null,
@@ -191,6 +206,6 @@ try {
   const path=`artifacts/reliability/workload-${randomUUID()}.json`;
   assert.equal(await fileHash(join(bin,executableName("fetchrail"))),executableSha256,"The executable must remain unchanged throughout qualification");
   if(baselineBin) assert.equal(await fileHash(join(baselineBin,executableName("fetchrail"))),baselineSha256,"Baseline provenance must remain unchanged");
-  await writeFile(path,JSON.stringify({executableSha256,baselineSha256,largeOrder:large?largeOrder:null,scope:"Windows isolated loopback, generated same-byte/hash fixture, test-tools build; app-process CPU/RAM exclude WebView2 children; UI mode measures 100 search input-to-render/two-frame observations per case with a 2 MiB/s cap; bridge latency is separate; baseline mode compares pre-observer engine to candidate; request-to-catalog uses same-host UTC dispatch and catalog span-end boundaries with a wall-clock drift check, excluding post-completion diagnostic-file writes; no WAN or regulatory conclusion",measurements},null,2));
+  await writeFile(path,JSON.stringify({executableSha256,baselineSha256,timingComparison,timingOrder:timingComparison?largeOrder:null,largeOrder:large?largeOrder:null,scope:"Windows isolated loopback, generated same-byte/hash fixture, test-tools build; app-process CPU/RAM exclude WebView2 children; UI mode measures 100 search input-to-render/two-frame observations per case with a 2 MiB/s cap; bridge latency is separate; baseline mode compares pre-observer engine to candidate; request-to-catalog uses same-host UTC dispatch and catalog span-end boundaries with a wall-clock drift check, excluding post-completion diagnostic-file writes; no WAN or regulatory conclusion",measurements},null,2));
   console.log(`PASS: isolated durability, privacy, history scaling and workload evidence: ${path}`);
 } finally {server.closeAllConnections();await new Promise(done=>server.close(done));}

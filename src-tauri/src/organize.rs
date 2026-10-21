@@ -330,6 +330,7 @@ mod tests {
             speed_limit_bps: 0,
             default_download_dir: root.to_string_lossy().to_string(),
             max_concurrent_downloads: 3,
+            max_requests_per_origin: 32,
             connections_per_download: 8,
             performance_auto: false,
             min_segment_size_mb: 4,
