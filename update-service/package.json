@@ -1,6 +1,7 @@
 {
   "name": "fetchrail-update-service",
   "private": true,
+  "license": "Apache-2.0",
   "type": "module",
   "scripts": { "test": "node test.mjs && node test-store-badges.mjs && node test-worker.mjs && node ../scripts/test-quality-report.mjs" },
   "devDependencies": { "miniflare": "5.20261006.1-alpha" }

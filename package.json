@@ -1,6 +1,7 @@
 {
   "name": "fetchrail",
   "private": true,
+  "license": "Apache-2.0",
   "version": "0.8.2",
   "type": "module",
   "scripts": {
