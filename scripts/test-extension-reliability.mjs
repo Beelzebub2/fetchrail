@@ -21,7 +21,9 @@ for (const family of ["chromium", "firefox"]) {
       f.events.get("changed")({ id: f.item.id, danger: { current: "safe" } }); await f.settle();
     }
     if (["offline", "intent", "oldApp", "invalidEnvelope", "permission"].includes(mode)) {
-      assert.equal(f.actions.includes("pause"), false, mode + " must preserve browser progress"); assert.equal(f.stages.size, 0); continue;
+      assert.equal(f.item.paused, false, mode + " must preserve browser progress");
+      assert.equal(f.actions.includes("pause"), !["intent", "permission"].includes(mode));
+      assert.equal(f.stages.size, 0); continue;
     }
     const receipt = [...f.stages.values()][0];
     if (["completed", "afterStage", "abortLost"].includes(mode)) {
@@ -44,7 +46,7 @@ for (const family of ["chromium", "firefox"]) {
   assert.equal(Object.keys(f.saved.pendingPrivateHandoffs).length, 1, "opaque private recovery tickets survive a worker restart");
   assert.ok(!JSON.stringify(f.saved).includes("files.test"));
   console.log(`PASS ${family}: ownership fault boundaries, late eligibility, compatibility, permissions and opaque private recovery`);
-  const fast=await browserFixture(family);fast.item.bytesReceived=0;
+  const fast=await browserFixture(family);fast.item.bytesReceived=0;fast.item.filename="";
   await fast.send({type:"startBrowserBatch",items:[{url:"https://files.test/page"}],tabId:1});
   const batch=fast.saved.browserBatch;fast.events.get("headers")({requestId:"fast",url:fast.item.url,tabId:batch.tabId,incognito:false,method:"GET",requestHeaders:[]});
   fast.item.startTime=new Date().toISOString();

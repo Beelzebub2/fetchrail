@@ -78,12 +78,14 @@ The companion needs one reload to pick up its new `webRequest` permission. Optio
 
 For an eligible browser download, the companion:
 
-1. Checks protocol capabilities, permissions and browser readiness, then saves an ownership intent before pausing the HTTP(S) transfer.
-2. Asks Fetchrail to verify a GET through its admitted redirect path, retaining that response for the transfer rather than discarding a probe.
+1. Checks permissions and browser readiness, then saves an ownership intent before pausing each HTTP(S) transfer independently.
+2. Checks protocol capabilities and asks Fetchrail to verify a GET through its admitted redirect path, retaining that response for the transfer rather than discarding a probe.
 3. Stages a non-runnable app record, confirms terminal browser cancellation and durably commits ownership and the intended start/confirmation action.
-4. Opens **Download file info** so you can confirm the category, folder, and filename, then start, keep for later, or cancel the download.
+4. Opens **Download file info** so you can confirm the category, folder, and filename. Further captures join that window: select a file to review its details, then use **Start downloads**, **Download later**, or **Cancel all** for the group.
 
-The caught transfer waits paused for that confirmation. Closing its information window cancels it.
+Caught transfers wait paused for that confirmation. Closing the window cancels its pending files; files already started elsewhere are preserved. A new arrival while a group action is running stays pending for review.
+
+You can click several download links without waiting for confirmation. Each file has its own handoff and recovery intent, so a slow app startup or verification does not leave subsequent browser transfers running. Chromium also defers its filename decision until that file's handoff resolves, preventing small files from completing between capture and cancellation; browser fallback releases the decision without changing the filename. Firefox waits for body readiness and polls more frequently during the first second; files that complete before capture stay in the browser.
 
 Rejected verification and confirmed aborts restore an eligible browser transfer. Fetchrail starts only after browser cancellation and a durable ownership commit. Lost replies are reconciled by stable handoff ID; an authoritative abort prevents late validation from adding a transfer. Generic Resume and scheduling cannot run provisional records. Committed activation is retried after restart, and cleanup failures cannot cancel accepted work. Unknown ownership stays visibly recoverable in **Browser capture**, with **Retry recovery** and **Return to browser** where valid. Browser completion preserves its file/history. Only the browser filename's basename is sent to the engine.
 
@@ -101,7 +103,9 @@ Verification compares available size, MIME and strong entity tags and retains th
 
 `npm run browser:check` runs deterministic browser API fault fixtures; `npm run browser:ui` renders the generated panel with controlled IPC faults. These are distinct from `npm run browser:qualify -- <test-build-executable>`, which loads generated extension files into disposable Windows browser profiles and uses an isolated real native app, local signed-in server and exact-byte checks. A sibling `torrent-harness` executable is required by the native companion fixture.
 
-The real-browser runner pregrants website access and uses temporary/unpacked extensions with a unique native-host registration. It does not prove signed-store installation or permission prompt behavior. Chromium `--normal-only` explicitly excludes private qualification. Private Chromium headless runs have not passed: test downloads were cancelled before a transferable body was observed, and the cause remains unconfirmed. Interactive private capture remains a release qualification gap. Firefox normal/private/two-container and Chromium normal-session transfers have passed. The dated implementation record in [the reliability plan](../docs/extension-reliability-implementation-plan-2026-10-20.md#implementation-record) records remaining gates, including minimum browser versions, Linux, derivatives and upgrades. Ship compatible native support before updating the companion.
+`npm run browser:qualify -- <test-build-executable> --chromium --normal-only --burst` checks three rapid website downloads, including small files, counts one real native confirmation window, clicks **Start downloads** once, and compares the resulting bytes. Chromium qualification uses its normal download delegate and a disposable profile's download directory; DevTools' `allow` override bypasses extension filename decisions and cannot qualify that capture path.
+
+The real-browser runner pregrants website access and uses temporary/unpacked extensions with a unique native-host registration. It does not prove signed-store installation or permission prompt behavior. Chromium `--normal-only` explicitly excludes private qualification. Chromium 156 normal/private transfers and the normal-session burst passed on 2026-10-22 using the normal download delegate; previous private headless runs with the DevTools override failed before body readiness. Interactive save dialogs remain unqualified. Firefox normal/private/two-container transfers passed previously, but its new burst qualification is not passing: the first run exposed session-observation loss, and a rerun after the context-retention fix timed out in browser automation setup. The dated implementation record in [the reliability plan](../docs/extension-reliability-implementation-plan-2026-10-20.md#implementation-record) records remaining gates, including minimum browser versions, Linux, derivatives and upgrades. Ship compatible native support before updating the companion.
 
 ## Permissions and native messaging
 

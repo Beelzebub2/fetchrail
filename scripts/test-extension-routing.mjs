@@ -4,6 +4,7 @@ for (const family of ["chromium", "firefox"]) {
   for (const changes of [{ paused:true }, { danger:"dangerous" }, { state:"complete" }, { byExtensionId:"other" }, { url:"blob:local", finalUrl:"blob:local" }]) {
     const f=await browserFixture(family); Object.assign(f.item,changes); f.create(); await f.settle();
     assert.deepEqual(f.actions,[]); assert.equal(f.stages.size,0);
+    if(family==="chromium") { let released=0;f.events.get("filename")({...f.item},()=>released++);assert.equal(released,1);assert.equal(f.stages.size,0); }
   }
   for (const incognito of [false,true]) {
     const f=await browserFixture(family); f.saved.useBrowserSession=true; f.item.incognito=incognito; await f.boot();
@@ -23,10 +24,71 @@ for (const family of ["chromium", "firefox"]) {
     f.create();await f.settle();assert.equal([...f.stages.values()][0].state,"aborted");assert.equal(f.actions.includes("erase"),false);
     if(mode==="cancel")assert.equal(f.item.paused,false);
   }
+  const stoppedChannel=await browserFixture(family);
+  stoppedChannel.saved.useBrowserSession=true;await stoppedChannel.boot();
+  stoppedChannel.events.get("headers")({requestId:"channel",url:stoppedChannel.item.url,tabId:1,incognito:false,method:"GET",requestHeaders:[{name:"Cookie",value:"channel-session"}]});
+  await new Promise(setImmediate);
+  stoppedChannel.faults.afterPause=()=>stoppedChannel.events.get("requestError")({requestId:"channel",incognito:false});
+  stoppedChannel.create();await stoppedChannel.settle();
+  assert.equal(stoppedChannel.calls.find(c=>c.method==="addDownloads").params.items[0].requestContext.cookie,"channel-session","Pausing must not discard the matched session context");
   const f=await browserFixture(family);f.saved.automaticDownloads=false;f.create();await f.settle();assert.equal(f.calls.length,0);
   if(family==="firefox") {
     const slow=await browserFixture(family);slow.item.bytesReceived=0;slow.create();await slow.settle();assert.equal(slow.actions.length,0);
     for(let i=0;i<12;i++)await slow.tick();slow.item.bytesReceived=1;await slow.tick();assert.equal([...slow.stages.values()][0].committed,true);
+  }
+  // Separate IDs must advance independently, even while the first native GET is slow.
+  let releaseFirst;
+  const firstBlocked=new Promise(resolve=>{releaseFirst=resolve;});
+  const burst=await browserFixture(family,{native:async request=>{
+    if(request.method==="addDownloads"&&request.params.items[0].url.endsWith("/0.zip"))await firstBlocked;
+  }});
+  const downloads=Array.from({length:3},(_,i)=>({...burst.item,id:100+i,url:`https://files.test/${i}.zip`,finalUrl:`https://files.test/${i}.zip`,
+    filename:`C:\\Downloads\\${i}.zip`,bytesReceived:family==="chromium"?0:1}));
+  const released=[];
+  for(const item of downloads){
+    burst.create(item);burst.create(item);
+    if(family==="chromium")assert.equal(burst.events.get("filename")({...item},()=>released.push(item.id)),true);
+  }
+  for(let i=0;i<50;i++)await new Promise(setImmediate);
+  assert.equal(burst.calls.filter(c=>c.method==="addDownloads").length,3,"All rapid clicks must reach verification without waiting for the first handoff or a progress poll");
+  assert.equal([...burst.stages.values()].filter(stage=>stage.committed).length,2,"A slow first file must not block its siblings");
+  if(family==="chromium")assert.deepEqual(released.sort(),[101,102],"Only the resolved filename decisions may be released");
+  releaseFirst();await burst.settle();
+  assert.equal([...burst.stages.values()].filter(stage=>stage.committed).length,3);
+  if(family==="chromium")assert.deepEqual(released.sort(),[100,101,102]);
+  assert.equal(new Set(burst.calls.filter(c=>c.method==="addDownloads").map(c=>c.id)).size,3);
+  for(const item of downloads)assert.deepEqual(burst.downloadActions.filter(action=>action.id===item.id).map(action=>action.action),["pause","cancel","erase"]);
+  let releaseStartup;
+  const startup=new Promise(resolve=>{releaseStartup=resolve;});
+  const cold=await browserFixture(family,{native:async request=>{if(request.method==="ping")await startup;}});
+  for(let i=0;i<8;i++)cold.create({...cold.item,id:200+i,url:`https://files.test/cold-${i}.zip`,finalUrl:`https://files.test/cold-${i}.zip`});
+  for(let i=0;i<50;i++)await new Promise(setImmediate);
+  assert.equal([...cold.items.values()].filter(item=>item.id>=200&&item.paused).length,8,"All browser transfers must be held during a slow companion startup");
+  assert.equal(Object.keys(cold.saved.pendingHandoffs).length,8,"Every held transfer needs its own durable intent");
+  releaseStartup();await cold.settle();assert.equal(cold.stages.size,8);
+  assert.ok([...cold.stages.values()].every(stage=>stage.committed));
+  const partial=await browserFixture(family);
+  for(let i=0;i<3;i++) {
+    const url=`https://files.test/${i===1?"reject":i}.zip`;
+    partial.create({...partial.item,id:300+i,url,finalUrl:url});
+  }
+  await partial.settle();
+  assert.equal([...partial.stages.values()].filter(stage=>stage.committed).length,2,"A rejected sibling cannot discard accepted files");
+  assert.equal(partial.items.get(301).paused,false);
+  assert.deepEqual(partial.downloadActions.filter(action=>action.id===301).map(action=>action.action),["pause","resume"]);
+  if(family==="chromium") {
+    for(const failure of ["offline","oldApp","permission","intent","automaticOff"]) {
+      const fallback=await browserFixture(family,{[failure]:true});
+      if(failure==="permission")fallback.saved.useBrowserSession=true;
+      if(failure==="automaticOff")fallback.saved.automaticDownloads=false;
+      await fallback.boot();fallback.item.bytesReceived=0;fallback.create();
+      let releases=0;
+      assert.equal(fallback.events.get("filename")({...fallback.item},()=>releases++),true);
+      await fallback.settle();
+      assert.equal(releases,1,`${failure} must release the browser filename decision exactly once`);
+      assert.equal(fallback.item.paused,false);assert.equal(fallback.stages.size,0);
+      assert.equal(fallback.actions.includes("cancel"),false);
+    }
   }
   console.log(`PASS ${family}: safety, user actions, scoped headers, readiness and duplicate events`);
 }

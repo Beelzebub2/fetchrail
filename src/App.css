@@ -541,7 +541,13 @@ dialog.modal-backdrop::backdrop { background: var(--backdrop); }
 .save-dock i { width: 8px; height: 8px; border-radius: 50%; background: var(--accent); }
 .save-dock svg { color: var(--ok); animation: pop 340ms var(--spring) both; }
 
-.prompt { --field: var(--bg); min-height: 100vh; display: grid; align-content: start; gap: 14px; padding: 20px 24px 22px; background: var(--panel); }
+.prompt { --field: var(--bg); min-height: 100vh; max-height: 100vh; overflow-y: auto; display: grid; align-content: start; gap: 14px; padding: 20px 24px 22px; background: var(--panel); }
+.prompt-files { display: grid; gap: 4px; max-height: 132px; overflow-y: auto; }
+.prompt-fields { min-width: 0; display: grid; gap: 14px; padding: 0; margin: 0; border: 0; }
+.prompt-file { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 9px 12px; border: 1px solid var(--line); border-radius: 8px; background: var(--field); color: var(--text-2); text-align: left; cursor: pointer; }
+.prompt-file[aria-pressed=true] { border-color: var(--accent); background: var(--accent-soft); color: var(--text); }
+.prompt-file span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.prompt-file small { flex: none; font-family: var(--mono); color: var(--text-2); }
 .prompt-head { display: flex; align-items: center; gap: 12px; }
 .prompt-head h1 { font-family: var(--display); font-size: 20px; font-weight: 650; letter-spacing: -.02em; line-height: 1.2; }
 .prompt-head p { margin-top: 2px; overflow: hidden; color: var(--text-2); font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }

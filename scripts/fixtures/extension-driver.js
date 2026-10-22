@@ -33,6 +33,36 @@ async function run() {
     step = "ping"; const companion=await send("ping");tuple={appVersion:companion.appVersion,extensionVersion:browserApi.runtime.getManifest().version,capabilities:companion.capabilities};
     step = "private access";
     const driverWindow = await browserApi.windows.getCurrent();
+    if (config.burst) {
+      const login = await browserApi.tabs.create({url:config.base + "/login?session=normal",windowId:driverWindow.id});
+      await loaded(login.id);
+      step = "burst capture with confirmations pending";
+      await Promise.all(Array.from({length:3},(_,i)=>browserApi.tabs.create({url:config.base + "/download-page?file=burst-" + i,windowId:driverWindow.id})));
+      let captured;
+      const captureDeadline=Date.now()+20000;
+      while(Date.now()<captureDeadline) {
+        const status=await send("getDownloads");
+        captured=status.downloads.filter(row=>/^burst-\d\.bin$/.test(row.fileName)&&row.status!=="cancelled"&&row.handoffCommitted===true);
+        if(captured.length===3)break;
+        await wait(100);
+      }
+      if(captured.length!==3)throw Error("Only " + captured.length + "/3 rapid website downloads reached the app");
+      if(captured.some(row=>row.status!=="paused"))throw Error("Website captures must await individual confirmation");
+      step="burst finish";
+      const confirmation=await fetch(config.base+"/confirm",{method:"POST",body:JSON.stringify(captured.map(row=>row.id))});
+      if(!confirmation.ok)throw Error(await confirmation.text());
+      const {promptCount}=await confirmation.json();
+      for(let i=0;i<300;i++) {
+        const status=await send("getDownloads");
+        if(captured.every(row=>status.downloads.find(other=>other.id===row.id)?.status==="completed"))break;
+        if(i===299)throw Error("Burst downloads did not finish");
+        await wait(100);
+      }
+      if((await browserApi.downloads.search({})).some(item=>item.state==="complete"&&/burst-\d\.bin$/.test(item.filename)))throw Error("Burst created a completed browser duplicate");
+      cases.push(...captured.map(row=>({name:row.fileName.slice(0,-4),state:"passed",id:row.id})));
+      await fetch(config.base+"/report",{method:"POST",body:JSON.stringify({ok:true,tuple,cases,promptCount})});
+      return;
+    }
     const privateAllowed = await browserApi.extension.isAllowedIncognitoAccess();
     if(!privateAllowed && !config.normalOnly)throw Error("Private-mode access is a required qualification prerequisite");
     const variants = [{ name: "normal", cookie: "normal" }, ...(!config.normalOnly ? [{ name: "private", cookie: "private", incognito: true }] : [])];
@@ -69,9 +99,10 @@ async function run() {
     await fetch(config.base + "/report", { method: "POST", body: JSON.stringify({ ok: true, tuple, cases }) });
   } catch (error) {
     const recovery = await send("recoveryState", { incognito: true }).catch(() => ({}));
+    const appDownloads = (await send("getDownloads").catch(()=>({downloads:[]}))).downloads.map(({id,fileName,status,handoffCommitted,error})=>({id,fileName,status,handoffCommitted,error}));
     const history = (await browserApi.downloads.search({}).catch(()=>[])).map(({id,state,paused,error,bytesReceived,byExtensionId})=>({id,state,paused,error,bytesReceived,byExtensionId}));
     const batch = await send("getBrowserBatch").catch(()=>null);
-    await fetch(config.base + "/report", { method: "POST", body: JSON.stringify({ ok: false, error: error.message, name:error.name, step, cases, recovery, history, batch }) });
+    await fetch(config.base + "/report", { method: "POST", body: JSON.stringify({ ok: false, error: error.message, name:error.name, step, cases, recovery, appDownloads, history, batch }) });
   } finally {clearInterval(progressTimer);}
 }
 void run();
