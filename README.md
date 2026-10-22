@@ -125,6 +125,10 @@ Existing Braid installations retain their history, queues, settings, and partial
 
 To report a problem, [open an issue](https://github.com/Beelzebub2/fetchrail/issues) with your Fetchrail version, operating system, browser if relevant, steps to reproduce, and the error shown by the app. Remove private URLs or credentials from anything you share.
 
+## License
+
+Fetchrail is licensed under the [Apache License 2.0](LICENSE). Redistribution must retain that license and the relevant attribution and notices in [NOTICE](NOTICE); changes must be identified. Apache 2.0 permits commercial reuse and proprietary derivatives, and does not require on-screen or UI credit. Third-party components remain under their own licenses.
+
 <p align="center">
   <strong>Put your downloads on rails.</strong><br>
   <a href="https://github.com/Beelzebub2/fetchrail/releases/latest">Download Fetchrail</a>

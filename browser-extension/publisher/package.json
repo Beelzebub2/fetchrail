@@ -1,6 +1,7 @@
 {
   "name": "fetchrail-amo-publisher",
   "private": true,
+  "license": "Apache-2.0",
   "version": "1.0.0",
   "type": "module",
   "description": "Release-only tooling for the Firefox Add-ons store",

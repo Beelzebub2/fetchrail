@@ -3,6 +3,7 @@ name = "fetchrail"
 version = "0.8.2"
 description = "Fetchrail high-performance download manager"
 authors = ["RRMTools"]
+license = "Apache-2.0"
 edition = "2021"
 default-run = "fetchrail"
 
