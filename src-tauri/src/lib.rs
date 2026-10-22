@@ -51,7 +51,7 @@ use tauri::{
     menu::{Menu, MenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
 };
-use tauri::{AppHandle, Manager, State, WindowEvent};
+use tauri::{AppHandle, Emitter, Manager, State, WindowEvent};
 use uuid::Uuid;
 
 struct FrontendReady(AtomicBool, std::sync::Mutex<Option<String>>);
@@ -59,6 +59,8 @@ struct ShuttingDown(AtomicBool);
 struct TrayReady(AtomicBool);
 struct BrowserIntegration(std::sync::Mutex<platform::Feature>);
 struct StartupRecovery(String);
+#[derive(Default)]
+struct PendingDownloadPrompts(std::sync::Mutex<Vec<Uuid>>, AtomicBool);
 
 fn valid_backup(path: &std::path::Path, name: &str) -> bool {
     match name {
@@ -663,26 +665,140 @@ fn restart_app(app: AppHandle) -> Result<(), String> {
 }
 
 const PROMPT_WINDOW: &str = "confirm-";
+const SHARED_PROMPT_WINDOW: &str = "confirm-pending";
+
+#[tauri::command]
+async fn dismiss_download_prompt(
+    manager: State<'_, Arc<DownloadManager>>,
+    id: Uuid,
+) -> Result<(), String> {
+    manager.dismiss_prompt(id).await
+}
+
+#[tauri::command]
+async fn pending_download_prompts(
+    app: AppHandle,
+    manager: State<'_, Arc<DownloadManager>>,
+    prompts: State<'_, PendingDownloadPrompts>,
+) -> Result<Vec<DownloadRecord>, String> {
+    let ids = prompts.0.lock().unwrap().clone();
+    let records = manager
+        .list()
+        .await
+        .into_iter()
+        .filter(|record| ids.contains(&record.id) && record.status == model::DownloadStatus::Paused)
+        .collect::<Vec<_>>();
+    // Prune only the IDs in this snapshot; captures can arrive while listing.
+    let mut pending = prompts.0.lock().unwrap();
+    pending.retain(|id| !ids.contains(id) || records.iter().any(|record| record.id == *id));
+    drop(pending);
+    let handle = app.clone();
+    let _ = app.run_on_main_thread(move || {
+        let state = handle.state::<PendingDownloadPrompts>();
+        if state.0.lock().unwrap().is_empty() {
+            if let Some(window) = handle.get_webview_window(SHARED_PROMPT_WINDOW) {
+                let _ = window.hide();
+            }
+        }
+    });
+    Ok(records
+        .into_iter()
+        .map(DownloadRecord::public_view)
+        .collect())
+}
+
+#[tauri::command]
+async fn finish_download_prompts(
+    app: AppHandle,
+    ids: Vec<Uuid>,
+    show_downloads: bool,
+) -> Result<(), String> {
+    let (sent, received) = tokio::sync::oneshot::channel();
+    let handle = app.clone();
+    app.run_on_main_thread(move || {
+        let prompts = handle.state::<PendingDownloadPrompts>();
+        let mut pending = prompts.0.lock().unwrap();
+        pending.retain(|id| !ids.contains(id));
+        if pending.is_empty() {
+            // Reuse the hidden window. A later capture can show it under the same
+            // lock, avoiding a destroy/create race that loses a newly arrived file.
+            if let Some(window) = handle.get_webview_window(SHARED_PROMPT_WINDOW) {
+                let _ = window.hide();
+            }
+            if show_downloads {
+                show_main_window(&handle);
+            }
+        }
+        let _ = sent.send(());
+    })
+    .map_err(|error| error.to_string())?;
+    received.await.map_err(|error| error.to_string())
+}
 
 /// Opens the "Download file info" window for a download a browser just handed over.
 /// If it cannot open, the download simply stays paused in the list.
 pub(crate) fn prompt_for_download(app: &AppHandle, id: Uuid) {
-    let window = tauri::WebviewWindowBuilder::new(
-        app,
-        format!("{PROMPT_WINDOW}{id}"),
-        tauri::WebviewUrl::App(format!("index.html?confirm={id}").into()),
-    )
-    .title("Download file info")
-    .inner_size(580.0, 432.0)
-    .resizable(false)
-    .maximizable(false)
-    .minimizable(false)
-    .always_on_top(true)
-    .center()
-    .build();
-    if let Err(error) = window {
-        eprintln!("Fetchrail download prompt: {error}");
+    let handle = app.clone();
+    let _ = app.run_on_main_thread(move || show_pending_download_prompt(&handle, id));
+}
+
+fn show_pending_download_prompt(app: &AppHandle, id: Uuid) {
+    let prompts = app.state::<PendingDownloadPrompts>();
+    let mut pending = prompts.0.lock().unwrap();
+    if !pending.contains(&id) {
+        pending.push(id);
     }
+    let count = pending.len();
+    drop(pending);
+    if let Some(window) = app.get_webview_window(SHARED_PROMPT_WINDOW) {
+        let _ = window.set_size(tauri::LogicalSize::new(
+            580.0,
+            if count > 1 { 680.0 } else { 432.0 },
+        ));
+        let _ = window.emit("fetchrail://download-prompt-added", id);
+        if !window.is_visible().unwrap_or(false) {
+            let _ = window.show();
+            let _ = window.set_focus();
+        }
+        return;
+    }
+    if prompts.1.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    // WebView2 construction must run off the event thread, with no queue lock
+    // held. Captures arriving during construction join the same pending list.
+    let handle = app.clone();
+    std::thread::spawn(move || {
+        let window = tauri::WebviewWindowBuilder::new(
+            &handle,
+            SHARED_PROMPT_WINDOW,
+            tauri::WebviewUrl::App("index.html?confirm=pending".into()),
+        )
+        .title("Download file info")
+        .inner_size(580.0, 432.0)
+        .resizable(false)
+        .maximizable(false)
+        .minimizable(false)
+        .always_on_top(true)
+        .visible(false)
+        .center()
+        .build();
+        let created = window.is_ok();
+        if let Err(error) = window {
+            eprintln!("Fetchrail download prompt: {error}");
+        }
+        let next = handle.clone();
+        let _ = handle.run_on_main_thread(move || {
+            let state = next.state::<PendingDownloadPrompts>();
+            state.1.store(false, Ordering::Release);
+            let first = state.0.lock().unwrap().first().copied();
+            if created {
+                if let Some(id) = first {
+                    show_pending_download_prompt(&next, id);
+                }
+            }
+        });
+    });
 }
 
 fn show_main_window(app: &AppHandle) {
@@ -882,6 +998,7 @@ pub fn run() {
             .expect("browser request journal"),
         )
         .manage(ShuttingDown(AtomicBool::new(false)))
+        .manage(PendingDownloadPrompts::default())
         .manage(TrayReady(AtomicBool::new(false)))
         .manage(BrowserIntegration(std::sync::Mutex::new(
             platform::Feature::new(false, "Browser integration has not started."),
@@ -1072,7 +1189,23 @@ pub fn run() {
                 let Some(manager) = window.app_handle().try_state::<Arc<DownloadManager>>() else {
                     return;
                 };
-                // Closing a download prompt is its Cancel button; an answered prompt is destroyed instead.
+                // Close cancels only the current group; later arrivals can reuse the window.
+                if window.label() == SHARED_PROMPT_WINDOW {
+                    api.prevent_close();
+                    let prompts = window.app_handle().state::<PendingDownloadPrompts>();
+                    let ids = {
+                        let mut pending = prompts.0.lock().unwrap();
+                        let _ = window.hide();
+                        std::mem::take(&mut *pending)
+                    };
+                    let manager = manager.inner().clone();
+                    tauri::async_runtime::spawn(async move {
+                        for id in ids {
+                            let _ = manager.dismiss_prompt(id).await;
+                        }
+                    });
+                    return;
+                }
                 if let Some(id) = window.label().strip_prefix(PROMPT_WINDOW) {
                     if let Ok(id) = Uuid::parse_str(id) {
                         let manager = manager.inner().clone();
@@ -1156,6 +1289,9 @@ pub fn run() {
             cancel_download,
             remove_download,
             place_download,
+            pending_download_prompts,
+            finish_download_prompts,
+            dismiss_download_prompt,
             reveal_download,
             get_settings,
             open_browser_extension_store,

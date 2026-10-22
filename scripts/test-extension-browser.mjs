@@ -16,6 +16,7 @@ const executable = resolve(process.argv[2] ?? `src-tauri/target/debug/${executab
 await access(executable);
 const families = process.argv.includes("--chromium") ? ["chromium"] : process.argv.includes("--firefox") ? ["firefox"] : ["chromium", "firefox"];
 const reports = [];
+const burst = process.argv.includes("--burst");
 async function openSocket(url) {
   const socket=new WebSocket(url);
   return new Promise((resolve,reject)=>{
@@ -32,26 +33,52 @@ for (const family of families) {
   await cp(resolve("browser-extension/dist/" + family), extension, { recursive: true });
   const host = "com.fetchrail.fixture" + randomUUID().replaceAll("-", "");
   const registryKeys = family === "firefox" ? [`HKCU\\Software\\Mozilla\\NativeMessagingHosts\\${host}`] : ["Google\\Chrome", "Chromium"].map(vendor => `HKCU\\Software\\${vendor}\\NativeMessagingHosts\\${host}`);
-  let browserContext, browserProcess, socket, app, report, claimed = false, ready = false, firefoxLog = "", trace, progress, browserVersion;
+  let browserContext, browserProcess, socket, app, appBrowser, appDebugPort, report, claimed = false, ready = false, firefoxLog = "", trace, progress, browserVersion;
   const fileRequests = [];
   const cookies = new Map(), bodySize = 8 * 1024 * 1024;
   const bodies = Object.fromEntries(["normal", "private", "container1", "container2"].map((name, i) => [name, Buffer.alloc(bodySize, 0x31 + i)]));
+  if (burst) for (let i = 0; i < 3; i++) bodies["burst-" + i] = Buffer.alloc(i === 0 ? bodySize : 256 * 1024, 0x41 + i);
   const server = createServer((request, response) => {
     const url = new URL(request.url, "http://fixture");
+    if (burst && url.pathname === "/confirm") {
+      void (async()=>{
+        const chunks=[];for await(const bytes of request)chunks.push(bytes);
+        const ids=JSON.parse(Buffer.concat(chunks).toString("utf8"));
+        appBrowser=await chromium.connectOverCDP("http://127.0.0.1:"+appDebugPort);
+        let prompts=[];
+        const deadline=Date.now()+15000;
+        while(Date.now()<deadline) {
+          prompts=appBrowser.contexts().flatMap(context=>context.pages()).filter(page=>page.url().includes("confirm="));
+          if(prompts.length)break;
+          await delay(100);
+        }
+        assert.equal(prompts.length,1,"A burst must open exactly one native confirmation window");
+        const prompt=prompts[0];
+        await prompt.getByRole("heading",{name:"Download 3 files",exact:true}).waitFor();
+        await prompt.getByRole("button",{name:"Start downloads",exact:true}).click();
+        await prompt.waitForFunction(()=>!document.querySelector(".prompt h1"));
+        // A late close/dismiss must preserve files already started by the group.
+        await prompt.evaluate(async ids=>{
+          for(const id of ids)await window.__TAURI_INTERNALS__.invoke("dismiss_download_prompt",{id});
+        },ids);
+        response.setHeader("Content-Type","application/json");response.end(JSON.stringify({promptCount:prompts.length}));
+      })().catch(error=>{response.writeHead(500).end(error.message);});return;
+    }
     if (url.pathname === "/progress") { let data=""; request.on("data",bytes=>data+=bytes);request.on("end",()=>{progress=JSON.parse(data);response.end();});return; }
     if (url.pathname === "/trace") { let data=""; request.on("data",bytes=>data+=bytes); request.on("end",()=>{trace=JSON.parse(data);response.end();}); return; }
     if (url.pathname === "/claim") { response.setHeader("Content-Type", "application/json"); if (!ready) response.end('{"ready":false}'); else if (claimed) response.end('{"stop":true}'); else { claimed = true; response.end('{"ready":true}'); } return; }
     if (url.pathname === "/report") { let text = ""; request.on("data", bytes => { text += bytes; }); request.on("end", () => { report = JSON.parse(text); response.end("ok"); }); return; }
     if (url.pathname === "/login") { response.setHeader("Set-Cookie", "session=" + url.searchParams.get("session") + "; Path=/; SameSite=Lax"); response.setHeader("Content-Type", "text/html"); response.end("<!doctype html><title>Isolated signed-in fixture</title>Ready"); return; }
-    if (url.pathname === "/download-page") { response.setHeader("Content-Type", "text/html"); response.end('<!doctype html><a id="file" href="/file.bin">Download</a><script>setTimeout(()=>document.querySelector("a").click(),300)</script>'); return; }
+    if (url.pathname === "/download-page") { response.setHeader("Content-Type", "text/html"); response.end('<!doctype html><a id="file" href="/file.bin' + (url.searchParams.has("file") ? '?file=' + encodeURIComponent(url.searchParams.get("file")) : '') + '">Download</a><script>setTimeout(()=>document.querySelector("a").click(),300)</script>'); return; }
     if (url.pathname === "/file.bin") {
-      const name = request.headers.cookie?.match(/(?:^|; )session=([^;]+)/)?.[1];
-      fileRequests.push({session:name, headers:Object.keys(request.headers), userAgent:request.headers["user-agent"]});
-      if (!bodies[name]) { response.writeHead(403).end(); return; }
+      const session = request.headers.cookie?.match(/(?:^|; )session=([^;]+)/)?.[1];
+      const name = url.searchParams.get("file") ?? session;
+      fileRequests.push({session, name, headers:Object.keys(request.headers), userAgent:request.headers["user-agent"]});
+      if (!bodies[session] || !bodies[name]) { response.writeHead(403).end(); return; }
       cookies.set(name, (cookies.get(name) ?? 0) + 1);
-      response.writeHead(200, { "Content-Type": "application/octet-stream", "Content-Length": bodySize, "Content-Disposition": `attachment; filename="${name}.bin"`, ETag: `"${name}"` });
+      response.writeHead(200, { "Content-Type": "application/octet-stream", "Content-Length": bodies[name].length, "Content-Disposition": `attachment; filename="${name}.bin"`, ETag: `"${name}"` });
       let offset = 0;
-      const timer = setInterval(() => { if (offset >= bodySize) { clearInterval(timer); response.end(); return; } response.write(bodies[name].subarray(offset, offset += 65536)); }, 15);
+      const timer = setInterval(() => { if (offset >= bodies[name].length) { clearInterval(timer); response.end(); return; } response.write(bodies[name].subarray(offset, offset += 65536)); }, 15);
       response.on("close", () => clearInterval(timer)); return;
     }
     response.writeHead(404).end();
@@ -65,10 +92,14 @@ for (const family of families) {
     const backgroundPath = join(extension, "background.js");
     await writeFile(backgroundPath, (await readFile(backgroundPath, "utf8")).replace('"com.rrmtools.braid"', JSON.stringify(host)) + `\nsetInterval(()=>void fetch(${JSON.stringify(base + "/trace")},{method:"POST",body:JSON.stringify([...recentRequests.values()].filter(t=>t.url.endsWith("/file.bin")).map(t=>({...t,context:Object.keys(t.context)})))}),500);\nvoid api.tabs.create({url:api.runtime.getURL("fixture-driver.html")});\n`);
     await writeFile(join(extension, "fixture-driver.html"), '<!doctype html><title>Fetchrail qualification</title><script src="fixture-driver.js"></script>');
-    await writeFile(join(extension, "fixture-driver.js"), "const FETCHRAIL_BROWSER_FIXTURE = " + JSON.stringify({ family, base, normalOnly:process.argv.includes("--normal-only") }) + ";\n" + await readFile(new URL("./fixtures/extension-driver.js", import.meta.url), "utf8"));
+    await writeFile(join(extension, "fixture-driver.js"), "const FETCHRAIL_BROWSER_FIXTURE = " + JSON.stringify({ family, base, burst, normalOnly:process.argv.includes("--normal-only") }) + ";\n" + await readFile(new URL("./fixtures/extension-driver.js", import.meta.url), "utf8"));
     const nativeManifest = join(fixture.root, "native-host.json");
     await writeFile(nativeManifest, JSON.stringify({ name: host, description: "Isolated Fetchrail qualification host", path: executable, type: "stdio", ...(family === "firefox" ? { allowed_extensions: [manifest.browser_specific_settings.gecko.id] } : { allowed_origins: ["chrome-extension://fkmedfamaoejlhddajndhjemiedmnldh/"] }) }));
     for (const key of registryKeys) execFileSync("reg.exe", ["add", key, "/ve", "/t", "REG_SZ", "/d", nativeManifest, "/f"], { windowsHide: true, stdio: "pipe" });
+    if(burst) {
+      const listener=createTcpServer();await new Promise(done=>listener.listen(0,"127.0.0.1",done));appDebugPort=listener.address().port;await new Promise(done=>listener.close(done));
+      fixture.env.WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS=(fixture.env.WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS??"")+" --remote-debugging-port="+appDebugPort;
+    }
     app = spawn(executable, ["--background"], { env: fixture.env, windowsHide: true, stdio: "ignore" });
     let bridgeReady=false;
     for(let n=0;n<300&&!bridgeReady;n++){if(app.exitCode!==null)throw Error("Isolated app exited before bridge initialization");bridgeReady=await access(join(fixture.stateDir,"browser-bridge.json")).then(()=>true,()=>false);if(!bridgeReady)await delay(100);}
@@ -83,6 +114,12 @@ for (const family of families) {
       await toggle.waitFor();
       if(!await toggle.evaluate(e=>e.hasAttribute("checked"))) await toggle.click();
       await delay(500); await browserContext.close(); browserContext = null;
+      // DevTools' "allow" overrides Chromium's download delegate and bypasses
+      // extension filename decisions. Exercise the real delegate in this profile.
+      const preferencesPath=join(profile,"Default","Preferences");
+      const preferences=JSON.parse(await readFile(preferencesPath,"utf8"));
+      preferences.download={...preferences.download,default_directory:downloads,prompt_for_download:false};
+      await writeFile(preferencesPath,JSON.stringify(preferences));
       const listener=createTcpServer();await new Promise(done=>listener.listen(0,"127.0.0.1",done));const port=listener.address().port;await new Promise(done=>listener.close(done));
       ready=true;
       browserProcess=spawn(process.env.FETCHRAIL_CHROMIUM_EXECUTABLE??chromium.executablePath(),["--headless","--no-first-run","--no-sandbox",`--user-data-dir=${profile}`,`--load-extension=${extension}`,`--disable-extensions-except=${extension}`,`--remote-debugging-port=${port}`],{env:fixture.env,windowsHide:true,stdio:"ignore"});
@@ -93,7 +130,7 @@ for (const family of families) {
       let nextId=0;const pending=new Map();
       socket.addEventListener("message",event=>{const message=JSON.parse(event.data),call=pending.get(message.id);if(!call)return;pending.delete(message.id);message.error?call.reject(Error(message.error.message)):call.resolve(message.result);});
       const send=(method,params={})=>new Promise((resolve,reject)=>{const id=++nextId,timer=setTimeout(()=>{pending.delete(id);reject(Error(method+" timed out"));},20000);pending.set(id,{resolve(v){clearTimeout(timer);resolve(v);},reject(e){clearTimeout(timer);reject(e);}});socket.send(JSON.stringify({id,method,params}));});
-      await send("Browser.setDownloadBehavior",{behavior:"allow",downloadPath:downloads});
+      await send("Browser.setDownloadBehavior",{behavior:"default"});
       await send("Target.createTarget",{url:"chrome-extension://fkmedfamaoejlhddajndhjemiedmnldh/fixture-driver.html"});
     } else {
       const listener = createTcpServer(); await new Promise(done => listener.listen(0, "127.0.0.1", done)); const port = listener.address().port; await new Promise(done => listener.close(done));
@@ -127,11 +164,11 @@ for (const family of families) {
       assert.deepEqual(await readFile(row.destination), bodies[result.name]);
       assert.equal(cookies.get(result.name), 2, "One browser GET and one retained native GET, without an extra native probe");
     }
-    reports.push({ family, browserVersion, scope:process.argv.includes("--normal-only")?"normal only":"normal/private/containers where applicable", browser: family === "chromium" ? process.env.FETCHRAIL_CHROMIUM_EXECUTABLE ?? chromium.executablePath() : firefox.executablePath(), ...report });
+    reports.push({ family, browserVersion, scope:burst?"normal website burst":process.argv.includes("--normal-only")?"normal only":"normal/private/containers where applicable", browser: family === "chromium" ? process.env.FETCHRAIL_CHROMIUM_EXECUTABLE ?? chromium.executablePath() : firefox.executablePath(), ...report });
     console.log("PASS actual " + family + ": " + report.cases.map(c => c.name + "=" + c.state).join(", "));
   } finally {
     if(firefoxLog) {await mkdir("artifacts/extension-browser",{recursive:true});await writeFile("artifacts/extension-browser/firefox.log",firefoxLog);}
-    socket?.close(); await browserContext?.close().catch(() => {});
+    socket?.close(); await browserContext?.close().catch(() => {});await appBrowser?.close().catch(()=>{});
     if (browserProcess?.exitCode === null) { const stopped = new Promise(done => browserProcess.once("exit", done)); browserProcess.kill(); await stopped; }
     if (app?.exitCode === null) { const stopped = new Promise(done => app.once("exit", done)); app.kill(); await stopped; }
     for (const key of registryKeys) { assert.ok(key.endsWith(host)); try { execFileSync("reg.exe", ["delete", key, "/f"], { windowsHide: true, stdio: "pipe" }); } catch {} }

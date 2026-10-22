@@ -544,6 +544,11 @@ function safeBrowserDownload(item) {
   return active && (!item.danger || item.danger === "safe")
     && (!item.byExtensionId || item.byExtensionId === api.runtime.id) && /^https?:\/\//i.test(item.finalUrl || item.url);
 }
+function browserDownloadReady(item) {
+  // Byte progress has no onChanged event. Chromium's filename decision holds
+  // completion even when the whole body arrives before pause() takes effect.
+  return item.bytesReceived > 0 || filenameDecisions.has(item.id);
+}
 function cancelledBrowserDownload(item) {
   // Chromium can retain paused=true on a terminal USER_CANCELED item.
   return item?.state === "interrupted" && (item.error === "USER_CANCELED" || (!item.error && !item.paused));
@@ -596,11 +601,9 @@ async function routeBrowserDownload(item) {
     }
     captureBatch = batch;
     if (!batch && (await api.storage.local.get("automaticDownloads")).automaticDownloads === false) return;
-    if (!(item.bytesReceived > 0)) return; // Wait until the browser has started its body, including save dialogs.
-    await requireCapabilities(["addDownloads", "getHandoff", "commitHandoff", "abortHandoff", "handoffReceipts"]);
+    if (!browserDownloadReady(item)) return;
     await ensureSessionPermission();
     const torrent = /\.torrent$/i.test(new URL(item.finalUrl || item.url).pathname) || /(?:x-)?bittorrent/i.test(item.mime ?? "") || /\.torrent$/i.test(item.filename ?? "");
-    if (torrent) await requireCapabilities(["torrentOfferReceipts"]);
     if (useBrowserSession && !trace) throw nativeError("SESSION_UNAVAILABLE", "No unambiguous browser request was observed. Keep this file in the browser, or retry after granting session access.");
     handoff = { id: crypto.randomUUID(), browserId: item.id, browserStartTime: item.startTime,
       incognito: !!item.incognito, cookieStoreId: item.cookieStoreId, source: batch ? "browserBatch" : "clickMonitor",
@@ -616,8 +619,14 @@ async function routeBrowserDownload(item) {
     paused = true;
     const [current] = await api.downloads.search({ id: item.id });
     if (!safeBrowserDownload(current) || !current.paused || !!current.incognito !== handoff.incognito || current.cookieStoreId !== item.cookieStoreId) throw nativeError("BROWSER_CHANGED", "The browser download changed before verification.");
+    // Hold every browser ID before a cold native startup or slow verification;
+    // independent handoffs must not race their browser bodies to completion.
+    await requireCapabilities(["addDownloads", "getHandoff", "commitHandoff", "abortHandoff", "handoffReceipts", ...(torrent ? ["torrentOfferReceipts"] : [])]);
     await observingRequests;
-    const requestTrace = matchingRequest(current);
+    // Firefox can emit onErrorOccurred when pause stops the browser channel.
+    // Retain the already matched final GET if that event removes its observation.
+    const requestTrace = matchingRequest(current) ?? (trace?.url === (current.finalUrl || current.url) ? trace : null);
+    if (useBrowserSession && !requestTrace) throw nativeError("SESSION_UNAVAILABLE", "The browser request changed before session capture. Finish this file in the browser.");
     const context = useBrowserSession ? requestTrace?.context : null;
     const capturedItem = { url: requestTrace?.method === "GET" ? requestTrace.url : current.finalUrl || current.url,
       suggestedFileName: current.filename?.split(/[\\/]/).pop(),
@@ -742,16 +751,23 @@ async function reconcileHandoffs() {
 
 const eligibility = new Map();
 const processedDownloads = new Set();
+const filenameDecisions = new Map();
+function releaseFilename(id) {
+  const suggest = filenameDecisions.get(id);
+  filenameDecisions.delete(id);
+  suggest?.(); // Preserve the browser/other extensions' filename and conflict policy.
+}
 function considerDownload(item) {
   if (!item || processedDownloads.has(item.id) || routingDownloads.has(item.id)) return;
   const state = eligibility.get(item.id) ?? { started: Date.now() };
   eligibility.set(item.id, state);
-  if (item.state === "complete" || (item.state === "interrupted" && !item.paused) || item.paused) { eligibility.delete(item.id); return; }
-  if (safeBrowserDownload(item) && item.bytesReceived > 0) {
+  if (item.state === "complete" || (item.state === "interrupted" && !item.paused) || item.paused) { clearTimeout(state.timer); eligibility.delete(item.id); return; }
+  if (safeBrowserDownload(item) && browserDownloadReady(item)) {
     clearTimeout(state.timer); eligibility.delete(item.id);
     processedDownloads.add(item.id);
     routingDownloads.add(item.id); activeActions++;
     void routeBrowserDownload(item).finally(async () => {
+      releaseFilename(item.id);
       routingDownloads.delete(item.id);
       try { await reconcileBrowserTerminal(item.id); } catch { /* A later browser event/poll can reconcile again. */ }
       activeActions--;
@@ -761,11 +777,17 @@ function considerDownload(item) {
       state.timer = null;
       const [latest] = await api.downloads.search({ id: item.id }).catch(() => []);
       considerDownload(latest);
-    }, 1000);
+    }, Date.now() - state.started < 1000 ? 50 : 1000);
   }
 }
 if (!api.downloads?.onCreated) void setBadge("!", "Fetchrail: reload the extension to enable browser download capture.");
 api.downloads?.onCreated?.addListener(considerDownload);
+if (!isFirefox) api.downloads?.onDeterminingFilename?.addListener((item, suggest) => {
+  if (!safeBrowserDownload(item) || item.paused || (processedDownloads.has(item.id) && !routingDownloads.has(item.id)) || filenameDecisions.has(item.id)) { suggest(); return; }
+  filenameDecisions.set(item.id, suggest);
+  considerDownload(item);
+  return true; // Each independent handoff releases its own completion decision.
+});
 async function reconcileBrowserTerminal(id) {
   if (routingDownloads.has(id)) return;
   if (directStart) await directStart;

@@ -3264,6 +3264,8 @@ function QueueSchedule({ queue, busy, save }: { queue: QueueRecord; busy: boolea
 }
 
 export function DownloadPrompt({ id }: { id: string }) {
+  const grouped = id === "pending";
+  const [downloads, setDownloads] = useState<DownloadRecord[]>([]);
   const [item, setItem] = useState<DownloadRecord | null>(null);
   const [settings, setSettings] = useState<DownloadSettings | null>(null);
   const [category, setCategory] = useState("");
@@ -3272,64 +3274,99 @@ export function DownloadPrompt({ id }: { id: string }) {
   const [remember, setRemember] = useState(false);
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
+  const drafts = useRef(new Map<string, { category: string; folder: string; name: string; remember: boolean }>());
+  const selection = useRef<string | null>(null);
+  const refreshRef = useRef<() => Promise<void>>(async () => {});
+
+  function selectItem(next: DownloadRecord) {
+    if (item) drafts.current.set(item.id, { category, folder, name, remember });
+    const draft = drafts.current.get(next.id)!;
+    selection.current = next.id;
+    setItem(next); setCategory(draft.category); setFolder(draft.folder); setName(draft.name); setRemember(draft.remember);
+  }
 
   useEffect(() => {
-    let disposed = false, booting = true;
+    let disposed = false, booting = true, generation = 0;
+    let currentSettings: DownloadSettings;
+    let known = new Set<string>();
     const buffered: (() => void)[] = [];
     const accept = (action: () => void) => { if (!disposed) { if (booting) buffered.push(action); else action(); } };
-    const unlistenSettings = listen<DownloadSettings>("fetchrail://settings-updated", event => accept(() => { setSettings(event.payload); applyLook(event.payload); }));
-    // Subscribe before the snapshot so delayed IPC cannot overwrite a newer event.
-    const unlisten = listen<DownloadRecord>("fetchrail://download-updated", (event) => accept(() => {
-      if (event.payload.id === id && event.payload.status !== "paused") {
-        if (event.payload.status !== "cancelled") void invoke("show_download_progress", { id }).catch((error) => { if (!disposed) setMessage(String(error)); });
+    const refresh = async () => {
+      const version = ++generation;
+      const all = await invoke<DownloadRecord[]>(grouped ? "pending_download_prompts" : "list_downloads");
+      if (disposed || version !== generation) return;
+      const pending = grouped ? all : all.filter(record => record.id === id);
+      known = new Set(pending.map(record => record.id));
+      for (const key of drafts.current.keys()) if (!known.has(key)) drafts.current.delete(key);
+      for (const record of pending) if (!drafts.current.has(record.id)) drafts.current.set(record.id, {
+        category: currentSettings.sortIntoCategoryFolders ? categoryFor(record.fileName, currentSettings)?.name ?? "" : "",
+        folder: record.destination.slice(0, -record.fileName.length - 1), name: record.fileName, remember: false,
+      });
+      setDownloads(pending);
+      const next = pending.find(record => record.id === selection.current) ?? pending[0];
+      if (!next) { selection.current = null; setItem(null); if (!grouped) await getCurrentWindow().destroy(); return; }
+      if (selection.current !== next.id) {
+        const draft = drafts.current.get(next.id)!;
+        selection.current = next.id;
+        setCategory(draft.category); setFolder(draft.folder); setName(draft.name); setRemember(draft.remember);
+      }
+      setItem(next);
+    };
+    const reload = () => { void refresh().catch(error => { if (!disposed) setMessage(String(error)); }); };
+    refreshRef.current = refresh;
+    const unlistenSettings = listen<DownloadSettings>("fetchrail://settings-updated", event => accept(() => {
+      currentSettings = event.payload; setSettings(event.payload); applyLook(event.payload);
+    }));
+    const unlisten = listen<DownloadRecord>("fetchrail://download-updated", event => accept(() => {
+      if (!known.has(event.payload.id)) return;
+      if (grouped) reload();
+      else if (event.payload.status !== "paused") {
+        if (event.payload.status !== "cancelled") void invoke("show_download_progress", { id }).catch(error => { if (!disposed) setMessage(String(error)); });
         void getCurrentWindow().destroy();
       }
     }));
-    const unlistenRemoved = listen<string>("fetchrail://download-removed", (event) => accept(() => {
-      if (event.payload === id) void getCurrentWindow().destroy();
-    }));
-    Promise.all([unlistenSettings, unlisten, unlistenRemoved]).then(() => Promise.all([invoke<DownloadRecord[]>("list_downloads"), invoke<DownloadSettings>("get_settings")]))
-      .then(([items, current]) => {
+    const unlistenRemoved = listen<string>("fetchrail://download-removed", event => accept(() => { if (known.has(event.payload)) reload(); }));
+    const unlistenAdded = listen<string>("fetchrail://download-prompt-added", () => accept(reload));
+    Promise.all([unlistenSettings, unlisten, unlistenRemoved, unlistenAdded])
+      .then(() => invoke<DownloadSettings>("get_settings"))
+      .then(async current => {
         if (disposed) return;
-        const found = items.find((entry) => entry.id === id);
-        if (!found) return void getCurrentWindow().destroy();
-        applyLook(current);
-        setItem(found);
-        setSettings(current);
-        setName(found.fileName);
-        setFolder(found.destination.slice(0, -found.fileName.length - 1));
-        setCategory(current.sortIntoCategoryFolders ? categoryFor(found.fileName, current)?.name ?? "" : "");
+        currentSettings = current; setSettings(current); applyLook(current);
+        await refresh();
         booting = false; buffered.splice(0).forEach(action => action());
-      })
-      .catch((error) => { if (!disposed) { booting = false; buffered.splice(0).forEach(action => action()); setMessage(String(error)); } });
+      }).catch(error => { if (!disposed) { booting = false; buffered.splice(0).forEach(action => action()); setMessage(String(error)); } });
     return () => {
       disposed = true;
-      for (const pending of [unlisten, unlistenRemoved, unlistenSettings]) void pending.then(stop => stop()).catch(() => {});
+      for (const pending of [unlisten, unlistenRemoved, unlistenSettings, unlistenAdded]) void pending.then(stop => stop()).catch(() => {});
     };
-  }, [id]);
+  }, [id, grouped]);
 
   async function finish(action: "start" | "later" | "cancel") {
-    if (!settings) return;
-    setBusy(true);
-    setMessage(null);
-    try {
-      if (action === "cancel") {
-        await invoke("remove_download", { id, deleteFile: false });
-      } else {
-        if (remember) {
-          await invoke("remember_download_folder", { category: category || null, directory: folder });
+    if (!settings || busy) return;
+    setBusy(true); setMessage(null);
+    const done: string[] = [], errors: string[] = [];
+    for (const record of downloads) {
+      const draft = record.id === item?.id ? { category, folder, name, remember } : drafts.current.get(record.id)!;
+      try {
+        if (action === "cancel") await invoke(grouped ? "dismiss_download_prompt" : "remove_download", { id: record.id, deleteFile: false });
+        else {
+          if (draft.remember) await invoke("remember_download_folder", { category: draft.category || null, directory: draft.folder });
+          await invoke("place_download", { id: record.id, directory: draft.folder, fileName: draft.name });
+          if (action === "start") {
+            if (downloads.length === 1) await invoke("show_download_progress", { id: record.id });
+            await invoke("resume_download", { id: record.id });
+          }
         }
-        await invoke("place_download", { id, directory: folder, fileName: name });
-        if (action === "start") {
-          await invoke("show_download_progress", { id });
-          await invoke("resume_download", { id });
-        }
-      }
-      await getCurrentWindow().destroy();
-    } catch (error) {
-      setMessage(String(error));
-      setBusy(false);
+        done.push(record.id);
+      } catch (error) { errors.push(record.fileName + ": " + String(error)); }
     }
+    try {
+      if (grouped) {
+        await invoke("finish_download_prompts", { ids: done, showDownloads: action === "start" && downloads.length > 1 });
+        await refreshRef.current();
+      } else if (!errors.length) await getCurrentWindow().destroy();
+    } catch (error) { errors.push(String(error)); }
+    setMessage(errors.length ? errors.join(" · ") : null); setBusy(false);
   }
 
   if (!item || !settings) {
@@ -3352,10 +3389,17 @@ export function DownloadPrompt({ id }: { id: string }) {
       <div className="prompt-head">
         <Logo size={34} />
         <div>
-          <h1>Download file info</h1>
-          <p className="mono">{size} · {hostOf(item.url)}</p>
+          <h1>{downloads.length > 1 ? "Download " + downloads.length + " files" : "Download file info"}</h1>
+          <p className="mono">{downloads.length > 1 ? "Review each file below, then start the group." : size + " · " + hostOf(item.url)}</p>
         </div>
       </div>
+      {downloads.length > 1 && <div className="prompt-files" role="group" aria-label="Captured files">
+        {downloads.map(record => <button key={record.id} type="button" className="prompt-file" aria-pressed={record.id === item.id} disabled={busy} onClick={() => selectItem(record)}>
+          <span>{record.id === item.id ? name : drafts.current.get(record.id)?.name ?? record.fileName}</span>
+          <small>{record.totalBytes == null ? "Unknown size" : formatBytes(record.totalBytes, true)}</small>
+        </button>)}
+      </div>}
+      <fieldset className="prompt-fields" disabled={busy}>
       <label>
         URL
         <input className="mono" value={item.url} readOnly />
@@ -3402,16 +3446,17 @@ export function DownloadPrompt({ id }: { id: string }) {
         <input type="checkbox" checked={remember} onChange={(event) => setRemember(event.target.checked)} />
         Remember this folder for {category || "General"}
       </label>
+      </fieldset>
       {message && <p className="extension-error" role="alert">{message}</p>}
       <div className="prompt-actions">
         <button type="button" className="ghost-button" disabled={busy} onClick={() => void finish("cancel")}>
-          Cancel
+          {downloads.length > 1 ? "Cancel all" : "Cancel"}
         </button>
         <button type="button" className="secondary-button" disabled={busy} onClick={() => void finish("later")}>
           Download later
         </button>
         <button className="primary-button" disabled={busy} autoFocus>
-          <Download size={16} /> Start download
+          <Download size={16} /> {downloads.length > 1 ? "Start downloads" : "Start download"}
         </button>
       </div>
     </form>

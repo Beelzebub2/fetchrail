@@ -10,6 +10,7 @@ export async function browserFixture(family = "chromium", faults = {}) {
   const item = { id: 42, url: "https://files.test/file.zip", finalUrl: "https://files.test/file.zip",
     startTime: new Date().toISOString(), state: "in_progress", danger: "safe", paused: false,
     bytesReceived: 1024, totalBytes: 8192, filename: "C:\\Downloads\\file.zip", mime: "application/zip", incognito: false };
+  const items = new Map([[item.id, item]]), downloadActions = [];
   const tabs = new Map([[1, { id: 1, windowId: 1, incognito: false, url: "https://files.test/page", title: "Fixture source" }]]);
   const api = {
     runtime: { id: "fixture", getURL: path => "chrome-extension://fixture/" + path,
@@ -41,11 +42,12 @@ export async function browserFixture(family = "chromium", faults = {}) {
     action: { async setBadgeBackgroundColor() {}, async setBadgeText() {}, async setTitle({ title }) { titles.push(title); } },
     downloads: {
       onCreated: event("created"), onChanged: event("changed"),
-      async search() { return faults.missing ? [] : [{ ...item }]; },
-      async pause() { actions.push("pause"); item.paused = true; if (faults.pauseDeath) return new Promise(() => {}); },
-      async resume() { actions.push("resume"); item.paused = false; },
-      async cancel() { actions.push("cancel"); if (faults.cancel) throw Error("cancel failed"); item.paused = family === "chromium"; item.state = faults.completed ? "complete" : "interrupted"; item.error = faults.completed ? undefined : "USER_CANCELED"; },
-      async erase() { actions.push("erase"); },
+      ...(family === "chromium" ? { onDeterminingFilename:event("filename") } : {}),
+      async search(query = {}) { return faults.missing ? [] : [...items.values()].filter(item => query.id == null || item.id === query.id).map(item => ({ ...item })); },
+      async pause(id) { actions.push("pause"); downloadActions.push({ action:"pause", id }); items.get(id).paused = true; faults.afterPause?.(items.get(id)); if (faults.pauseDeath) return new Promise(() => {}); },
+      async resume(id) { actions.push("resume"); downloadActions.push({ action:"resume", id }); items.get(id).paused = false; },
+      async cancel(id) { actions.push("cancel"); downloadActions.push({ action:"cancel", id }); if (faults.cancel) throw Error("cancel failed"); const item=items.get(id); item.paused = family === "chromium"; item.state = faults.completed ? "complete" : "interrupted"; item.error = faults.completed ? undefined : "USER_CANCELED"; },
+      async erase({ id }) { actions.push("erase"); downloadActions.push({ action:"erase", id }); },
     },
   };
   const capabilities = ["addDownloads", "getDownloads", "getHandoff", "commitHandoff", "abortHandoff", "handoffReceipts", "browserRequestClaims", "torrentOfferReceipts"];
@@ -101,6 +103,6 @@ export async function browserFixture(family = "chromium", faults = {}) {
   const sendAs = (message, sender) => new Promise(resolve => { if (!events.get("message")(message, sender, resolve)) resolve({ refused: true }); });
   const send = message => sendAs(message, { id: api.runtime.id, url: api.runtime.getURL("panel.html") });
   await boot();
-  return { api, item, faults, saved, session, stages, calls, actions, titles, timers, events, tabs, boot, settle, send, sendAs, evaluate: code => vm.runInContext(code, context),
-    create() { events.get("created")({ ...item }); }, async tick() { const timer = timers.shift(); if (timer) await timer.fn(); await settle(); } };
+  return { api, item, items, downloadActions, faults, saved, session, stages, calls, actions, titles, timers, events, tabs, boot, settle, send, sendAs, evaluate: code => vm.runInContext(code, context),
+    create(download = item) { items.set(download.id,download); events.get("created")({ ...download }); }, async tick() { const timer = timers.shift(); if (timer) await timer.fn(); await settle(); } };
 }

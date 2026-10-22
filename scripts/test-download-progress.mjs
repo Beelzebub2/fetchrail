@@ -56,6 +56,25 @@ try {
       transformCallback(callback) { callbacks.set(++next, callback); return next; },
       async invoke(name, args = {}) {
         window.testCalls.push({ name, args });
+        if (name === "pending_download_prompts") return structuredClone((window.testPromptRecords ?? []).filter(record=>record.status==="paused"));
+        if (name === "finish_download_prompts") { window.testPromptRecords=window.testPromptRecords.filter(record=>!args.ids.includes(record.id));return; }
+        const promptRecord=window.testPromptRecords?.find(record=>record.id===args.id);
+        if(promptRecord && ["place_download","resume_download","dismiss_download_prompt"].includes(name)) {
+          if(name==="place_download") {
+            if(window.testPromptFailure===args.id)throw Error("Destination is unavailable");
+            promptRecord.fileName=args.fileName;promptRecord.destination=args.directory+"/"+args.fileName;
+          } else if(name==="resume_download") {
+            promptRecord.status="downloading";
+            if(window.testPromptArrival) {
+              window.testPromptRecords.push(window.testPromptArrival);window.testPromptArrival=null;
+              window.testEmit("fetchrail://download-prompt-added","late-file");
+            }
+          } else {
+            window.testPromptRecords=window.testPromptRecords.filter(record=>record.id!==args.id);
+            window.testEmit("fetchrail://download-removed",args.id);return;
+          }
+          window.testEmit("fetchrail://download-updated",structuredClone(promptRecord));return structuredClone(promptRecord);
+        }
         if (name === "plugin:event|listen") { listeners.set(args.handler, args.event); return args.handler; }
         if (name === "plugin:event|unlisten") { listeners.delete(args.eventId); return; }
         if (name === "get_download") return structuredClone(window.testRecord);
@@ -237,6 +256,52 @@ try {
   assert.ok(promptCalls.includes("remember_download_folder") && !promptCalls.includes("patch_settings"));
   assert.equal(await page.evaluate(() => window.testSettings.speedLimitBps), 789, "Remembering a folder preserves a newer setting from another window");
   assert.ok(promptCalls.indexOf("show_download_progress") < promptCalls.indexOf("resume_download"), "Start must open the progress window before the transfer begins.");
+  const openPromptGroup=async()=>{
+    await page.goto(base+"?confirm=pending");
+    await page.waitForFunction(()=>window.testCalls.some(call=>call.name==="pending_download_prompts"));
+    await page.evaluate(()=>{
+      window.testPromptRecords=["one","two","three"].map(name=>({...structuredClone(window.testRecord),id:name,fileName:name+".bin",destination:"C:/Downloads/"+name+".bin",status:"paused",handoffCommitted:true}));
+      window.testEmit("fetchrail://download-prompt-added","one");
+    });
+    await page.getByRole("heading",{name:"Download 3 files",exact:true}).waitFor();
+  };
+  await openPromptGroup();
+  await page.setViewportSize({width:580,height:680});
+  await page.getByRole("textbox",{name:"File name",exact:true}).fill("renamed-one.bin");
+  await page.getByRole("textbox",{name:"Save to",exact:false}).fill("C:/First folder");
+  await page.getByRole("button",{name:/two.bin/}).click();
+  await page.getByRole("textbox",{name:"File name",exact:true}).fill("renamed-two.bin");
+  await page.getByRole("button",{name:/renamed-one.bin/}).click();
+  assert.equal(await page.getByRole("textbox",{name:"File name",exact:true}).inputValue(),"renamed-one.bin","Changing the reviewed file preserves edits");
+  await page.screenshot({path:join(output,"download-group.png"),fullPage:true});
+  await page.evaluate(()=>{
+    window.testPromptArrival={...structuredClone(window.testRecord),id:"late-file",fileName:"late.bin",destination:"C:/Downloads/late.bin",status:"paused"};
+    window.testCalls=[];
+  });
+  await page.getByRole("button",{name:"Start downloads",exact:true}).click();
+  await page.waitForFunction(()=>window.testCalls.some(call=>call.name==="finish_download_prompts"));
+  const groupCalls=await page.evaluate(()=>window.testCalls);
+  assert.deepEqual(groupCalls.filter(call=>call.name==="resume_download").map(call=>call.args.id),["one","two","three"],"One click starts every listed file exactly once");
+  assert.deepEqual(groupCalls.find(call=>call.name==="place_download"&&call.args.id==="one").args,{id:"one",directory:"C:/First folder",fileName:"renamed-one.bin"});
+  assert.equal(groupCalls.some(call=>call.name==="show_download_progress"),false,"A group must not open a stack of progress windows");
+  assert.equal(groupCalls.some(call=>call.name==="plugin:window|destroy"),false,"Late captures must retain the shared prompt");
+  await page.getByRole("button",{name:"Start download",exact:true}).waitFor();
+  assert.equal(await page.getByRole("textbox",{name:"File name",exact:true}).inputValue(),"late.bin");
+  await openPromptGroup();
+  await page.evaluate(()=>{window.testPromptFailure="two";window.testCalls=[];});
+  await page.getByRole("button",{name:"Start downloads",exact:true}).click();
+  await page.getByRole("alert").filter({hasText:"Destination is unavailable"}).waitFor();
+  assert.deepEqual(await page.evaluate(()=>window.testCalls.filter(call=>call.name==="resume_download").map(call=>call.args.id)),["one","three"],"A failed file remains for retry while its siblings start");
+  assert.equal(await page.getByRole("textbox",{name:"File name",exact:true}).inputValue(),"two.bin");
+  await openPromptGroup();
+  await page.evaluate(()=>{window.testCalls=[];});
+  await page.getByRole("button",{name:"Download later",exact:true}).click();
+  await page.waitForFunction(()=>window.testCalls.some(call=>call.name==="finish_download_prompts"));
+  assert.equal(await page.evaluate(()=>window.testCalls.filter(call=>call.name==="place_download").length),3);
+  assert.equal(await page.evaluate(()=>window.testCalls.some(call=>call.name==="resume_download")),false);
+  await openPromptGroup();
+  await page.getByRole("button",{name:"Cancel all",exact:true}).click();
+  await page.waitForFunction(()=>window.testPromptRecords.length===0);
   await page.goto(base + "?bootstrap");
   await page.waitForFunction(() => Object.keys(window.testBootstrap).length === 3);
   await page.evaluate(() => {

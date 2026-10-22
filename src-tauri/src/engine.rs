@@ -3947,11 +3947,27 @@ impl DownloadManager {
     }
 
     pub async fn remove(&self, id: Uuid, delete_file: bool) -> Result<(), String> {
+        self.remove_checked(id, delete_file, false).await
+    }
+
+    pub(crate) async fn dismiss_prompt(&self, id: Uuid) -> Result<(), String> {
+        self.remove_checked(id, false, true).await
+    }
+
+    async fn remove_checked(
+        &self,
+        id: Uuid,
+        delete_file: bool,
+        pending_only: bool,
+    ) -> Result<(), String> {
         let task = self.task(id).await?;
         if task.record.read().await.torrent.is_some() {
             return self.remove_torrent(id, delete_file).await;
         }
         let _dispatch = self.dispatch_lock.lock().await;
+        if pending_only && task.record.read().await.status != DownloadStatus::Paused {
+            return Ok(()); // A response or another window already started this file.
+        }
         if task.running.load(Ordering::Acquire) {
             return Err("Pause or cancel the download before removing it.".into());
         }
