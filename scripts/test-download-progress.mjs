@@ -103,6 +103,7 @@ try {
         if (name === "reset_calibration") { window.testPerformance.latest = null; window.testPerformance.applied = null; window.testSettings.performanceAuto = false; window.testEmit("fetchrail://settings-updated", structuredClone(window.testSettings)); return structuredClone(window.testSettings); }
         if (name === "get_overview") return { active: 0, queued: 0, completed: 1, failed: 0, currentSpeedBps: 0 };
         if (name === "request_browser_downloads") return "browser-request-fixture";
+        if (name === "add_downloads") return { accepted: [], errors: [] };
         if (name === "list_queues") { const snapshot = [{ name: "Default", paused: false, startsAt: null, stopsAt: null }]; if (location.search.includes("bootstrap")) return new Promise(resolve => { window.testBootstrap.queues = () => resolve(snapshot); }); return snapshot; }
         if (name === "plugin:app|version") return "0.5.2";
         if (name === "update_status") return { state: "current" };
@@ -387,7 +388,32 @@ try {
   await page.getByRole("button", { name: "Dismiss error" }).click();
   await page.getByRole("button", { name: "Download options", exact: true }).click();
   await page.getByRole("checkbox", { name: "Use browser session for signed-in sites or private repositories" }).uncheck();
-  await page.getByRole("button", { name: "Close new download dialog" }).click();
+  const urlsInput = page.getByRole("textbox", { name: "Download URLs" });
+  const browserSession = page.getByRole("checkbox", { name: "Use browser session for signed-in sites or private repositories" });
+  await urlsInput.fill("file:///private/secret.txt");
+  await page.locator(".modal").getByRole("button", { name: "Download", exact: true }).click();
+  await page.locator(".modal").getByRole("alert").filter({ hasText: "Enter valid HTTP, HTTPS, FTP, FTPS, FTPES, or SFTP file URLs." }).waitFor();
+  assert.equal(await page.evaluate(() => window.testCalls.some(call => call.name === "add_downloads")), false, "Unsupported file URLs must never reach the desktop download API.");
+  await urlsInput.fill("sftp://files.example.com/archive.zip");
+  await page.locator(".modal").getByRole("button", { name: "Download", exact: true }).click();
+  await page.locator(".modal").getByRole("alert").filter({ hasText: "SFTP links require a username" }).waitFor();
+  assert.equal(await page.evaluate(() => window.testCalls.some(call => call.name === "add_downloads")), false, "SFTP without a username must be rejected before submission.");
+  await urlsInput.fill("ftpes://secure.example.com/archive.zip");
+  await page.locator(".modal").getByText(/FTP, FTPS, FTPES, and SFTP use one stream by default/).waitFor();
+  await browserSession.check();
+  await page.getByRole("status").filter({ hasText: "Browser sessions are for HTTP and HTTPS only." }).waitFor();
+  await page.locator(".modal").getByRole("button", { name: "Use browser", exact: true }).click();
+  await page.locator(".modal").getByRole("alert").filter({ hasText: "Browser sessions support HTTP and HTTPS links only." }).waitFor();
+  assert.equal(await page.evaluate(() => window.testCalls.filter(call => call.name === "request_browser_downloads").length), 1, "FTP/FTPS/FTPES/SFTP may never be sent through a browser session.");
+  await browserSession.uncheck();
+  const directUrls = ["ftp://ftp.example.com/release.torrent", "ftps://secure.example.com/archive.zip", "ftpes://explicit.example.com/archive.zip", "sftp://user@files.example.com/archive.zip"];
+  await urlsInput.fill(directUrls.join("\n"));
+  await page.locator(".modal").getByRole("button", { name: "Download", exact: true }).click();
+  await page.waitForFunction(() => window.testCalls.some(call => call.name === "add_downloads"));
+  const directRequest = await page.evaluate(() => window.testCalls.find(call => call.name === "add_downloads"));
+  assert.deepEqual(directRequest.args.requests.map(request => request.url), directUrls, "FTP, FTPS, FTPES and SFTP must use ordinary desktop downloads, including .torrent file names.");
+  assert.equal(await page.evaluate(() => window.testCalls.some(call => call.name === "import_torrent")), false, "An FTP .torrent file is a direct file download, not a torrent import.");
+  assert.equal(await page.getByRole("heading", { name: "New downloads" }).count(), 0, "Accepted direct URLs should close the form.");
   // Large files may queue 32 immutable byte ranges on 16 live connections.
   // Neither the connection label nor the throughput header may confuse those units.
   await page.evaluate(() => {

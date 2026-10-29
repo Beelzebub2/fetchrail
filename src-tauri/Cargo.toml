@@ -55,6 +55,10 @@ minisign-verify = "0.2"
 base64 = "0.22"
 sha2 = "0.10"
 flate2 = "1.1.10"
+suppaftp = { version = "=12.1.2", default-features = false, features = ["tokio-rustls-aws-lc-rs", "deprecated"] }
+russh = "=0.63.2"
+russh-sftp = "=3.0.1"
+webpki-roots = "1"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 zbus = { version = "5", default-features = false, features = ["tokio"] }

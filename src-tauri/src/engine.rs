@@ -29,6 +29,8 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 use url::Url;
 use uuid::Uuid;
+mod remote_download;
+mod remote_transport;
 #[cfg(feature = "test-tools")]
 pub(crate) mod trace;
 
@@ -1377,13 +1379,23 @@ async fn gc_torrent_orphans(data_dir: &Path, committed: &HashSet<Uuid>) -> std::
 
 impl DownloadManager {
     pub async fn replace_source(&self, id: Uuid, source: String) -> Result<DownloadRecord, String> {
-        let url =
-            Url::parse(source.trim()).map_err(|_| "Enter a valid HTTP or HTTPS download link.")?;
-        if !matches!(url.scheme(), "http" | "https")
-            || !url.username().is_empty()
-            || url.password().is_some()
+        let url = Url::parse(source.trim()).map_err(|_| "Enter a valid download link.")?;
+        if !matches!(
+            url.scheme(),
+            "http" | "https" | "ftp" | "ftps" | "ftpes" | "sftp"
+        ) || url.host_str().is_none()
+        {
+            return Err("Use an HTTP, HTTPS, FTP, FTPS, FTPES or SFTP file link.".into());
+        }
+        if matches!(url.scheme(), "http" | "https")
+            && (!url.username().is_empty() || url.password().is_some())
         {
             return Err("Use an HTTP or HTTPS link without embedded credentials.".into());
+        }
+        if remote_transport::is_remote_url(&url) {
+            // Reject malformed remote sources before changing persisted URLs
+            // or preserving previous parts in a separate recovery directory.
+            remote_transport::validate_url(&url)?;
         }
         let _dispatch = self.dispatch_lock.lock().await;
         let task = self.task(id).await?;
@@ -1397,7 +1409,7 @@ impl DownloadManager {
             || task.running.load(Ordering::Acquire)
         {
             return Err(
-                "Pause this HTTP download and wait for it to stop before updating its link.".into(),
+                "Pause this download and wait for it to stop before updating its link.".into(),
             );
         }
         let part_dir = self.part_dir(id);
@@ -3358,8 +3370,24 @@ impl DownloadManager {
         persist: bool,
     ) -> Result<DownloadRecord, String> {
         let parsed = Url::parse(request.url.trim()).map_err(|error| error.to_string())?;
-        if !matches!(parsed.scheme(), "http" | "https") {
-            return Err("Only HTTP and HTTPS URLs are supported.".into());
+        if !matches!(
+            parsed.scheme(),
+            "http" | "https" | "ftp" | "ftps" | "ftpes" | "sftp"
+        ) || parsed.host_str().is_none()
+        {
+            return Err(
+                "Only HTTP, HTTPS, FTP, FTPS, FTPES and SFTP file URLs are supported.".into(),
+            );
+        }
+        if remote_transport::is_remote_url(&parsed)
+            && (request.handoff_id.is_some() || request.request_context.is_some())
+        {
+            return Err(
+                "FTP and SFTP downloads must be added directly, outside a browser handoff.".into(),
+            );
+        }
+        if remote_transport::is_remote_url(&parsed) {
+            remote_transport::validate_url(&parsed)?;
         }
         context_headers(request.request_context.as_ref()).map_err(|error| error.to_string())?;
         let expected_sha256 = normalize_sha256(request.expected_sha256.as_deref())?;
@@ -5134,7 +5162,30 @@ impl DownloadManager {
             trace.phase(trace::Phase::Probe);
         }
         let verified = task.browser_verification.lock().unwrap().clone();
-        let probe = if let Some(verified) = verified {
+        let probe = if remote_transport::is_remote_url(&url) {
+            let info = tokio::select! {
+                result = remote_transport::probe(&url, &cancel) => result,
+                _ = cancel.cancelled() => return Err(EngineError::Cancelled),
+            }
+            .map_err(EngineError::Message)?;
+            let expected_sha256 = task.record.read().await.expected_sha256.clone();
+            // FTP timestamps and SFTP file attributes are advisory, not strong
+            // resource validators. Only a trusted end-to-end hash allows us to
+            // reuse saved ranges; the final merge always verifies that hash.
+            let validated_resume =
+                info.supports_resume && info.total_bytes.is_some() && expected_sha256.is_some();
+            ProbeResult {
+                total_bytes: info.total_bytes,
+                accepts_ranges: validated_resume,
+                suggested_file_name: None,
+                validator: if validated_resume {
+                    expected_sha256.map(|hash| StrongEtag(format!("\"sha256:{hash}\"")))
+                } else {
+                    None
+                },
+                final_url: Some(url.clone()),
+            }
+        } else if let Some(verified) = verified {
             verified
         } else {
             transfer_span!(
@@ -5222,7 +5273,17 @@ impl DownloadManager {
         let total = probe.total_bytes;
         self.emit_record(&*task.record.read().await);
         let part_dir = self.part_dir(task.record.read().await.id);
-        let planned_count = if probe.accepts_ranges && probe.validator.is_some() {
+        let planned_count = if remote_transport::is_remote_url(&url) && probe.accepts_ranges {
+            // FTP/SFTP starts a new authenticated session for every segment.
+            // Excess HTTP-style micro-ranges would waste SSH/TLS handshakes.
+            // Give very large transfers a small extra work queue to balance
+            // slow peers without paying hundreds of reconnection costs.
+            if total.is_some_and(|total| total >= 512 * 1024 * 1024) {
+                (connection_count * 2).min(32)
+            } else {
+                connection_count
+            }
+        } else if probe.accepts_ranges && probe.validator.is_some() {
             queued_range_count(
                 total.unwrap_or(0),
                 connection_count,
@@ -5284,7 +5345,10 @@ impl DownloadManager {
             }
         }
         let destination = PathBuf::from(task.record.read().await.destination.clone());
-        let hardware = if settings.performance_auto && !snapshot.connections_manual {
+        let hardware = if settings.performance_auto
+            && !snapshot.connections_manual
+            && !remote_transport::is_remote_url(&url)
+        {
             Some(
                 self.performance.hardware(
                     destination
@@ -5354,17 +5418,30 @@ impl DownloadManager {
         );
 
         let transfer_result = async {
-            let first_result = Self::download_ranges(
-                &self.client,
-                &self.limiter,
-                &task,
-                &cancel,
-                &url,
-                &part_dir,
-                &current_segments(&segments),
-                &probe,
-            )
-            .await;
+            let first_result = if remote_transport::is_remote_url(&url) {
+                remote_download::download_ranges(
+                    &self.limiter,
+                    &task,
+                    &cancel,
+                    &url,
+                    &part_dir,
+                    &current_segments(&segments),
+                    &probe,
+                )
+                .await
+            } else {
+                Self::download_ranges(
+                    &self.client,
+                    &self.limiter,
+                    &task,
+                    &cancel,
+                    &url,
+                    &part_dir,
+                    &current_segments(&segments),
+                    &probe,
+                )
+                .await
+            };
 
             if matches!(first_result, Err(EngineError::RangeUnsupported)) {
                 task.health.cause(crate::health::Cause::RangeIgnored);
@@ -5388,17 +5465,30 @@ impl DownloadManager {
                 prepare_parts(&part_dir, &fallback, &ranges).await?;
                 let single = segment_counters(&part_dir, &ranges).await?;
                 *segments.lock().expect("segments mutex poisoned") = single.clone();
-                Self::download_ranges(
-                    &self.client,
-                    &self.limiter,
-                    &task,
-                    &cancel,
-                    &url,
-                    &part_dir,
-                    &single,
-                    &fallback,
-                )
-                .await?;
+                if remote_transport::is_remote_url(&url) {
+                    remote_download::download_ranges(
+                        &self.limiter,
+                        &task,
+                        &cancel,
+                        &url,
+                        &part_dir,
+                        &single,
+                        &fallback,
+                    )
+                    .await?;
+                } else {
+                    Self::download_ranges(
+                        &self.client,
+                        &self.limiter,
+                        &task,
+                        &cancel,
+                        &url,
+                        &part_dir,
+                        &single,
+                        &fallback,
+                    )
+                    .await?;
+                }
             } else {
                 first_result?;
             }
@@ -6805,6 +6895,13 @@ impl DownloadManager {
         #[cfg(windows)]
         let windows_attachment_check = self.settings.read().await.windows_attachment_check;
         #[cfg(windows)]
+        let attachment_source_url = if remote_transport::is_remote_url(&Url::parse(&record.url)?) {
+            // Windows attachment metadata must never embed remote login details.
+            record.clone().public_view().url
+        } else {
+            record.url.clone()
+        };
+        #[cfg(windows)]
         let overlapping = if windows_attachment_check && total >= 64 * 1024 * 1024 && {
             let enabled = true;
             #[cfg(feature = "test-tools")]
@@ -6820,7 +6917,7 @@ impl DownloadManager {
             let hashes = complete_hashes.clone();
             let expected = expected_sha256.clone();
             let token = cancel.clone();
-            let url = record.url.clone();
+            let url = attachment_source_url.clone();
             let name = desired_name.to_owned();
             let runtime = tokio::runtime::Handle::current();
             let scan_health = task.health.clone();
@@ -6871,7 +6968,7 @@ impl DownloadManager {
                 Attachment,
                 crate::platform::mark_download(
                     &temp_path,
-                    &record.url,
+                    &attachment_source_url,
                     desired_name,
                     windows_attachment_check,
                     Some(task.health.clone()),
@@ -7813,7 +7910,18 @@ fn safe_file_name(value: &str) -> String {
 fn name_from_url(url: &Url) -> String {
     url.path_segments()
         .and_then(|mut segments| segments.rfind(|segment| !segment.is_empty()))
-        .map(safe_file_name)
+        .map(|segment| {
+            if remote_transport::is_remote_url(url) {
+                percent_encoding::percent_decode_str(segment)
+                    .decode_utf8()
+                    .map_or_else(
+                        |_| safe_file_name(segment),
+                        |decoded| safe_file_name(&decoded),
+                    )
+            } else {
+                safe_file_name(segment)
+            }
+        })
         .filter(|name| !name.is_empty())
         .unwrap_or_else(|| "download".to_string())
 }
