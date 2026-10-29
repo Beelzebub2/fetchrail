@@ -322,7 +322,7 @@ jobs:
           ! grep -q 'not found' elf-dependencies.txt
       - name: Run actual WebKitGTK desktop and HTTP fixtures
         # Keep X11 available while restart recovery closes the last app connection.
-        run: xvfb-run -a -s "-screen 0 1280x1024x24 -noreset" dbus-run-session -- npm run linux:qualify -- --test-tools
+        run: xvfb-run -a -s "-screen 0 1280x1024x24 -noreset" dbus-run-session -- npm run linux:qualify -- src-tauri/target/release/fetchrail --test-tools
       - name: Install native WebKitGTK desktop test driver
         run: |
           sudo apt-get install -y --no-install-recommends webkit2gtk-driver weston
