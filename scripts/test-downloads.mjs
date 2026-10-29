@@ -380,11 +380,17 @@ try {
     console.log(`PASS: ${browser} regular/private extension capture through the real native host and engine, exact SHA-256, browser fallback`);
   }
   for (const item of [{ url: base + "auth.bin" }, { url: base + "range.bin", expectedBytes: data.length + 1 },
-    { url: base + "range.bin", expectedMime: "text/html" }, { url: base + "invalid.bin" }]) {
+    { url: base + "range.bin", expectedMime: "text/html" }]) {
     const rejected = await native("addDownloads", { source: "clickMonitor", items: [item] });
     assert.equal(rejected.accepted, 0); assert.equal(rejected.ids.length, 0); assert.equal(rejected.rejected, 1);
   }
-  console.log("PASS: browser capture reaches the engine; authentication, size/type mismatches and invalid ranges reject before handoff");
+  const verifiedFullGet = await native("addDownloads", { source: "clickMonitor", items: [{ url: base + "invalid.bin" }] });
+  assert.equal(verifiedFullGet.accepted, 1, "A verified browser GET is valid even if the server mishandles byte ranges.");
+  ids.push(verifiedFullGet.ids[0]);
+  await complete(verifiedFullGet.ids[0], 1);
+  assert.equal(observed.get("invalid.bin").gets, 1, "The browser handoff must consume its verified GET.");
+  assert.equal(observed.get("invalid.bin").ranges.length, 0, "A verified full GET does not need a byte-range response.");
+  console.log("PASS: browser capture rejects authentication and size/type mismatches, and consumes a valid full GET without relying on broken range responses");
   const opaque = await add("opaque-manual");
   assert.equal((await complete(opaque, 4)).fileName, "opaque-manual.rar", "GET filename must also be detected when HEAD advertises ranges without a name.");
   console.log("PASS: server filenames replace URL IDs before capture prompts and for manually added downloads");
