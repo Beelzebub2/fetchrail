@@ -1,7 +1,7 @@
 import { readFile } from "node:fs/promises";
 import { setTimeout } from "node:timers/promises";
 import { pathToFileURL } from "node:url";
-import { authorization } from "./firefox-add-ons-policy.mjs";
+import { amoRequest } from "./firefox-add-ons-policy.mjs";
 
 // AMO listing icons are separate metadata: manifest.icons only covers the installed extension.
 // https://mozilla.github.io/addons-server/topics/api/addons.html#addon-icon
@@ -10,15 +10,12 @@ export async function syncIcon({ issuer, secret, guid, icon, fetcher = fetch, pa
   const url = `https://addons.mozilla.org/api/v5/addons/addon/${encodeURIComponent(guid)}/`;
   const form = new FormData();
   form.set("icon", new Blob([icon], { type: "image/png" }), "fetchrail.png");
-  const response = await fetcher(url, {
-    method: "PATCH", headers: { Authorization: authorization(issuer, secret) }, body: form,
-    signal: AbortSignal.timeout(30_000),
-  });
+  const response = await amoRequest({ issuer, secret, fetcher, pause }, url, { method: "PATCH", body: form });
   if (!response.ok) throw new Error(`Mozilla AMO icon upload failed (HTTP ${response.status}).`);
   // Resizing is asynchronous. Wait for a custom 128px image to be available publicly.
   for (let attempt = 0; attempt < 12; attempt++) {
     if (attempt) await pause(5000);
-    const listing = await fetcher(url, { headers: { "Cache-Control": "no-cache", Authorization: authorization(issuer, secret) }, signal: AbortSignal.timeout(30_000) });
+    const listing = await amoRequest({ issuer, secret, fetcher, pause }, url, { headers: { "Cache-Control": "no-cache" } });
     if (!listing.ok) throw new Error(`Mozilla AMO icon verification failed (HTTP ${listing.status}).`);
     const iconUrl = (await listing.json()).icons?.["128"];
     if (typeof iconUrl !== "string" || iconUrl.includes("/addon-icons/default-")) continue;
