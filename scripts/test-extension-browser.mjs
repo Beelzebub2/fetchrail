@@ -33,7 +33,7 @@ for (const family of families) {
   await cp(resolve("browser-extension/dist/" + family), extension, { recursive: true });
   const host = "com.fetchrail.fixture" + randomUUID().replaceAll("-", "");
   const registryKeys = family === "firefox" ? [`HKCU\\Software\\Mozilla\\NativeMessagingHosts\\${host}`] : ["Google\\Chrome", "Chromium"].map(vendor => `HKCU\\Software\\${vendor}\\NativeMessagingHosts\\${host}`);
-  let browserContext, browserProcess, socket, app, appBrowser, appDebugPort, report, claimed = false, ready = false, firefoxLog = "", trace, progress, browserVersion;
+  let browserContext, browserProcess, socket, app, appBrowser, appDebugPort, report, claimed = false, ready = false, driverReady = false, firefoxLog = "", trace, progress, browserVersion;
   const fileRequests = [];
   const cookies = new Map(), bodySize = 8 * 1024 * 1024;
   const bodies = Object.fromEntries(["normal", "private", "container1", "container2"].map((name, i) => [name, Buffer.alloc(bodySize, 0x31 + i)]));
@@ -66,6 +66,7 @@ for (const family of families) {
     }
     if (url.pathname === "/progress") { let data=""; request.on("data",bytes=>data+=bytes);request.on("end",()=>{progress=JSON.parse(data);response.end();});return; }
     if (url.pathname === "/trace") { let data=""; request.on("data",bytes=>data+=bytes); request.on("end",()=>{trace=JSON.parse(data);response.end();}); return; }
+    if (url.pathname === "/driver-ready") { response.end(driverReady ? "ready" : "pending"); return; }
     if (url.pathname === "/claim") { response.setHeader("Content-Type", "application/json"); if (!ready) response.end('{"ready":false}'); else if (claimed) response.end('{"stop":true}'); else { claimed = true; response.end('{"ready":true}'); } return; }
     if (url.pathname === "/report") { let text = ""; request.on("data", bytes => { text += bytes; }); request.on("end", () => { report = JSON.parse(text); response.end("ok"); }); return; }
     if (url.pathname === "/login") { response.setHeader("Set-Cookie", "session=" + url.searchParams.get("session") + "; Path=/; SameSite=Lax"); response.setHeader("Content-Type", "text/html"); response.end("<!doctype html><title>Isolated signed-in fixture</title>Ready"); return; }
@@ -90,7 +91,13 @@ for (const family of families) {
     manifest.host_permissions = ["http://*/*", "https://*/*"];
     await writeFile(manifestPath, JSON.stringify(manifest));
     const backgroundPath = join(extension, "background.js");
-    await writeFile(backgroundPath, (await readFile(backgroundPath, "utf8")).replace('"com.rrmtools.braid"', JSON.stringify(host)) + `\nsetInterval(()=>void fetch(${JSON.stringify(base + "/trace")},{method:"POST",body:JSON.stringify([...recentRequests.values()].filter(t=>t.url.endsWith("/file.bin")).map(t=>({...t,context:Object.keys(t.context)})))}),500);\nvoid api.tabs.create({url:api.runtime.getURL("fixture-driver.html")});\n`);
+    // Firefox can reject a new extension page's principal when the background
+    // opens it during the temporary add-on's BiDi installation. Start it only
+    // once webExtension.install has returned and the extension is registered.
+    const openDriver = family === "firefox"
+      ? `void (async()=>{for(let i=0;i<300;i++){const state=await fetch(${JSON.stringify(base + "/driver-ready")}).then(r=>r.text()).catch(()=>"");if(state==="ready"){await api.tabs.create({url:api.runtime.getURL("fixture-driver.html")});return;}await new Promise(done=>setTimeout(done,100));}throw Error("Firefox fixture driver was not enabled after installation");})();`
+      : `void api.tabs.create({url:api.runtime.getURL("fixture-driver.html")});`;
+    await writeFile(backgroundPath, (await readFile(backgroundPath, "utf8")).replace('"com.rrmtools.braid"', JSON.stringify(host)) + `\nsetInterval(()=>void fetch(${JSON.stringify(base + "/trace")},{method:"POST",body:JSON.stringify([...recentRequests.values()].filter(t=>t.url.endsWith("/file.bin")).map(t=>({...t,context:Object.keys(t.context)})))}),500);\n${openDriver}\n`);
     await writeFile(join(extension, "fixture-driver.html"), '<!doctype html><title>Fetchrail qualification</title><script src="fixture-driver.js"></script>');
     await writeFile(join(extension, "fixture-driver.js"), "const FETCHRAIL_BROWSER_FIXTURE = " + JSON.stringify({ family, base, burst, normalOnly:process.argv.includes("--normal-only") }) + ";\n" + await readFile(new URL("./fixtures/extension-driver.js", import.meta.url), "utf8"));
     const nativeManifest = join(fixture.root, "native-host.json");
@@ -147,8 +154,9 @@ for (const family of families) {
       const bidi = (method, params) => new Promise((resolve, reject) => { const id = ++nextId; const timer=setTimeout(()=>{pending.delete(id);reject(Error(method+" timed out"));},20000); pending.set(id, { resolve(value){clearTimeout(timer);resolve(value);}, reject(error){clearTimeout(timer);reject(error);} }); socket.send(JSON.stringify({ id, method, params })); });
       const session=await bidi("session.new", { capabilities: {} });browserVersion=session.capabilities.browserVersion;
       await bidi("browser.setDownloadBehavior", {downloadBehavior:{type:"allowed",destinationFolder:downloads}});
-      ready = true;
       await bidi("webExtension.install", { extensionData: { type: "path", path: extension }, "moz:allowPrivateBrowsing": true });
+      ready = true;
+      driverReady = true;
     }
     for (let i = 0; i < 1500 && !report; i++) { if (app.exitCode !== null) throw Error("Isolated app exited"); await delay(100); }
     report ??= {ok:false,error:"Browser driver timed out",progress};

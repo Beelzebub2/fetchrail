@@ -119,7 +119,7 @@ try {
   assert.equal((await slow).accepted,0);assert.equal((await call("getHandoff",{handoffId:slowId})).state,"aborted","A late validator cannot accept after authoritative abort");
   const torrentFile=join(fixture.root,"fixture.torrent"), payload=join(fixture.root,"payload.bin");
   await writeFile(payload,body);
-  const torrentHarness=openTorrentHarness(join(dirname(exe),executableName("torrent-harness")),fixture.root,"descriptor-state");
+  const torrentHarness=openTorrentHarness(resolve(process.env.FETCHRAIL_TORRENT_HARNESS ?? join(dirname(exe),executableName("torrent-harness"))),fixture.root,"descriptor-state");
   try {await torrentHarness.call({op:"create",path:payload,output:torrentFile,format:"hybrid",pieceLength:16384});} finally {await torrentHarness.close();}
   descriptor=await readFile(torrentFile);
   const torrentId=randomUUID(), torrentParams={source:"browserBatch",handoffProtocol:2,startPaused:true,queue:"Default",speedLimitBps:4096,
@@ -144,13 +144,42 @@ try {
   const stopped=new Promise(done=>app.on("exit",done));app.kill();await stopped;
   if(faultInjection) await rm(join(fixture.root,"hold-browser-activation"));
   app=spawn(exe,["--background"],{env:fixture.env,windowsHide:true,stdio:"ignore"});
-  let restarted;
-  for(let n=0;n<300;n++){try{config=JSON.parse(await readFile(join(fixture.stateDir,"browser-bridge.json"),"utf8"));const row=(await call("getDownloads")).downloads.find(r=>r.id===restartStage.ids[0]);assert.notEqual(row.status,"failed",row.error);if(row.status==="completed"){restarted=row;break;}}catch{}await delay(100);}
-  assert.ok(restarted,"A committed activation intent is retried after app restart");
+  const expectAutomaticActivation=faultInjection&&process.platform==="win32";
+  let restarted, lastStatus, restartError;
+  for(let n=0;n<300;n++){
+    try{
+      config=JSON.parse(await readFile(join(fixture.stateDir,"browser-bridge.json"),"utf8"));
+      const row=(await call("getDownloads")).downloads.find(r=>r.id===restartStage.ids[0]);
+      lastStatus=row;
+      if(row?.status==="failed")throw Error(row.error??"Download failed after restart");
+      if(row&&(expectAutomaticActivation?row.status==="completed":["paused","completed"].includes(row.status))){restarted=row;break;}
+    }catch(error){restartError=error.message;}
+    await delay(100);
+  }
+  assert.ok(restarted,`Browser recovery after restart: expected ${expectAutomaticActivation?"automatic activation":"safe pause or completed transfer"}; last=${JSON.stringify(lastStatus)}, error=${restartError??"none"}`);
+  if(process.platform!=="win32"&&restarted.status==="paused"){
+    assert.match(restarted.error??"",/reauthorize.*browser/i,"Linux must require fresh browser authorization after restart");
+    await delay(500);
+    const after=(await call("getDownloads")).downloads.find(r=>r.id===restartStage.ids[0]);
+    assert.equal(after.status,"paused","Linux must not retry a browser transfer without its discarded credentials");
+    assert.ok(!(await readFile(join(fixture.stateDir,"downloads.json"),"utf8")).includes("session=fixture"),"Linux must never persist the browser cookie");
+  }
+  if(process.platform==="win32"&&!faultInjection&&restarted.status==="paused"){
+    await call("controlDownload",{downloadId:restartStage.ids[0],action:"resume"});
+    let resumed;
+    for(let n=0;n<300;n++){
+      const row=(await call("getDownloads")).downloads.find(r=>r.id===restartStage.ids[0]);
+      assert.notEqual(row.status,"failed",row.error);
+      if(row.status==="completed"){resumed=row;break;}
+      await delay(100);
+    }
+    assert.ok(resumed,"Windows can manually resume a committed transfer using protected restored credentials");
+  }
+  if(faultInjection&&process.platform!=="win32")assert.equal(restarted.status,"paused","Interrupted Linux browser handoffs need new authorization");
   assert.equal((await call("getHandoff",{handoffId:torrentId})).state,"committed");
   const restartedOffer=JSON.parse(await readFile(join(fixture.stateDir,"torrent-offers.json"),"utf8")).find(o=>o.id===torrentId);
   assert.equal(restartedOffer.state,"offered");assert.deepEqual(await readFile(restartedOffer.source),descriptor);
-  console.log("PASS: real native authenticated handoffs, exact bytes, redirects, retained single-use/empty/chunked streams, concurrent abort, restart activation and durable authenticated torrent offers.");
+  console.log("PASS: real native authenticated handoffs, exact bytes, redirects, retained single-use/empty/chunked streams, concurrent abort, platform-safe restart recovery and durable authenticated torrent offers.");
 } finally {
   if (app.exitCode === null) { const closed = new Promise(done => app.on("exit", done)); app.kill(); await closed; }
   server.closeAllConnections(); await new Promise(done => server.close(done));

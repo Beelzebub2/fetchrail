@@ -17,6 +17,33 @@ for (const family of ["chromium", "firefox"]) {
     assert.equal(f.stages.size,1); assert.ok(!JSON.stringify(f.saved).includes("synthetic-session"));
     if(incognito) assert.ok(!JSON.stringify(f.session).includes("files.test"));
   }
+  // Real Firefox can deliver the download before its private/container headers.
+  for (const cookieStoreId of ["firefox-private", "firefox-container-1"]) {
+    const late = await browserFixture(family);
+    const incognito = cookieStoreId === "firefox-private";
+    late.saved.useBrowserSession = true;
+    Object.assign(late.item, { incognito, cookieStoreId });
+    await late.boot(); late.create();
+    for (let i = 0; i < 20; i++) await new Promise(setImmediate);
+    assert.equal(late.stages.size, 0, "A download cannot capture without matching headers");
+    const details = { requestId:"late", url:late.item.url, tabId:1, incognito, cookieStoreId, method:"GET" };
+    late.events.get("before")(details);
+    for (let i = 0; i < 20; i++) await new Promise(setImmediate);
+    assert.equal(late.stages.size, 0, "A request without headers is not session evidence");
+    late.events.get("headers")({ ...details, requestHeaders:[{name:"Cookie", value:"late-session"}] });
+    await late.settle();
+    assert.deepEqual(late.actions, ["pause", "cancel", "erase"]);
+    assert.equal(late.calls.find(c=>c.method==="addDownloads").params.items[0].requestContext.cookie, "late-session");
+    if (incognito) assert.ok(!JSON.stringify(late.session).includes("late-session"));
+  }
+  const missing = await browserFixture(family);
+  missing.saved.useBrowserSession = true; await missing.boot(); missing.create();
+  for (let i = 0; i < 20; i++) await new Promise(setImmediate);
+  missing.events.get("headers")({requestId:"other-context", url:missing.item.url, tabId:1, incognito:true, method:"GET", requestHeaders:[{name:"Cookie",value:"wrong-session"}]});
+  await new Promise(setImmediate);
+  await missing.tick();
+  assert.equal(missing.stages.size, 0, "Missing evidence cannot borrow a different private context");
+  assert.deepEqual(missing.actions, [], "Evidence timeout preserves browser ownership");
   for(const mode of ["cancel","userCompleted","safetyChanged"]) {
     const f=await browserFixture(family);
     if(mode==="cancel") f.faults.cancel=true;

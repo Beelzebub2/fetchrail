@@ -1551,6 +1551,36 @@ impl DownloadManager {
                     record.eta_seconds = None;
                     record.merged_bytes = 0;
                 }
+                // Linux deliberately does not persist browser request credentials or
+                // the verified response body. A committed handoff interrupted before
+                // publication must wait for browser reauthorization after restart.
+                // Otherwise a queued transfer could run with missing credentials.
+                if !cfg!(windows)
+                    && record.torrent.is_none()
+                    && stored.browser_verification.is_some()
+                    && record
+                        .extra
+                        .get("handoffCommitted")
+                        .and_then(|value| value.as_bool())
+                        == Some(true)
+                    && !matches!(
+                        record.status,
+                        DownloadStatus::Completed
+                            | DownloadStatus::Failed
+                            | DownloadStatus::Cancelled
+                    )
+                {
+                    record.status = DownloadStatus::Paused;
+                    record.scheduled_for = None;
+                    record.speed_bps = 0;
+                    record.eta_seconds = None;
+                    record.extra.remove("handoffActivationPending");
+                    record.extra.remove("handoffDisposition");
+                    record.error = Some(
+                        "Browser session ended on restart. Reauthorize this file in the browser before resuming."
+                            .into(),
+                    );
+                }
                 if record.torrent.is_none() {
                     match recover_verified_publication(
                         &parts_dir.join(record.id.to_string()),
