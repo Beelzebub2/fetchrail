@@ -5,7 +5,7 @@ import { execFileSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { authorization, syncPrivacyPolicy, verifyCredentials } from "./firefox-add-ons-policy.mjs";
+import { authorization, amoRequest, syncPrivacyPolicy, verifyCredentials } from "./firefox-add-ons-policy.mjs";
 import { syncIcon } from "./firefox-add-ons-icon.mjs";
 import { localManifest } from "./prepare-local-firefox.mjs";
 
@@ -107,6 +107,31 @@ await assert.rejects(syncPrivacyPolicy({ ...args, fetcher: async () => Response.
   /did not return the submitted privacy policy/, "Blank-line normalization must not hide changed policy text");
 await assert.rejects(syncPrivacyPolicy({ ...args, fetcher: async (_url, req) => new Response(JSON.stringify({ privacy_policy: { "en-US": req.method === "GET" ? "a different policy" : policy } }), { status: 200 }) }), /did not return the submitted privacy policy/);
 await assert.rejects(syncPrivacyPolicy({ ...args, fetcher: async () => new Response("{}", { status: 403 }) }), /HTTP 403/);
+// Metadata writes can be throttled after a successful version/icon submission.
+const waits = [], tokens = [], rateMethods = [];
+let ratePolicy = "previous policy", attempts = 0;
+assert.equal(await syncPrivacyPolicy({ ...args, pause: async ms => waits.push(ms), fetcher: async (_url, request) => {
+  rateMethods.push(request.method); tokens.push(request.headers.Authorization);
+  if (request.method === "PATCH" && attempts++ === 0) return new Response("throttled", {status:429, headers:{"Retry-After":"65"}});
+  if (request.method === "PATCH") ratePolicy = JSON.parse(request.body).privacy_policy["en-US"];
+  return Response.json({privacy_policy:{"en-US":ratePolicy}});
+} }), true);
+assert.deepEqual(rateMethods, ["GET", "PATCH", "PATCH", "GET"]);
+assert.deepEqual(waits, [65000]);
+assert.equal(new Set(tokens).size, tokens.length, "A retry must refresh the JWT after waiting beyond its 60-second lifetime");
+let limitedCalls = 0;
+const fallbackWaits = [];
+const limited = await amoRequest({ ...args, pause: async ms => fallbackWaits.push(ms), fetcher: async () => { limitedCalls++; return new Response("throttled", {status:429}); } }, "https://addons.mozilla.org/api/v5/accounts/profile/");
+assert.equal(limited.status, 429); assert.equal(limitedCalls, 3); assert.deepEqual(fallbackWaits, [30000, 30000]);
+const datedWaits = [];
+let datedCalls = 0;
+await amoRequest({ ...args, pause: async ms => datedWaits.push(ms), fetcher: async () => ++datedCalls === 1
+  ? new Response("throttled", {status:429, headers:{"Retry-After":new Date(Date.now() + 60000).toUTCString()}}) : Response.json({}) }, "https://addons.mozilla.org/api/v5/accounts/profile/");
+assert.equal(datedWaits.length, 1); assert.ok(datedWaits[0] > 58000 && datedWaits[0] <= 60000);
+await assert.rejects(amoRequest({ ...args, pause: async () => assert.fail("Never retry before a long server cooldown"), fetcher: async () => new Response("throttled", {status:429, headers:{"Retry-After":"600"}}) }, "https://addons.mozilla.org/api/v5/accounts/profile/"), /rate limit.*retry window/);
+const denied = await amoRequest({ ...args, pause: async () => assert.fail("Permission failures must not retry"), fetcher: async () => new Response("denied", {status:403}) }, "https://addons.mozilla.org/api/v5/accounts/profile/");
+assert.equal(denied.status, 403);
+
 const icon = await readFile(new URL("../browser-extension/src/icons/128.png", import.meta.url));
 let uploads = 0, checks = 0;
 const iconArgs = { issuer: args.issuer, secret: args.secret, guid: args.guid, icon, pause: async () => {}, fetcher: async (url, request) => {
