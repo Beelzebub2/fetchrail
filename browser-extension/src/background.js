@@ -8,6 +8,7 @@ let activeActions = 0;
 let checkingUpdate = false;
 const routingDownloads = new Set();
 const recentRequests = new Map();
+const requestWaiters = new Set();
 let useBrowserSession = false;
 let captureInitializationError;
 const captureReady = Promise.all([
@@ -46,6 +47,25 @@ function matchingRequest(item) {
   return matches[0];
 }
 
+async function observedDownloadRequest(item) {
+  if (!useBrowserSession) return matchingRequest(item);
+  const observed = () => {
+    const trace = matchingRequest(item);
+    return trace?.headersObserved ? trace : null;
+  };
+  if (observed()) return observed();
+  // Download events can precede webRequest delivery. Wake on matching headers,
+  // retaining the browser as owner if permission or evidence never arrives.
+  await new Promise((resolve, reject) => {
+    const finish = error => { clearTimeout(timer); requestWaiters.delete(check); error ? reject(error) : resolve(); };
+    const check = () => { try { if (observed()) finish(); } catch (error) { finish(error); } };
+    const timer = setTimeout(() => finish(), 1000);
+    requestWaiters.add(check);
+    check();
+  });
+  return observed();
+}
+
 let savingRequests = false;
 function saveRequests() {
   if (savingRequests) return;
@@ -80,7 +100,8 @@ function rememberRequest(details) {
   recentRequests.delete(key);
   const trace = { ...previous, incognito: !!details.incognito, cookieStoreId: details.cookieStoreId, tabId: details.tabId,
     frameId: details.frameId, documentId: details.documentId, type: details.type, requestId: details.requestId,
-    originalUrl: previous?.originalUrl ?? details.url, url: details.url, method: details.method ?? previous?.method, context, time: now };
+    originalUrl: previous?.originalUrl ?? details.url, url: details.url, method: details.method ?? previous?.method, context, time: now,
+    headersObserved: !!details.requestHeaders || (previous?.url === details.url && previous.headersObserved === true) };
   if (details.responseHeaders) {
     const headers = Object.fromEntries(details.responseHeaders.map(h => [h.name.toLowerCase(), h.value ?? ""]));
     trace.attachment = /attachment/i.test(headers["content-disposition"] ?? "");
@@ -94,6 +115,7 @@ function rememberRequest(details) {
     recentRequests.delete(expendable[0]);
   }
   saveRequests();
+  for (const check of requestWaiters) check();
 }
 let observingRequests = Promise.resolve();
 function queueRequest(details) {
@@ -591,7 +613,8 @@ async function routeBrowserDownload(item) {
       await setBadge("!", recoveryNotice); return;
     }
     if (directStart) await directStart;
-    const trace = matchingRequest(item);
+    await ensureSessionPermission();
+    const trace = await observedDownloadRequest(item);
     let batch = await loadBatch(!!item.incognito), options = {};
     if (batch?.browserDownloadId !== item.id || !batch.direct) batch = null;
     if (trace) {

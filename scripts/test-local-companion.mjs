@@ -119,7 +119,7 @@ try {
   assert.equal((await slow).accepted,0);assert.equal((await call("getHandoff",{handoffId:slowId})).state,"aborted","A late validator cannot accept after authoritative abort");
   const torrentFile=join(fixture.root,"fixture.torrent"), payload=join(fixture.root,"payload.bin");
   await writeFile(payload,body);
-  const torrentHarness=openTorrentHarness(join(dirname(exe),executableName("torrent-harness")),fixture.root,"descriptor-state");
+  const torrentHarness=openTorrentHarness(resolve(process.env.FETCHRAIL_TORRENT_HARNESS ?? join(dirname(exe),executableName("torrent-harness"))),fixture.root,"descriptor-state");
   try {await torrentHarness.call({op:"create",path:payload,output:torrentFile,format:"hybrid",pieceLength:16384});} finally {await torrentHarness.close();}
   descriptor=await readFile(torrentFile);
   const torrentId=randomUUID(), torrentParams={source:"browserBatch",handoffProtocol:2,startPaused:true,queue:"Default",speedLimitBps:4096,

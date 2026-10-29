@@ -13,7 +13,7 @@ export function openTorrentHarness(executable, root, name) {
   const child = spawn(executable, [join(root, name)], { windowsHide: true, stdio: ["pipe", "pipe", "pipe"] });
   const waiting = [];
   let ended = false;
-  const closed = new Promise(done => child.once("exit", code => {
+  const closed = new Promise(done => child.once("close", code => {
     ended = true;
     for (const pending of waiting.splice(0)) pending.reject(Error(`Harness exited: ${code}`));
     done(code);
@@ -24,7 +24,7 @@ export function openTorrentHarness(executable, root, name) {
     catch (error) { pending.reject(error); }
   });
   child.stderr.on("data", bytes => process.stderr.write(bytes));
-  child.on("error", error => { for (const pending of waiting.splice(0)) pending.reject(error); });
+  child.on("error", error => { ended = true; for (const pending of waiting.splice(0)) pending.reject(error); });
   return { child, closed, call(request) {
     if (ended) return Promise.reject(Error("Harness is closed"));
     return new Promise((resolve, reject) => {

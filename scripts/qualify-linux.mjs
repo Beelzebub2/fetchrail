@@ -37,7 +37,7 @@ try {
   for (const [name, command, args] of [
     ["embedded desktop and native messaging", process.execPath, ["scripts/smoke-desktop.mjs", binary]],
     ["HTTP transfers and restart recovery", process.execPath, ["scripts/test-downloads.mjs", resolve(binary, "..")]],
-    ["retained Firefox companion handoffs", process.execPath, ["scripts/test-local-companion.mjs", binary, "--test-tools"]],
+    ["retained Firefox companion handoffs", process.execPath, ["scripts/test-local-companion.mjs", binary, ...(process.argv.includes("--test-tools") ? ["--test-tools"] : [])]],
     ["native torrent swarms", process.execPath, ["scripts/test-torrents.mjs", resolve(process.env.FETCHRAIL_TORRENT_HARNESS ?? join(resolve(binary, ".."), "torrent-harness"))]],
     ["extension behavior", process.execPath, ["scripts/test-extension.mjs"]],
     ["extension routing", process.execPath, ["scripts/test-extension-routing.mjs"]],
