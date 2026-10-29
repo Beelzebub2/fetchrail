@@ -266,7 +266,8 @@ try {
   await native("controlDownload", { downloadId: session.ids[0], action: "resume" });
   if (process.platform === "win32") {
     // Only Windows encrypts the saved credential envelope using the user's DPAPI identity.
-    await complete(session.ids[0], 4);
+    // Browser verification retains a complete GET and deliberately uses one connection.
+    await complete(session.ids[0], 1);
     await waitFor(async () => !parseStateSnapshot(await read("downloads.json")).find((item) => item.id === session.ids[0]).requestContext, "completed session headers are removed from disk");
     console.log("PASS: Windows DPAPI retains browser credentials across a restart, then removes them on completion");
   } else {
@@ -286,7 +287,7 @@ try {
     }] });
     assert.equal(renewed.accepted, 1, "A fresh browser handoff can reauthorize a failed Linux session");
     ids.push(renewed.ids[0]);
-    await complete(renewed.ids[0], 4);
+    await complete(renewed.ids[0], 1);
     console.log("PASS: Linux drops browser credentials on restart, fails closed and accepts a fresh authenticated browser handoff");
   }
   const landing = await add("landing.html");
@@ -300,15 +301,19 @@ try {
     let webRequest;
     let captured;
     const events = [];
-    const extensionState = { useBrowserSession: true };
-    const item = { id: 42, state: "in_progress", paused: false, incognito: false, danger: "safe",
+    const extensionState = { useBrowserSession: false };
+    let storageChanged;
+    const item = { id: 42, state: "in_progress", paused: false, incognito: false, danger: "safe", startTime: new Date().toISOString(),
       url: base + name, filename: join(out, name), totalBytes: data.length, bytesReceived: 1024, mime: "application/octet-stream" };
     const api = {
       runtime: { id: "capture-test", getURL: (path) => "chrome-extension://capture-test/" + path,
+        getManifest: () => browser === "firefox" ? { browser_specific_settings: { gecko: { id: "capture-test" } } } : { manifest_version: 3 },
         onInstalled: { addListener() {} }, onStartup: { addListener() {} }, onMessage: { addListener() {} } },
       alarms: { create() {}, onAlarm: { addListener() {} } },
       contextMenus: { onClicked: { addListener() {} } },
-      storage: { local: { async get(key) { return { [key]: structuredClone(extensionState[key]) }; }, async set(values) { Object.assign(extensionState, structuredClone(values)); } } },
+      storage: { local: { async get(key) { return { [key]: structuredClone(extensionState[key]) }; }, async set(values) { Object.assign(extensionState, structuredClone(values)); } },
+        onChanged: { addListener(fn) { storageChanged = fn; } } },
+      permissions: { async contains() { return true; }, onRemoved: { addListener() {} } },
       webRequest: { onBeforeSendHeaders: { addListener(fn) { webRequest = fn; } } },
       action: { async setBadgeBackgroundColor() {}, async setBadgeText() {}, async setTitle() {} },
       downloads: {
@@ -318,7 +323,7 @@ try {
         async cancel() {
           assert.equal((await record(captured)).status, "paused", "The engine must own the download before browser cancellation.");
           assert.equal((await record(captured)).fileName, detectedName, "Resolve the server filename before opening the paused download prompt.");
-          events.push("cancel"); item.state = "interrupted";
+          events.push("cancel"); item.state = "interrupted"; item.error = "USER_CANCELED"; item.paused = false;
         },
         async erase() { events.push("erase"); },
         async resume() { events.push("resume"); item.paused = false; },
@@ -329,7 +334,7 @@ try {
       events.push(message.method);
       const result = await native(message.method, message.params, message.id);
       if (result.accepted) { captured = result.ids[0]; ids.push(captured); }
-      return { ok: true, result };
+      return { v: 1, id: message.id, ok: true, result };
     };
     if (browser === "firefox") api.runtime.sendNativeMessage = sendNative;
     else api.runtime.sendNativeMessage = (hostName, message, callback) => {
@@ -337,24 +342,29 @@ try {
         api.runtime.lastError = { message: error.message }; callback(); delete api.runtime.lastError;
       });
     };
-    const context = vm.createContext({ [browser === "firefox" ? "browser" : "chrome"]: api, crypto: { randomUUID }, URL, structuredClone });
+    const context = vm.createContext({ [browser === "firefox" ? "browser" : "chrome"]: api, crypto: { randomUUID },
+      URL, TextEncoder, structuredClone, setTimeout, clearTimeout, queueMicrotask });
     vm.runInContext(await readFile(join(root, "browser-extension", "dist", browser, "background.js"), "utf8"), context);
     listener({ ...item });
     await waitFor(() => vm.runInContext("activeActions", context) === 0, `${browser} extension capture`);
-    assert.deepEqual(events, ["pause", "search", "addDownloads", "search", "cancel", "commitHandoff", "erase"]);
+    assert.deepEqual(events.filter(event => !["search", "ping"].includes(event)), ["pause", "addDownloads", "cancel", "commitHandoff", "erase"]);
     assert.equal((await record(captured)).fileName, detectedName);
-    assert.ok(observed.get(name).ranges.some(({ start, end }) => start === 0 && end === 0), "Capture must verify a GET before accepting the browser handoff.");
+    assert.equal(observed.get(name)?.gets, 1, "Capture must verify a full GET before accepting the browser handoff.");
+    assert.equal(observed.get(name).ranges.length, 0, "Browser verification must retain its full response without a separate range probe.");
     await native("controlDownload", { downloadId: captured, action: "resume" });
-    await complete(captured, 4);
+    await complete(captured, 1);
+    assert.equal(observed.get(name).gets, 1, "The transfer must consume its verified GET without fetching the file again.");
     events.length = 0;
-    Object.assign(item, { state: "in_progress", paused: false, url: base + "auth.bin" });
+    Object.assign(item, { id: 43, state: "in_progress", paused: false, error: undefined, startTime: new Date().toISOString(), url: base + "auth.bin" });
     listener({ ...item });
     await waitFor(() => vm.runInContext("activeActions", context) === 0, `${browser} authenticated download fallback`);
-    assert.deepEqual(events, ["pause", "search", "addDownloads", "resume"]);
+    assert.deepEqual(events.filter(event => ["pause", "addDownloads", "cancel", "commitHandoff", "erase", "resume"].includes(event)), ["pause", "addDownloads", "resume"]);
     // Replay a private-window GET against a real cookie/referrer-protected server.
     events.length = 0;
     detectedName = `private-session-${browser}.bin`;
-    Object.assign(item, { state: "in_progress", paused: false, incognito: true, url: base + "private-source-" + browser, filename: join(out, detectedName),
+    extensionState.useBrowserSession = true;
+    storageChanged?.({ useBrowserSession: { newValue: true } }, "local");
+    Object.assign(item, { id: 44, state: "in_progress", paused: false, error: undefined, startTime: new Date().toISOString(), incognito: true, url: base + "private-source-" + browser, filename: join(out, detectedName),
       ...(browser === "chromium" ? { finalUrl: base + detectedName } : {}) });
     webRequest({ url: item.url, tabId: 10, incognito: true, requestId: "private-redirect", method: "GET", requestHeaders: [{ name: "Cookie", value: "original-host-only" }] });
     webRequest({ url: base + detectedName, tabId: 10, incognito: true, requestId: "private-redirect", method: "GET", requestHeaders: [
@@ -363,10 +373,10 @@ try {
     webRequest({ url: base + detectedName, tabId: 11, incognito: false, method: "GET", requestHeaders: [{ name: "Cookie", value: "wrong-regular-session" }] });
     listener({ ...item });
     await waitFor(() => vm.runInContext("activeActions", context) === 0, `${browser} private session capture`);
-    assert.deepEqual(events, ["pause", "search", "addDownloads", "search", "cancel", "commitHandoff", "erase"]);
+    assert.deepEqual(events.filter(event => !["search", "ping"].includes(event)), ["pause", "addDownloads", "cancel", "commitHandoff", "erase"]);
     assert.equal((await record(captured)).requestContext, undefined);
     await native("controlDownload", { downloadId: captured, action: "resume" });
-    await complete(captured, 4);
+    await complete(captured, 1);
     console.log(`PASS: ${browser} regular/private extension capture through the real native host and engine, exact SHA-256, browser fallback`);
   }
   for (const item of [{ url: base + "auth.bin" }, { url: base + "range.bin", expectedBytes: data.length + 1 },
