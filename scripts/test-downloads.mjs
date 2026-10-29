@@ -387,6 +387,8 @@ try {
   const verifiedFullGet = await native("addDownloads", { source: "clickMonitor", items: [{ url: base + "invalid.bin" }] });
   assert.equal(verifiedFullGet.accepted, 1, "A verified browser GET is valid even if the server mishandles byte ranges.");
   ids.push(verifiedFullGet.ids[0]);
+  assert.equal((await record(verifiedFullGet.ids[0])).status, "paused", "A captured click-monitor download waits for the user's prompt before transferring.");
+  await native("controlDownload", { downloadId: verifiedFullGet.ids[0], action: "resume" });
   await complete(verifiedFullGet.ids[0], 1);
   assert.equal(observed.get("invalid.bin").gets, 1, "The browser handoff must consume its verified GET.");
   assert.equal(observed.get("invalid.bin").ranges.length, 0, "A verified full GET does not need a byte-range response.");
