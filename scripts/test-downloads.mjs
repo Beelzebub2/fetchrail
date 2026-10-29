@@ -266,7 +266,8 @@ try {
   await native("controlDownload", { downloadId: session.ids[0], action: "resume" });
   if (process.platform === "win32") {
     // Only Windows encrypts the saved credential envelope using the user's DPAPI identity.
-    await complete(session.ids[0], 4);
+    // Browser verification retains a complete GET and deliberately uses one connection.
+    await complete(session.ids[0], 1);
     await waitFor(async () => !parseStateSnapshot(await read("downloads.json")).find((item) => item.id === session.ids[0]).requestContext, "completed session headers are removed from disk");
     console.log("PASS: Windows DPAPI retains browser credentials across a restart, then removes them on completion");
   } else {
@@ -286,7 +287,7 @@ try {
     }] });
     assert.equal(renewed.accepted, 1, "A fresh browser handoff can reauthorize a failed Linux session");
     ids.push(renewed.ids[0]);
-    await complete(renewed.ids[0], 4);
+    await complete(renewed.ids[0], 1);
     console.log("PASS: Linux drops browser credentials on restart, fails closed and accepts a fresh authenticated browser handoff");
   }
   const landing = await add("landing.html");
@@ -343,9 +344,11 @@ try {
     await waitFor(() => vm.runInContext("activeActions", context) === 0, `${browser} extension capture`);
     assert.deepEqual(events, ["pause", "search", "addDownloads", "search", "cancel", "commitHandoff", "erase"]);
     assert.equal((await record(captured)).fileName, detectedName);
-    assert.ok(observed.get(name).ranges.some(({ start, end }) => start === 0 && end === 0), "Capture must verify a GET before accepting the browser handoff.");
+    assert.equal(observed.get(name)?.gets, 1, "Capture must verify a full GET before accepting the browser handoff.");
+    assert.equal(observed.get(name).ranges.length, 0, "Browser verification must retain its full response without a separate range probe.");
     await native("controlDownload", { downloadId: captured, action: "resume" });
-    await complete(captured, 4);
+    await complete(captured, 1);
+    assert.equal(observed.get(name).gets, 1, "The transfer must consume its verified GET without fetching the file again.");
     events.length = 0;
     Object.assign(item, { state: "in_progress", paused: false, url: base + "auth.bin" });
     listener({ ...item });
@@ -366,7 +369,7 @@ try {
     assert.deepEqual(events, ["pause", "search", "addDownloads", "search", "cancel", "commitHandoff", "erase"]);
     assert.equal((await record(captured)).requestContext, undefined);
     await native("controlDownload", { downloadId: captured, action: "resume" });
-    await complete(captured, 4);
+    await complete(captured, 1);
     console.log(`PASS: ${browser} regular/private extension capture through the real native host and engine, exact SHA-256, browser fallback`);
   }
   for (const item of [{ url: base + "auth.bin" }, { url: base + "range.bin", expectedBytes: data.length + 1 },
