@@ -251,9 +251,10 @@ async fn replace_download_source(
     manager: State<'_, Arc<DownloadManager>>,
     id: Uuid,
     source: String,
+    reuse_verified_parts: Option<bool>,
 ) -> Result<DownloadRecord, String> {
     manager
-        .replace_source(id, source)
+        .replace_source(id, source, reuse_verified_parts.unwrap_or(false))
         .await
         .map(DownloadRecord::public_view)
 }

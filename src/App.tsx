@@ -1685,6 +1685,7 @@ function DownloadRow({
   const [limitDraft, setLimitDraft] = useState(0);
   const [editingSource, setEditingSource] = useState(false);
   const [sourceDraft, setSourceDraft] = useState("");
+  const [reuseVerifiedParts, setReuseVerifiedParts] = useState(false);
   const running = runningStatuses.has(item.status);
   const canPause = ["queued", "scheduled", "connecting", "downloading"].includes(item.status);
   const provisional = !!item.handoffId && !item.handoffCommitted;
@@ -1867,7 +1868,7 @@ function DownloadRow({
             <Ellipsis size={16} />
           </button>
           <div className="menu" popover="auto" id={menuId} style={{ positionAnchor: anchor }}>
-            {!provisional && ["paused", "failed"].includes(item.status) && <button popoverTarget={menuId} popoverTargetAction="hide" onClick={() => { setSourceDraft(""); setEditingSource(true); }}>Update download link…</button>}
+            {!provisional && ["paused", "failed"].includes(item.status) && <button popoverTarget={menuId} popoverTargetAction="hide" onClick={() => { setSourceDraft(""); setReuseVerifiedParts(false); setEditingSource(true); }}>Update download link…</button>}
             <button popoverTarget={menuId} popoverTargetAction="hide" onClick={() => void command("set_download_retry", item.id, { enabled: item.autoRetry === false })}>Automatic retry: {item.autoRetry === false ? "off" : "on"}</button>
             {item.nextRetryAt && <button popoverTarget={menuId} popoverTargetAction="hide" onClick={() => void command("resume_download", item.id)}>Retry now · planned {formatDateTime(item.nextRetryAt)}</button>}
             <button popoverTarget={menuId} popoverTargetAction="hide" onClick={() => { setLimitDraft(item.speedLimitBps / 1024); setEditingLimit(true); }}>
@@ -1975,7 +1976,25 @@ function DownloadRow({
           <button type="button" className="ghost-button" onClick={() => setEditingLimit(false)}>Cancel</button>
         </div>
       )}
-      {editingSource && <div className="row-schedule" role="group" aria-label={`Update download link for ${item.fileName}`}><label>New file URL (HTTP, HTTPS, FTP, FTPS, FTPES, SFTP) <input type="url" value={sourceDraft} onChange={e => setSourceDraft(e.target.value)} /></label><span>Your previous partial file stays in recovery storage. Resume after saving to download from the new link from the beginning.</span><button className="secondary-button" disabled={!directDownloadScheme(sourceDraft)} onClick={async () => { if (await command("replace_download_source", item.id, { source: sourceDraft })) setEditingSource(false); }}>Save link</button><button className="ghost-button" onClick={() => setEditingSource(false)}>Cancel</button></div>}
+      {editingSource && (
+        <div className="row-schedule" role="group" aria-label={`Update download link for ${item.fileName}`}>
+          <label>New file URL (HTTP, HTTPS, FTP, FTPS, FTPES, SFTP)
+            <input type="url" value={sourceDraft} onChange={e => setSourceDraft(e.target.value)} />
+          </label>
+          <label>
+            <input type="checkbox" checked={reuseVerifiedParts} disabled={!item.expectedSha256} onChange={e => setReuseVerifiedParts(e.target.checked)} />
+            Attempt to reuse downloaded bytes using the trusted expected SHA-256
+          </label>
+          <span>{reuseVerifiedParts
+            ? "On resume, Fetchrail checks saved range hashes and the new file size. It verifies the complete SHA-256 before publishing; incompatible parts are preserved separately and downloaded again."
+            : "The previous partial file is preserved in recovery storage. The new link starts from the beginning."}</span>
+          {!item.expectedSha256 && <span>Verified recovery requires an expected SHA-256 supplied when the download was created. Matching ETags alone are not enough.</span>}
+          <button className="secondary-button" disabled={!directDownloadScheme(sourceDraft)} onClick={async () => {
+            if (await command("replace_download_source", item.id, { source: sourceDraft, reuseVerifiedParts })) setEditingSource(false);
+          }}>Save link</button>
+          <button className="ghost-button" onClick={() => setEditingSource(false)}>Cancel</button>
+        </div>
+      )}
       <div className="connections" id={panelId} inert={!expanded}>
         <div>
           <div className="connections-body">

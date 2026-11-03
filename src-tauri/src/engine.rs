@@ -1378,7 +1378,12 @@ async fn gc_torrent_orphans(data_dir: &Path, committed: &HashSet<Uuid>) -> std::
 }
 
 impl DownloadManager {
-    pub async fn replace_source(&self, id: Uuid, source: String) -> Result<DownloadRecord, String> {
+    pub async fn replace_source(
+        &self,
+        id: Uuid,
+        source: String,
+        reuse_verified_parts: bool,
+    ) -> Result<DownloadRecord, String> {
         let url = Url::parse(source.trim()).map_err(|_| "Enter a valid download link.")?;
         if !matches!(
             url.scheme(),
@@ -1419,24 +1424,41 @@ impl DownloadManager {
         {
             return Err("This download has a pending publication. Resume it to reconcile the file before changing sources.".into());
         }
-        // A same ETag on a new URL proves nothing. Always preserve the old attempt and restart.
+        if reuse_verified_parts && record.expected_sha256.is_none() {
+            return Err("Reusing parts from another URL requires a trusted expected SHA-256. Add the download again with its published checksum, or replace the link without reusing partial data.".into());
+        }
+        // A same ETag on a new URL proves nothing. Only a trusted end-to-end
+        // checksum can authorize cross-URL reuse; rebind individual checkpointed
+        // ranges after the replacement source has been probed on the next run.
         let preserved = part_dir.with_file_name(format!("{id}.previous-source-{}", Uuid::new_v4()));
-        let moved = match fs::rename(&part_dir, &preserved).await {
-            Ok(()) => true,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
-            Err(e) => return Err(e.to_string()),
+        let moved = if reuse_verified_parts {
+            false
+        } else {
+            match fs::rename(&part_dir, &preserved).await {
+                Ok(()) => true,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+                Err(e) => return Err(e.to_string()),
+            }
         };
         record.url = url.into();
         record.status = DownloadStatus::Paused;
         record.error = None;
-        record.downloaded_bytes = 0;
+        if !reuse_verified_parts {
+            record.downloaded_bytes = 0;
+            record.segments.clear();
+        }
         record.merged_bytes = 0;
         record.total_bytes = None;
-        record.segments.clear();
         record.finished_at = None;
         record.resume_supported = None;
         record.extra.remove("retryAttempts");
         record.extra.remove("nextRetryAt");
+        record.extra.remove("trustedSourceReusePending");
+        if reuse_verified_parts {
+            record
+                .extra
+                .insert("trustedSourceReusePending".into(), json!(true));
+        }
         self.tasks.write().await.insert(
             id,
             Arc::new(DownloadTask {
@@ -5201,6 +5223,30 @@ impl DownloadManager {
         let settings = self.settings.read().await.clone();
         let snapshot = task.record.read().await.clone();
         let initial_downloaded = snapshot.downloaded_bytes;
+        if snapshot
+            .extra
+            .get("trustedSourceReusePending")
+            .and_then(|v| v.as_bool())
+            == Some(true)
+        {
+            // Rebind only checkpointed bytes verified against the local staged
+            // content. Mismatched size, missing range support, or an invalid
+            // checkpoint leaves the old attempt quarantined by prepare_parts.
+            let part_dir = self.part_dir(snapshot.id);
+            let recovered =
+                rebind_trusted_source_parts(&part_dir, &probe, snapshot.expected_sha256.as_deref())
+                    .await?;
+            let mut record = task.record.write().await;
+            record.extra.remove("trustedSourceReusePending");
+            if recovered.is_none() {
+                record.downloaded_bytes = 0;
+                record.segments.clear();
+            } else {
+                record.downloaded_bytes = recovered.unwrap_or(0);
+            }
+            drop(record);
+            self.persist_records().await?;
+        }
         let requested_connections = snapshot
             .requested_connections
             .unwrap_or(snapshot.connections)
@@ -8062,6 +8108,89 @@ async fn part_checkpoint(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(error.into()),
     }
+}
+
+// An HTTP ETag is scoped to one resource, not to arbitrary links. Never carry
+// partial bytes to a replacement URL based on size or ETag alone. A trusted
+// caller-supplied SHA-256 anchors the complete output; this also rechecks the
+// local durable range commitments before changing the manifest's URL scope.
+// The final publication still verifies the entire expected SHA-256.
+async fn rebind_trusted_source_parts(
+    part_dir: &Path,
+    probe: &ProbeResult,
+    expected_sha256: Option<&str>,
+) -> EngineResult<Option<u64>> {
+    if !expected_sha256
+        .is_some_and(|hash| hash.len() == 64 && hash.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        || !probe.accepts_ranges
+        || probe.validator.is_none()
+        || probe.final_url.is_none()
+    {
+        return Ok(None);
+    }
+    let Some(total) = probe.total_bytes else {
+        return Ok(None);
+    };
+    let Some(mut saved) = fs::read(part_dir.join("transfer.json"))
+        .await
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<PartManifest>(&bytes).ok())
+    else {
+        return Ok(None);
+    };
+    if !saved.shared_staging
+        || !saved.accepts_ranges
+        || saved.validator.is_none()
+        || saved.final_url_sha256.is_none()
+        || saved.total_bytes != Some(total)
+        || !valid_manifest_ranges(&saved, total)
+    {
+        return Ok(None);
+    }
+    let stage = part_dir.join("0.part");
+    let metadata = match fs::symlink_metadata(&stage).await {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    if !metadata.file_type().is_file() || metadata.len() != total {
+        return Ok(None);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        if metadata.file_attributes() & 0x400 != 0 {
+            return Ok(None);
+        }
+    }
+    let cancel = CancellationToken::new();
+    let mut recovered = 0u64;
+    for (index, range) in saved.ranges.iter().enumerate() {
+        let Some(checkpoint) = part_checkpoint(part_dir, index, range.len()).await? else {
+            continue;
+        };
+        if checkpoint.bytes == 0 {
+            continue;
+        }
+        let actual =
+            crate::staging::prefix_hasher(&stage, range.start, checkpoint.bytes, &cancel).await?;
+        if format!("{:x}", actual.finalize()) != checkpoint.sha256 {
+            return Ok(None);
+        }
+        recovered += checkpoint.bytes;
+    }
+    if recovered == 0 {
+        return Ok(None);
+    }
+    saved.validator = probe.validator.clone();
+    saved.final_url_sha256 = probe
+        .final_url
+        .as_ref()
+        .map(|url| format!("{:x}", Sha256::digest(url.as_str().as_bytes())));
+    // The atomic manifest update precedes readmission. After a crash, normal
+    // resume accepts only this exact new URL and its probed representation.
+    write_json_atomic(&part_dir.join("transfer.json"), &saved).await?;
+    Ok(Some(recovered))
 }
 
 async fn prepare_parts(

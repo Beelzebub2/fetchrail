@@ -10,6 +10,14 @@
 
 Pause a transfer to free a download slot, then resume it when you are ready. If Fetchrail closes during a transfer, the download returns paused on the next launch.
 
+### Replace an expired download link
+
+Pause a download, choose **More → Update download link**, and paste its replacement URL. By default, Fetchrail preserves the previous partial data separately and starts the new link from zero: a matching file size or ETag from another URL does **not** prove the bytes are the same.
+
+If you supplied a **trusted Expected SHA-256** when creating the download, you can check **Attempt to reuse downloaded bytes**. On resume, Fetchrail probes the new link, confirms byte-range support and the same total size, and verifies the local saved range commitments. Only checkpointed bytes from the shared staging file may be reused. If any requirement fails, incompatible parts are quarantined and the new link starts cleanly. Even after reuse, the complete SHA-256 is checked before the file is published. Links containing temporary authorization parameters are never written into the part manifest.
+
+The replacement link is entered manually; Fetchrail does not yet renew signed URLs from a website or account automatically.
+
 ## FTP, FTPS and SFTP files
 
 Paste a direct `ftp://`, `ftps://`, `ftpes://` or `sftp://` file URL in **New downloads**. Files on these servers use the ordinary download list, folders, queues, schedules and speed controls. Only the desktop downloader accepts these URLs; the browser's session/extension handoff remains for HTTP and HTTPS. FTP/FTPS URLs can use an explicit username and password, and SFTP requires a username. SFTP can authenticate through a configured SSH agent or unencrypted default private key, or a password in the URL.
