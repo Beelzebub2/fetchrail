@@ -1,5 +1,7 @@
 # Fetchrail for Android (developer preview)
 
+Release notes: [Android v0.1.0](../docs/releases/android-v0.1.0.md).
+
 The Android application is a native Kotlin/Jetpack Compose client backed by a
 Rust transfer engine. It uses the existing desktop Fetchrail Rust origin
 admission, adaptive slow-peer detection and bandwidth-bucket modules directly
