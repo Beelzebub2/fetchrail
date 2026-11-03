@@ -85,6 +85,8 @@ export type DownloadRecord = {
   nextRetryAt?: string | null;
   failureCategory?: string;
   expectedSha256?: string | null;
+  mirrorCount?: number;
+  mirrorStatus?: Array<{ source: number; ready: boolean; reason?: string; attempts: number; failures: number }>;
   torrent?: TorrentSummary;
   speedLimitBps: number;
   id: string;
@@ -636,6 +638,9 @@ function App() {
   const [url, setUrl] = useState("");
   const [downloadLimit, setDownloadLimit] = useState(0);
   const [expectedSha256, setExpectedSha256] = useState("");
+  const [mirrorUrls, setMirrorUrls] = useState("");
+  const [metalinkFileName, setMetalinkFileName] = useState("");
+  const [metalinkSize, setMetalinkSize] = useState<number | null>(null);
   const [useBrowserSession, setUseBrowserSession] = useState(false);
   const [batchError, setBatchError] = useState<string | null>(null);
   const [directory, setDirectory] = useState("");
@@ -829,6 +834,27 @@ function App() {
     [downloads],
   );
 
+  async function importMetalinkFile(file: File | undefined) {
+    if (!file) return;
+    setBatchError(null);
+    setMessage(null);
+    try {
+      if (file.size > 512 * 1024) throw new Error("Metalink exceeds the 512 KiB limit.");
+      const xml = await file.text();
+      const imported = await invoke<{ fileName: string; size: number | null; expectedSha256: string; urls: string[] }>("inspect_metalink", { xml });
+      setUrl(imported.urls[0]);
+      setMirrorUrls(imported.urls.slice(1).join("\n"));
+      setExpectedSha256(imported.expectedSha256);
+      setMetalinkFileName(imported.fileName);
+      setMetalinkSize(imported.size);
+      setUseBrowserSession(false);
+      setShowAdd(true);
+    } catch (error) {
+      setBatchError(String(error));
+      setMessage(String(error));
+    }
+  }
+
   async function addDownload(event: FormEvent) {
     event.preventDefault();
     if (!url.trim() || !isTauri()) return;
@@ -848,6 +874,13 @@ function App() {
       const allUrls = url.trim().split(/\s+/).filter(Boolean);
       const torrentUrls = allUrls.filter(source => source.startsWith("magnet:") || (isBrowserDownloadUrl(source) && /\.torrent(?:[?#]|$)/i.test(source)));
       const urls = allUrls.filter(source => !torrentUrls.includes(source));
+      const extraMirrors = mirrorUrls.trim().split(/\s+/).filter(Boolean);
+      if (extraMirrors.length && (urls.length !== 1 || torrentUrls.length || !expectedSha256.trim() || useBrowserSession)) {
+        throw new Error("Mirror acceleration needs one direct HTTP(S) file link and a trusted SHA-256, without a browser session.");
+      }
+      if (extraMirrors.length > 7 || extraMirrors.some(source => !isBrowserDownloadUrl(source))) {
+        throw new Error("Use at most seven additional HTTP(S) mirror URLs.");
+      }
       if (urls.some(missingSftpUsername)) throw new Error("SFTP links require a username, for example sftp://user@files.example.com/archive.zip.");
       if (urls.some(source => !directDownloadScheme(source))) throw new Error("Enter valid HTTP, HTTPS, FTP, FTPS, FTPES, or SFTP file URLs.");
       if (useBrowserSession && urls.some(source => !isBrowserDownloadUrl(source))) {
@@ -859,7 +892,10 @@ function App() {
       const requests = urls.map((item) => ({
           url: item,
           directory: directory.trim() || null,
-          fileName: null,
+          fileName: metalinkFileName || null,
+          expectedBytes: metalinkSize,
+          metalinkSize,
+          mirrorUrls: extraMirrors.length ? extraMirrors : null,
           queue: selectedQueue,
           scheduledFor,
           startPaused: startMode === "paused",
@@ -885,6 +921,9 @@ function App() {
       }
       setUrl("");
       setExpectedSha256("");
+      setMirrorUrls("");
+      setMetalinkFileName("");
+      setMetalinkSize(null);
       setStartMode("now");
       setScheduledLocal("");
       setShowAdd(false);
@@ -1424,13 +1463,33 @@ function App() {
                 autoFocus
                 className="mono"
                 value={url}
-                onChange={(event) => setUrl(event.target.value)}
+                onChange={(event) => { setUrl(event.target.value); setMetalinkFileName(""); setMetalinkSize(null); }}
                 placeholder={"https://example.com/archive.zip\nsftp://user@files.example.com/archive.zip"}
                 rows={3}
                 spellCheck={false}
                 required
               />
             </label>
+            <div className="metalink-import">
+              <label>
+                Import Metalink (.meta4)
+                <input type="file" accept=".meta4,.metalink,application/metalink4+xml,application/xml"
+                  aria-label="Choose a Metalink file"
+                  onChange={event => {
+                    void importMetalinkFile(event.target.files?.[0]);
+                    event.target.value = "";
+                  }} />
+              </label>
+              <p className="hint">Reads a local manifest for review. No file is downloaded until you confirm the URLs and checksum.</p>
+              {metalinkFileName && <p className="hint" role="status">Metalink file: {metalinkFileName}{metalinkSize ? ` · ${formatBytes(metalinkSize, true)}` : ""}</p>}
+            </div>
+            <label>
+              Alternative mirror URLs (optional, up to seven)
+              <textarea className="mono" rows={2} spellCheck={false} value={mirrorUrls}
+                onChange={event => setMirrorUrls(event.target.value)}
+                placeholder={"https://mirror-a.example.com/archive.zip\nhttps://mirror-b.example.com/archive.zip"} />
+            </label>
+            <p className="hint">Mirrors use parallel HTTP(S) connections and per-source range checks. A trusted SHA-256 is required; the final result is verified before publishing. Mirror links cannot use browser-session credentials.</p>
             <label>
               <span className="label-line">
                 Save to
@@ -1820,7 +1879,7 @@ function DownloadRow({
           {item.error ? (
             <span className="error-text" title={item.error}>{item.error}</span>
           ) : (
-            <span title={item.url}>{hostOf(item.url)} · {item.queue}</span>
+            <span title={item.url}>{hostOf(item.url)} · {item.queue}{item.mirrorCount && item.mirrorCount > 1 ? ` · ${item.mirrorCount} sources` : ""}</span>
           )}
         </div>
         <div className="col-progress">
@@ -2130,7 +2189,18 @@ function DownloadRow({
               <dd>{item.queue} · Added {formatDateTime(item.createdAt)}</dd>
               <dt>Speed limit</dt>
               <dd>{item.speedLimitBps ? formatSpeed(item.speedLimitBps) : "Unlimited"}</dd>
+              {!!item.mirrorCount && item.mirrorCount > 1 && <>
+                <dt>Mirror sources</dt>
+                <dd>{item.mirrorStatus?.filter(source => source.ready).length ?? 1} of {item.mirrorCount} eligible · SHA-256 required</dd>
+              </>}
             </dl>
+            {!!item.mirrorStatus?.length && <div className="mirror-diagnostics" aria-label="Mirror transfer diagnostics">
+              {item.mirrorStatus.map(source => <div key={source.source}>
+                <strong>Source {source.source}</strong>
+                <span>{source.ready ? "Verified range support" : (source.reason ?? "Not eligible").replace(/_/g, " ")}</span>
+                <small className="mono">{source.attempts} requests · {source.failures} failed</small>
+              </div>)}
+            </div>}
             {expanded && <DownloadHealth id={item.id} />}
           </div>
         </div>

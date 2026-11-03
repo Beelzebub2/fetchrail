@@ -126,6 +126,10 @@ try {
         if (name === "reset_calibration") { window.testPerformance.latest = null; window.testPerformance.applied = null; window.testSettings.performanceAuto = false; window.testEmit("fetchrail://settings-updated", structuredClone(window.testSettings)); return structuredClone(window.testSettings); }
         if (name === "get_overview") return { active: 0, queued: 0, completed: 1, failed: 0, currentSpeedBps: 0 };
         if (name === "request_browser_downloads") return "browser-request-fixture";
+        if (name === "inspect_metalink") return {
+          fileName: "archive.zip", size: 1048576, expectedSha256: "a".repeat(64),
+          urls: ["https://files.example.com/archive.zip?key=secret", "https://mirror.example.net/archive.zip?key=other"],
+        };
         if (name === "add_downloads") return { accepted: [], errors: [] };
         if (name === "list_queues") { const snapshot = [{ name: "Default", paused: false, startsAt: null, stopsAt: null }]; if (location.search.includes("bootstrap")) return new Promise(resolve => { window.testBootstrap.queues = () => resolve(snapshot); }); return snapshot; }
         if (name === "plugin:app|version") return "0.5.2";
@@ -437,6 +441,28 @@ try {
   assert.deepEqual(directRequest.args.requests.map(request => request.url), directUrls, "FTP, FTPS, FTPES and SFTP must use ordinary desktop downloads, including .torrent file names.");
   assert.equal(await page.evaluate(() => window.testCalls.some(call => call.name === "import_torrent")), false, "An FTP .torrent file is a direct file download, not a torrent import.");
   assert.equal(await page.getByRole("heading", { name: "New downloads" }).count(), 0, "Accepted direct URLs should close the form.");
+  await page.getByRole("button", { name: "Download options", exact: true }).click();
+  const beforeMirrors = await page.evaluate(() => window.testCalls.filter(call => call.name === "add_downloads").length);
+  await page.getByRole("textbox", { name: "Download URLs" }).fill("https://files.example.com/archive.zip");
+  await page.getByRole("textbox", { name: /Alternative mirror URLs/ }).fill("https://mirror.example.net/archive.zip");
+  await page.locator(".modal").getByRole("button", { name: "Download", exact: true }).click();
+  await page.locator(".modal").getByRole("alert").filter({ hasText: "Mirror acceleration needs one direct HTTP(S) file link and a trusted SHA-256" }).waitFor();
+  assert.equal(await page.evaluate(() => window.testCalls.filter(call => call.name === "add_downloads").length), beforeMirrors,
+    "Mirror downloads without a trusted checksum must not reach the engine.");
+  await page.getByLabel("Choose a Metalink file").setInputFiles({ name: "archive.meta4", mimeType: "application/metalink4+xml", buffer: Buffer.from("<metalink/>") });
+  await page.getByRole("status").filter({ hasText: "Metalink file: archive.zip" }).waitFor();
+  assert.equal(await page.getByRole("textbox", { name: "Download URLs" }).inputValue(), "https://files.example.com/archive.zip?key=secret");
+  assert.equal(await page.getByRole("textbox", { name: /Alternative mirror URLs/ }).inputValue(), "https://mirror.example.net/archive.zip?key=other");
+  assert.equal(await page.getByPlaceholder("64 hexadecimal characters").inputValue(), "a".repeat(64));
+  await page.locator(".modal").getByRole("button", { name: "Download", exact: true }).click();
+  await page.waitForFunction(before => window.testCalls.filter(call => call.name === "add_downloads").length > before, beforeMirrors);
+  const metalinkRequest = await page.evaluate(() => window.testCalls.filter(call => call.name === "add_downloads").at(-1).args.requests[0]);
+  assert.deepEqual(metalinkRequest.mirrorUrls, ["https://mirror.example.net/archive.zip?key=other"]);
+  assert.equal(metalinkRequest.fileName, "archive.zip");
+  assert.equal(metalinkRequest.expectedBytes, 1048576);
+  assert.equal(metalinkRequest.metalinkSize, 1048576);
+  assert.equal(metalinkRequest.expectedSha256, "a".repeat(64));
+  assert.equal(await page.getByRole("heading", { name: "New downloads" }).count(), 0);
   // Large files may queue 32 immutable byte ranges on 16 live connections.
   // Neither the connection label nor the throughput header may confuse those units.
   await page.evaluate(() => {

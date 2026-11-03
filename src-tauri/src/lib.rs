@@ -19,6 +19,7 @@ pub mod install;
 mod integrity;
 #[cfg(target_os = "linux")]
 mod linux_updates;
+mod metalink;
 mod model;
 pub mod native_host;
 pub mod native_protocol;
@@ -172,6 +173,13 @@ async fn add_download(
         .add(request)
         .await
         .map(DownloadRecord::public_view)
+}
+
+/// Inspect user-selected .meta4 XML bytes. The backend does not accept paths
+/// or fetch URLs while reading a manifest; approval stays in the add dialog.
+#[tauri::command]
+fn inspect_metalink(xml: String) -> Result<metalink::MetalinkImport, String> {
+    metalink::inspect(&xml)
 }
 
 #[tauri::command]
@@ -1391,6 +1399,7 @@ pub fn run() {
             download_window::open_download,
             add_download,
             add_downloads,
+            inspect_metalink,
             automation_state,
             automation_add_feed,
             automation_remove_feed,
