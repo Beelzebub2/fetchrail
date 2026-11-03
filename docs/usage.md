@@ -48,7 +48,17 @@ RSS, watch folders, search plugins and remote control are later features. See [t
 
 Use **New downloads** to paste several file URLs, one per line. The batch shares your folder, queue, start time, and per-file speed limit; rejected links stay in the form for correction.
 
+### Verified multi-mirror HTTP downloads and Metalink (.meta4)
+
+For a single HTTP(S) file, paste the primary URL in **New downloads**, add up to seven equivalent HTTP(S) addresses under **Alternative mirror URLs**, and supply a **trusted SHA-256** (64 hexadecimal characters) from the file publisher. Alternatively, **Import Metalink (.meta4)** from a file on your computer to prefill the name, size, checksum, and URLs, then inspect everything before selecting **Download**. Import reads only the XML bytes chosen in the dialog; it never opens arbitrary filesystem paths or starts transfers on its own. The importer supports one-file Metalink 4 documents with a SHA-256 hash and up to eight HTTP(S) URLs. It rejects malformed XML, DTD/custom entities, insecure filename paths, private literal host addresses, unsupported schemes, and manifests larger than 512 KiB.
+
+Only verified-eligible mirrors are used. Fetchrail independently checks each alternate's size, HTTP byte-range support and its own strong representation validator; a mirror that cannot prove these properties is skipped. **An ETag from one website does not establish byte identity with another website**, even when the ETags look the same. The trusted SHA-256 is mandatory before combining ranges across websites, and the complete merged file must match it before any output is published. Each range is requested from one eligible source, with bounded retries that rotate to another eligible source when a mirror fails or changes. Existing queue, speed limits, proxy routing, pause/resume, verified staging and no-overwrite publication rules still apply. Expand a download's connection details to inspect numbered per-mirror eligibility, request counts and failures without exposing signed mirror URLs.
+
+The primary URL must successfully pass its initial probe; optional mirrors cannot rescue a failed initial primary probe. Only HTTP(S) direct downloads are supported, not torrent, FTP/SFTP or browser-session handoffs. Matching sizes, validators and the checksum supplied inside a Metalink file do **not** authenticate the file's publisher: only import manifests from a source you trust. Cross-host transfers may be slower if mirror latency, bandwidth limits or failed probes outweigh the benefit. Local throughput measurements can be taken with the ignored Rust test `mirror_vs_single_source_throughput_baseline`; no fixed speed improvement is guaranteed. Private mirror URLs are kept out of ordinary download records and diagnostic events; the private saved transfer state retains the source list for restart recovery (protected with the existing Windows user-scoped state protection).
+
 **Settings → Downloads** sets the total speed limit. Each download's **More → Speed limit** changes its cap while running. Limits use KiB/s; zero means unlimited.
+
+Metalink's declared size is checked against the primary server's HTTP probe before any mirror ranges are combined. A size mismatch stops the transfer; the reported size is not treated as a substitute for a SHA-256 checksum.
 
 ### Desktop HTTP proxy and per-website request limits
 

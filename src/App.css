@@ -701,3 +701,10 @@ dialog.modal-backdrop::backdrop { background: var(--backdrop); }
 .download-health { min-width: 0; margin-block: 1rem; }
 .download-health summary { cursor: pointer; }
 .download-health .diag-table-wrap { overflow-x: auto; }
+.metalink-import { display: grid; gap: 6px; padding: 10px 12px; border: 1px solid var(--line); border-radius: 10px; }
+.metalink-import label { display: grid; gap: 6px; font-size: 12px; }
+.metalink-import input[type="file"] { max-width: 100%; }
+.mirror-diagnostics { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(150px, 100%), 1fr)); gap: 8px; margin-block: 12px; }
+.mirror-diagnostics > div { display: grid; gap: 4px; padding: 8px 10px; border: 1px solid var(--line); border-radius: 8px; overflow-wrap: anywhere; }
+.mirror-diagnostics strong { font-size: 12px; }
+.mirror-diagnostics span, .mirror-diagnostics small { font-size: 11px; color: var(--text-2); }

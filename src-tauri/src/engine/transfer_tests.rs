@@ -10,7 +10,7 @@ use std::{
 const HTTP_FIXTURE: &str = r#"
 import { createServer } from 'node:http';
 const total = Number(process.argv[1]), mode = process.argv[2];
-const body = Buffer.alloc(mode === 'uneven-rates' ? 64 * 1024 : 16 * 1024, 0x5a);
+const body = Buffer.alloc(mode === 'uneven-rates' ? 64 * 1024 : 16 * 1024, mode === 'corrupt' ? 0x4b : 0x5a);
 let failed = false, active = 0, peak = 0, firstRangeRequests = 0;
 const served = [];
 const handler = (request, response) => {
@@ -348,6 +348,182 @@ async fn verify_parts(dir: &Path, segments: &[SegmentCounter]) {
             segment.range.len()
         );
         assert!(!segment.active.load(Ordering::Relaxed));
+    }
+}
+
+#[tokio::test]
+async fn hash_authorized_mirrors_share_independent_ranges_without_overlapping_parts() {
+    let total = 8 * 1024 * 1024;
+    let primary = TestServer::new(total, "normal");
+    let alternate = TestServer::new(total, "normal");
+    let (dir, segments, mut probe) = parts(total, 8).await;
+    probe.final_url = Some(primary.url.clone());
+    let alternate_probe = ProbeResult {
+        final_url: Some(alternate.url.clone()),
+        ..probe.clone()
+    };
+    let task = task();
+    *task.qualified_mirrors.lock().unwrap() = vec![
+        mirrors::QualifiedMirror::fixture(primary.url.clone(), probe.clone(), 1),
+        mirrors::QualifiedMirror::fixture(alternate.url.clone(), alternate_probe, 2),
+    ];
+    let client = download_client_builder().no_proxy().build().unwrap();
+    DownloadManager::download_ranges(
+        &client,
+        &RateLimiter::new(0),
+        &task,
+        &CancellationToken::new(),
+        &primary.url,
+        &dir,
+        &segments,
+        &probe,
+    )
+    .await
+    .unwrap();
+    verify_parts(&dir, &segments).await;
+    let sources = task.qualified_mirrors.lock().unwrap().clone();
+    assert!(sources
+        .iter()
+        .all(|source| source.attempts.load(Ordering::Relaxed) > 0));
+    assert!(primary.requests.lock().unwrap().len() > 0);
+    assert!(alternate.requests.lock().unwrap().len() > 0);
+    assert!(sources
+        .iter()
+        .all(|source| source.failures.load(Ordering::Relaxed) == 0));
+    fs::remove_dir_all(&dir).await.unwrap();
+}
+
+#[tokio::test]
+async fn changed_alternative_validator_falls_back_without_using_invalid_response() {
+    let total = 8 * 1024 * 1024;
+    let primary = TestServer::new(total, "normal");
+    let changed = TestServer::new(total, "changed");
+    let (dir, segments, mut probe) = parts(total, 8).await;
+    probe.final_url = Some(primary.url.clone());
+    // Pretend the mirror changed its ETag after a successful probe, before
+    // delivering the body. Invalid bytes must never reach part storage.
+    let invalid_probe = ProbeResult {
+        final_url: Some(changed.url.clone()),
+        ..probe.clone()
+    };
+    let task = task();
+    *task.qualified_mirrors.lock().unwrap() = vec![
+        mirrors::QualifiedMirror::fixture(primary.url.clone(), probe.clone(), 1),
+        mirrors::QualifiedMirror::fixture(changed.url.clone(), invalid_probe, 2),
+    ];
+    let client = download_client_builder().no_proxy().build().unwrap();
+    DownloadManager::download_ranges(
+        &client,
+        &RateLimiter::new(0),
+        &task,
+        &CancellationToken::new(),
+        &primary.url,
+        &dir,
+        &segments,
+        &probe,
+    )
+    .await
+    .unwrap();
+    verify_parts(&dir, &segments).await;
+    let sources = task.qualified_mirrors.lock().unwrap().clone();
+    assert!(sources[1].failures.load(Ordering::Relaxed) > 0);
+    assert!(sources[0].attempts.load(Ordering::Relaxed) >= 4);
+    fs::remove_dir_all(&dir).await.unwrap();
+}
+
+#[tokio::test]
+async fn identical_mirror_metadata_cannot_publish_mixed_bytes_without_matching_sha256() {
+    let total = 4 * 1024 * 1024;
+    let trusted = TestServer::new(total, "normal");
+    let malicious = TestServer::new(total, "corrupt");
+    let (dir, segments, mut probe) = parts(total, 4).await;
+    probe.final_url = Some(trusted.url.clone());
+    // Deliberately identical length, ranges and validator text: none of these
+    // proves equivalence across two different HTTP origins.
+    let fake_matching = ProbeResult {
+        final_url: Some(malicious.url.clone()),
+        ..probe.clone()
+    };
+    let task = task();
+    *task.qualified_mirrors.lock().unwrap() = vec![
+        mirrors::QualifiedMirror::fixture(trusted.url.clone(), probe.clone(), 1),
+        mirrors::QualifiedMirror::fixture(malicious.url.clone(), fake_matching, 2),
+    ];
+    let client = download_client_builder().no_proxy().build().unwrap();
+    DownloadManager::download_ranges(
+        &client,
+        &RateLimiter::new(0),
+        &task,
+        &CancellationToken::new(),
+        &trusted.url,
+        &dir,
+        &segments,
+        &probe,
+    )
+    .await
+    .unwrap();
+    let staged = dir.join("staged-not-published.bin");
+    let mut output = fs::File::create(&staged).await.unwrap();
+    for index in 0..segments.len() {
+        let bytes = fs::read(dir.join(format!("{index}.part"))).await.unwrap();
+        output.write_all(&bytes).await.unwrap();
+    }
+    output.flush().await.unwrap();
+    drop(output);
+    let publisher_checksum = format!("{:x}", Sha256::digest(vec![0x5a; total as usize]));
+    assert!(
+        verify_file_hash(&staged, &publisher_checksum, &CancellationToken::new()).is_err(),
+        "A combined file with one corrupt mirror must fail the publication checksum"
+    );
+    assert!(fs::metadata(&staged).await.unwrap().len() == total);
+    fs::remove_dir_all(dir).await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "local throughput comparison; controlled loopback speed, not a CI pass/fail assertion"]
+async fn mirror_vs_single_source_throughput_baseline() {
+    let total = 32 * 1024 * 1024;
+    for number_of_sources in [1, 2] {
+        let servers = (0..number_of_sources)
+            .map(|_| TestServer::new(total, "slow-group"))
+            .collect::<Vec<_>>();
+        let (dir, segments, mut probe) = parts(total, 8).await;
+        probe.final_url = Some(servers[0].url.clone());
+        let task = task();
+        if number_of_sources == 2 {
+            *task.qualified_mirrors.lock().unwrap() = servers
+                .iter()
+                .enumerate()
+                .map(|(index, server)| {
+                    mirrors::QualifiedMirror::fixture(
+                        server.url.clone(),
+                        ProbeResult {
+                            final_url: Some(server.url.clone()),
+                            ..probe.clone()
+                        },
+                        index + 1,
+                    )
+                })
+                .collect();
+        }
+        let started = Instant::now();
+        let client = download_client_builder().no_proxy().build().unwrap();
+        DownloadManager::download_ranges(
+            &client,
+            &RateLimiter::new(0),
+            &task,
+            &CancellationToken::new(),
+            &servers[0].url,
+            &dir,
+            &segments,
+            &probe,
+        )
+        .await
+        .unwrap();
+        verify_parts(&dir, &segments).await;
+        eprintln!("Mirror benchmark: sources={number_of_sources}, bytes={total}, elapsed_ms={}, throughput_mib_s={:.2}",
+            started.elapsed().as_millis(), total as f64 / 1024.0 / 1024.0 / started.elapsed().as_secs_f64());
+        fs::remove_dir_all(&dir).await.unwrap();
     }
 }
 
