@@ -4,11 +4,19 @@
 
 ## Your first download
 
-1. Paste an HTTP or HTTPS file URL into Fetchrail.
+1. Paste an HTTP, HTTPS, FTP, FTPS, FTPES or SFTP file URL into Fetchrail.
 2. Choose a destination, queue, or future start time when needed.
 3. Start the download and expand its row to inspect the individual connections.
 
 Pause a transfer to free a download slot, then resume it when you are ready. If Fetchrail closes during a transfer, the download returns paused on the next launch.
+
+## FTP, FTPS and SFTP files
+
+Paste a direct `ftp://`, `ftps://`, `ftpes://` or `sftp://` file URL in **New downloads**. Files on these servers use the ordinary download list, folders, queues, schedules and speed controls. Only the desktop downloader accepts these URLs; the browser's session/extension handoff remains for HTTP and HTTPS. FTP/FTPS URLs can use an explicit username and password, and SFTP requires a username. SFTP can authenticate through a configured SSH agent or unencrypted default private key, or a password in the URL.
+
+**FTP** is unencrypted; choose **FTPS** (FTP with TLS) or **SFTP** (SSH file transfer) when connecting with credentials or transferring sensitive content. FTPS requires valid TLS server certificates; `ftps://` and `ftpes://` use explicit TLS on port 21 by default, while port 990 uses implicit TLS. SFTP requires a trusted server SSH host key in `~/.ssh/known_hosts`. When possible, prefer SSH agent authentication because passwords embedded in links may be retained in local download state; Linux stores private state with restricted file permissions, while Windows protects application state with DPAPI.
+
+HTTP servers can supply a strong ETag. FTP and SFTP file length and modification time are weaker signals, so Fetchrail normally uses one connection and starts over after an interruption. To enable parallel ranges and verified restart on a capable remote server, enter an independently trusted **Expected SHA-256** for that one file. The result is verified end-to-end before publication; a mismatched file cannot become a completed download.
 
 ## Torrents and magnets
 

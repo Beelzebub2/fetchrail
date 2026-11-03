@@ -374,6 +374,31 @@ function nameFromUrl(url: string) {
   }
 }
 
+const directDownloadSchemes = new Set(["http:", "https:", "ftp:", "ftps:", "ftpes:", "sftp:"]);
+
+function directDownloadScheme(source: string): string | null {
+  try {
+    const url = new URL(source);
+    return url.hostname && directDownloadSchemes.has(url.protocol)
+      && (url.protocol !== "sftp:" || url.username) ? url.protocol : null;
+  } catch {
+    return null;
+  }
+}
+
+function missingSftpUsername(source: string): boolean {
+  try {
+    const url = new URL(source);
+    return url.protocol === "sftp:" && !!url.hostname && !url.username;
+  } catch {
+    return false;
+  }
+}
+
+function isBrowserDownloadUrl(source: string) {
+  return ["http:", "https:"].includes(directDownloadScheme(source) ?? "");
+}
+
 // Sizes and byte ranges pass `fine` so neighbouring gigabyte values stay distinguishable.
 export function formatBytes(value: number | null, fine = false) {
   if (value == null) return "Unknown";
@@ -423,7 +448,10 @@ function queueWaitNote(queue: QueueRecord | undefined) {
 
 function hostOf(url: string) {
   try {
-    return new URL(url).host;
+    const parsed = new URL(url);
+    return ["ftp:", "ftps:", "ftpes:", "sftp:"].includes(parsed.protocol)
+      ? `${parsed.protocol.slice(0, -1).toUpperCase()} · ${parsed.host}`
+      : parsed.host;
   } catch {
     return url;
   }
@@ -782,10 +810,15 @@ function App() {
     setBatchError(null);
     try {
       const allUrls = url.trim().split(/\s+/).filter(Boolean);
-      const torrentUrls = allUrls.filter(source => source.startsWith("magnet:") || /\.torrent(?:[?#]|$)/i.test(source));
-      setTorrentSources(current => [...current, ...torrentUrls]);
+      const torrentUrls = allUrls.filter(source => source.startsWith("magnet:") || (isBrowserDownloadUrl(source) && /\.torrent(?:[?#]|$)/i.test(source)));
       const urls = allUrls.filter(source => !torrentUrls.includes(source));
-      if (expectedSha256.trim() && (urls.length !== 1 || torrentUrls.length)) throw new Error("Use an expected SHA-256 with one HTTP file link at a time.");
+      if (urls.some(missingSftpUsername)) throw new Error("SFTP links require a username, for example sftp://user@files.example.com/archive.zip.");
+      if (urls.some(source => !directDownloadScheme(source))) throw new Error("Enter valid HTTP, HTTPS, FTP, FTPS, FTPES, or SFTP file URLs.");
+      if (useBrowserSession && urls.some(source => !isBrowserDownloadUrl(source))) {
+        throw new Error("Browser sessions support HTTP and HTTPS links only. Turn off Use browser session for FTP, FTPS, FTPES, or SFTP files.");
+      }
+      if (expectedSha256.trim() && (urls.length !== 1 || torrentUrls.length)) throw new Error("Use an expected SHA-256 with one direct file link at a time.");
+      setTorrentSources(current => [...current, ...torrentUrls]);
       if (!urls.length) { setUrl(""); setShowAdd(false); return; }
       const requests = urls.map((item) => ({
           url: item,
@@ -972,6 +1005,7 @@ function App() {
   const dialogConnections = connections || settings?.connectionsPerDownload || 8;
   // Without a chosen folder, the engine files the download under its category.
   const dialogCategory = settings?.sortIntoCategoryFolders ? categoryFor(nameFromUrl(url), settings) : null;
+  const hasFileTransferLinks = url.trim().split(/\s+/).some(source => ["ftp:", "ftps:", "ftpes:", "sftp:"].includes(directDownloadScheme(source) ?? ""));
 
   // Each settings section opens at its top, not wherever the last one was scrolled to.
   const content = useRef<HTMLElement>(null);
@@ -1014,7 +1048,7 @@ function App() {
               <input
                 value={url}
                 onChange={(event) => setUrl(event.target.value)}
-                placeholder="Paste a link or magnet"
+                placeholder="Paste an HTTP, FTP, FTPES, SFTP, or magnet link"
                 aria-label="Link to download"
                 type="url"
               />
@@ -1312,7 +1346,7 @@ function App() {
             <div className="modal-head">
               <div>
                 <h2 id="add-download-title">New downloads</h2>
-                <p>Paste file links, one per line. For pages with several download buttons, use Browse download pages in the browser companion.</p>
+                <p>Paste HTTP, HTTPS, FTP, FTPS, FTPES, or SFTP file links, one per line. FTPES uses explicit FTP over TLS. For pages with several download buttons, use Browse download pages in the browser companion.</p>
               </div>
               <button
                 type="button"
@@ -1330,7 +1364,7 @@ function App() {
                 className="mono"
                 value={url}
                 onChange={(event) => setUrl(event.target.value)}
-                placeholder="https://example.com/archive.zip"
+                placeholder={"https://example.com/archive.zip\nsftp://user@files.example.com/archive.zip"}
                 rows={3}
                 spellCheck={false}
                 required
@@ -1353,8 +1387,10 @@ function App() {
               </div>
             </label>
             <label>Expected SHA-256 (optional, one file)<input className="mono" value={expectedSha256} onChange={event => setExpectedSha256(event.target.value)} pattern="[0-9a-fA-F]{64}" placeholder="64 hexadecimal characters" spellCheck={false} /></label>
+            {hasFileTransferLinks && <p className="hint">FTP, FTPS, FTPES, and SFTP use one stream by default. A trusted expected SHA-256 enables verified parallel downloads and pause/resume where the server supports it.</p>}
             <label className="check"><input type="checkbox" checked={useBrowserSession} onChange={event => setUseBrowserSession(event.target.checked)} /> Use browser session for signed-in sites or private repositories</label>
             {useBrowserSession && <p className="hint">Open the companion in the regular or private window where you are signed in, then choose Use this window to start these downloads.</p>}
+            {useBrowserSession && hasFileTransferLinks && <p className="hint" role="status">Browser sessions are for HTTP and HTTPS only. Uncheck Use browser session to download FTP, FTPS, FTPES, or SFTP files directly.</p>}
             <fieldset className="choice-field">
               <legend>
                 Connections
@@ -1939,7 +1975,7 @@ function DownloadRow({
           <button type="button" className="ghost-button" onClick={() => setEditingLimit(false)}>Cancel</button>
         </div>
       )}
-      {editingSource && <div className="row-schedule" role="group" aria-label={`Update download link for ${item.fileName}`}><label>New HTTP or HTTPS link <input type="url" value={sourceDraft} onChange={e => setSourceDraft(e.target.value)} /></label><span>Your previous partial file stays in recovery storage. Resume after saving to download from the new link from the beginning.</span><button className="secondary-button" disabled={!/^https?:\/\//i.test(sourceDraft)} onClick={async () => { if (await command("replace_download_source", item.id, { source: sourceDraft })) setEditingSource(false); }}>Save link</button><button className="ghost-button" onClick={() => setEditingSource(false)}>Cancel</button></div>}
+      {editingSource && <div className="row-schedule" role="group" aria-label={`Update download link for ${item.fileName}`}><label>New file URL (HTTP, HTTPS, FTP, FTPS, FTPES, SFTP) <input type="url" value={sourceDraft} onChange={e => setSourceDraft(e.target.value)} /></label><span>Your previous partial file stays in recovery storage. Resume after saving to download from the new link from the beginning.</span><button className="secondary-button" disabled={!directDownloadScheme(sourceDraft)} onClick={async () => { if (await command("replace_download_source", item.id, { source: sourceDraft })) setEditingSource(false); }}>Save link</button><button className="ghost-button" onClick={() => setEditingSource(false)}>Cancel</button></div>}
       <div className="connections" id={panelId} inert={!expanded}>
         <div>
           <div className="connections-body">

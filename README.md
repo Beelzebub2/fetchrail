@@ -54,6 +54,14 @@ Every download shows its speed, time remaining and the progress of each connecti
 - **Closed mid-transfer?** The download comes back paused the next time Fetchrail starts.
 - **Resume** reuses saved parts only when the file's length, range layout and ETag or Last-Modified still match. Anything else restarts cleanly.
 
+## FTP, FTPS and SFTP downloads
+
+Fetchrail also accepts direct file URLs using `ftp://`, `ftps://`, `ftpes://` and `sftp://` in **New downloads**. They share the download queue, schedules, progress window, per-file and global speed limits, and protected final-file publication with HTTP jobs. The browser companion continues to handle HTTP(S) links only.
+
+These servers do not provide HTTP's strong representation validators. By default, each remote file downloads as a single stream and an interrupted file starts again. For remote servers that support reading from a byte offset, supply a trusted **Expected SHA-256** when adding a file to enable verified parallel ranges and safe partial reuse. Fetchrail verifies the whole output against that hash before publication, including after a resumed or split transfer.
+
+Use **FTPS** to encrypt FTP traffic, or **SFTP** for file transfers over SSH. Plain FTP does not encrypt its data or credentials. `ftps://` and `ftpes://` default to explicit TLS on port 21; `ftps://host:990` uses implicit TLS. SFTP servers must have a trusted SSH host key in your known-hosts configuration. See the [user guide](docs/usage.md#ftp-ftps-and-sftp-files) for protocol-specific limitations.
+
 ## Decide when, where and how fast
 
 | Control | What it does |
@@ -100,7 +108,7 @@ Two themes, four accents. Fetchrail uses the system tray when your desktop suppo
 
 1. Choose your system's build from the [latest release](https://github.com/Beelzebub2/fetchrail/releases/latest). For Linux package availability and source builds, see the [Linux guide](docs/linux.md).
 2. Run Windows setup or install your Linux package, then launch Fetchrail.
-3. Paste an HTTP or HTTPS file link, pick a destination and start.
+3. Paste an HTTP, HTTPS, FTP, FTPS, FTPES or SFTP file link, pick a destination and start.
 
 | Platform | What to know |
 | :-- | :-- |
