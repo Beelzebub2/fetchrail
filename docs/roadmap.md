@@ -4,7 +4,7 @@
 
 ## Remaining work
 
-Remaining work includes general proxy configuration, configurable per-host limits, clipboard monitoring, recurring bandwidth windows, and optional Explorer context-menu integration. Automatic browser interception exclusions for websites, file types and minimum sizes are implemented in the browser companion; explicit browser batches bypass them. Global/per-file speed limits, queue start/stop windows, browser batches and opt-in final-request session support are implemented. Blob URLs and protected streaming formats require separate browser authentication/media support.
+Remaining work includes authenticated proxy support with secure credential storage, recurring **speed-limit** windows, safe external RAR/7z extraction, and optional Explorer context-menu integration. The desktop HTTP download engine supports opt-in HTTP/SOCKS5 proxy configuration after restart and configurable per-origin admission limits; torrent and FTP proxy routing are separate. Safe manual and opt-in automatic ZIP extraction is implemented. Weekly queue start/stop windows and bounded priority aging are implemented. Opt-in local clipboard-link suggestions are implemented on Windows and Linux. Automatic browser interception exclusions for websites, file types and minimum sizes are implemented in the browser companion; explicit browser batches bypass them. Global/per-file speed limits, queue start/stop windows, browser batches and opt-in final-request session support are implemented. Blob URLs and protected streaming formats require separate browser authentication/media support.
 
 ## Torrent support
 
