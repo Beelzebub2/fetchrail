@@ -92,6 +92,7 @@ h1, h2, p { margin: 0; }
 .clipboard-suggestion strong { font-size: 13px; }
 .clipboard-suggestion .grow span { font-size: 12px; color: var(--text-2); }
 .clipboard-suggestion button { flex: none; }
+.archive-extraction-note { margin: 8px 0; padding: 10px 12px; border: 1px solid var(--line); border-radius: 10px; background: var(--surface); color: var(--text-2); font-size: 12px; overflow-wrap: anywhere; }
 .top-rail { flex: none; border-bottom: 1px solid var(--line); background: var(--panel); transition: background 300ms, border-color 300ms; }
 .rail-main { display: flex; flex-wrap: wrap; align-items: center; gap: 12px 24px; padding: 14px 24px; }
 .brand { display: flex; align-items: center; gap: 10px; font-family: var(--display); font-size: 21px; font-weight: 700; letter-spacing: -.02em; }

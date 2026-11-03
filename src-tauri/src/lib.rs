@@ -2,6 +2,7 @@
 compile_error!("Release builds must embed the frontend: enable --features tauri/custom-protocol.");
 
 mod analytics;
+mod archive;
 mod browser_bridge;
 mod browser_extension;
 mod browser_handoff;
@@ -300,6 +301,11 @@ async fn set_download_priority(
         .set_download_priority(id, priority)
         .await
         .map(DownloadRecord::public_view)
+}
+
+#[tauri::command]
+async fn extract_archive(manager: State<'_, Arc<DownloadManager>>, id: Uuid) -> Result<(), String> {
+    archive::run(manager.inner(), id).await
 }
 
 #[tauri::command]
@@ -1066,6 +1072,7 @@ pub fn run() {
                 };
             app.manage(manager.clone());
             clipboard_monitor::start(app.handle().clone(), manager.clone());
+            archive::start(manager.clone());
             offer_torrent_arguments(
                 app.handle(),
                 std::env::args().collect(),
@@ -1308,6 +1315,7 @@ pub fn run() {
             schedule_queue,
             schedule_queue_weekly,
             set_download_priority,
+            extract_archive,
             list_downloads,
             get_overview,
             pause_download,

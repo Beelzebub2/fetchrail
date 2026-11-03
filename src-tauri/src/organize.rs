@@ -336,6 +336,8 @@ mod tests {
             windows_attachment_check: true,
             launch_on_start: false,
             clipboard_monitoring: false,
+            auto_extract_zip: false,
+            auto_extract_since: None,
             minimize_to_tray: true,
             theme: Default::default(),
             accent: Default::default(),

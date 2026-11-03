@@ -3784,6 +3784,70 @@ impl DownloadManager {
         records
     }
 
+    pub async fn reserve_archive_extraction(&self, id: Uuid) -> Result<PathBuf, String> {
+        let _persist = self.persist_lock.lock().await;
+        let task = self.task(id).await?;
+        let previous = task.record.read().await.clone();
+        if previous.status != DownloadStatus::Completed || previous.torrent.is_some() {
+            return Err("Only completed single-file downloads can be extracted.".into());
+        }
+        let source = PathBuf::from(&previous.destination);
+        if !source
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("zip"))
+        {
+            return Err(
+                "Only completed ZIP downloads are supported by the built-in extractor.".into(),
+            );
+        }
+        if let Some(state) = previous
+            .extra
+            .get("archiveExtraction")
+            .and_then(|v| v.get("state"))
+            .and_then(|v| v.as_str())
+        {
+            if matches!(state, "extracting" | "complete") {
+                return Err(
+                    "This archive has already been extracted or is being extracted.".into(),
+                );
+            }
+        }
+        let snapshot = {
+            let mut record = task.record.write().await;
+            record
+                .extra
+                .insert("archiveExtraction".into(), json!({"state": "extracting"}));
+            record.clone()
+        };
+        if let Err(error) = self.persist_records_locked().await {
+            *task.record.write().await = previous;
+            return Err(error.to_string());
+        }
+        self.emit_record(&snapshot);
+        Ok(source)
+    }
+
+    pub async fn complete_archive_extraction(
+        &self,
+        id: Uuid,
+        state: serde_json::Value,
+    ) -> Result<(), String> {
+        let _persist = self.persist_lock.lock().await;
+        let task = self.task(id).await?;
+        let previous = task.record.read().await.clone();
+        let snapshot = {
+            let mut record = task.record.write().await;
+            record.extra.insert("archiveExtraction".into(), state);
+            record.clone()
+        };
+        if let Err(error) = self.persist_records_locked().await {
+            *task.record.write().await = previous;
+            return Err(error.to_string());
+        }
+        self.emit_record(&snapshot);
+        Ok(())
+    }
+
     pub async fn overview(&self) -> EngineOverview {
         let records = self.list().await;
         EngineOverview {
@@ -4593,6 +4657,19 @@ impl DownloadManager {
         settings.extra.remove("runtimeWarning");
         settings.preserve_analytics_consent(&*self.settings.read().await);
         let mut settings = settings.normalized();
+        // Turning on auto-extraction must never retroactively extract the
+        // user's entire existing download history. The durable timestamp
+        // only admits ZIPs completed after the user enabled this option.
+        let previous = self.settings.read().await.clone();
+        settings.auto_extract_since = if settings.auto_extract_zip {
+            if previous.auto_extract_zip {
+                previous.auto_extract_since.or_else(|| Some(Utc::now()))
+            } else {
+                Some(Utc::now())
+            }
+        } else {
+            None
+        };
         let path = PathBuf::from(&settings.default_download_dir);
         fs::create_dir_all(&path)
             .await
@@ -7689,6 +7766,8 @@ fn default_settings(download_dir: &Path) -> DownloadSettings {
         windows_attachment_check: true,
         launch_on_start: false,
         clipboard_monitoring: false,
+        auto_extract_zip: false,
+        auto_extract_since: None,
         minimize_to_tray: true,
         theme: Default::default(),
         accent: Default::default(),
