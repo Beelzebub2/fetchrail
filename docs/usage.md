@@ -10,6 +10,12 @@
 
 Pause a transfer to free a download slot, then resume it when you are ready. If Fetchrail closes during a transfer, the download returns paused on the next launch.
 
+### Clipboard link suggestions (opt-in)
+
+Enable **Settings → General → Suggest links copied to clipboard** if you want Fetchrail to recognize newly copied HTTP, HTTPS, FTP, SFTP or magnet links while the app is running. It is off by default. After enabling it, newly copied links appear in a small suggestion bar; select **Review links** to open the normal download confirmation window, or dismiss them. No transfer starts automatically. The existing clipboard contents are ignored when the setting is first enabled.
+
+Only local clipboard text is examined. Raw clipboard contents and link history are neither persisted nor sent to any server or analytics. Long clipboard contents are skipped. On Linux, the monitor requires an available `wl-paste` (Wayland) or `xclip` (X11) executable and ordinary desktop clipboard access.
+
 ### Replace an expired download link
 
 Pause a download, choose **More → Update download link**, and paste its replacement URL. By default, Fetchrail preserves the previous partial data separately and starts the new link from zero: a matching file size or ETag from another URL does **not** prove the bytes are the same.
@@ -47,6 +53,10 @@ Use **New downloads** to paste several file URLs, one per line. The batch shares
 ## Queues and schedules
 
 In **Settings → Queues**, save a start time and optional stop time for a queue. At the stop time, active network transfers return to the queue with their partial bytes intact. Clear or extend the window to continue them.
+
+Expand **Weekly recurring hours** under a queue to choose weekdays and time windows. A window starting Monday at 22:00 and ending at 02:00 also allows Tuesday from midnight to 02:00. Add up to 14 windows per queue, or remove every window to return to unrestricted weekly operation. These rules use the computer's **current local timezone** and automatically follow daylight-saving clock changes; a skipped local hour does not occur and a repeated local hour is included twice. Manual queue pauses and one-time start/stop restrictions still take precedence. A closed window pauses active transfers while preserving partial bytes; new jobs wait until the next open window.
+
+Under a download's **More → Download priority**, choose Low, Below normal, Normal, High or Urgent. Priority applies when a new transfer slot is available; it does not interrupt another download or change the global connection limit. Older waiting jobs gain one level per hour until they match Urgent, after which the oldest wins. This prevents permanent starvation without allowing one item to exceed normal resource limits.
 
 Schedules use local time in the interface. Fetchrail must be running to execute them, including in the tray.
 

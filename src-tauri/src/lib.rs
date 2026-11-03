@@ -6,6 +6,7 @@ mod browser_bridge;
 mod browser_extension;
 mod browser_handoff;
 mod browser_session;
+mod clipboard_monitor;
 mod diagnostics;
 mod download_window;
 mod engine;
@@ -43,7 +44,7 @@ use chrono::{DateTime, Utc};
 use engine::DownloadManager;
 use model::{
     AddDownloadRequest, BatchDownloadResult, DownloadRecord, DownloadSettings, EngineOverview,
-    QueueRecord,
+    QueueRecord, WeeklyWindow,
 };
 use organize::{OrganizeMode, OrganizeReport};
 #[cfg(not(windows))]
@@ -278,6 +279,27 @@ async fn schedule_queue(
     stops_at: Option<DateTime<Utc>>,
 ) -> Result<Vec<QueueRecord>, String> {
     manager.schedule_queue(name, starts_at, stops_at).await
+}
+
+#[tauri::command]
+async fn schedule_queue_weekly(
+    manager: State<'_, Arc<DownloadManager>>,
+    name: String,
+    weekly_windows: Vec<WeeklyWindow>,
+) -> Result<Vec<QueueRecord>, String> {
+    manager.schedule_queue_weekly(name, weekly_windows).await
+}
+
+#[tauri::command]
+async fn set_download_priority(
+    manager: State<'_, Arc<DownloadManager>>,
+    id: Uuid,
+    priority: u8,
+) -> Result<DownloadRecord, String> {
+    manager
+        .set_download_priority(id, priority)
+        .await
+        .map(DownloadRecord::public_view)
 }
 
 #[tauri::command]
@@ -1043,6 +1065,7 @@ pub fn run() {
                     }
                 };
             app.manage(manager.clone());
+            clipboard_monitor::start(app.handle().clone(), manager.clone());
             offer_torrent_arguments(
                 app.handle(),
                 std::env::args().collect(),
@@ -1283,6 +1306,8 @@ pub fn run() {
             replace_download_source,
             set_download_retry,
             schedule_queue,
+            schedule_queue_weekly,
+            set_download_priority,
             list_downloads,
             get_overview,
             pause_download,

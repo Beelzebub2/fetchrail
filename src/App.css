@@ -86,6 +86,12 @@ h1, h2, p { margin: 0; }
 .logo .cut { stroke: var(--accent); stroke-width: 9; transition: stroke 300ms; }
 
 .app-shell { display: flex; flex-direction: column; height: 100vh; }
+.clipboard-suggestion { display: flex; align-items: center; gap: 12px; padding: 10px 24px; border-top: 1px solid var(--line); background: var(--surface); animation: rise-in 220ms var(--ease) both; }
+.clipboard-suggestion > svg { flex: none; color: var(--accent-text); }
+.clipboard-suggestion .grow { display: grid; gap: 2px; min-width: 0; }
+.clipboard-suggestion strong { font-size: 13px; }
+.clipboard-suggestion .grow span { font-size: 12px; color: var(--text-2); }
+.clipboard-suggestion button { flex: none; }
 .top-rail { flex: none; border-bottom: 1px solid var(--line); background: var(--panel); transition: background 300ms, border-color 300ms; }
 .rail-main { display: flex; flex-wrap: wrap; align-items: center; gap: 12px 24px; padding: 14px 24px; }
 .brand { display: flex; align-items: center; gap: 10px; font-family: var(--display); font-size: 21px; font-weight: 700; letter-spacing: -.02em; }
@@ -308,6 +314,18 @@ h1, h2, p { margin: 0; }
 .queue-window { display: flex; flex-wrap: wrap; align-items: end; gap: 8px; padding-top: 10px; }
 .queue-window label { flex: 1 1 170px; }
 .queue-window button { min-height: 36px; }
+.weekly-editor { margin-top: 8px; padding-top: 8px; border-top: 1px solid var(--line-soft); font-size: 12px; }
+.weekly-editor summary { cursor: pointer; color: var(--text-2); font-weight: 600; }
+.weekly-editor .hint { margin: 8px 0; line-height: 1.5; }
+.weekly-window { margin-top: 10px; padding: 10px; border: 1px solid var(--line); border-radius: 10px; }
+.weekly-days { display: flex; flex-wrap: wrap; gap: 4px; }
+.weekly-days button { flex: 1; min-width: 36px; padding: 6px 7px; border-radius: 6px; background: var(--raised); color: var(--text-2); font-size: 11px; }
+.weekly-days button[aria-pressed=true] { background: var(--accent-soft); color: var(--accent-text); }
+.weekly-hours, .weekly-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 8px; align-items: end; }
+.weekly-hours label { display: grid; gap: 4px; flex: 1 1 90px; }
+.weekly-hours input { padding: 7px; border: 1px solid var(--line); border-radius: 8px; background: var(--bg); color: var(--text); }
+.weekly-editor [role=alert] { color: var(--danger); }
+.queue-track-weekly { display: block; padding: 8px 12px; font-size: 11px; color: var(--text-2); }
 .form input:not([type=checkbox],[type=radio]),.form select { width: 100%; min-width: 0; height: 40px; padding: 0 12px; border: 1px solid var(--line); border-radius: 10px; outline: 0; color: var(--text); background: var(--field); font-size: 14px; font-weight: 400; transition: border-color 150ms, box-shadow 200ms, background 300ms; }
 .form input:not([type=checkbox],[type=radio]):focus,.form select:focus { border-color: var(--accent); box-shadow: 0 0 0 4px var(--accent-soft); }
 .form input:is([type=number],[type=datetime-local],.mono),.path-input input { font-family: var(--mono); font-size: 13px; }

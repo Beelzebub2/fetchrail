@@ -66,7 +66,7 @@ macro_rules! transfer_span {
 use crate::model::{
     default_categories, default_queue_name, AddDownloadRequest, BatchDownloadError,
     BatchDownloadResult, BrowserRequestContext, DownloadRecord, DownloadSettings, DownloadStatus,
-    EngineOverview, QueueRecord, SegmentProgress,
+    EngineOverview, QueueRecord, SegmentProgress, WeeklyWindow,
 };
 use crate::organize::{self, OrganizeMode, OrganizeReport};
 use crate::rate_limit::RateLimiter;
@@ -1558,6 +1558,7 @@ impl DownloadManager {
                     paused: false,
                     starts_at: None,
                     stops_at: None,
+                    weekly_windows: vec![],
                 },
             );
         }
@@ -4213,6 +4214,7 @@ impl DownloadManager {
             paused: false,
             starts_at: None,
             stops_at: None,
+            weekly_windows: vec![],
         });
         let snapshot = queues.clone();
         drop(queues);
@@ -4313,6 +4315,75 @@ impl DownloadManager {
             .await
             .map_err(|error| error.to_string())?;
         let _ = self.app.emit(QUEUES_EVENT, &snapshot);
+        Ok(snapshot)
+    }
+
+    pub async fn schedule_queue_weekly(
+        &self,
+        name: String,
+        weekly_windows: Vec<WeeklyWindow>,
+    ) -> Result<Vec<QueueRecord>, String> {
+        if weekly_windows.len() > 14 || weekly_windows.iter().any(|window| !window.valid()) {
+            return Err(
+                "Use up to 14 weekly windows with valid days and different start/end times.".into(),
+            );
+        }
+        let _dispatch = self.dispatch_lock.lock().await;
+        let (snapshot, previous_windows) = {
+            let mut queues = self.queues.write().await;
+            let queue = queues
+                .iter_mut()
+                .find(|queue| queue.name.eq_ignore_ascii_case(name.trim()))
+                .ok_or("Queue not found.")?;
+            let previous_windows = std::mem::replace(&mut queue.weekly_windows, weekly_windows);
+            (queues.clone(), previous_windows)
+        };
+        if let Err(error) = self.persist_queues().await {
+            let mut queues = self.queues.write().await;
+            if let Some(queue) = queues
+                .iter_mut()
+                .find(|queue| queue.name.eq_ignore_ascii_case(name.trim()))
+            {
+                queue.weekly_windows = previous_windows;
+            }
+            return Err(error.to_string());
+        }
+        let _ = self.app.emit(QUEUES_EVENT, &snapshot);
+        Ok(snapshot)
+    }
+
+    pub async fn set_download_priority(
+        &self,
+        id: Uuid,
+        priority: u8,
+    ) -> Result<DownloadRecord, String> {
+        if priority > 4 {
+            return Err("Download priority must be between 0 (Low) and 4 (Urgent).".into());
+        }
+        let _dispatch = self.dispatch_lock.lock().await;
+        let task = self.task(id).await?;
+        let _persist = self.persist_lock.lock().await;
+        let previous = task.record.read().await.clone();
+        if matches!(
+            previous.status,
+            DownloadStatus::Completed | DownloadStatus::Cancelled
+        ) {
+            return Err("Completed and cancelled downloads cannot change priority.".into());
+        }
+        let snapshot = {
+            let mut record = task.record.write().await;
+            if priority == 2 {
+                record.extra.remove("queuePriority");
+            } else {
+                record.extra.insert("queuePriority".into(), json!(priority));
+            }
+            record.clone()
+        };
+        if let Err(error) = self.persist_records_locked().await {
+            *task.record.write().await = previous;
+            return Err(error.to_string());
+        }
+        self.emit_record(&snapshot);
         Ok(snapshot)
     }
 
@@ -5034,9 +5105,16 @@ impl DownloadManager {
             if !record_is_dispatch_ready(&record, &paused_queues, now) {
                 continue;
             }
-            candidates.push((record.created_at, task.clone()));
+            candidates.push((
+                queue_priority_score(&record, now),
+                record.created_at,
+                task.clone(),
+            ));
         }
-        candidates.sort_by_key(|(created_at, _)| *created_at);
+        // Urgent items go first, but waiting jobs gain one priority level per
+        // hour (up to Urgent), so a steady stream of new urgent downloads
+        // cannot starve an older lower-priority download indefinitely.
+        candidates.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
         #[cfg(feature = "test-tools")]
         if !candidates.is_empty() {
             if let Ok(Some(root)) = crate::platform::test_root() {
@@ -5051,7 +5129,7 @@ impl DownloadManager {
             }
         }
 
-        for (_, task) in candidates {
+        for (_, _, task) in candidates {
             let is_seed = task
                 .record
                 .read()
@@ -7610,6 +7688,7 @@ fn default_settings(download_dir: &Path) -> DownloadSettings {
         min_segment_size_mb: 4,
         windows_attachment_check: true,
         launch_on_start: false,
+        clipboard_monitoring: false,
         minimize_to_tray: true,
         theme: Default::default(),
         accent: Default::default(),
@@ -7805,7 +7884,23 @@ fn default_queues() -> Vec<QueueRecord> {
         paused: false,
         starts_at: None,
         stops_at: None,
+        weekly_windows: vec![],
     }]
+}
+
+fn queue_priority_score(record: &DownloadRecord, now: DateTime<Utc>) -> u8 {
+    let requested = record
+        .extra
+        .get("queuePriority")
+        .and_then(|value| value.as_u64())
+        .unwrap_or(2)
+        .min(4) as u8;
+    let age_hours = now
+        .signed_duration_since(record.created_at)
+        .num_hours()
+        .max(0)
+        .min(4) as u8;
+    requested.saturating_add(age_hours).min(4)
 }
 
 fn normalize_queue_name(value: &str) -> Result<String, String> {
@@ -9202,6 +9297,37 @@ mod tests {
         let queued = queued_record(DownloadStatus::Queued, "Default", None);
         assert!(!record_is_dispatch_ready(&paused, &[], now));
         assert!(record_is_dispatch_ready(&queued, &[], now));
+    }
+
+    #[test]
+    fn download_priority_ages_fairly_and_defaults_to_normal() {
+        let now = Utc::now();
+        let mut low = queued_record(DownloadStatus::Queued, "Default", None);
+        let mut urgent = low.clone();
+        urgent.created_at = now - ChronoDuration::minutes(5);
+        urgent.extra.insert("queuePriority".into(), json!(4));
+        low.extra.insert("queuePriority".into(), json!(0));
+        low.created_at = now - ChronoDuration::hours(5);
+        assert_eq!(super::queue_priority_score(&low, now), 4);
+        assert_eq!(super::queue_priority_score(&urgent, now), 4);
+        assert!(
+            low.created_at < urgent.created_at,
+            "older low-priority task wins after aging"
+        );
+        let normal = queued_record(DownloadStatus::Queued, "Default", None);
+        assert_eq!(super::queue_priority_score(&normal, now), 2);
+        low.created_at = now + ChronoDuration::minutes(5);
+        assert_eq!(
+            super::queue_priority_score(&low, now),
+            0,
+            "future timestamps cannot gain aging"
+        );
+        low.extra.insert("queuePriority".into(), json!(1000));
+        assert_eq!(
+            super::queue_priority_score(&low, now),
+            4,
+            "corrupt priorities are bounded"
+        );
     }
 
     #[test]
