@@ -750,6 +750,45 @@ $("#automatic-downloads").addEventListener("change", async () => {
   } catch (error) { input.checked = !input.checked; notice(error.message, true); }
   finally { input.disabled = false; }
 });
+const emptyCaptureRules = { excludedHosts: [], excludedExtensions: [], minimumBytes: 0 };
+function parseCaptureRules() {
+  const hosts = $("#capture-excluded-hosts").value.split(/[\n,]+/).map(value => value.trim().toLowerCase()).filter(Boolean);
+  const extensions = $("#capture-excluded-extensions").value.split(/[,\s]+/).map(value => value.trim().toLowerCase().replace(/^\./, "")).filter(Boolean);
+  if (hosts.length > 100 || extensions.length > 100) throw Error("Enter at most 100 website and file-type exclusions.");
+  const excludedHosts = [...new Set(hosts.map(value => {
+    const domain = value.startsWith("*.") ? value.slice(2) : value;
+    if (!/^[a-z0-9.-]{1,253}$/.test(domain) || domain.startsWith(".") || domain.endsWith(".") ||
+      domain.split(".").some(part => !part || part.startsWith("-") || part.endsWith("-") || part.length > 63))
+      throw Error(`Invalid domain: ${value}. Enter a hostname such as example.com, not a full URL.`);
+    return domain;
+  }))];
+  if (extensions.some(value => !/^[a-z0-9]{1,16}$/.test(value))) throw Error("File types must be extensions such as zip, pdf or mp4.");
+  const minimumMiB = Number($("#capture-min-size").value);
+  if (!Number.isSafeInteger(minimumMiB) || minimumMiB < 0 || minimumMiB > 1_000_000) throw Error("Minimum size must be a whole number from 0 to 1,000,000 MiB.");
+  return { excludedHosts, excludedExtensions: [...new Set(extensions)], minimumBytes: minimumMiB * 1024 * 1024 };
+}
+function renderCaptureRules(rules) {
+  const valid = rules && typeof rules === "object" ? rules : emptyCaptureRules;
+  $("#capture-excluded-hosts").value = (Array.isArray(valid.excludedHosts) ? valid.excludedHosts : []).join("\n");
+  $("#capture-excluded-extensions").value = (Array.isArray(valid.excludedExtensions) ? valid.excludedExtensions : []).join(", ");
+  $("#capture-min-size").value = Number.isSafeInteger(valid.minimumBytes) && valid.minimumBytes >= 0
+    ? String(Math.round(valid.minimumBytes / 1024 / 1024)) : "0";
+}
+$("#capture-rules-save").addEventListener("click", async () => {
+  const button = $("#capture-rules-save");
+  button.disabled = true;
+  try {
+    const captureRules = parseCaptureRules();
+    await api.storage.local.set({ captureRules });
+    notice("Capture exclusions saved. Explicitly selected downloads still work.");
+  } catch (error) { notice(error.message, true); }
+  finally { button.disabled = false; }
+});
+// Resetting the companion's options also removes automatic exclusions.
+$("#options-reset").addEventListener("click", () => {
+  renderCaptureRules(emptyCaptureRules);
+  void api.storage.local.set({ captureRules: emptyCaptureRules }).catch(error => notice(error.message, true));
+});
 $("#options-open").addEventListener("click", () => openDialog($("#options-sheet"), $("#sheet-scrim"), $("#options-open")));
 $("#sheet-done").addEventListener("click", () => closeDialog());
 $("#sheet-scrim").addEventListener("click", () => closeDialog());
@@ -769,8 +808,9 @@ async function initialize() {
   $("#extension-version").textContent = version ?? "Unknown";
   $("#speed-history").append(...speedHistory.map(() => document.createElement("i")));
   try {
-    const saved = await api.storage.local.get(["connections", "queue", "automaticDownloads", "useBrowserSession"]);
+    const saved = await api.storage.local.get(["connections", "queue", "automaticDownloads", "useBrowserSession", "captureRules"]);
     $("#automatic-downloads").checked = saved.automaticDownloads !== false;
+    renderCaptureRules(saved.captureRules);
     $("#browser-session").checked = saved.useBrowserSession === true;
     if ([0, 1, 2, 4, 8, 16, 32].includes(saved.connections)) choose($("#connections"), String(saved.connections));
     preferredQueue = saved.queue ?? "Default";
@@ -837,6 +877,7 @@ api.storage.onChanged?.addListener((changes, area) => {
   if (area !== "local") return;
   if (changes.useBrowserSession) $("#browser-session").checked = changes.useBrowserSession.newValue === true;
   if (changes.automaticDownloads) $("#automatic-downloads").checked = changes.automaticDownloads.newValue !== false;
+  if (changes.captureRules && !document.querySelector(".capture-rule-input:focus, #capture-min-size:focus")) renderCaptureRules(changes.captureRules.newValue);
   if (changes.connections) choose($("#connections"), String(changes.connections.newValue ?? 0));
   if (changes.queue) { preferredQueue = changes.queue.newValue ?? "Default"; choose($("#queue"), preferredQueue); }
   optionsSummary();

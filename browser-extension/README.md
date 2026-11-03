@@ -76,6 +76,10 @@ The companion needs one reload to pick up its new `webRequest` permission. Optio
 
 **Catch browser downloads** is enabled by default. Turn it off at the bottom of the companion when you want downloads to remain in the browser.
 
+To control which downloads are intercepted, open **Options → Automatic capture rules**. Add websites (one hostname per line), excluded file extensions, or a minimum file size in MiB. Excluding a website covers that hostname and its subdomains, and matches both the download server and the referring website when the browser provides it. Files with an unknown size stay in the browser when a minimum size is set. Leaving all fields empty retains the original automatic capture behavior.
+
+These rules affect *automatic* interception only. Downloads you explicitly select in the companion's page picker or a browser batch still proceed as requested. Excluded downloads are not paused or cancelled by Fetchrail.
+
 For an eligible browser download, the companion:
 
 1. Checks permissions and browser readiness, then saves an ownership intent before pausing each HTTP(S) transfer independently.

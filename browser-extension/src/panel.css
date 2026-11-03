@@ -251,6 +251,13 @@ footer { display: flex; flex: none; align-items: center; justify-content: space-
 .sheet .reveal > div { margin: 0 -4px; padding: 0 4px; }
 .option-group { display: flex; flex-direction: column; gap: 6px; }
 .option-group.tight { gap: 2px; }
+.capture-rule-group { border-top: 1px solid var(--line); padding-top: 12px; }
+.capture-rule-group summary { cursor: pointer; color: var(--text); font-size: 12.5px; font-weight: 650; }
+.capture-rule-group > .option-group { margin-top: 12px; }
+.capture-rule-group .hint { margin: 0; font-size: 11px; }
+.capture-rule-input { width: 100%; min-width: 0; padding: 10px 12px; border: 1px solid var(--line); border-radius: 10px; color: var(--text); background: var(--bg); font-family: var(--mono); font-size: 12px; resize: vertical; }
+.capture-rule-input:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+#capture-rules-save { margin-top: 12px; width: 100%; }
 .option-label { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; }
 #connections-default { color: var(--text-3); font-size: 11.5px; }
 .segments { display: flex; gap: 2px; padding: 3px; border-radius: 10px; background: var(--bg); }

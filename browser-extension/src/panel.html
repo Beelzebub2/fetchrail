@@ -164,6 +164,25 @@
           <label class="option-switch"><span>Use my browser session</span><input id="browser-session" class="switch" type="checkbox" /></label>
           <p class="hint">Uses your sign-in for captured files, including private repositories. For private windows, also allow this extension in incognito/private browsing in your browser's extension settings. Accepted files appear in Fetchrail's history.</p>
         </div>
+        <details class="capture-rule-group">
+          <summary>Automatic capture rules</summary>
+          <div class="option-group">
+            <label class="caption" for="capture-excluded-hosts">Don't catch downloads from these websites</label>
+            <textarea id="capture-excluded-hosts" class="capture-rule-input" rows="3" maxlength="3000" placeholder="example.com&#10;downloads.example.org" spellcheck="false"></textarea>
+            <p class="hint">One domain per line, including subdomains. Applies to the download server or referring website.</p>
+          </div>
+          <div class="option-group">
+            <label class="caption" for="capture-excluded-extensions">File types to leave in the browser</label>
+            <input id="capture-excluded-extensions" class="capture-rule-input" maxlength="500" placeholder="pdf, jpg, mp4" spellcheck="false" />
+            <p class="hint">Comma-separated extensions without wildcards.</p>
+          </div>
+          <div class="option-group">
+            <label class="caption" for="capture-min-size">Minimum file size to capture</label>
+            <label class="unit-field field"><input id="capture-min-size" type="number" min="0" max="1000000" step="1" value="0" /><span>MiB</span></label>
+            <p class="hint">Zero captures any size. Files with unknown size remain in the browser when a minimum is set.</p>
+          </div>
+          <button id="capture-rules-save" class="text-button outlined" type="button">Save capture rules</button>
+        </details>
         <button id="options-reset" class="text-button reset">Reset to defaults</button>
       </div>
     </div>

@@ -1,6 +1,31 @@
 import assert from "node:assert/strict";
 import { browserFixture } from "./fixtures/extension-browser.mjs";
 for (const family of ["chromium", "firefox"]) {
+  for (const [label, rules, overrides] of [
+    ["exact website", { excludedHosts: ["files.test"] }, {}],
+    ["subdomain", { excludedHosts: ["test"] }, {}],
+    ["referring website", { excludedHosts: ["refer.test"] }, { referrer: "https://refer.test/downloads", url: "https://cdn.other.test/file.zip", finalUrl: "https://cdn.other.test/file.zip" }],
+    ["file extension", { excludedExtensions: ["zip"] }, {}],
+    ["minimum size", { minimumBytes: 16384 }, {}],
+    ["unknown size", { minimumBytes: 1 }, { totalBytes: -1 }],
+  ]) {
+    const f = await browserFixture(family);
+    f.saved.captureRules = rules;
+    Object.assign(f.item, overrides);
+    f.create(); await f.settle();
+    assert.deepEqual(f.actions, [], `${label}: excluded downloads must stay in the browser`);
+    assert.equal(f.item.paused, false);
+    assert.equal(f.stages.size, 0);
+    if (family === "chromium") {
+      let released = 0;
+      f.events.get("filename")({ ...f.item }, () => released++);
+      assert.equal(released, 1, `${label}: the filename decision must be released`);
+    }
+  }
+  const allowed = await browserFixture(family);
+  allowed.saved.captureRules = { excludedHosts: ["other.test"], excludedExtensions: ["mp4"], minimumBytes: 4096 };
+  allowed.create(); await allowed.settle();
+  assert.deepEqual(allowed.actions, ["pause", "cancel", "erase"], "Rules must not prevent ordinary eligible downloads");
   for (const changes of [{ paused:true }, { danger:"dangerous" }, { state:"complete" }, { byExtensionId:"other" }, { url:"blob:local", finalUrl:"blob:local" }]) {
     const f=await browserFixture(family); Object.assign(f.item,changes); f.create(); await f.settle();
     assert.deepEqual(f.actions,[]); assert.equal(f.stages.size,0);
