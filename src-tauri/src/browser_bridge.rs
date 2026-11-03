@@ -535,6 +535,8 @@ async fn process_request(
                             expected_sha256: item
                                 .expected_sha256
                                 .or_else(|| request.params.expected_sha256.clone()),
+                            mirror_urls: None,
+                            metalink_size: None,
                             url: item.url,
                             directory: request.params.directory.clone(),
                             file_name,
