@@ -5394,12 +5394,12 @@ impl DownloadManager {
         }
         let verified = task.browser_verification.lock().unwrap().clone();
         let probe = if remote_transport::is_remote_url(&url) {
+            let expected_sha256 = task.record.read().await.expected_sha256.clone();
             let info = tokio::select! {
-                result = remote_transport::probe(&url, &cancel) => result,
+                result = remote_transport::probe(&url, &cancel, expected_sha256.is_some()) => result,
                 _ = cancel.cancelled() => return Err(EngineError::Cancelled),
             }
             .map_err(EngineError::Message)?;
-            let expected_sha256 = task.record.read().await.expected_sha256.clone();
             // FTP timestamps and SFTP file attributes are advisory, not strong
             // resource validators. Only a trusted end-to-end hash allows us to
             // reuse saved ranges; the final merge always verifies that hash.
