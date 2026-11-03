@@ -1455,6 +1455,7 @@ dependencies = [
  "libc",
  "minisign-verify",
  "percent-encoding",
+ "quick-xml",
  "reqwest",
  "russh",
  "russh-sftp",

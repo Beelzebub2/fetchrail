@@ -29,6 +29,7 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 use url::Url;
 use uuid::Uuid;
+mod mirrors;
 mod remote_download;
 mod remote_transport;
 #[cfg(feature = "test-tools")]
@@ -1218,6 +1219,9 @@ struct DownloadTask {
     limiter: RateLimiter,
     performance: Mutex<Option<Arc<crate::performance::LivePolicy>>>,
     received_sha256: Mutex<Option<String>>,
+    // Raw alternative URLs never enter DownloadRecord, UI events or logs.
+    mirror_urls: Mutex<Vec<Url>>,
+    qualified_mirrors: Mutex<Vec<mirrors::QualifiedMirror>>,
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -1231,6 +1235,8 @@ pub(crate) struct StoredDownload {
     request_context: Option<BrowserRequestContext>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     browser_verification: Option<ProbeResult>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    mirror_urls: Vec<String>,
 }
 
 impl DownloadTask {
@@ -1249,6 +1255,8 @@ impl DownloadTask {
             limiter: RateLimiter::new(record.speed_limit_bps),
             performance: Mutex::new(None),
             received_sha256: Mutex::new(None),
+            mirror_urls: Mutex::new(Vec::new()),
+            qualified_mirrors: Mutex::new(Vec::new()),
             request_context,
             browser_verification: Mutex::new(None),
             prefetched: Mutex::new(None),
@@ -1490,6 +1498,8 @@ impl DownloadManager {
         record.extra.remove("retryAttempts");
         record.extra.remove("nextRetryAt");
         record.extra.remove("trustedSourceReusePending");
+        record.extra.remove("mirrorStatus");
+        record.extra.remove("mirrorCount");
         if reuse_verified_parts {
             record
                 .extra
@@ -1687,7 +1697,16 @@ impl DownloadManager {
                     record.extra.insert("handoffQualified".into(), json!(false));
                     record.error = Some("Verification stream was interrupted before ownership committed. Return this file to the browser.".into());
                 }
+                let has_trusted_hash = record.expected_sha256.is_some();
                 let task = DownloadTask::new(record, stored.request_context, None, None);
+                if has_trusted_hash {
+                    *task.mirror_urls.lock().unwrap() = stored
+                        .mirror_urls
+                        .iter()
+                        .filter_map(|item| crate::metalink::validate_mirror_url(item, true).ok())
+                        .take(7)
+                        .collect();
+                }
                 *task.browser_verification.lock().unwrap() = stored.browser_verification;
                 task_map.insert(id, Arc::new(task));
             }
@@ -3455,6 +3474,38 @@ impl DownloadManager {
         }
         context_headers(request.request_context.as_ref()).map_err(|error| error.to_string())?;
         let expected_sha256 = normalize_sha256(request.expected_sha256.as_deref())?;
+        if request
+            .metalink_size
+            .is_some_and(|size| size == 0 || size > 9_007_199_254_740_991)
+            || (request.metalink_size.is_some() && expected_sha256.is_none())
+        {
+            return Err(
+                "Metalink file size requires a positive safe integer and a trusted SHA-256.".into(),
+            );
+        }
+        let raw_mirrors = request.mirror_urls.as_deref().unwrap_or(&[]);
+        if raw_mirrors.len() > 7 {
+            return Err("At most seven alternative mirrors may be added to one download.".into());
+        }
+        if !raw_mirrors.is_empty()
+            && (expected_sha256.is_none()
+                || request.handoff_id.is_some()
+                || request.request_context.is_some()
+                || !matches!(parsed.scheme(), "http" | "https")
+                || !parsed.username().is_empty()
+                || parsed.password().is_some())
+        {
+            return Err("Multi-mirror HTTP(S) downloads require one trusted SHA-256 and cannot use browser sessions or embedded credentials.".into());
+        }
+        let mut mirror_urls = Vec::new();
+        let mut mirror_seen = HashSet::from([parsed.to_string()]);
+        for raw in raw_mirrors {
+            let url = crate::metalink::validate_mirror_url(raw, true)?;
+            if !mirror_seen.insert(url.to_string()) {
+                return Err("Use each mirror URL only once.".into());
+            }
+            mirror_urls.push(url);
+        }
         if let Some(key) = &request.handoff_id {
             if let Some(record) = self
                 .list()
@@ -3517,7 +3568,7 @@ impl DownloadManager {
         } else {
             DownloadStatus::Queued
         };
-        let record = DownloadRecord {
+        let mut record = DownloadRecord {
             torrent: None,
             id,
             extra: request
@@ -3565,12 +3616,22 @@ impl DownloadManager {
             progress_requested: false,
         };
 
+        if !mirror_urls.is_empty() {
+            record
+                .extra
+                .insert("mirrorCount".into(), json!(1 + mirror_urls.len()));
+        }
+        if let Some(size) = request.metalink_size {
+            record.extra.insert("metalinkSize".into(), json!(size));
+        }
+
         let task = Arc::new(DownloadTask::new(
             record.clone(),
             request.request_context,
             self.analytics.prepare(),
             self.analytics.quality.prepare(),
         ));
+        *task.mirror_urls.lock().unwrap() = mirror_urls;
         self.tasks.write().await.insert(id, task.clone());
         if persist {
             if let Err(error) = self.persist_records().await {
@@ -5429,6 +5490,28 @@ impl DownloadManager {
             )?
         };
 
+        if let Some(size) = task
+            .record
+            .read()
+            .await
+            .extra
+            .get("metalinkSize")
+            .and_then(|value| value.as_u64())
+        {
+            if probe.total_bytes != Some(size) {
+                return Err(EngineError::Message(
+                    "The source size differs from the Metalink manifest; no bytes were combined."
+                        .into(),
+                ));
+            }
+        }
+
+        // Qualify each alternative against its own HTTP representation
+        // validator, range support and the primary length. Cross-origin ETags
+        // alone never authorize mixing: add_inner required a trusted SHA-256.
+        self.qualify_mirror_sources(&task, &url, &probe, &cancel)
+            .await?;
+
         let settings = self.settings.read().await.clone();
         let snapshot = task.record.read().await.clone();
         let initial_downloaded = snapshot.downloaded_bytes;
@@ -5699,6 +5782,7 @@ impl DownloadManager {
             };
 
             if matches!(first_result, Err(EngineError::RangeUnsupported)) {
+                task.qualified_mirrors.lock().unwrap().clear();
                 task.health.cause(crate::health::Cause::RangeIgnored);
                 {
                     let mut record = task.record.write().await;
@@ -5867,6 +5951,8 @@ impl DownloadManager {
             trace.phase(trace::Phase::Body);
         }
         let next_range = AtomicUsize::new(0);
+        let mirror_pool = task.qualified_mirrors.lock().unwrap().clone();
+        let mirror_pool = &mirror_pool;
         let record = task.record.read().await;
         let workers = record
             .requested_connections
@@ -5918,7 +6004,10 @@ impl DownloadManager {
                         #[cfg(feature = "test-tools")]
                         let mut previous_retry_cause = None;
                         let mut recovery = PeerRecovery::Peers;
-                        for attempt in 0..3 {
+                        // Try enough sources to reach every qualified mirror,
+                        // still bounded to eight attempts per range.
+                        let budget = 3usize.max(mirror_pool.len()).min(8);
+                        for attempt in 0..budget {
                             #[cfg(feature = "test-tools")]
                             if attempt > 0 {
                                 if let Some(trace) = &task.trace {
@@ -5951,16 +6040,21 @@ impl DownloadManager {
                             }
                             let attempt_at = Instant::now();
                             let before_attempt = segment.downloaded.load(Ordering::Relaxed);
+                            let selected = (!mirror_pool.is_empty())
+                                .then(|| &mirror_pool[(index + attempt) % mirror_pool.len()]);
+                            if let Some(source) = selected {
+                                source.attempts.fetch_add(1, Ordering::Relaxed);
+                            }
                             let result = Self::download_segment(
                                 &client,
                                 limiter,
                                 task,
                                 batch_cancel,
-                                url,
+                                selected.map_or(url, |source| &source.url),
                                 part_dir,
                                 index,
                                 segment,
-                                probe,
+                                selected.map_or(probe, |source| &source.probe),
                                 peer_rate,
                                 segments,
                                 workers,
@@ -5973,6 +6067,11 @@ impl DownloadManager {
                                 },
                             )
                             .await;
+                            if result.is_err() {
+                                if let Some(source) = selected {
+                                    source.failures.fetch_add(1, Ordering::Relaxed);
+                                }
+                            }
                             task.health.attempt(index, attempt, attempt_at,
                                 segment.downloaded.load(Ordering::Relaxed).saturating_sub(before_attempt),
                                 result.as_ref().err().map(|error| error.health_cause(task.health.failed_phase())));
@@ -5980,7 +6079,7 @@ impl DownloadManager {
                                 return Ok(());
                             };
                             #[cfg(test)]
-                            eprintln!("Range {index}, attempt {attempt}: {error:?}");
+                            eprintln!("Range {index}, attempt {attempt}: {:?}", error.health_cause(task.health.failed_phase()));
                             let transient = match &error {
                                 EngineError::Slow(_) | EngineError::Incomplete => true,
                                 EngineError::Request(error) => {
@@ -5994,13 +6093,20 @@ impl DownloadManager {
                                     status.is_server_error()
                                         || *status == StatusCode::TOO_MANY_REQUESTS
                                         || *status == StatusCode::REQUEST_TIMEOUT
+                                        || (mirror_pool.len() > 1 && status.is_client_error())
                                 }
+                                EngineError::RangeUnsupported if mirror_pool.len() > 1 => true,
+                                EngineError::Observed(
+                                    crate::health::Cause::SourceChanged
+                                    | crate::health::Cause::RangeInvalid,
+                                    _,
+                                ) if mirror_pool.len() > 1 => true,
                                 EngineError::RetryAfter { delay, .. } => {
                                     *delay <= Duration::from_secs(3600)
                                 }
                                 _ => false,
                             };
-                            if !transient || attempt == 2 {
+                            if !transient || attempt + 1 >= budget {
                                 return Err(error);
                             }
                             task.health.cause(error.health_cause(task.health.failed_phase()));
@@ -6742,6 +6848,22 @@ impl DownloadManager {
         }
         let snapshot = {
             let mut record = task.record.write().await;
+            let qualified = task.qualified_mirrors.lock().unwrap().clone();
+            if let Some(statuses) = record
+                .extra
+                .get_mut("mirrorStatus")
+                .and_then(serde_json::Value::as_array_mut)
+            {
+                for source in qualified {
+                    if let Some(entry) = statuses
+                        .iter_mut()
+                        .find(|entry| entry["source"] == source.ordinal)
+                    {
+                        entry["attempts"] = json!(source.attempts.load(Ordering::Relaxed));
+                        entry["failures"] = json!(source.failures.load(Ordering::Relaxed));
+                    }
+                }
+            }
             record.downloaded_bytes = downloaded;
             record
                 .extra
@@ -7358,6 +7480,12 @@ impl DownloadManager {
                     "auth_required" => "Link expired or authentication is required. Update the download link, then resume.".into(),
                     "disk_full" => "Download storage is full. Free space, then retry.".into(),
                     "permission_denied" => "Cannot write download storage. Choose a writable folder or unlock the file, then retry.".into(),
+                    "checksum_failed" if !task.mirror_urls.lock().unwrap().is_empty() =>
+                        "Downloaded bytes did not match the trusted SHA-256. No unverified file was published.".into(),
+                    "resource_changed" if !task.mirror_urls.lock().unwrap().is_empty() =>
+                        "A mirror changed its representation or byte ranges. No unverified file was published.".into(),
+                    _ if !task.mirror_urls.lock().unwrap().is_empty() =>
+                        "Multi-mirror transfer failed. Check mirror availability and retry; private source URLs are withheld.".into(),
                     _ => error.to_string(),
                 });
                 record.finished_at = Some(Utc::now());
@@ -7481,6 +7609,13 @@ impl DownloadManager {
                 record,
                 request_context,
                 browser_verification: task.browser_verification.lock().unwrap().clone(),
+                mirror_urls: task
+                    .mirror_urls
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .map(Url::to_string)
+                    .collect(),
             });
         }
         records.sort_by_key(|task| task.record.created_at);
@@ -9378,9 +9513,14 @@ mod tests {
             record,
             request_context: Some(context),
             browser_verification: None,
+            mirror_urls: vec!["https://mirror.example.com/file?token=private-source-secret".into()],
         };
         let disk = serde_json::to_string(&stored).unwrap();
         assert!(disk.contains("session=secret"));
+        assert!(
+            disk.contains("private-source-secret"),
+            "alternative mirrors belong to the private state only"
+        );
         let loaded: StoredDownload = serde_json::from_str(&disk).unwrap();
         assert!(!serde_json::to_string(&loaded.record)
             .unwrap()

@@ -435,6 +435,14 @@ pub struct AddDownloadRequest {
     #[serde(skip)]
     pub handoff_id: Option<String>,
     pub expected_sha256: Option<String>,
+    /// Additional equivalent HTTP(S) sources. A trusted expected SHA-256 is
+    /// mandatory before any bytes from different URLs may be combined.
+    #[serde(default)]
+    pub mirror_urls: Option<Vec<String>>,
+    /// Advertised file size from an explicitly approved Metalink. Compared to
+    /// the primary HTTP probe before ranges are allowed.
+    #[serde(default)]
+    pub metalink_size: Option<u64>,
     pub url: String,
     pub directory: Option<String>,
     pub file_name: Option<String>,
