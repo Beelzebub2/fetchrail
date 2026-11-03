@@ -160,6 +160,8 @@ export type DownloadSettings = Appearance & {
   localCrashHistory?: boolean;
   torrent: TorrentSettings;
   speedLimitBps: number;
+  maxRequestsPerOrigin: number;
+  networkProxy: { mode: "none" | "http" | "socks5"; host: string; port: number };
   autoUpdate: boolean;
   categories: Category[];
   sortIntoCategoryFolders: boolean;
@@ -2771,6 +2773,45 @@ function SettingsPage({
                   <input type="number" min={0} max={1_000_000} step={1} value={draft.speedLimitBps / 1024} onChange={(event) => onChange({ speedLimitBps: Math.round(Number(event.target.value) * 1024) })} />
                   <small>0 = unlimited.</small>
                 </label>
+              </section>
+              <section className="card minor rise d3" aria-labelledby="network-settings-title">
+                <div className="card-head">
+                  <h2 id="network-settings-title">Network routing</h2>
+                  <p>Control requests to individual websites and optional desktop HTTP proxy routing.</p>
+                </div>
+                <label>
+                  Maximum simultaneous HTTP requests per website
+                  <input type="number" min={1} max={32} step={1}
+                    value={draft.maxRequestsPerOrigin}
+                    onChange={event => onChange({ maxRequestsPerOrigin: Number(event.target.value) })} />
+                  <small>1–32. Applies immediately across downloads. Servers' Retry-After limits remain in effect.</small>
+                </label>
+                <div className="setting-grid">
+                  <label>
+                    HTTP/HTTPS downloads proxy
+                    <select value={draft.networkProxy?.mode ?? "none"}
+                      onChange={event => onChange({ networkProxy: { ...(draft.networkProxy ?? { host: "", port: 0 }), mode: event.target.value as "none" | "http" | "socks5" } })}>
+                      <option value="none">System/default routing</option>
+                      <option value="http">HTTP proxy</option>
+                      <option value="socks5">SOCKS5 (remote DNS)</option>
+                    </select>
+                  </label>
+                  <label>
+                    Proxy host
+                    <input type="text" spellCheck={false} autoComplete="off" placeholder="proxy.example.com"
+                      disabled={!draft.networkProxy || draft.networkProxy.mode === "none"}
+                      value={draft.networkProxy?.host ?? ""}
+                      onChange={event => onChange({ networkProxy: { ...(draft.networkProxy ?? { mode: "none", port: 0 }), host: event.target.value } })} />
+                  </label>
+                  <label>
+                    Proxy port
+                    <input type="number" min={1} max={65535} step={1}
+                      disabled={!draft.networkProxy || draft.networkProxy.mode === "none"}
+                      value={draft.networkProxy?.port ?? 0}
+                      onChange={event => onChange({ networkProxy: { ...(draft.networkProxy ?? { mode: "none", host: "" }), port: Number(event.target.value) } })} />
+                  </label>
+                </div>
+                <p className="hint">Proxy changes take effect only after a complete application restart; until then, downloads still use the previously active network route. No automatic direct fallback occurs when a selected proxy fails. Authenticated proxies are not supported. FTP/SFTP and torrents have separate transport/proxy settings; this is not a VPN kill switch.</p>
               </section>
             </div>
           </section>
