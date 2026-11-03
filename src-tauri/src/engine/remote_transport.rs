@@ -6,7 +6,7 @@ use std::{
     path::PathBuf,
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc,
+        Arc, OnceLock,
     },
     time::Duration,
 };
@@ -15,7 +15,7 @@ use russh::{
     client::{self, Handle},
     keys::{self, agent::AgentIdentity, key::PrivateKeyWithHashAlg, PublicKeyOrCertificate},
 };
-use russh_sftp::client::SftpSession;
+use russh_sftp::client::{Config as SftpConfig, SftpSession};
 use suppaftp::{
     tokio::{
         AsyncFtpStream, AsyncRustlsConnector, AsyncRustlsFtpStream, ImplAsyncFtpStream,
@@ -33,6 +33,13 @@ use url::Url;
 
 const CHUNK_BYTES: usize = 128 * 1024;
 const CHANNEL_SLOTS: usize = 4;
+// russh-sftp already pipelines read requests. Increase its bounded window
+// rather than opening extra SSH connections on high-latency links. Typical
+// servers answer with 32-64 KiB packets; 64 requests keep 2-4 MiB in flight.
+const SFTP_READ_AHEAD: usize = 64;
+// Bounded aggregate pressure for manually configured parallel SFTP transfers:
+// at most 256 * 256 KiB = 64 MiB of negotiated response packet capacity.
+const SFTP_PENDING_READ_BUDGET: usize = 256;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 const IO_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -144,16 +151,30 @@ async fn guarded<T, E>(
 
 fn tls_connector() -> AsyncRustlsConnector {
     // Certificate-chain and hostname verification must never be bypassed.
-    // Mozilla's maintained public roots work in packaged Windows and Linux.
-    let roots = {
+    // Keep one immutable certificate store for all FTPS sessions instead of
+    // reconstructing public roots for each parallel range and retry.
+    static CONFIG: OnceLock<Arc<suppaftp::tokio_rustls::rustls::ClientConfig>> = OnceLock::new();
+    let config = CONFIG.get_or_init(|| {
         let mut roots = suppaftp::tokio_rustls::rustls::RootCertStore::empty();
         roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-        roots
-    };
-    let config = suppaftp::tokio_rustls::rustls::ClientConfig::builder()
-        .with_root_certificates(roots)
-        .with_no_client_auth();
-    AsyncRustlsConnector::from(suppaftp::tokio_rustls::TlsConnector::from(Arc::new(config)))
+        Arc::new(
+            suppaftp::tokio_rustls::rustls::ClientConfig::builder()
+                .with_root_certificates(roots)
+                .with_no_client_auth(),
+        )
+    });
+    AsyncRustlsConnector::from(suppaftp::tokio_rustls::TlsConnector::from(config.clone()))
+}
+
+fn sftp_read_ahead(concurrent_streams: usize, remaining_bytes: Option<u64>) -> usize {
+    let ceiling =
+        (SFTP_PENDING_READ_BUDGET / concurrent_streams.clamp(1, 32)).clamp(8, SFTP_READ_AHEAD);
+    // The SFTP library speculates this many READs once it learns the server's
+    // packet size. Do not send dozens of needless EOF requests for small files
+    // or unknown-length sources; preserve a large window for bulk downloads.
+    remaining_bytes.map_or(ceiling.min(16), |bytes| {
+        ceiling.min(bytes.div_ceil(32 * 1024).clamp(1, ceiling as u64) as usize)
+    })
 }
 
 enum FtpSession {
@@ -267,6 +288,7 @@ async fn probe_ftp<T: TokioTlsStream + Send>(
     ftp: &mut ImplAsyncFtpStream<T>,
     target: &Target,
     cancel: &CancellationToken,
+    check_resume: bool,
 ) -> Result<RemoteInfo, String> {
     let total_bytes = guarded(
         cancel,
@@ -277,16 +299,21 @@ async fn probe_ftp<T: TokioTlsStream + Send>(
     .await
     .ok()
     .map(|size| size as u64);
-    // A successful REST 0 confirms the server implements a restart marker.
-    // The caller must still require a separate trusted file identity.
-    let supports_resume = guarded(
-        cancel,
-        IO_TIMEOUT,
-        "FTP restart negotiation failed.",
-        ftp.resume_transfer(0),
-    )
-    .await
-    .is_ok();
+    // REST is useful only with a trusted expected hash. Skipping it for
+    // ordinary single-stream transfers saves a round-trip and avoids sending
+    // restart markers to servers that do not support them.
+    let supports_resume = if check_resume && total_bytes.is_some_and(|bytes| bytes > 0) {
+        guarded(
+            cancel,
+            IO_TIMEOUT,
+            "FTP restart negotiation failed.",
+            ftp.resume_transfer(0),
+        )
+        .await
+        .is_ok()
+    } else {
+        false
+    };
     if cancel.is_cancelled() {
         return Err("Remote transfer cancelled.".into());
     }
@@ -326,6 +353,8 @@ impl client::Handler for KnownHost {
 async fn connect_sftp(
     target: &Target,
     cancel: &CancellationToken,
+    concurrent_streams: usize,
+    remaining_bytes: Option<u64>,
 ) -> Result<(Handle<KnownHost>, SftpSession), String> {
     let rejected = Arc::new(AtomicBool::new(false));
     let handler = KnownHost {
@@ -388,11 +417,15 @@ async fn connect_sftp(
         channel.request_subsystem(true, "sftp"),
     )
     .await?;
+    let sftp_config = SftpConfig {
+        max_concurrent_reads: sftp_read_ahead(concurrent_streams, remaining_bytes),
+        ..SftpConfig::default()
+    };
     let sftp = guarded(
         cancel,
         IO_TIMEOUT,
         "SFTP subsystem negotiation failed.",
-        SftpSession::new(channel.into_stream()),
+        SftpSession::new_with_config(channel.into_stream(), sftp_config),
     )
     .await?;
     sftp.set_timeout(30);
@@ -555,7 +588,11 @@ async fn try_identity_files(
     false
 }
 
-pub(crate) async fn probe(url: &Url, cancel: &CancellationToken) -> Result<RemoteInfo, String> {
+pub(crate) async fn probe(
+    url: &Url,
+    cancel: &CancellationToken,
+    check_resume: bool,
+) -> Result<RemoteInfo, String> {
     if cancel.is_cancelled() {
         return Err("Remote transfer cancelled.".into());
     }
@@ -563,12 +600,16 @@ pub(crate) async fn probe(url: &Url, cancel: &CancellationToken) -> Result<Remot
     match target.protocol {
         Protocol::Ftp | Protocol::FtpsExplicit | Protocol::FtpsImplicit => {
             match open_ftp(&target, cancel).await? {
-                FtpSession::Plain(mut ftp) => probe_ftp(&mut ftp, &target, cancel).await,
-                FtpSession::Secure(mut ftp) => probe_ftp(&mut ftp, &target, cancel).await,
+                FtpSession::Plain(mut ftp) => {
+                    probe_ftp(&mut ftp, &target, cancel, check_resume).await
+                }
+                FtpSession::Secure(mut ftp) => {
+                    probe_ftp(&mut ftp, &target, cancel, check_resume).await
+                }
             }
         }
         Protocol::Sftp => {
-            let (_ssh, sftp) = connect_sftp(&target, cancel).await?;
+            let (_ssh, sftp) = connect_sftp(&target, cancel, 1, Some(0)).await?;
             let attributes = guarded(
                 cancel,
                 IO_TIMEOUT,
@@ -611,18 +652,26 @@ async fn transfer_ftp<T: TokioTlsStream + Send>(
     mut ftp: ImplAsyncFtpStream<T>,
     path: String,
     offset: u64,
+    advertised_size: Option<u64>,
     cancel: CancellationToken,
     tx: mpsc::Sender<Result<Vec<u8>, String>>,
 ) -> Result<(), String> {
-    let known_size = guarded(
-        &cancel,
-        IO_TIMEOUT,
-        "FTP file-size lookup failed.",
-        ftp.size(&path),
-    )
-    .await
-    .ok()
-    .map(|value| value as u64);
+    // The initial probe already checked this file. Repeating SIZE for every
+    // parallel range costs a control-channel RTT on every authenticated
+    // connection; the final byte count and expected SHA-256 remain authoritative.
+    let known_size = if let Some(size) = advertised_size {
+        Some(size)
+    } else {
+        guarded(
+            &cancel,
+            IO_TIMEOUT,
+            "FTP file-size lookup failed.",
+            ftp.size(&path),
+        )
+        .await
+        .ok()
+        .map(|value| value as u64)
+    };
     if known_size.is_some_and(|total| offset > total) {
         return Err("Requested FTP offset exceeds the remote file.".into());
     }
@@ -645,6 +694,8 @@ async fn transfer_ftp<T: TokioTlsStream + Send>(
     )
     .await?;
     let mut received = 0u64;
+    // suppaftp's data-stream adapter expects the conventional fixed read
+    // buffer for reliable EOF and terminal reply handling on Windows.
     let mut buf = vec![0; CHUNK_BYTES];
     loop {
         let n = tokio::select! {
@@ -680,6 +731,8 @@ async fn transfer_ftp<T: TokioTlsStream + Send>(
         if known_size.is_some_and(|size| offset.saturating_add(received) > size) {
             return Err("FTP source grew or sent extra bytes during the transfer.".into());
         }
+        // Keep the established FTP fixed-buffer read path; SFTP separately
+        // uses move-only read buffers where its protocol adapter supports it.
         if send_chunk(&tx, &cancel, buf[..n].to_vec()).await.is_err() {
             return if cancel.is_cancelled() {
                 Err("Remote transfer cancelled.".into())
@@ -702,10 +755,10 @@ async fn transfer_ftp<T: TokioTlsStream + Send>(
 }
 
 async fn transfer_sftp(
-    _ssh: Handle<KnownHost>,
     sftp: SftpSession,
     path: String,
     offset: u64,
+    advertised_size: Option<u64>,
     cancel: CancellationToken,
     tx: mpsc::Sender<Result<Vec<u8>, String>>,
 ) -> Result<(), String> {
@@ -716,34 +769,43 @@ async fn transfer_sftp(
         sftp.open(path),
     )
     .await?;
-    let metadata = guarded(
-        &cancel,
-        IO_TIMEOUT,
-        "SFTP file metadata lookup failed.",
-        file.metadata(),
-    )
-    .await?;
-    if metadata.is_dir() {
-        return Err("SFTP source is a directory.".into());
-    }
-    if metadata.size.is_some_and(|size| offset > size) {
+    // Avoid an FSTAT round-trip on every segment when the initial probe has
+    // already checked the type and returned a length.
+    let known_size = if let Some(size) = advertised_size {
+        Some(size)
+    } else {
+        let metadata = guarded(
+            &cancel,
+            IO_TIMEOUT,
+            "SFTP file metadata lookup failed.",
+            file.metadata(),
+        )
+        .await?;
+        if metadata.is_dir() {
+            return Err("SFTP source is a directory.".into());
+        }
+        metadata.size
+    };
+    if known_size.is_some_and(|size| offset > size) {
         return Err("Requested SFTP offset exceeds the remote file.".into());
     }
-    guarded(
-        &cancel,
-        IO_TIMEOUT,
-        "SFTP seek failed.",
-        file.seek(std::io::SeekFrom::Start(offset)),
-    )
-    .await?;
+    if offset > 0 {
+        guarded(
+            &cancel,
+            IO_TIMEOUT,
+            "SFTP seek failed.",
+            file.seek(std::io::SeekFrom::Start(offset)),
+        )
+        .await?;
+    }
     let mut received = 0u64;
-    let mut buf = vec![0; CHUNK_BYTES];
+    let mut buf = Vec::with_capacity(CHUNK_BYTES);
     loop {
         let n = tokio::select! {
             biased;
             _ = cancel.cancelled() => return Err("Remote transfer cancelled.".into()),
             _ = tx.closed() => return Ok(()),
-            result = tokio::time::timeout(IO_TIMEOUT, file.read(&mut buf)) => match result {
+            result = tokio::time::timeout(IO_TIMEOUT, file.read_buf(&mut buf)) => match result {
                 Ok(Ok(n)) => n,
                 _ => return Err("SFTP data connection failed or stalled.".into()),
             }
@@ -752,24 +814,19 @@ async fn transfer_sftp(
             break;
         }
         received += n as u64;
-        if metadata
-            .size
-            .is_some_and(|size| offset.saturating_add(received) > size)
-        {
+        if known_size.is_some_and(|size| offset.saturating_add(received) > size) {
             return Err("SFTP source grew or sent extra bytes during transfer.".into());
         }
-        if send_chunk(&tx, &cancel, buf[..n].to_vec()).await.is_err() {
+        if send_chunk(&tx, &cancel, buf).await.is_err() {
             return if cancel.is_cancelled() {
                 Err("Remote transfer cancelled.".into())
             } else {
                 Ok(())
             };
         }
+        buf = Vec::with_capacity(CHUNK_BYTES);
     }
-    if metadata
-        .size
-        .is_some_and(|size| offset.saturating_add(received) != size)
-    {
+    if known_size.is_some_and(|size| offset.saturating_add(received) != size) {
         return Err("SFTP source ended before the announced file length.".into());
     }
     guarded(&cancel, IO_TIMEOUT, "SFTP file close failed.", file.close()).await?;
@@ -779,6 +836,9 @@ async fn transfer_sftp(
 pub(crate) async fn stream(
     url: &Url,
     offset: u64,
+    advertised_size: Option<u64>,
+    concurrent_streams: usize,
+    remaining_bytes: Option<u64>,
     cancel: &CancellationToken,
 ) -> Result<mpsc::Receiver<Result<Vec<u8>, String>>, String> {
     if cancel.is_cancelled() {
@@ -793,10 +853,26 @@ pub(crate) async fn stream(
             tokio::spawn(async move {
                 let result = match ftp {
                     FtpSession::Plain(ftp) => {
-                        transfer_ftp(ftp, target.path, offset, cancel, tx.clone()).await
+                        transfer_ftp(
+                            ftp,
+                            target.path,
+                            offset,
+                            advertised_size,
+                            cancel,
+                            tx.clone(),
+                        )
+                        .await
                     }
                     FtpSession::Secure(ftp) => {
-                        transfer_ftp(ftp, target.path, offset, cancel, tx.clone()).await
+                        transfer_ftp(
+                            ftp,
+                            target.path,
+                            offset,
+                            advertised_size,
+                            cancel,
+                            tx.clone(),
+                        )
+                        .await
                     }
                 };
                 if let Err(error) = result {
@@ -805,11 +881,21 @@ pub(crate) async fn stream(
             });
         }
         Protocol::Sftp => {
-            let (ssh, sftp) = connect_sftp(&target, &cancel).await?;
+            let (ssh, sftp) =
+                connect_sftp(&target, &cancel, concurrent_streams, remaining_bytes).await?;
             tokio::spawn(async move {
-                if let Err(error) =
-                    transfer_sftp(ssh, sftp, target.path, offset, cancel, tx.clone()).await
-                {
+                let result = transfer_sftp(
+                    sftp,
+                    target.path,
+                    offset,
+                    advertised_size,
+                    cancel,
+                    tx.clone(),
+                )
+                .await;
+                // Keep the authenticated SSH session alive until SFTP is done.
+                drop(ssh);
+                if let Err(error) = result {
                     send_failure(&tx, error).await;
                 }
             });
@@ -821,18 +907,124 @@ pub(crate) async fn stream(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use russh_sftp::protocol::{
+        Attrs as SftpAttrs, Data as SftpData, FileAttributes as SftpFileAttributes,
+        Handle as SftpHandle, OpenFlags, Status as SftpStatus, StatusCode as SftpStatusCode,
+    };
     use tokio::{
         io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
         net::{TcpListener, TcpStream},
         task::JoinHandle,
     };
 
-    #[derive(Clone, Copy, Default)]
+    struct SftpFixture {
+        bytes: Arc<Vec<u8>>,
+        fstat_count: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl russh_sftp::server::Handler for SftpFixture {
+        type Error = SftpStatusCode;
+
+        fn unimplemented(&self) -> Self::Error {
+            SftpStatusCode::OpUnsupported
+        }
+
+        async fn open(
+            &mut self,
+            id: u32,
+            filename: String,
+            _flags: OpenFlags,
+            _attrs: SftpFileAttributes,
+        ) -> Result<SftpHandle, Self::Error> {
+            if filename != "/file.bin" {
+                return Err(SftpStatusCode::NoSuchFile);
+            }
+            Ok(SftpHandle {
+                id,
+                handle: "fixture-file".into(),
+            })
+        }
+
+        async fn read(
+            &mut self,
+            id: u32,
+            handle: String,
+            offset: u64,
+            len: u32,
+        ) -> Result<SftpData, Self::Error> {
+            if handle != "fixture-file" {
+                return Err(SftpStatusCode::Failure);
+            }
+            let start = usize::try_from(offset).map_err(|_| SftpStatusCode::Eof)?;
+            if start >= self.bytes.len() {
+                return Err(SftpStatusCode::Eof);
+            }
+            // A small per-request result exercises the library's short-read
+            // handling and bounded in-flight read queue.
+            let end = start
+                .saturating_add((len as usize).min(32 * 1024))
+                .min(self.bytes.len());
+            Ok(SftpData {
+                id,
+                data: self.bytes[start..end].to_vec(),
+            })
+        }
+
+        async fn fstat(&mut self, id: u32, handle: String) -> Result<SftpAttrs, Self::Error> {
+            if handle != "fixture-file" {
+                return Err(SftpStatusCode::Failure);
+            }
+            self.fstat_count.fetch_add(1, Ordering::Relaxed);
+            Ok(SftpAttrs {
+                id,
+                attrs: SftpFileAttributes {
+                    size: Some(self.bytes.len() as u64),
+                    ..Default::default()
+                },
+            })
+        }
+
+        async fn close(&mut self, id: u32, _handle: String) -> Result<SftpStatus, Self::Error> {
+            Ok(SftpStatus {
+                id,
+                status_code: SftpStatusCode::Ok,
+                error_message: String::new(),
+                language_tag: String::new(),
+            })
+        }
+    }
+
+    async fn sftp_fixture(bytes: Vec<u8>) -> (SftpSession, Arc<std::sync::atomic::AtomicUsize>) {
+        let (client, server) = tokio::io::duplex(2 * 1024 * 1024);
+        let fstat_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        russh_sftp::server::run(
+            server,
+            SftpFixture {
+                bytes: Arc::new(bytes),
+                fstat_count: fstat_count.clone(),
+            },
+        )
+        .await;
+        let session = SftpSession::new_with_config(
+            client,
+            SftpConfig {
+                max_concurrent_reads: SFTP_READ_AHEAD,
+                ..SftpConfig::default()
+            },
+        )
+        .await
+        .unwrap();
+        session.set_timeout(30);
+        (session, fstat_count)
+    }
+
+    #[derive(Clone, Default)]
     struct FtpFixtureOptions {
         deny_rest: bool,
         fail_final: bool,
         short_body: bool,
         stall: bool,
+        commands: Option<Arc<std::sync::Mutex<Vec<String>>>>,
     }
 
     async fn respond(connection: &mut BufReader<TcpStream>, response: &str) {
@@ -854,6 +1046,9 @@ mod tests {
                 return;
             }
             let command = line.trim();
+            if let Some(commands) = &options.commands {
+                commands.lock().unwrap().push(command.to_owned());
+            }
             let (verb, argument) = command.split_once(' ').unwrap_or((command, ""));
             match verb {
                 "USER" if argument == "anonymous" => {
@@ -912,13 +1107,12 @@ mod tests {
                     };
                     data.write_all(bytes).await.unwrap();
                     data.shutdown().await.unwrap();
-                    // On Windows, closing a socket immediately after a large
-                    // write can send RST before its buffered bytes are read.
-                    // Wait for the client's half-close before dropping it.
-                    let mut discarded = [0u8; 1];
-                    let _ = tokio::time::timeout(Duration::from_secs(3), data.read(&mut discarded))
-                        .await;
-                    drop(data);
+                    // A real FTP server sends its terminal control reply as
+                    // soon as its data stream finishes. Holding 226/426 until
+                    // the client half-closes can deadlock with clients whose
+                    // finish() waits for it. The client can also half-close
+                    // its write side *before* reading the full body, so a
+                    // read(0) here is not proof the payload was consumed.
                     respond(
                         &mut connection,
                         if options.fail_final {
@@ -928,6 +1122,11 @@ mod tests {
                         },
                     )
                     .await;
+                    // Keep the test's tiny loopback data socket alive long
+                    // enough for Windows to deliver its buffered bytes/FIN,
+                    // without incorrectly waiting for an early client FIN.
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                    drop(data);
                     offset = 0;
                 }
                 "QUIT" => {
@@ -949,7 +1148,7 @@ mod tests {
         let contents = Arc::new(contents);
         let server_handle = tokio::spawn(async move {
             while let Ok((socket, _)) = server.accept().await {
-                tokio::spawn(serve_ftp(socket, contents.clone(), options));
+                tokio::spawn(serve_ftp(socket, contents.clone(), options.clone()));
             }
         });
         (url, server_handle)
@@ -960,9 +1159,12 @@ mod tests {
     ) -> Result<(Vec<u8>, usize), String> {
         let mut output = Vec::new();
         let mut max_chunk = 0usize;
-        while let Some(received) = tokio::time::timeout(Duration::from_secs(5), receiver.recv())
+        // Windows loopback sockets can take several seconds to complete the
+        // data half-close under test/CI contention. Production has its own
+        // 30s I/O deadline; this test window must not undercut that handshake.
+        while let Some(received) = tokio::time::timeout(Duration::from_secs(12), receiver.recv())
             .await
-            .map_err(|_| "Transfer fixture timed out")?
+            .map_err(|_| format!("Transfer fixture timed out after {} bytes", output.len()))?
         {
             let data = received?;
             max_chunk = max_chunk.max(data.len());
@@ -1013,16 +1215,37 @@ mod tests {
         assert_eq!(target.path, "/a file.bin");
     }
 
+    #[test]
+    fn sftp_pipelining_balances_bandwidth_delay_and_memory_for_parallel_ranges() {
+        // One connection can fill a high-RTT link; additional authenticated
+        // ranges share the same aggregate 64 MiB packet-capacity budget.
+        for (connections, requests_per_session) in [(1, 64), (4, 64), (8, 32), (16, 16), (32, 8)] {
+            assert_eq!(
+                sftp_read_ahead(connections, Some(128 * 1024 * 1024)),
+                requests_per_session
+            );
+            assert!(
+                connections * sftp_read_ahead(connections, Some(128 * 1024 * 1024))
+                    <= SFTP_PENDING_READ_BUDGET
+            );
+        }
+        assert_eq!(sftp_read_ahead(1, Some(1)), 1);
+        assert_eq!(sftp_read_ahead(1, Some(40 * 1024)), 2);
+        assert_eq!(sftp_read_ahead(1, Some(512 * 1024)), 16);
+        assert_eq!(sftp_read_ahead(1, None), 16);
+        assert_eq!(sftp_read_ahead(32, Some(1)), 1);
+    }
+
     #[tokio::test]
     async fn cancelled_probe_and_stream_never_open_sockets() {
         let url = Url::parse("sftp://alice:secret@example.invalid/file.bin").unwrap();
         let cancel = CancellationToken::new();
         cancel.cancel();
-        assert!(probe(&url, &cancel)
+        assert!(probe(&url, &cancel, true)
             .await
             .unwrap_err()
             .contains("cancelled"));
-        assert!(stream(&url, 0, &cancel)
+        assert!(stream(&url, 0, None, 1, None, &cancel)
             .await
             .unwrap_err()
             .contains("cancelled"));
@@ -1035,21 +1258,140 @@ mod tests {
             .collect::<Vec<_>>();
         let (url, server) = ftp_fixture(bytes.clone(), FtpFixtureOptions::default()).await;
         let cancel = CancellationToken::new();
-        let metadata = probe(&url, &cancel).await.unwrap();
+        let metadata = probe(&url, &cancel, true).await.unwrap();
         assert_eq!(metadata.total_bytes, Some(bytes.len() as u64));
         assert!(metadata.supports_resume);
 
-        let (output, chunk_size) = collect_stream(stream(&url, 0, &cancel).await.unwrap())
+        let (output, chunk_size) = collect_stream(
+            stream(
+                &url,
+                0,
+                metadata.total_bytes,
+                1,
+                metadata.total_bytes,
+                &cancel,
+            )
             .await
-            .unwrap();
+            .unwrap(),
+        )
+        .await
+        .unwrap();
         assert_eq!(output, bytes);
         assert!(chunk_size <= CHUNK_BYTES);
 
         let offset = CHUNK_BYTES + 15;
-        let (output, _) = collect_stream(stream(&url, offset as u64, &cancel).await.unwrap())
-            .await
-            .unwrap();
+        let (output, _) = collect_stream(
+            stream(&url, offset as u64, metadata.total_bytes, 1, None, &cancel)
+                .await
+                .unwrap(),
+        )
+        .await
+        .unwrap();
         assert_eq!(output, bytes[offset..]);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn unverified_ftp_skips_restart_probe_and_reuses_advertised_length() {
+        let bytes = (0..(CHUNK_BYTES * 2 + 37))
+            .map(|index| (index % 211) as u8)
+            .collect::<Vec<_>>();
+        let commands = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (url, server) = ftp_fixture(
+            bytes.clone(),
+            FtpFixtureOptions {
+                commands: Some(commands.clone()),
+                ..Default::default()
+            },
+        )
+        .await;
+        let cancel = CancellationToken::new();
+        let metadata = probe(&url, &cancel, false).await.unwrap();
+        assert_eq!(metadata.total_bytes, Some(bytes.len() as u64));
+        assert!(!metadata.supports_resume);
+
+        let (output, _) = collect_stream(
+            stream(
+                &url,
+                0,
+                metadata.total_bytes,
+                1,
+                metadata.total_bytes,
+                &cancel,
+            )
+            .await
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(output, bytes);
+        let commands = commands.lock().unwrap();
+        assert_eq!(
+            commands
+                .iter()
+                .filter(|command| command.starts_with("SIZE "))
+                .count(),
+            1
+        );
+        assert!(!commands.iter().any(|command| command.starts_with("REST ")));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn sftp_reads_short_packets_and_avoids_duplicate_metadata_lookups() {
+        let bytes = (0..(CHUNK_BYTES * 10 + 17))
+            .map(|index| (index % 239) as u8)
+            .collect::<Vec<_>>();
+        let (session, fstat_count) = sftp_fixture(bytes.clone()).await;
+        let cancel = CancellationToken::new();
+        let (sender, receiver) = mpsc::channel(CHANNEL_SLOTS);
+        let transfer = tokio::spawn(transfer_sftp(
+            session,
+            "/file.bin".into(),
+            0,
+            Some(bytes.len() as u64),
+            cancel,
+            sender,
+        ));
+        let (output, max_chunk) = collect_stream(receiver).await.unwrap();
+        transfer.await.unwrap().unwrap();
+        assert_eq!(output, bytes);
+        assert!(max_chunk <= CHUNK_BYTES);
+        assert_eq!(fstat_count.load(Ordering::Relaxed), 0);
+
+        let offset = CHUNK_BYTES + 11;
+        let (session, fstat_count) = sftp_fixture(bytes.clone()).await;
+        let (sender, receiver) = mpsc::channel(CHANNEL_SLOTS);
+        let transfer = tokio::spawn(transfer_sftp(
+            session,
+            "/file.bin".into(),
+            offset as u64,
+            None,
+            CancellationToken::new(),
+            sender,
+        ));
+        let (output, _) = collect_stream(receiver).await.unwrap();
+        transfer.await.unwrap().unwrap();
+        assert_eq!(output, bytes[offset..]);
+        assert_eq!(fstat_count.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn advertised_length_still_rejects_changed_ftp_source() {
+        let bytes = vec![37; CHUNK_BYTES * 2 + 19];
+        let (url, server) = ftp_fixture(bytes.clone(), FtpFixtureOptions::default()).await;
+        let cancel = CancellationToken::new();
+        let error = collect_stream(
+            stream(&url, 0, Some(bytes.len() as u64 - 1), 1, None, &cancel)
+                .await
+                .unwrap(),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error.contains("extra bytes"),
+            "unexpected FTP error: {error}"
+        );
         server.abort();
     }
 
@@ -1065,8 +1407,8 @@ mod tests {
             },
         )
         .await;
-        assert!(!probe(&url, &cancel).await.unwrap().supports_resume);
-        let error = collect_stream(stream(&url, 10, &cancel).await.unwrap())
+        assert!(!probe(&url, &cancel, true).await.unwrap().supports_resume);
+        let error = collect_stream(stream(&url, 10, None, 1, None, &cancel).await.unwrap())
             .await
             .unwrap_err();
         assert!(error.contains("offset"));
@@ -1080,7 +1422,7 @@ mod tests {
             },
         )
         .await;
-        let error = collect_stream(stream(&url, 0, &cancel).await.unwrap())
+        let error = collect_stream(stream(&url, 0, None, 1, None, &cancel).await.unwrap())
             .await
             .unwrap_err();
         assert!(error.contains("confirm"), "unexpected FTP error: {error}");
@@ -1094,10 +1436,10 @@ mod tests {
             },
         )
         .await;
-        let error = collect_stream(stream(&url, 0, &cancel).await.unwrap())
+        let error = collect_stream(stream(&url, 0, None, 1, None, &cancel).await.unwrap())
             .await
             .unwrap_err();
-        assert!(error.contains("length"));
+        assert!(error.contains("length"), "unexpected FTP error: {error}");
         server.abort();
     }
 
@@ -1112,7 +1454,7 @@ mod tests {
         )
         .await;
         let cancel = CancellationToken::new();
-        let mut receiver = stream(&url, 0, &cancel).await.unwrap();
+        let mut receiver = stream(&url, 0, None, 1, None, &cancel).await.unwrap();
         let chunk = tokio::time::timeout(Duration::from_secs(5), receiver.recv())
             .await
             .unwrap()
