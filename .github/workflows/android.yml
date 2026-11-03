@@ -35,9 +35,8 @@ jobs:
       - uses: android-actions/setup-android@v3
       - name: Install Android SDK and NDK
         run: |
-          yes | sdkmanager --licenses >/dev/null
           sdkmanager "platforms;android-37" "build-tools;36.0.0" "ndk;28.2.13676358"
-      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb928c1d # stable
+      - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: stable
           targets: aarch64-linux-android
