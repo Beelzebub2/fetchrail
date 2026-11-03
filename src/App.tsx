@@ -104,6 +104,7 @@ export type DownloadRecord = {
   createdAt: string;
   finishedAt: string | null;
   queue: string;
+  queuePriority?: number;
   scheduledFor: string | null;
   segments: SegmentProgress[];
   resumeSupported: boolean | null;
@@ -174,11 +175,14 @@ export type DownloadSettings = Appearance & {
   minimizeToTray: boolean;
 };
 
+type WeeklyWindow = { daysMask: number; startMinute: number; endMinute: number };
+
 type QueueRecord = {
   name: string;
   paused: boolean;
   startsAt: string | null;
   stopsAt: string | null;
+  weeklyWindows: WeeklyWindow[];
 };
 
 type OrganizeReport = {
@@ -445,7 +449,17 @@ function queueWaitNote(queue: QueueRecord | undefined) {
   if (queue.paused) return `${queue.name} is paused`;
   if (queue.startsAt && new Date(queue.startsAt).getTime() > Date.now()) return `${queue.name} starts ${formatDateTime(queue.startsAt)}`;
   if (queue.stopsAt && new Date(queue.stopsAt).getTime() <= Date.now()) return `${queue.name} schedule has ended`;
+  if (queue.weeklyWindows?.length && !weeklyActiveNow(queue.weeklyWindows, new Date())) return `${queue.name} waits for its weekly hours`;
   return "";
+}
+
+function weeklyActiveNow(windows: WeeklyWindow[], date: Date) {
+  const weekday = (date.getDay() + 6) % 7;
+  const minute = date.getHours() * 60 + date.getMinutes();
+  return windows.some(window => window.startMinute < window.endMinute
+    ? Boolean(window.daysMask & (1 << weekday)) && minute >= window.startMinute && minute < window.endMinute
+    : Boolean(window.daysMask & (1 << weekday)) && minute >= window.startMinute
+      || Boolean(window.daysMask & (1 << ((weekday + 6) % 7))) && minute < window.endMinute);
 }
 
 function hostOf(url: string) {
@@ -896,7 +910,7 @@ function App() {
   }
 
   async function queueCommand(
-    name: "create_queue" | "delete_queue" | "set_queue_paused" | "schedule_queue",
+    name: "create_queue" | "delete_queue" | "set_queue_paused" | "schedule_queue" | "schedule_queue_weekly",
     args: Record<string, unknown>,
   ) {
     setBusy(true);
@@ -1263,6 +1277,7 @@ function App() {
             onDeleteQueue={(name) => queueCommand("delete_queue", { name })}
             onToggleQueue={(name, paused) => queueCommand("set_queue_paused", { name, paused })}
             onScheduleQueue={(name, startsAt, stopsAt) => queueCommand("schedule_queue", { name, startsAt, stopsAt })}
+            onWeeklyQueue={(name, weeklyWindows) => queueCommand("schedule_queue_weekly", { name, weeklyWindows })}
           />
         ) : (
           <>
@@ -1934,6 +1949,22 @@ function DownloadRow({
                 ))}
               </select>
             </label>
+            {!provisional && !["completed", "cancelled"].includes(item.status) && (
+              <label>
+                Download priority
+                <select
+                  value={item.queuePriority ?? 2}
+                  onChange={(event) => void command("set_download_priority", item.id, { priority: Number(event.target.value) })}
+                  aria-label={`Priority for ${item.fileName}`}
+                >
+                  <option value={0}>Low</option>
+                  <option value={1}>Below normal</option>
+                  <option value={2}>Normal</option>
+                  <option value={3}>High</option>
+                  <option value={4}>Urgent</option>
+                </select>
+              </label>
+            )}
             {!["completed", "cancelled", "merging"].includes(item.status) && (
               <button
                 popoverTarget={menuId}
@@ -2319,6 +2350,7 @@ function SettingsPage({
   onDeleteQueue,
   onToggleQueue,
   onScheduleQueue,
+  onWeeklyQueue,
 }: {
   settings: DownloadSettings;
   // The saved settings with the unsaved changes on top.
@@ -2343,6 +2375,7 @@ function SettingsPage({
   onDeleteQueue: (name: string) => Promise<boolean>;
   onToggleQueue: (name: string, paused: boolean) => Promise<boolean>;
   onScheduleQueue: (name: string, startsAt: string | null, stopsAt: string | null) => Promise<boolean>;
+  onWeeklyQueue: (name: string, weeklyWindows: WeeklyWindow[]) => Promise<boolean>;
 }) {
   const capabilities = usePlatformCapabilities();
   const [queueName, setQueueName] = useState("");
@@ -2757,7 +2790,7 @@ function SettingsPage({
                   <span />
                 </div>
                 {queues.map((queue) => {
-                  const span = scheduleWindow(queue, now);
+                  const span = queue.weeklyWindows?.length ? null : scheduleWindow(queue, now);
                   const scheduled = queue.startsAt || queue.stopsAt;
                   return (
                     <div className="queue-settings-item" key={queue.name}>
@@ -2767,6 +2800,7 @@ function SettingsPage({
                       </div>
                       <div className="queue-plan">
                         <div className={queue.paused ? "queue-track paused" : "queue-track"} aria-hidden="true">
+                          {!!queue.weeklyWindows?.length && <span className="queue-track-weekly">Recurring weekly hours</span>}
                           {span && (
                             <i className={scheduled ? "" : "open"} style={{ left: span.left + "%", width: span.width + "%" }}>
                               {scheduled ? scheduleLabel(queue) : "No schedule"}
@@ -2774,6 +2808,7 @@ function SettingsPage({
                           )}
                         </div>
                         <QueueSchedule key={`${queue.name}:${queue.startsAt}:${queue.stopsAt}`} queue={queue} busy={busy} save={onScheduleQueue} />
+                        <WeeklySchedule key={`${queue.name}:${JSON.stringify(queue.weeklyWindows)}`} queue={queue} busy={busy} save={onWeeklyQueue} />
                       </div>
                       <div className="queue-controls">
                         <label className="switch-label">
@@ -3357,6 +3392,47 @@ function QueueSchedule({ queue, busy, save }: { queue: QueueRecord; busy: boolea
     {(queue.startsAt || queue.stopsAt) && <button type="button" className="ghost-button" disabled={busy || saving} onClick={() => void save(queue.name, null, null)}>Clear</button>}
     {error && <small role="alert">{error}</small>}
   </div>;
+}
+
+const weekdays = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
+const timeValue = (minute: number) => `${String(Math.floor(minute / 60)).padStart(2, "0")}:${String(minute % 60).padStart(2, "0")}`;
+function WeeklySchedule({ queue, busy, save }: { queue: QueueRecord; busy: boolean; save: (name: string, windows: WeeklyWindow[]) => Promise<boolean> }) {
+  const [windows, setWindows] = useState<WeeklyWindow[]>(queue.weeklyWindows ?? []);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState("");
+  const update = (index: number, patch: Partial<WeeklyWindow>) => setWindows(previous => previous.map((window, i) => i === index ? { ...window, ...patch } : window));
+  const timeChanged = (index: number, field: "startMinute" | "endMinute", text: string) => {
+    const match = /^(\d\d):(\d\d)$/.exec(text);
+    if (!match) return;
+    update(index, { [field]: Number(match[1]) * 60 + Number(match[2]) });
+  };
+  return <details className="weekly-editor">
+    <summary>Weekly recurring hours {windows.length ? `(${windows.length} windows)` : "(disabled)"}</summary>
+    <p className="hint">Local computer time, including daylight-saving changes. Each window starts on the chosen days; overnight hours continue into the following morning. Empty means no weekly restriction. One-time dates still apply separately.</p>
+    {windows.map((window, index) => <div key={index} className="weekly-window">
+      <div className="weekly-days" role="group" aria-label={`Days for weekly window ${index + 1}`}>
+        {weekdays.map((day, bit) => <button key={day} type="button" aria-pressed={Boolean(window.daysMask & (1 << bit))} disabled={busy || saving}
+          onClick={() => update(index, { daysMask: window.daysMask ^ (1 << bit) })}>{day}</button>)}
+      </div>
+      <div className="weekly-hours">
+        <label>From <input aria-label={`Window ${index + 1} start`} type="time" value={timeValue(window.startMinute)} onChange={event => timeChanged(index, "startMinute", event.target.value)} /></label>
+        <label>Until <input aria-label={`Window ${index + 1} end`} type="time" value={timeValue(window.endMinute)} onChange={event => timeChanged(index, "endMinute", event.target.value)} /></label>
+        <button type="button" className="ghost-button" disabled={busy || saving} onClick={() => setWindows(current => current.filter((_, at) => at !== index))}>Remove</button>
+      </div>
+    </div>)}
+    <div className="weekly-actions">
+      <button type="button" className="secondary-button" disabled={busy || saving || windows.length >= 14} onClick={() => setWindows(current => [...current, { daysMask: 31, startMinute: 9 * 60, endMinute: 17 * 60 }])}>Add weekly window</button>
+      <button type="button" className="secondary-button" disabled={busy || saving} onClick={async () => {
+        if (windows.some(window => !window.daysMask || window.daysMask > 127 || window.startMinute === window.endMinute || window.startMinute >= 1440 || window.endMinute >= 1440)) {
+          setError("Choose at least one day and different valid start/end times for every window."); return;
+        }
+        setError(""); setSaving(true);
+        try { if (!(await save(queue.name, windows))) setError("Unable to save weekly hours. Check the app message for details."); }
+        finally { setSaving(false); }
+      }}>Save weekly hours</button>
+    </div>
+    {error && <small role="alert">{error}</small>}
+  </details>;
 }
 
 export function DownloadPrompt({ id }: { id: string }) {
