@@ -4,7 +4,7 @@
 
 ## Remaining work
 
-Remaining work includes browser interception exclusion rules, proxy configuration, per-host limits, clipboard monitoring, recurring bandwidth windows, and optional Explorer context-menu integration. Global/per-file speed limits, queue start/stop windows, browser batches and opt-in final-request session support are implemented. Blob URLs and protected streaming formats require separate browser authentication/media support.
+Remaining work includes general proxy configuration, configurable per-host limits, clipboard monitoring, recurring bandwidth windows, and optional Explorer context-menu integration. Automatic browser interception exclusions for websites, file types and minimum sizes are implemented in the browser companion; explicit browser batches bypass them. Global/per-file speed limits, queue start/stop windows, browser batches and opt-in final-request session support are implemented. Blob URLs and protected streaming formats require separate browser authentication/media support.
 
 ## Torrent support
 

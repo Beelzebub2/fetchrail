@@ -566,6 +566,33 @@ function safeBrowserDownload(item) {
   return active && (!item.danger || item.danger === "safe")
     && (!item.byExtensionId || item.byExtensionId === api.runtime.id) && /^https?:\/\//i.test(item.finalUrl || item.url);
 }
+
+// Automatic capture exclusions never pause or cancel a browser-owned file.
+// Manually selected downloads and page batches intentionally bypass them.
+function excludedFromAutomaticCapture(item, rules) {
+  if (!rules || typeof rules !== "object") return false;
+  const sites = [item.finalUrl || item.url, item.url, item.referrer].flatMap(value => {
+    try { const url = new URL(value); return /^https?:$/.test(url.protocol) ? [url.hostname.toLowerCase()] : []; }
+    catch { return []; }
+  });
+  const hosts = Array.isArray(rules.excludedHosts) ? rules.excludedHosts : [];
+  for (const rawHost of hosts.slice(0, 200)) {
+    if (typeof rawHost !== "string" || !/^[a-z0-9.-]{1,253}$/i.test(rawHost)) continue;
+    const host = rawHost.toLowerCase();
+    if (sites.some(site => site === host || site.endsWith("." + host))) return true;
+  }
+  const file = (typeof item.filename === "string" && item.filename.split(/[\\/]/).pop()) ||
+    (() => { try { return new URL(item.finalUrl || item.url).pathname.split("/").pop(); } catch { return ""; } })();
+  const extension = /\.([a-z0-9]{1,16})$/i.exec(file ?? "")?.[1]?.toLowerCase();
+  if (extension && Array.isArray(rules.excludedExtensions) && rules.excludedExtensions
+    .slice(0, 200).some(value => typeof value === "string" && value.toLowerCase().replace(/^\./, "") === extension)) return true;
+  if (Number.isSafeInteger(rules.minimumBytes) && rules.minimumBytes > 0) {
+    // Unknown-size files stay in the browser rather than being handed off
+    // before the user's minimum-size rule can be evaluated.
+    if (!Number.isSafeInteger(item.totalBytes) || item.totalBytes < rules.minimumBytes) return true;
+  }
+  return false;
+}
 function browserDownloadReady(item) {
   // Byte progress has no onChanged event. Chromium's filename decision holds
   // completion even when the whole body arrives before pause() takes effect.
@@ -623,7 +650,10 @@ async function routeBrowserDownload(item) {
       if (trace.method !== "GET") throw nativeError("UNSUPPORTED_METHOD", "Form downloads must finish in the browser.");
     }
     captureBatch = batch;
-    if (!batch && (await api.storage.local.get("automaticDownloads")).automaticDownloads === false) return;
+    if (!batch) {
+      const { automaticDownloads, captureRules } = await api.storage.local.get(["automaticDownloads", "captureRules"]);
+      if (automaticDownloads === false || excludedFromAutomaticCapture(item, captureRules)) return;
+    }
     if (!browserDownloadReady(item)) return;
     await ensureSessionPermission();
     const torrent = /\.torrent$/i.test(new URL(item.finalUrl || item.url).pathname) || /(?:x-)?bittorrent/i.test(item.mime ?? "") || /\.torrent$/i.test(item.filename ?? "");

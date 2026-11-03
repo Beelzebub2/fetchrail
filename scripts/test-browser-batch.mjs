@@ -3,7 +3,9 @@ import vm from "node:vm";
 import { randomUUID } from "node:crypto";
 import { browserFixture } from "./fixtures/extension-browser.mjs";
 for (const family of ["chromium", "firefox"]) {
-  const f = await browserFixture(family); f.saved.useBrowserSession=true; await f.boot();
+  const f = await browserFixture(family); f.saved.useBrowserSession=true;
+  f.saved.captureRules = { excludedHosts: ["files.test"], excludedExtensions: ["zip"], minimumBytes: 20000 };
+  await f.boot();
   const options={queue:"Night",connections:4,speedLimitBps:262144,startPaused:true,scheduledFor:"2030-01-01T00:00:00Z"};
   const start=await f.send({type:"startBrowserBatch",items:[{url:"https://files.test/#/one"},{url:"https://files.test/#/two"},{url:"https://files.test/#/three"}],...options});
   assert.equal(start.ok,true); assert.equal(f.saved.browserBatch.items.length,3,"Navigation fragments identify distinct pages");
@@ -13,7 +15,8 @@ for (const family of ["chromium", "firefox"]) {
     f.events.get("headers")({requestId:String(f.item.id),tabId:f.saved.browserBatch.tabId,url,method:"GET",requestHeaders:[{name:"Cookie",value:"synthetic-session"}]});
     await new Promise(setImmediate); f.create(); await f.settle();
   };
-  await capture(); assert.equal(f.saved.browserBatch.index,1); assert.equal(f.saved.browserBatch.accepted,1);
+  await capture(); assert.equal(f.saved.browserBatch.index,1); assert.equal(f.saved.browserBatch.accepted,1,
+    "Explicit browser batches bypass automatic capture exclusions");
   const firstNative=f.calls.find(c=>c.method==="addDownloads");
   for(const[key,value]of Object.entries(options))assert.equal(firstNative.params[key],value);
   await capture("https://files.test/reject.zip"); assert.equal(f.saved.browserBatch.status,"browser");assert.equal(f.saved.browserBatch.index,1);assert.equal(f.item.paused,false);
