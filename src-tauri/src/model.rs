@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Datelike, Local, Timelike, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -192,6 +192,70 @@ impl<'de> Deserialize<'de> for Accent {
     }
 }
 
+fn default_origin_request_cap() -> usize {
+    32
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum NetworkProxyMode {
+    #[default]
+    None,
+    Http,
+    Socks5,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase", deny_unknown_fields)]
+pub struct NetworkProxy {
+    pub mode: NetworkProxyMode,
+    pub host: String,
+    pub port: u16,
+}
+
+impl NetworkProxy {
+    /// Returns a credential-free proxy URL; invalid input never falls back to
+    /// a direct connection when a proxy is explicitly selected.
+    pub fn endpoint(&self) -> Result<Option<String>, String> {
+        if self.mode == NetworkProxyMode::None {
+            return Ok(None);
+        }
+        let host = self.host.trim();
+        if host.is_empty() || host.len() > 253 || self.port == 0 {
+            return Err("HTTP proxy requires a hostname and a port from 1 to 65535.".into());
+        }
+        let host = if let Ok(ipv6) = host.parse::<std::net::Ipv6Addr>() {
+            format!("[{ipv6}]")
+        } else {
+            if host.starts_with('.')
+                || host.ends_with('.')
+                || !host.is_ascii()
+                || host.split('.').any(|label| {
+                    label.is_empty()
+                        || label.len() > 63
+                        || label.starts_with('-')
+                        || label.ends_with('-')
+                        || !label
+                            .bytes()
+                            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+                })
+            {
+                return Err(
+                    "Proxy host must be a DNS name or IP address, not a URL or credential.".into(),
+                );
+            }
+            host.to_ascii_lowercase()
+        };
+        let scheme = match self.mode {
+            NetworkProxyMode::Http => "http",
+            // Remote DNS resolution avoids leaking names to the local resolver.
+            NetworkProxyMode::Socks5 => "socks5h",
+            NetworkProxyMode::None => unreachable!(),
+        };
+        Ok(Some(format!("{scheme}://{host}:{}", self.port)))
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DownloadSettings {
@@ -208,6 +272,11 @@ pub struct DownloadSettings {
     /// Shared by all downloads and connections; zero is unlimited.
     #[serde(default)]
     pub speed_limit_bps: u64,
+    #[serde(default = "default_origin_request_cap")]
+    pub max_requests_per_origin: usize,
+    /// Explicit desktop HTTP/HTTPS proxy. No credentials are accepted or stored.
+    #[serde(default)]
+    pub network_proxy: NetworkProxy,
     pub default_download_dir: String,
     pub max_concurrent_downloads: usize,
     pub connections_per_download: usize,
@@ -220,6 +289,14 @@ pub struct DownloadSettings {
     pub windows_attachment_check: bool,
     #[serde(default)]
     pub launch_on_start: bool,
+    /// Opt-in local clipboard inspection: sends URL candidates to the app only.
+    #[serde(default)]
+    pub clipboard_monitoring: bool,
+    /// Extract future completed ZIP downloads only when explicitly enabled.
+    #[serde(default)]
+    pub auto_extract_zip: bool,
+    #[serde(default)]
+    pub auto_extract_since: Option<DateTime<Utc>>,
     #[serde(default = "default_true")]
     pub minimize_to_tray: bool,
     #[serde(default)]
@@ -303,6 +380,7 @@ impl DownloadSettings {
         }
         self.max_concurrent_downloads = self.max_concurrent_downloads.clamp(1, 12);
         self.connections_per_download = self.connections_per_download.clamp(1, 32);
+        self.max_requests_per_origin = self.max_requests_per_origin.clamp(1, 32);
         self.min_segment_size_mb = self.min_segment_size_mb.clamp(1, 128);
         self.torrent.max_seeds = self.torrent.max_seeds.clamp(1, 100);
         self.torrent.connections = self.torrent.connections.clamp(20, 2000);
@@ -390,6 +468,41 @@ pub struct QueueRecord {
     pub starts_at: Option<DateTime<Utc>>,
     #[serde(default)]
     pub stops_at: Option<DateTime<Utc>>,
+    /// Local wall-clock windows, Monday=bit0 through Sunday=bit6.
+    /// Kept separate from the existing one-time UTC start/stop dates.
+    #[serde(default)]
+    pub weekly_windows: Vec<WeeklyWindow>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WeeklyWindow {
+    pub days_mask: u8,
+    pub start_minute: u16,
+    pub end_minute: u16,
+}
+
+impl WeeklyWindow {
+    pub fn valid(&self) -> bool {
+        self.days_mask > 0
+            && self.days_mask <= 0b111_1111
+            && self.start_minute < 1440
+            && self.end_minute < 1440
+            && self.start_minute != self.end_minute
+    }
+
+    fn contains_local(&self, weekday: u8, minute: u16) -> bool {
+        if !self.valid() || weekday >= 7 || minute >= 1440 {
+            return false;
+        }
+        let today = (self.days_mask & (1 << weekday)) != 0;
+        if self.start_minute < self.end_minute {
+            return today && (self.start_minute..self.end_minute).contains(&minute);
+        }
+        let yesterday = (weekday + 6) % 7;
+        (today && minute >= self.start_minute)
+            || ((self.days_mask & (1 << yesterday)) != 0 && minute < self.end_minute)
+    }
 }
 
 impl QueueRecord {
@@ -397,6 +510,14 @@ impl QueueRecord {
         !self.paused
             && self.starts_at.is_none_or(|start| now >= start)
             && self.stops_at.is_none_or(|stop| now < stop)
+            && (self.weekly_windows.is_empty() || {
+                let local = now.with_timezone(&Local);
+                let weekday = local.weekday().num_days_from_monday() as u8;
+                let minute = (local.hour() * 60 + local.minute()) as u16;
+                self.weekly_windows
+                    .iter()
+                    .any(|window| window.contains_local(weekday, minute))
+            })
     }
 }
 
@@ -477,6 +598,7 @@ mod tests {
             paused: false,
             starts_at: Some(now),
             stops_at: Some(now + chrono::Duration::minutes(1)),
+            weekly_windows: vec![],
         };
         assert!(!queue.allows_downloads(now - chrono::Duration::seconds(1)));
         assert!(queue.allows_downloads(now));
@@ -486,6 +608,101 @@ mod tests {
         let old: QueueRecord =
             serde_json::from_str(r#"{"name":"Default","paused":false}"#).unwrap();
         assert!(old.allows_downloads(now));
+    }
+
+    #[test]
+    fn weekly_windows_cover_day_boundaries_without_opening_other_days() {
+        let mon_night = WeeklyWindow {
+            days_mask: 0b0000001,
+            start_minute: 22 * 60,
+            end_minute: 2 * 60,
+        };
+        assert!(mon_night.valid());
+        assert!(!mon_night.contains_local(0, 21 * 60 + 59));
+        assert!(mon_night.contains_local(0, 22 * 60));
+        assert!(mon_night.contains_local(1, 119));
+        assert!(!mon_night.contains_local(1, 120));
+        assert!(!mon_night.contains_local(2, 60));
+        let sunday = WeeklyWindow {
+            days_mask: 0b1000000,
+            ..mon_night
+        };
+        assert!(
+            sunday.contains_local(0, 90),
+            "Sunday window crosses the week boundary"
+        );
+        assert!(!sunday.contains_local(1, 90));
+    }
+
+    #[test]
+    fn weekly_windows_validate_and_handle_repeated_or_missing_local_hours() {
+        let all_days = WeeklyWindow {
+            days_mask: 0b1111111,
+            start_minute: 60,
+            end_minute: 180,
+        };
+        // A wall-clock window is checked against the OS-local time of each
+        // instant. DST gaps naturally have no such instants; repeated local
+        // hours are eligible both times without inventing UTC offsets.
+        let first = chrono::DateTime::parse_from_rfc3339("2026-10-25T01:30:00+01:00").unwrap();
+        let repeated = chrono::DateTime::parse_from_rfc3339("2026-10-25T01:30:00+00:00").unwrap();
+        assert_ne!(first.with_timezone(&Utc), repeated.with_timezone(&Utc));
+        assert_eq!(
+            (first.hour(), first.minute()),
+            (repeated.hour(), repeated.minute())
+        );
+        assert!(all_days.contains_local(6, (first.hour() * 60 + first.minute()) as u16));
+        assert!(all_days.contains_local(6, (repeated.hour() * 60 + repeated.minute()) as u16));
+        assert!(!all_days.contains_local(6, 180));
+        assert!(!WeeklyWindow {
+            days_mask: 0,
+            ..all_days.clone()
+        }
+        .valid());
+        assert!(!WeeklyWindow {
+            start_minute: 180,
+            end_minute: 180,
+            ..all_days.clone()
+        }
+        .valid());
+        assert!(!WeeklyWindow {
+            start_minute: 1440,
+            ..all_days.clone()
+        }
+        .valid());
+        assert!(!WeeklyWindow {
+            days_mask: 128,
+            ..all_days
+        }
+        .valid());
+        let queue: QueueRecord =
+            serde_json::from_str(r#"{"name":"Night","paused":false}"#).unwrap();
+        assert!(
+            queue.weekly_windows.is_empty(),
+            "prior releases remain unrestricted by weekly hours"
+        );
+        let now = Utc::now();
+        let local = now.with_timezone(&Local);
+        let current_minute = (local.hour() * 60 + local.minute()) as u16;
+        let today = local.weekday().num_days_from_monday();
+        let mut current_queue = queue;
+        current_queue.weekly_windows = vec![WeeklyWindow {
+            days_mask: 1 << today,
+            start_minute: current_minute,
+            end_minute: (current_minute + 1) % 1440,
+        }];
+        assert!(current_queue.allows_downloads(now));
+        current_queue.starts_at = Some(now + chrono::Duration::minutes(10));
+        assert!(
+            !current_queue.allows_downloads(now),
+            "one-time date also restricts weekly windows"
+        );
+        current_queue.starts_at = None;
+        current_queue.paused = true;
+        assert!(
+            !current_queue.allows_downloads(now),
+            "manual pause always wins"
+        );
     }
 
     #[test]
@@ -566,6 +783,8 @@ mod tests {
             extra: Default::default(),
             torrent: Default::default(),
             speed_limit_bps: 0,
+            max_requests_per_origin: 32,
+            network_proxy: Default::default(),
             default_download_dir: download_root.into(),
             max_concurrent_downloads: 3,
             connections_per_download: 8,
@@ -573,6 +792,9 @@ mod tests {
             min_segment_size_mb: 4,
             windows_attachment_check: true,
             launch_on_start: false,
+            clipboard_monitoring: false,
+            auto_extract_zip: false,
+            auto_extract_since: None,
             minimize_to_tray: true,
             theme: Theme::default(),
             accent: Accent::default(),
@@ -628,10 +850,32 @@ mod tests {
         legacy.remove("sortIntoCategoryFolders");
         legacy.remove("deleteFilesOnRemove");
         legacy.remove("windowsAttachmentCheck");
+        legacy.remove("clipboardMonitoring");
+        legacy.remove("autoExtractZip");
+        legacy.remove("autoExtractSince");
+        legacy.remove("maxRequestsPerOrigin");
+        legacy.remove("networkProxy");
         let restored: DownloadSettings =
             serde_json::from_value(serde_json::Value::Object(legacy)).unwrap();
         assert!(restored.sort_into_category_folders);
         assert_eq!(restored.delete_files_on_remove, None);
+        assert!(
+            !restored.clipboard_monitoring,
+            "legacy profiles must never enable clipboard monitoring"
+        );
+        assert!(
+            !restored.auto_extract_zip,
+            "legacy profiles must never auto-extract ZIPs"
+        );
+        assert!(restored.auto_extract_since.is_none());
+        assert_eq!(restored.max_requests_per_origin, 32);
+        assert_eq!(restored.network_proxy.mode, NetworkProxyMode::None);
+        let mut low_cap = settings.clone();
+        low_cap.max_requests_per_origin = 0;
+        assert_eq!(low_cap.normalized().max_requests_per_origin, 1);
+        let mut high_cap = settings.clone();
+        high_cap.max_requests_per_origin = 1000;
+        assert_eq!(high_cap.normalized().max_requests_per_origin, 32);
         assert!(
             restored.windows_attachment_check,
             "existing profiles retain Windows checking"
@@ -645,5 +889,64 @@ mod tests {
             .iter()
             .any(|category| category.name == "Programs"
                 && category.extensions.contains(&"exe".to_string())));
+    }
+
+    #[test]
+    fn network_proxy_rejects_credentials_and_unsafe_host_syntax() {
+        let proxy = NetworkProxy {
+            mode: NetworkProxyMode::Socks5,
+            host: "proxy.example.com".into(),
+            port: 1080,
+        };
+        assert_eq!(
+            proxy.endpoint().unwrap().unwrap(),
+            "socks5h://proxy.example.com:1080"
+        );
+        assert_eq!(
+            NetworkProxy {
+                mode: NetworkProxyMode::Http,
+                host: "::1".into(),
+                port: 3128
+            }
+            .endpoint()
+            .unwrap()
+            .unwrap(),
+            "http://[::1]:3128"
+        );
+        for host in [
+            "user:password@proxy.example.com",
+            "https://proxy.example.com",
+            "host/path",
+            "host?secret=1",
+            "bad host",
+            "example..com",
+            "-name.com",
+        ] {
+            assert!(
+                NetworkProxy {
+                    host: host.into(),
+                    ..proxy.clone()
+                }
+                .endpoint()
+                .is_err(),
+                "unsafe host {host}"
+            );
+        }
+        assert!(NetworkProxy {
+            port: 0,
+            ..proxy.clone()
+        }
+        .endpoint()
+        .is_err());
+        assert_eq!(
+            NetworkProxy {
+                mode: NetworkProxyMode::None,
+                host: "anything".into(),
+                ..proxy
+            }
+            .endpoint()
+            .unwrap(),
+            None
+        );
     }
 }

@@ -66,7 +66,7 @@ macro_rules! transfer_span {
 use crate::model::{
     default_categories, default_queue_name, AddDownloadRequest, BatchDownloadError,
     BatchDownloadResult, BrowserRequestContext, DownloadRecord, DownloadSettings, DownloadStatus,
-    EngineOverview, QueueRecord, SegmentProgress,
+    EngineOverview, NetworkProxy, QueueRecord, SegmentProgress, WeeklyWindow,
 };
 use crate::organize::{self, OrganizeMode, OrganizeReport};
 use crate::rate_limit::RateLimiter;
@@ -127,8 +127,39 @@ pub(crate) fn download_client_builder() -> reqwest::ClientBuilder {
     } else {
         builder
     };
-    builder
+    // All native HTTP clients (metadata, parallel range pools, retry clients
+    // and browser handoffs) must take the same effective proxy. A previously
+    // configured proxy never falls back to a direct client on failure.
+    if let Some(proxy) = active_http_proxy()
+        .read()
+        .expect("HTTP proxy configuration poisoned")
+        .clone()
+    {
+        // Clear environment/system bypass rules before attaching the explicit
+        // proxy, so NO_PROXY cannot silently route selected hosts directly.
+        builder.no_proxy().proxy(proxy)
+    } else {
+        builder
+    }
 }
+
+fn active_http_proxy() -> &'static std::sync::RwLock<Option<reqwest::Proxy>> {
+    static ACTIVE: std::sync::OnceLock<std::sync::RwLock<Option<reqwest::Proxy>>> =
+        std::sync::OnceLock::new();
+    ACTIVE.get_or_init(|| std::sync::RwLock::new(None))
+}
+
+fn validated_http_proxy(config: &NetworkProxy) -> Result<Option<reqwest::Proxy>, String> {
+    let endpoint = config.endpoint()?;
+    endpoint
+        .map(|endpoint| {
+            reqwest::Proxy::all(endpoint)
+                .map_err(|_| "HTTP proxy configuration is invalid.".to_string())
+        })
+        .transpose()
+}
+
+static REQUEST_CAP_PER_ORIGIN: AtomicUsize = AtomicUsize::new(32);
 
 fn global_budget() -> &'static tokio::sync::Semaphore {
     static BUDGET: std::sync::OnceLock<tokio::sync::Semaphore> = std::sync::OnceLock::new();
@@ -180,7 +211,12 @@ async fn send_admitted(
             health = health,
             trace,
             Origin,
-            origin.acquire(32, cancel).await
+            origin
+                .acquire(
+                    REQUEST_CAP_PER_ORIGIN.load(Ordering::Relaxed).clamp(1, 32),
+                    cancel
+                )
+                .await
         )
         .ok_or(EngineError::Cancelled)?;
         let global = transfer_span!(
@@ -1558,9 +1594,15 @@ impl DownloadManager {
                     paused: false,
                     starts_at: None,
                     stops_at: None,
+                    weekly_windows: vec![],
                 },
             );
         }
+        let selected_proxy = validated_http_proxy(&settings.network_proxy)?;
+        *active_http_proxy()
+            .write()
+            .expect("HTTP proxy configuration poisoned") = selected_proxy;
+        REQUEST_CAP_PER_ORIGIN.store(settings.max_requests_per_origin, Ordering::Release);
         let client = download_client_builder()
             .build()
             .map_err(|error| format!("Could not initialize HTTP client: {error}"))?;
@@ -3783,6 +3825,70 @@ impl DownloadManager {
         records
     }
 
+    pub async fn reserve_archive_extraction(&self, id: Uuid) -> Result<PathBuf, String> {
+        let _persist = self.persist_lock.lock().await;
+        let task = self.task(id).await?;
+        let previous = task.record.read().await.clone();
+        if previous.status != DownloadStatus::Completed || previous.torrent.is_some() {
+            return Err("Only completed single-file downloads can be extracted.".into());
+        }
+        let source = PathBuf::from(&previous.destination);
+        if !source
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("zip"))
+        {
+            return Err(
+                "Only completed ZIP downloads are supported by the built-in extractor.".into(),
+            );
+        }
+        if let Some(state) = previous
+            .extra
+            .get("archiveExtraction")
+            .and_then(|v| v.get("state"))
+            .and_then(|v| v.as_str())
+        {
+            if matches!(state, "extracting" | "complete") {
+                return Err(
+                    "This archive has already been extracted or is being extracted.".into(),
+                );
+            }
+        }
+        let snapshot = {
+            let mut record = task.record.write().await;
+            record
+                .extra
+                .insert("archiveExtraction".into(), json!({"state": "extracting"}));
+            record.clone()
+        };
+        if let Err(error) = self.persist_records_locked().await {
+            *task.record.write().await = previous;
+            return Err(error.to_string());
+        }
+        self.emit_record(&snapshot);
+        Ok(source)
+    }
+
+    pub async fn complete_archive_extraction(
+        &self,
+        id: Uuid,
+        state: serde_json::Value,
+    ) -> Result<(), String> {
+        let _persist = self.persist_lock.lock().await;
+        let task = self.task(id).await?;
+        let previous = task.record.read().await.clone();
+        let snapshot = {
+            let mut record = task.record.write().await;
+            record.extra.insert("archiveExtraction".into(), state);
+            record.clone()
+        };
+        if let Err(error) = self.persist_records_locked().await {
+            *task.record.write().await = previous;
+            return Err(error.to_string());
+        }
+        self.emit_record(&snapshot);
+        Ok(())
+    }
+
     pub async fn overview(&self) -> EngineOverview {
         let records = self.list().await;
         EngineOverview {
@@ -4213,6 +4319,7 @@ impl DownloadManager {
             paused: false,
             starts_at: None,
             stops_at: None,
+            weekly_windows: vec![],
         });
         let snapshot = queues.clone();
         drop(queues);
@@ -4313,6 +4420,75 @@ impl DownloadManager {
             .await
             .map_err(|error| error.to_string())?;
         let _ = self.app.emit(QUEUES_EVENT, &snapshot);
+        Ok(snapshot)
+    }
+
+    pub async fn schedule_queue_weekly(
+        &self,
+        name: String,
+        weekly_windows: Vec<WeeklyWindow>,
+    ) -> Result<Vec<QueueRecord>, String> {
+        if weekly_windows.len() > 14 || weekly_windows.iter().any(|window| !window.valid()) {
+            return Err(
+                "Use up to 14 weekly windows with valid days and different start/end times.".into(),
+            );
+        }
+        let _dispatch = self.dispatch_lock.lock().await;
+        let (snapshot, previous_windows) = {
+            let mut queues = self.queues.write().await;
+            let queue = queues
+                .iter_mut()
+                .find(|queue| queue.name.eq_ignore_ascii_case(name.trim()))
+                .ok_or("Queue not found.")?;
+            let previous_windows = std::mem::replace(&mut queue.weekly_windows, weekly_windows);
+            (queues.clone(), previous_windows)
+        };
+        if let Err(error) = self.persist_queues().await {
+            let mut queues = self.queues.write().await;
+            if let Some(queue) = queues
+                .iter_mut()
+                .find(|queue| queue.name.eq_ignore_ascii_case(name.trim()))
+            {
+                queue.weekly_windows = previous_windows;
+            }
+            return Err(error.to_string());
+        }
+        let _ = self.app.emit(QUEUES_EVENT, &snapshot);
+        Ok(snapshot)
+    }
+
+    pub async fn set_download_priority(
+        &self,
+        id: Uuid,
+        priority: u8,
+    ) -> Result<DownloadRecord, String> {
+        if priority > 4 {
+            return Err("Download priority must be between 0 (Low) and 4 (Urgent).".into());
+        }
+        let _dispatch = self.dispatch_lock.lock().await;
+        let task = self.task(id).await?;
+        let _persist = self.persist_lock.lock().await;
+        let previous = task.record.read().await.clone();
+        if matches!(
+            previous.status,
+            DownloadStatus::Completed | DownloadStatus::Cancelled
+        ) {
+            return Err("Completed and cancelled downloads cannot change priority.".into());
+        }
+        let snapshot = {
+            let mut record = task.record.write().await;
+            if priority == 2 {
+                record.extra.remove("queuePriority");
+            } else {
+                record.extra.insert("queuePriority".into(), json!(priority));
+            }
+            record.clone()
+        };
+        if let Err(error) = self.persist_records_locked().await {
+            *task.record.write().await = previous;
+            return Err(error.to_string());
+        }
+        self.emit_record(&snapshot);
         Ok(snapshot)
     }
 
@@ -4522,6 +4698,27 @@ impl DownloadManager {
         settings.extra.remove("runtimeWarning");
         settings.preserve_analytics_consent(&*self.settings.read().await);
         let mut settings = settings.normalized();
+        if settings.network_proxy.mode == crate::model::NetworkProxyMode::None {
+            // Disabling proxy routing clears any leftover host/port values;
+            // these are never needed for the default network route.
+            settings.network_proxy = NetworkProxy::default();
+        }
+        // Validate before writing the settings file. Failed proxy setups must
+        // never degrade to direct connections or become silently accepted.
+        validated_http_proxy(&settings.network_proxy)?;
+        // Turning on auto-extraction must never retroactively extract the
+        // user's entire existing download history. The durable timestamp
+        // only admits ZIPs completed after the user enabled this option.
+        let previous = self.settings.read().await.clone();
+        settings.auto_extract_since = if settings.auto_extract_zip {
+            if previous.auto_extract_zip {
+                previous.auto_extract_since.or_else(|| Some(Utc::now()))
+            } else {
+                Some(Utc::now())
+            }
+        } else {
+            None
+        };
         let path = PathBuf::from(&settings.default_download_dir);
         fs::create_dir_all(&path)
             .await
@@ -4532,8 +4729,10 @@ impl DownloadManager {
                 .await
                 .map_err(|error| error.to_string())?;
         }
+        let previous_proxy = self.settings.read().await.network_proxy.clone();
         let prior_limit = self.settings.read().await.speed_limit_bps;
         *self.settings.write().await = settings.clone();
+        REQUEST_CAP_PER_ORIGIN.store(settings.max_requests_per_origin, Ordering::Release);
         if settings.speed_limit_bps > 0 {
             for task in self.tasks.read().await.values() {
                 if let Some(policy) = task
@@ -4563,6 +4762,9 @@ impl DownloadManager {
         // The durable desired settings are committed. Application failures are
         // warnings, not a rejected save that can cause stale clients to retry.
         let mut warnings = Vec::new();
+        if settings.network_proxy != previous_proxy {
+            warnings.push("HTTP/SOCKS proxy settings are saved, but require a full app restart. Until then, existing and new HTTP downloads still use the previously active network route.".into());
+        }
         if let Err(error) = sync_startup_registration(settings.launch_on_start) {
             warnings.push(error);
         }
@@ -5034,9 +5236,16 @@ impl DownloadManager {
             if !record_is_dispatch_ready(&record, &paused_queues, now) {
                 continue;
             }
-            candidates.push((record.created_at, task.clone()));
+            candidates.push((
+                queue_priority_score(&record, now),
+                record.created_at,
+                task.clone(),
+            ));
         }
-        candidates.sort_by_key(|(created_at, _)| *created_at);
+        // Urgent items go first, but waiting jobs gain one priority level per
+        // hour (up to Urgent), so a steady stream of new urgent downloads
+        // cannot starve an older lower-priority download indefinitely.
+        candidates.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
         #[cfg(feature = "test-tools")]
         if !candidates.is_empty() {
             if let Ok(Some(root)) = crate::platform::test_root() {
@@ -5051,7 +5260,7 @@ impl DownloadManager {
             }
         }
 
-        for (_, task) in candidates {
+        for (_, _, task) in candidates {
             let is_seed = task
                 .record
                 .read()
@@ -7603,6 +7812,8 @@ fn default_settings(download_dir: &Path) -> DownloadSettings {
         extra: Default::default(),
         torrent: Default::default(),
         speed_limit_bps: 0,
+        max_requests_per_origin: 32,
+        network_proxy: Default::default(),
         default_download_dir: download_dir.to_string_lossy().to_string(),
         max_concurrent_downloads: 3,
         connections_per_download: 8,
@@ -7610,6 +7821,9 @@ fn default_settings(download_dir: &Path) -> DownloadSettings {
         min_segment_size_mb: 4,
         windows_attachment_check: true,
         launch_on_start: false,
+        clipboard_monitoring: false,
+        auto_extract_zip: false,
+        auto_extract_since: None,
         minimize_to_tray: true,
         theme: Default::default(),
         accent: Default::default(),
@@ -7805,7 +8019,23 @@ fn default_queues() -> Vec<QueueRecord> {
         paused: false,
         starts_at: None,
         stops_at: None,
+        weekly_windows: vec![],
     }]
+}
+
+fn queue_priority_score(record: &DownloadRecord, now: DateTime<Utc>) -> u8 {
+    let requested = record
+        .extra
+        .get("queuePriority")
+        .and_then(|value| value.as_u64())
+        .unwrap_or(2)
+        .min(4) as u8;
+    let age_hours = now
+        .signed_duration_since(record.created_at)
+        .num_hours()
+        .max(0)
+        .min(4) as u8;
+    requested.saturating_add(age_hours).min(4)
 }
 
 fn normalize_queue_name(value: &str) -> Result<String, String> {
@@ -8643,6 +8873,166 @@ mod tests {
     use crate::model::{DownloadRecord, DownloadStatus};
 
     #[tokio::test]
+    async fn explicit_proxy_routes_http_requests_without_resolving_target_locally() {
+        use crate::model::{NetworkProxy, NetworkProxyMode};
+        use tokio::{
+            io::{AsyncReadExt, AsyncWriteExt},
+            net::TcpListener,
+        };
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let proxy_server = tokio::spawn(async move {
+            let (mut socket, _) =
+                tokio::time::timeout(std::time::Duration::from_secs(4), listener.accept())
+                    .await
+                    .unwrap()
+                    .unwrap();
+            let mut request = vec![0u8; 2048];
+            let received = socket.read(&mut request).await.unwrap();
+            let request = String::from_utf8_lossy(&request[..received]);
+            assert!(
+                request.starts_with("GET http://not-a-real-host.invalid/file HTTP/1.1"),
+                "explicit proxy must receive absolute target URL"
+            );
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello",
+                )
+                .await
+                .unwrap();
+        });
+        let config = NetworkProxy {
+            mode: NetworkProxyMode::Http,
+            host: "127.0.0.1".into(),
+            port,
+        };
+        let selected = super::validated_http_proxy(&config).unwrap().unwrap();
+        let client = super::download_client_builder()
+            .no_proxy()
+            .proxy(selected)
+            .build()
+            .unwrap();
+        let body = tokio::time::timeout(
+            std::time::Duration::from_secs(4),
+            client.get("http://not-a-real-host.invalid/file").send(),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .bytes()
+        .await
+        .unwrap();
+        assert_eq!(body, b"hello"[..]);
+        proxy_server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn failed_explicit_proxy_does_not_fall_back_to_a_direct_origin() {
+        use crate::model::{NetworkProxy, NetworkProxyMode};
+        use tokio::net::TcpListener;
+
+        let origin = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin_port = origin.local_addr().unwrap().port();
+        let proxy_socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let unused_port = proxy_socket.local_addr().unwrap().port();
+        drop(proxy_socket);
+        let config = NetworkProxy {
+            mode: NetworkProxyMode::Http,
+            host: "127.0.0.1".into(),
+            port: unused_port,
+        };
+        let selected = super::validated_http_proxy(&config).unwrap().unwrap();
+        let client = super::download_client_builder()
+            .no_proxy()
+            .proxy(selected)
+            .connect_timeout(std::time::Duration::from_secs(1))
+            .build()
+            .unwrap();
+        let target = format!("http://127.0.0.1:{origin_port}/must-stay-unreached");
+        assert!(
+            client.get(&target).send().await.is_err(),
+            "an unavailable selected proxy must fail closed"
+        );
+        assert!(tokio::time::timeout(std::time::Duration::from_millis(150), origin.accept()).await.is_err(),
+            "NO_PROXY or system settings must not bypass the explicit proxy to a direct destination");
+    }
+
+    #[tokio::test]
+    async fn socks5_proxy_resolves_the_target_hostname_remotely() {
+        use crate::model::{NetworkProxy, NetworkProxyMode};
+        use tokio::{
+            io::{AsyncReadExt, AsyncWriteExt},
+            net::TcpListener,
+        };
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) =
+                tokio::time::timeout(std::time::Duration::from_secs(5), listener.accept())
+                    .await
+                    .unwrap()
+                    .unwrap();
+            let mut greeting = [0; 3];
+            stream.read_exact(&mut greeting).await.unwrap();
+            assert_eq!(greeting, [5, 1, 0]);
+            stream.write_all(&[5, 0]).await.unwrap();
+            let mut request = [0; 4];
+            stream.read_exact(&mut request).await.unwrap();
+            assert_eq!(
+                request,
+                [5, 1, 0, 3],
+                "SOCKS5 remote DNS must send a domain rather than a local IP address"
+            );
+            let mut length = [0; 1];
+            stream.read_exact(&mut length).await.unwrap();
+            let mut domain = vec![0; length[0] as usize];
+            stream.read_exact(&mut domain).await.unwrap();
+            assert_eq!(domain, b"unresolvable-proxy-test.invalid");
+            let mut target_port = [0; 2];
+            stream.read_exact(&mut target_port).await.unwrap();
+            assert_eq!(u16::from_be_bytes(target_port), 80);
+            stream
+                .write_all(&[5, 0, 0, 1, 127, 0, 0, 1, 0, 80])
+                .await
+                .unwrap();
+            let mut http = [0; 1024];
+            let received = stream.read(&mut http).await.unwrap();
+            assert!(String::from_utf8_lossy(&http[..received]).starts_with("GET /segment HTTP/1.1"));
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\nSOCK")
+                .await
+                .unwrap();
+        });
+        let config = NetworkProxy {
+            mode: NetworkProxyMode::Socks5,
+            host: "127.0.0.1".into(),
+            port,
+        };
+        let proxy = super::validated_http_proxy(&config).unwrap().unwrap();
+        let client = super::download_client_builder()
+            .no_proxy()
+            .proxy(proxy)
+            .build()
+            .unwrap();
+        let body = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            client
+                .get("http://unresolvable-proxy-test.invalid/segment")
+                .send(),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .bytes()
+        .await
+        .unwrap();
+        assert_eq!(body, b"SOCK"[..]);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn settings_and_consent_migrate_both_generations_with_the_secret_policy() {
         let root = std::env::temp_dir().join(format!("fetchrail-settings-{}", Uuid::new_v4()));
         tokio::fs::create_dir_all(&root).await.unwrap();
@@ -9202,6 +9592,37 @@ mod tests {
         let queued = queued_record(DownloadStatus::Queued, "Default", None);
         assert!(!record_is_dispatch_ready(&paused, &[], now));
         assert!(record_is_dispatch_ready(&queued, &[], now));
+    }
+
+    #[test]
+    fn download_priority_ages_fairly_and_defaults_to_normal() {
+        let now = Utc::now();
+        let mut low = queued_record(DownloadStatus::Queued, "Default", None);
+        let mut urgent = low.clone();
+        urgent.created_at = now - ChronoDuration::minutes(5);
+        urgent.extra.insert("queuePriority".into(), json!(4));
+        low.extra.insert("queuePriority".into(), json!(0));
+        low.created_at = now - ChronoDuration::hours(5);
+        assert_eq!(super::queue_priority_score(&low, now), 4);
+        assert_eq!(super::queue_priority_score(&urgent, now), 4);
+        assert!(
+            low.created_at < urgent.created_at,
+            "older low-priority task wins after aging"
+        );
+        let normal = queued_record(DownloadStatus::Queued, "Default", None);
+        assert_eq!(super::queue_priority_score(&normal, now), 2);
+        low.created_at = now + ChronoDuration::minutes(5);
+        assert_eq!(
+            super::queue_priority_score(&low, now),
+            0,
+            "future timestamps cannot gain aging"
+        );
+        low.extra.insert("queuePriority".into(), json!(1000));
+        assert_eq!(
+            super::queue_priority_score(&low, now),
+            4,
+            "corrupt priorities are bounded"
+        );
     }
 
     #[test]
