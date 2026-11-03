@@ -327,6 +327,19 @@ h1, h2, p { margin: 0; }
 .weekly-hours input { padding: 7px; border: 1px solid var(--line); border-radius: 8px; background: var(--bg); color: var(--text); }
 .weekly-editor [role=alert] { color: var(--danger); }
 .queue-track-weekly { display: block; padding: 8px 12px; font-size: 11px; color: var(--text-2); }
+.automation-settings { display: grid; gap: 16px; }
+.automation-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(320px, 100%), 1fr)); gap: 16px; }
+.automation-settings .card { min-width: 0; }
+.automation-fields { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(160px, 100%), 1fr)); gap: 10px; }
+.automation-settings .card > label { display: grid; gap: 5px; }
+.automation-list { display: grid; gap: 7px; margin-top: 10px; }
+.automation-source { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding: 10px; border: 1px solid var(--line); border-radius: 9px; }
+.automation-source .grow { flex: 1 1 190px; min-width: 0; display: grid; gap: 4px; }
+.automation-source strong, .automation-source small { overflow-wrap: anywhere; }
+.automation-source strong { font-size: 12px; }
+.automation-source small { color: var(--text-2); font-size: 11px; }
+.automation-warning { color: var(--danger) !important; overflow-wrap: anywhere; }
+.automation-source-actions { display: flex; align-items: center; gap: 6px; }
 .form input:not([type=checkbox],[type=radio]),.form select { width: 100%; min-width: 0; height: 40px; padding: 0 12px; border: 1px solid var(--line); border-radius: 10px; outline: 0; color: var(--text); background: var(--field); font-size: 14px; font-weight: 400; transition: border-color 150ms, box-shadow 200ms, background 300ms; }
 .form input:not([type=checkbox],[type=radio]):focus,.form select:focus { border-color: var(--accent); box-shadow: 0 0 0 4px var(--accent-soft); }
 .form input:is([type=number],[type=datetime-local],.mono),.path-input input { font-family: var(--mono); font-size: 13px; }

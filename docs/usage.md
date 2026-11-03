@@ -80,6 +80,14 @@ Under a download's **More → Download priority**, choose Low, Below normal, Nor
 
 Schedules use local time in the interface. Fetchrail must be running to execute them, including in the tray.
 
+## RSS subscriptions and watched download folders
+
+Open **Settings → Automation** to subscribe to up to 12 RSS/Atom feeds and watch up to eight local folders. Everything is **opt-in**, and items appear under **Review newly discovered items**: **nothing starts downloading automatically**. Choose **Review** to open the normal download confirmation flow. Local `.torrent` files still require choosing files and seeding preferences in the torrent import dialog. Pause a particular feed or folder with its on/off switch; review suggestions can be dismissed, and removing a subscription clears its pending suggestions but never deletes watched files.
+
+Feed monitoring checks at a configurable 15–1440 minute interval while Fetchrail is running, including in the system tray. The first fetch establishes a baseline; subsequent new RSS `<enclosure>` or Atom `rel="enclosure"` entries appear for review. `ETag` and `Last-Modified` reduce repeat downloads; saved deduplication hashes prevent already-seen entries returning after a restart. Feed fetches accept only public HTTP(S) on standard ports and block private/localhost DNS and IPs, disallow XML DTD/entities, cap response XML at 1 MiB and handle redirects with explicit destination validation. No website scraping, arbitrary authentication or automatic torrent seeding is performed.
+
+Watched folders only scan **direct children**, not subdirectories, up to 250 entries, and accept `.torrent`, `.txt` and `.urls` entries up to 1 MiB each. Each link-list line must be a public HTTP(S) URL. Symlinks/reparse points are not followed; unreadable, oversized or invalid candidates are reported without being deleted. Scans run locally every 20 seconds while Fetchrail is open. Feed and watch states are stored in the app's protected, backed-up local state. On first use, folder candidates appear for review; no data is uploaded merely to inspect a watched folder.
+
 ## File categories
 
 ### Safe ZIP extraction
