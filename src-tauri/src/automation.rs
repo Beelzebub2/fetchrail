@@ -1025,10 +1025,13 @@ mod tests {
             folders: vec![],
             pending: vec![],
         };
-        let path = std::env::temp_dir().join(format!(
-            "fetchrail-automation-state-{}.json",
-            Uuid::new_v4()
-        ));
+        // write_private_atomic protects the *parent directory* (mode 0700 on
+        // Unix). Test within our own child directory; trying to protect /tmp
+        // itself fails with EPERM on Linux runners and must never chmod the
+        // shared system temporary directory.
+        let directory =
+            std::env::temp_dir().join(format!("fetchrail-automation-state-{}", Uuid::new_v4()));
+        let path = directory.join("automation.json");
         crate::state_store::write(&path, &state).unwrap();
         let mut saved: AutomationState = crate::state_store::read(&path).unwrap();
         assert_eq!(saved, state);
@@ -1056,8 +1059,7 @@ mod tests {
                 .unwrap(),
             state
         );
-        fs::remove_file(&path).unwrap();
-        fs::remove_file(path.with_extension("json.backup")).unwrap();
+        fs::remove_dir_all(&directory).unwrap();
     }
 
     #[test]
