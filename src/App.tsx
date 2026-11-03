@@ -10,6 +10,7 @@ import {
   ArrowLeft,
   ArrowRight,
   CalendarClock,
+  ClipboardPaste,
   Check,
   ChevronDown,
   ChevronRight,
@@ -169,6 +170,7 @@ export type DownloadSettings = Appearance & {
   minSegmentSizeMb: number;
   windowsAttachmentCheck: boolean;
   launchOnStart: boolean;
+  clipboardMonitoring: boolean;
   minimizeToTray: boolean;
 };
 
@@ -625,6 +627,7 @@ function App() {
   const [update, setUpdate] = useState<UpdateStatus>({ state: "idle" });
   const [version, setVersion] = useState("");
   const [torrentSources, setTorrentSources] = useState<string[]>([]);
+  const [clipboardLinks, setClipboardLinks] = useState<string[]>([]);
   const [torrentImport, setTorrentImport] = useState<TorrentImport | null>(null);
   const [selectedTorrent, setSelectedTorrent] = useState<string | null>(null);
   const [removing, setRemoving] = useState<DownloadRecord | null>(null);
@@ -645,6 +648,17 @@ function App() {
     const handoff = listen<string[]>("fetchrail://torrent-sources", event => setTorrentSources(current => [...new Set([...current, ...event.payload])]));
     return () => { void stop.then(fn => fn()); void handoff.then(fn => fn()); };
   }, []);
+  useEffect(() => {
+    if (!isTauri()) return;
+    const subscription = listen<string[]>("fetchrail://clipboard-links", (event) => {
+      if (!event.payload?.length) return;
+      setClipboardLinks(event.payload.slice(0, 10));
+    });
+    return () => { void subscription.then(unlisten => unlisten()); };
+  }, []);
+  useEffect(() => {
+    if (settings?.clipboardMonitoring === false) setClipboardLinks([]);
+  }, [settings?.clipboardMonitoring]);
   const torrentSelected = downloads.find(item => item.id === selectedTorrent && item.torrent);
   const listScroll = useRef<HTMLDivElement>(null);
 
@@ -1102,6 +1116,20 @@ function App() {
             </button>
           </div>
         </div>
+
+        {settings?.clipboardMonitoring && clipboardLinks.length > 0 && (
+          <section className="clipboard-suggestion" aria-label="Copied download link" role="status">
+            <ClipboardPaste size={17} aria-hidden="true" />
+            <div className="grow">
+              <strong>{clipboardLinks.length === 1 ? "Download link copied" : `${clipboardLinks.length} download links copied`}</strong>
+              <span>Review before adding. Clipboard links never start downloads automatically.</span>
+            </div>
+            <button type="button" className="secondary-button" onClick={() => {
+              setUrl(clipboardLinks.join("\n")); setClipboardLinks([]); setShowAdd(true);
+            }}>Review links</button>
+            <button type="button" className="icon-button" title="Dismiss copied links" aria-label="Dismiss copied links" onClick={() => setClipboardLinks([])}><X size={16} /></button>
+          </section>
+        )}
 
         <div className="rail-tabs" data-mode={inSettings ? "settings" : "downloads"} ref={glide.strip}>
           {inSettings ? (
@@ -2481,6 +2509,19 @@ function SettingsPage({
                         type="checkbox"
                         checked={draft.minimizeToTray}
                         onChange={(event) => onChange({ minimizeToTray: event.target.checked })}
+                      />
+                    </label>
+                    <label>
+                      <span className="tile" aria-hidden="true"><ClipboardPaste size={18} /></span>
+                      <span className="grow">
+                        <strong>Suggest links copied to clipboard</strong>
+                        <small>Off by default. Only checks for download links and asks before adding. Never saves or uploads clipboard history. Linux requires wl-paste (Wayland) or xclip (X11).</small>
+                      </span>
+                      <input
+                        className="switch"
+                        type="checkbox"
+                        checked={draft.clipboardMonitoring}
+                        onChange={(event) => onChange({ clipboardMonitoring: event.target.checked })}
                       />
                     </label>
                     <label>

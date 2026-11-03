@@ -86,6 +86,12 @@ h1, h2, p { margin: 0; }
 .logo .cut { stroke: var(--accent); stroke-width: 9; transition: stroke 300ms; }
 
 .app-shell { display: flex; flex-direction: column; height: 100vh; }
+.clipboard-suggestion { display: flex; align-items: center; gap: 12px; padding: 10px 24px; border-top: 1px solid var(--line); background: var(--surface); animation: rise-in 220ms var(--ease) both; }
+.clipboard-suggestion > svg { flex: none; color: var(--accent-text); }
+.clipboard-suggestion .grow { display: grid; gap: 2px; min-width: 0; }
+.clipboard-suggestion strong { font-size: 13px; }
+.clipboard-suggestion .grow span { font-size: 12px; color: var(--text-2); }
+.clipboard-suggestion button { flex: none; }
 .top-rail { flex: none; border-bottom: 1px solid var(--line); background: var(--panel); transition: background 300ms, border-color 300ms; }
 .rail-main { display: flex; flex-wrap: wrap; align-items: center; gap: 12px 24px; padding: 14px 24px; }
 .brand { display: flex; align-items: center; gap: 10px; font-family: var(--display); font-size: 21px; font-weight: 700; letter-spacing: -.02em; }
