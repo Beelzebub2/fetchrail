@@ -115,6 +115,8 @@ Two themes, four accents. Fetchrail uses the system tray when your desktop suppo
 | **Windows x64** | `Fetchrail-Setup-vVERSION-windows-x64.exe`. Setup installs for your account without an administrator prompt and needs the Microsoft Edge WebView2 Runtime. |
 | **Linux x64 / ARM64** | Packaging targets `.deb`, `.rpm`, AppImage, native archives and an Arch PKGBUILD. Check the [Linux guide](docs/linux.md) and [qualification matrix](docs/linux-support-matrix.md) for available builds and current coverage. |
 
+**Android developer preview:** A native Android 14+ HTTP download client is under development, with segmented Rust transfers and system-managed background download jobs. See the [Android build guide](android/README.md) for current limitations and ARM64 test APKs from CI. It is not yet a Play Store release.
+
 Linux package availability follows the published release inventory. The guide includes source builds, and the qualification matrix records tested distro and CPU combinations.
 
 Existing Braid installations retain their history, queues, settings, and partial downloads.
