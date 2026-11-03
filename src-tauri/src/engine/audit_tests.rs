@@ -1179,6 +1179,114 @@ async fn manifest_scopes_resume_to_exact_url_without_persisting_signed_query_sec
     fs::remove_dir_all(root).await.unwrap();
 }
 
+#[tokio::test]
+async fn trusted_checksum_rebinds_only_verified_staging_to_replacement_url() {
+    use std::io::Write;
+
+    let root = std::env::temp_dir().join(format!("fetchrail-trusted-rebind-{}", Uuid::new_v4()));
+    let total = 9 * 1024 * 1024;
+    let ranges = split_ranges(total, 2);
+    let old_probe = ProbeResult {
+        total_bytes: Some(total),
+        accepts_ranges: true,
+        suggested_file_name: None,
+        validator: Some("\"old-resource\"".into()),
+        final_url: Some(Url::parse("https://old.example.test/file?signature=private").unwrap()),
+    };
+    prepare_parts(&root, &old_probe, &ranges).await.unwrap();
+    let shared = root.join("0.part");
+    let prefix = vec![42u8; 64 * 1024];
+    let mut stage = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&shared)
+        .unwrap();
+    stage.write_all(&prefix).unwrap();
+    stage.sync_all().unwrap();
+    drop(stage);
+    write_json_atomic(
+        &root.join("0.progress.json"),
+        &PartCheckpoint {
+            bytes: prefix.len() as u64,
+            sha256: format!("{:x}", Sha256::digest(&prefix)),
+        },
+    )
+    .await
+    .unwrap();
+    let new_probe = ProbeResult {
+        total_bytes: Some(total),
+        accepts_ranges: true,
+        suggested_file_name: None,
+        validator: Some("\"new-resource\"".into()),
+        final_url: Some(
+            Url::parse("https://mirror.example.test/file?signature=new-private").unwrap(),
+        ),
+    };
+    let trusted = "e".repeat(64);
+    assert_eq!(
+        rebind_trusted_source_parts(&root, &new_probe, None)
+            .await
+            .unwrap(),
+        None
+    );
+    let wrong_size = ProbeResult {
+        total_bytes: Some(total + 1),
+        ..new_probe.clone()
+    };
+    assert_eq!(
+        rebind_trusted_source_parts(&root, &wrong_size, Some(&trusted))
+            .await
+            .unwrap(),
+        None
+    );
+    assert_eq!(
+        rebind_trusted_source_parts(&root, &new_probe, Some(&trusted))
+            .await
+            .unwrap(),
+        Some(prefix.len() as u64)
+    );
+    prepare_parts(&root, &new_probe, &ranges).await.unwrap();
+    assert_eq!(fs::metadata(&shared).await.unwrap().len(), total);
+    assert_eq!(
+        part_checkpoint(&root, 0, ranges[0].len())
+            .await
+            .unwrap()
+            .unwrap()
+            .bytes,
+        prefix.len() as u64
+    );
+    let raw = fs::read_to_string(root.join("transfer.json"))
+        .await
+        .unwrap();
+    assert!(!raw.contains("new-private"));
+    assert!(!raw.contains("signature="));
+    let rebound: PartManifest = serde_json::from_str(&raw).unwrap();
+    assert_eq!(rebound.validator, new_probe.validator);
+    assert_eq!(rebound.ranges, ranges);
+    assert_eq!(
+        rebound.final_url_sha256,
+        Some(format!(
+            "{:x}",
+            Sha256::digest(new_probe.final_url.unwrap().as_str().as_bytes())
+        ))
+    );
+    // A damaged checkpoint must not be carried to yet another source, even
+    // when its reported length and ETag match.
+    let mut stage = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&shared)
+        .unwrap();
+    stage.write_all(b"damage").unwrap();
+    stage.sync_all().unwrap();
+    drop(stage);
+    assert_eq!(
+        rebind_trusted_source_parts(&root, &old_probe, Some(&trusted))
+            .await
+            .unwrap(),
+        None
+    );
+    fs::remove_dir_all(root).await.unwrap();
+}
+
 #[test]
 fn publication_child_fault_fixture() {
     let Ok(root) = std::env::var("FETCHRAIL_PUBLICATION_CRASH_ROOT") else {
