@@ -45,7 +45,7 @@ percent-encoding = "2"
 reqwest = { version = "0.13", features = ["http2", "json", "rustls", "stream"] }
 sanitize-filename = "0.6"
 thiserror = "2"
-tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
+tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "sync", "time"] }
 tokio-util = "0.7"
 tracing = { version = "0.1", optional = true }
 url = { version = "2", features = ["serde"] }
@@ -59,6 +59,7 @@ suppaftp = { version = "=12.1.2", default-features = false, features = ["tokio-r
 russh = "=0.63.2"
 russh-sftp = "=3.0.1"
 webpki-roots = "1"
+zip = { version = "=4.6.1", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 zbus = { version = "5", default-features = false, features = ["tokio"] }
@@ -68,7 +69,7 @@ libc = "0.2"
 # Match Tauri's tray-icon version so native events use its existing event-loop relay.
 tray-icon = { version = "=0.25.1", default-features = false }
 winreg = "0.55"
-windows = { version = "0.62", features = ["Networking_Connectivity", "Win32_NetworkManagement_IpHelper", "Win32_NetworkManagement_Ndis", "Win32_Networking_WinSock", "Win32_System_SystemInformation", "Win32_System_ProcessStatus", "Win32_System_Power", "Win32_System_Com", "Win32_System_Threading", "Win32_System_IO", "Win32_System_Ioctl", "Win32_System_Memory", "Win32_Storage_FileSystem", "Win32_Security_Cryptography", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
+windows = { version = "0.62", features = ["Networking_Connectivity", "Win32_NetworkManagement_IpHelper", "Win32_NetworkManagement_Ndis", "Win32_Networking_WinSock", "Win32_System_SystemInformation", "Win32_System_ProcessStatus", "Win32_System_Power", "Win32_System_Com", "Win32_System_Threading", "Win32_System_IO", "Win32_System_Ioctl", "Win32_System_Memory", "Win32_System_DataExchange", "Win32_Storage_FileSystem", "Win32_Security_Cryptography", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
 
 # Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration
 [profile.release]
