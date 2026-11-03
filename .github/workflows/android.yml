@@ -49,6 +49,8 @@ jobs:
         run: |
           cargo fmt --manifest-path android/rust/Cargo.toml -- --check
           cargo test --manifest-path android/rust/Cargo.toml --locked
+      - name: Verify URLCheck and Android link chooser intent filters
+        run: python3 android/scripts/test-link-chooser.py
       - name: Build ARM64 native download engine
         run: |
           cargo install cargo-ndk --locked
@@ -61,6 +63,12 @@ jobs:
           gradle-version: "9.3.1"
       - name: Assemble APK
         run: gradle -p android :app:assembleDebug --stacktrace
+      - name: Verify packaged Android web-link receiver
+        run: |
+          "$ANDROID_HOME/build-tools/36.0.0/aapt2" dump xmltree android/app/build/outputs/apk/debug/app-debug.apk --file AndroidManifest.xml > "$RUNNER_TEMP/fetchrail-android-manifest.txt"
+          grep -Fq 'com.rrmtools.fetchrail.DownloadLinkActivity' "$RUNNER_TEMP/fetchrail-android-manifest.txt"
+          grep -Fq 'android.intent.action.VIEW' "$RUNNER_TEMP/fetchrail-android-manifest.txt"
+          grep -Fq 'android.intent.category.BROWSABLE' "$RUNNER_TEMP/fetchrail-android-manifest.txt"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: fetchrail-android-arm64-debug

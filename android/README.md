@@ -16,6 +16,9 @@ maintaining copies.
   Transfers remain managed by Android if you leave the activity; a stopped job
   can be retried without trusting unverified partial bytes.
 - Share an HTTP/HTTPS link to Fetchrail or paste it directly in the app.
+- Select **Download with Fetchrail** in URLCheck's **Open with** menu, or in any
+  compatible Android app's web-link chooser. It pre-fills the download URL for
+  confirmation; it does not silently intercept unrelated webpage links.
 - Pause, resume, retry and remove a download.
 - Download to app-specific storage first. After completion, use **Save to
   Downloads** to publish a copy in Downloads/Fetchrail through MediaStore.
@@ -29,6 +32,20 @@ native messaging, site-login/session replay, FTP/SFTP, or automatic interception
 of Android browser downloads. Share URLs explicitly. Unlike the mature desktop
 engine, the Android HTTP implementation is a small mobile adapter that reuses
 the shared Rust connection policies; not every desktop feature is ported yet.
+
+### Opening links from URLCheck and other apps
+
+Install the latest Android preview build, open a URL in URLCheck, then tap the
+arrow next to **Open** and select **Download with Fetchrail**. The URL appears
+on Fetchrail's download screen; tap **Start download** to confirm. This also
+works with supported Android link chooser menus and text/plain Share actions.
+The incoming HTTP/HTTPS URL is passed through with its query parameters intact.
+
+Android 12+ usually routes generic web links straight to a default browser;
+registering as a link-handling app does **not** change that system behavior or
+automatically replace Chrome/Vivaldi downloads. URLCheck's explicit app picker
+is the intended route. URLCheck may hide an app when its **Hide the source app**
+or **Hide app if URL was rejected** options apply; those are URLCheck settings.
 
 The application does not ask for broad storage permissions. Active and completed
 files reside in its own app-scoped folder; uninstalling the app deletes those

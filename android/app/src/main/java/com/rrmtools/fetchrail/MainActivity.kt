@@ -40,11 +40,18 @@ private val Panel = Color(0xFF1B2028)
 private val Muted = Color(0xFF9AA5B4)
 
 class MainActivity : ComponentActivity() {
-    private val incomingLink = mutableStateOf("")
+    private data class IncomingLink(val url: String, val sequence: Int)
+    private val incomingLink = mutableStateOf(IncomingLink("", 0))
+
+    private fun receiveLink(intent: Intent?) {
+        IncomingLinks.from(intent)?.let { url ->
+            incomingLink.value = IncomingLink(url, incomingLink.value.sequence + 1)
+        }
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        incomingLink.value = sharedUrl(intent).orEmpty()
+        receiveLink(intent)
         if (checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
             requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 101)
         }
@@ -57,7 +64,8 @@ class MainActivity : ComponentActivity() {
                 )
             ) {
                 FetchrailScreen(
-                    root = downloadRoot, incoming = incomingLink.value,
+                    root = downloadRoot, incoming = incomingLink.value.url,
+                    incomingSequence = incomingLink.value.sequence,
                     start = { input ->
                         val id = NativeBridge.result(NativeBridge.enqueue(downloadRoot, input)).getString("value")
                         try {
@@ -87,17 +95,7 @@ class MainActivity : ComponentActivity() {
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
         setIntent(intent)
-        sharedUrl(intent)?.let { incomingLink.value = it }
-    }
-
-    private fun sharedUrl(intent: Intent?): String? {
-        val source = when (intent?.action) {
-            Intent.ACTION_SEND -> intent.getStringExtra(Intent.EXTRA_TEXT)
-            Intent.ACTION_VIEW -> intent.dataString
-            else -> null
-        } ?: return null
-        return Regex("https?://[^\\s<>]+", RegexOption.IGNORE_CASE)
-            .find(source)?.value?.trimEnd('.', ',', ')')
+        receiveLink(intent)
     }
 
     /** Export on demand, avoiding an automatic second copy of multi-gigabyte files. */
@@ -137,6 +135,7 @@ class MainActivity : ComponentActivity() {
 private fun FetchrailScreen(
     root: String,
     incoming: String,
+    incomingSequence: Int,
     start: (String) -> Unit,
     pause: (TransferRecord) -> Unit,
     resume: (TransferRecord) -> Unit,
@@ -152,7 +151,7 @@ private fun FetchrailScreen(
     var exporting by remember { mutableStateOf<String?>(null) }
     val scope = rememberCoroutineScope()
 
-    LaunchedEffect(incoming) { if (incoming.isNotBlank()) address = incoming }
+    LaunchedEffect(incomingSequence) { if (incoming.isNotBlank()) address = incoming }
     LaunchedEffect(root) {
         while (isActive) {
             try {

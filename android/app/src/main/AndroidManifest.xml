@@ -24,12 +24,22 @@
                 <category android:name="android.intent.category.DEFAULT" />
                 <data android:mimeType="text/plain" />
             </intent-filter>
+        </activity>
+        <!-- A named external download target for URLCheck's Open with list and other
+             ACTION_VIEW choosers. Not an auto-verified default browser/App Link. -->
+        <activity
+            android:name=".DownloadLinkActivity"
+            android:exported="true"
+            android:label="@string/download_with_fetchrail"
+            android:icon="@drawable/ic_fetchrail"
+            android:noHistory="true"
+            android:theme="@android:style/Theme.NoDisplay">
             <intent-filter>
                 <action android:name="android.intent.action.VIEW" />
                 <category android:name="android.intent.category.DEFAULT" />
                 <category android:name="android.intent.category.BROWSABLE" />
-                <data android:scheme="https" />
                 <data android:scheme="http" />
+                <data android:scheme="https" />
             </intent-filter>
         </activity>
         <service
