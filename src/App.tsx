@@ -33,6 +33,7 @@ import {
   Power,
   Puzzle,
   RotateCw,
+  Rss,
   Search,
   Settings,
   Settings2,
@@ -46,6 +47,7 @@ import { PRESETS, accentColors, accentField, accentHex, accentSpot, distance, sp
 import { INTERFACE_SCALES, useInterfaceScale } from "./interfaceScale";
 import { PageHead } from "./PageHead";
 import { PerformanceInvitation, PerformancePage, type PerformanceView } from "./Performance";
+import { AutomationPage, type AutomationPending } from "./Automation";
 import { DownloadHealth } from "./DownloadHealth";
 import { AnalyticsPrompt, PrivacySettings } from "./Privacy";
 import type { AnalyticsConsent } from "./Privacy";
@@ -262,6 +264,7 @@ const settingsSections = [
   ["downloads", "Downloads", Download],
   ["performance", "Performance", Activity],
   ["queues", "Queues", CalendarClock],
+  ["automation", "Automation", Rss],
   ["categories", "File categories", FolderOpen],
   ["torrents", "Torrents", Share2],
   ["browser", "Browser", Globe],
@@ -1283,6 +1286,16 @@ function App() {
             onToggleQueue={(name, paused) => queueCommand("set_queue_paused", { name, paused })}
             onScheduleQueue={(name, startsAt, stopsAt) => queueCommand("schedule_queue", { name, startsAt, stopsAt })}
             onWeeklyQueue={(name, weeklyWindows) => queueCommand("schedule_queue_weekly", { name, weeklyWindows })}
+            onReviewAutomation={(suggestion) => {
+              if (suggestion.kind === "torrent") {
+                setTorrentSources(current => current.includes(suggestion.target) ? current : [...current, suggestion.target]);
+              } else {
+                setUrl(suggestion.target);
+                setSelectedQueue(queues.some(queue => queue.name === suggestion.queue) ? suggestion.queue : queues[0]?.name ?? "Default");
+                setShowAdd(true);
+              }
+              setShowSettings(false);
+            }}
           />
         ) : (
           <>
@@ -2370,6 +2383,7 @@ function SettingsPage({
   onToggleQueue,
   onScheduleQueue,
   onWeeklyQueue,
+  onReviewAutomation,
 }: {
   settings: DownloadSettings;
   // The saved settings with the unsaved changes on top.
@@ -2395,6 +2409,7 @@ function SettingsPage({
   onToggleQueue: (name: string, paused: boolean) => Promise<boolean>;
   onScheduleQueue: (name: string, startsAt: string | null, stopsAt: string | null) => Promise<boolean>;
   onWeeklyQueue: (name: string, weeklyWindows: WeeklyWindow[]) => Promise<boolean>;
+  onReviewAutomation: (suggestion: AutomationPending) => void;
 }) {
   const capabilities = usePlatformCapabilities();
   const [queueName, setQueueName] = useState("");
@@ -2905,6 +2920,8 @@ function SettingsPage({
             </section>
           </section>
         )}
+
+        {section === "automation" && <AutomationPage queues={queues.map(queue => queue.name)} onReview={onReviewAutomation} />}
 
         {section === "categories" && (
           <section aria-labelledby="category-settings-title">

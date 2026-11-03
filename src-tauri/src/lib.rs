@@ -3,6 +3,7 @@ compile_error!("Release builds must embed the frontend: enable --features tauri/
 
 mod analytics;
 mod archive;
+mod automation;
 mod browser_bridge;
 mod browser_extension;
 mod browser_handoff;
@@ -194,6 +195,87 @@ async fn add_downloads(
             .collect();
         batch
     })
+}
+
+fn automation_service(
+    app: &AppHandle,
+) -> Result<tauri::State<'_, Arc<automation::AutomationService>>, String> {
+    app.try_state::<Arc<automation::AutomationService>>()
+        .ok_or_else(|| {
+            "Automation is unavailable. Check that its saved state can be recovered.".to_string()
+        })
+}
+
+#[tauri::command]
+async fn automation_state(app: AppHandle) -> Result<automation::AutomationState, String> {
+    Ok(automation_service(&app)?.snapshot().await)
+}
+
+#[tauri::command]
+async fn automation_add_feed(
+    app: AppHandle,
+    url: String,
+    queue: String,
+    interval_minutes: u16,
+) -> Result<automation::AutomationState, String> {
+    automation_service(&app)?
+        .add_feed(url, queue, interval_minutes)
+        .await
+}
+
+#[tauri::command]
+async fn automation_remove_feed(
+    app: AppHandle,
+    id: Uuid,
+) -> Result<automation::AutomationState, String> {
+    automation_service(&app)?.remove_feed(id).await
+}
+
+#[tauri::command]
+async fn automation_set_feed_enabled(
+    app: AppHandle,
+    id: Uuid,
+    enabled: bool,
+) -> Result<automation::AutomationState, String> {
+    automation_service(&app)?
+        .set_feed_enabled(id, enabled)
+        .await
+}
+
+#[tauri::command]
+async fn automation_add_folder(
+    app: AppHandle,
+    directory: String,
+    queue: String,
+) -> Result<automation::AutomationState, String> {
+    automation_service(&app)?.add_folder(directory, queue).await
+}
+
+#[tauri::command]
+async fn automation_remove_folder(
+    app: AppHandle,
+    id: Uuid,
+) -> Result<automation::AutomationState, String> {
+    automation_service(&app)?.remove_folder(id).await
+}
+
+#[tauri::command]
+async fn automation_set_folder_enabled(
+    app: AppHandle,
+    id: Uuid,
+    enabled: bool,
+) -> Result<automation::AutomationState, String> {
+    automation_service(&app)?
+        .set_folder_enabled(id, enabled)
+        .await
+}
+
+#[tauri::command]
+async fn automation_dismiss(
+    app: AppHandle,
+    id: Uuid,
+) -> Result<automation::AutomationState, String> {
+    automation_service(&app)?.dismiss(id).await
 }
 
 #[tauri::command]
@@ -1073,6 +1155,13 @@ pub fn run() {
             app.manage(manager.clone());
             clipboard_monitor::start(app.handle().clone(), manager.clone());
             archive::start(manager.clone());
+            match automation::AutomationService::load(app.handle().clone()) {
+                Ok(service) => {
+                    app.manage(service.clone());
+                    automation::AutomationService::start(service);
+                }
+                Err(error) => eprintln!("Fetchrail automation: {error}"),
+            }
             offer_torrent_arguments(
                 app.handle(),
                 std::env::args().collect(),
@@ -1302,6 +1391,14 @@ pub fn run() {
             download_window::open_download,
             add_download,
             add_downloads,
+            automation_state,
+            automation_add_feed,
+            automation_remove_feed,
+            automation_set_feed_enabled,
+            automation_add_folder,
+            automation_remove_folder,
+            automation_set_folder_enabled,
+            automation_dismiss,
             request_browser_downloads,
             import_torrent,
             torrent_import_status,

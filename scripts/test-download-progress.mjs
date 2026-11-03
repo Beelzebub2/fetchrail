@@ -33,6 +33,7 @@ try {
     const callbacks = new Map(), listeners = new Map();
     let next = 0;
     window.testCalls = [];
+    window.testAutomation = { feeds: [], folders: [], pending: [] };
     window.testBootstrap = {};
     window.testRecord = {
       id: "test-download", fileName: "example-archive.rar", url: "https://example.com/example-archive.rar",
@@ -56,6 +57,28 @@ try {
       transformCallback(callback) { callbacks.set(++next, callback); return next; },
       async invoke(name, args = {}) {
         window.testCalls.push({ name, args });
+        if (name === "automation_state") return structuredClone(window.testAutomation);
+        if (name === "automation_add_feed") {
+          window.testAutomation.feeds.push({ id: `feed-${window.testAutomation.feeds.length+1}`, url: args.url, queue: args.queue, enabled: true,
+            intervalMinutes: args.intervalMinutes, initialized: false, lastChecked: null, lastError: null });
+          window.testEmit("fetchrail://automation-updated", structuredClone(window.testAutomation));
+          return structuredClone(window.testAutomation);
+        }
+        if (name === "automation_set_feed_enabled") {
+          window.testAutomation.feeds.find(feed=>feed.id===args.id).enabled=args.enabled;
+          window.testEmit("fetchrail://automation-updated", structuredClone(window.testAutomation));
+          return structuredClone(window.testAutomation);
+        }
+        if (name === "automation_remove_feed") {
+          window.testAutomation.feeds = window.testAutomation.feeds.filter(feed=>feed.id!==args.id);
+          window.testEmit("fetchrail://automation-updated", structuredClone(window.testAutomation));
+          return structuredClone(window.testAutomation);
+        }
+        if (name === "automation_dismiss") {
+          window.testAutomation.pending = window.testAutomation.pending.filter(item=>item.id!==args.id);
+          window.testEmit("fetchrail://automation-updated", structuredClone(window.testAutomation));
+          return structuredClone(window.testAutomation);
+        }
         if (name === "pending_download_prompts") return structuredClone((window.testPromptRecords ?? []).filter(record=>record.status==="paused"));
         if (name === "finish_download_prompts") { window.testPromptRecords=window.testPromptRecords.filter(record=>!args.ids.includes(record.id));return; }
         const promptRecord=window.testPromptRecords?.find(record=>record.id===args.id);
@@ -449,7 +472,32 @@ try {
   await gear.click();
   await page.getByRole("heading", { name: "General", exact: true }).waitFor();
   assert.equal(await gear.getAttribute("aria-pressed"), "true");
-  assert.equal(await rail.getByRole("tab").count(), 8, "Calibration and diagnostics share the Performance section.");
+  assert.equal(await rail.getByRole("tab").count(), 9, "Automation has its own settings tab while calibration and diagnostics share Performance.");
+  assert.equal(await rail.getByRole("tab", { name: "Automation" }).count(), 1, "RSS and watched-folder discovery is accessible from Settings.");
+  const beforeAutomationDownloads = await page.evaluate(() => window.testCalls.filter(call => call.name === "add_downloads").length);
+  await rail.getByRole("tab", { name: "Automation" }).click();
+  await page.getByRole("heading", { name: "Automatic discovery" }).waitFor();
+  assert.equal(await page.getByRole("button", { name: "Add feed" }).isDisabled(), true, "An empty feed URL cannot enable monitoring.");
+  await page.getByPlaceholder("https://example.com/feed.xml").fill("https://feeds.example.com/rss");
+  await page.getByRole("button", { name: "Add feed" }).click();
+  await page.waitForFunction(() => window.testAutomation.feeds.length === 1);
+  await page.getByText("First scan pending").waitFor();
+  const feedEnabled = page.getByRole("checkbox", { name: "Enable feed https://feeds.example.com/rss" });
+  await feedEnabled.uncheck();
+  await page.waitForFunction(() => window.testAutomation.feeds[0]?.enabled === false);
+  await feedEnabled.check();
+  await page.waitForFunction(() => window.testAutomation.feeds[0]?.enabled === true);
+  await page.evaluate(() => {
+    window.testAutomation.pending = [{ id: "suggestion-one", sourceId: "feed-1", kind: "url", target: "https://files.example.com/safe.bin", queue: "Default", note: "Fresh enclosure", discovered: new Date().toISOString() }];
+    window.testEmit("fetchrail://automation-updated", structuredClone(window.testAutomation));
+  });
+  await page.getByText("Fresh enclosure").waitFor();
+  assert.equal(await page.getByRole("button", { name: "Review", exact: true }).count(), 1, "New items require an explicit user review.");
+  assert.equal(await page.evaluate(() => window.testCalls.filter(call => call.name === "add_downloads").length), beforeAutomationDownloads, "Feed discovery must never start downloads itself.");
+  await page.getByRole("button", { name: "Dismiss https://files.example.com/safe.bin" }).click();
+  await page.waitForFunction(() => window.testAutomation.pending.length === 0);
+  await page.getByRole("tab", { name: "General" }).click();
+  await page.getByRole("heading", { name: "General", exact: true }).waitFor();
   assert.equal(await page.locator(".content").getByRole("tab").count(), 0, "Settings must not stack a tab bar of its own under the rail.");
   assert.equal(await page.getByRole("button", { name: /^All downloads/ }).count(), 0, "The view tabs give way to the settings sections.");
   assert.equal(await page.getByRole("heading", { name: "Settings", exact: true }).count(), 0, "There is no shared Settings page head.");
