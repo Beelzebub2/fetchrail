@@ -18,6 +18,8 @@ Paste a direct `ftp://`, `ftps://`, `ftpes://` or `sftp://` file URL in **New do
 
 HTTP servers can supply a strong ETag. FTP and SFTP file length and modification time are weaker signals, so Fetchrail normally uses one connection and starts over after an interruption. To enable parallel ranges and verified restart on a capable remote server, enter an independently trusted **Expected SHA-256** for that one file. The result is verified end-to-end before publication; a mismatched file cannot become a completed download.
 
+FTP/FTPS and SFTP reuse file-size information from the initial probe instead of repeatedly querying it for every transfer segment. SFTP automatically pipelines reads for higher throughput on high-latency connections, while keeping its total read-ahead memory bounded across parallel connections. These optimizations do not change your download speed limits or the expected-hash requirement for safe resume.
+
 ## Torrents and magnets
 
 Paste a magnet link or a public `.torrent` URL into the download bar, choose **Open torrent**, or drop a local `.torrent` file into the app. Magnets fetch metadata first. Payload downloading begins after you choose the files, destination and queue in the confirmation dialog. **Add paused** keeps the new job ready for later. Existing files require explicit verification before reuse.

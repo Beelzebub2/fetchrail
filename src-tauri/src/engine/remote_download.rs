@@ -42,7 +42,7 @@ pub(super) async fn download_ranges(
             loop {
                 let result = download_segment(
                     limiter, task, &stop, url, part_dir, segment, index, shared,
-                    !probe.accepts_ranges,
+                    !probe.accepts_ranges, probe.total_bytes, workers,
                 ).await;
                 match result {
                     Ok(()) => break,
@@ -119,6 +119,8 @@ async fn download_segment(
     index: usize,
     shared: bool,
     require_eof: bool,
+    total_bytes: Option<u64>,
+    workers: usize,
 ) -> EngineResult<()> {
     task.check_stopped(cancel)?;
     let range = segment.range;
@@ -171,10 +173,16 @@ async fn download_segment(
     segment.active.store(true, Ordering::Relaxed);
     segment.waiting.store(true, Ordering::Relaxed);
     let outcome = async {
-        let mut stream =
-            remote_transport::stream(url, range.start.saturating_add(existing), cancel)
-                .await
-                .map_err(remote_error)?;
+        let mut stream = remote_transport::stream(
+            url,
+            range.start.saturating_add(existing),
+            total_bytes,
+            workers,
+            expected_len.map(|len| len.saturating_sub(existing)),
+            cancel,
+        )
+        .await
+        .map_err(remote_error)?;
         let mut file = fs::OpenOptions::new()
             .create(!shared)
             .write(true)
