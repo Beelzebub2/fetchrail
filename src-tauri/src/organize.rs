@@ -335,6 +335,7 @@ mod tests {
             min_segment_size_mb: 4,
             windows_attachment_check: true,
             launch_on_start: false,
+            clipboard_monitoring: false,
             minimize_to_tray: true,
             theme: Default::default(),
             accent: Default::default(),

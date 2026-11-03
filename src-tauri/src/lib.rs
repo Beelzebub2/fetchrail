@@ -6,6 +6,7 @@ mod browser_bridge;
 mod browser_extension;
 mod browser_handoff;
 mod browser_session;
+mod clipboard_monitor;
 mod diagnostics;
 mod download_window;
 mod engine;
@@ -1043,6 +1044,7 @@ pub fn run() {
                     }
                 };
             app.manage(manager.clone());
+            clipboard_monitor::start(app.handle().clone(), manager.clone());
             offer_torrent_arguments(
                 app.handle(),
                 std::env::args().collect(),

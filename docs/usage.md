@@ -10,6 +10,12 @@
 
 Pause a transfer to free a download slot, then resume it when you are ready. If Fetchrail closes during a transfer, the download returns paused on the next launch.
 
+### Clipboard link suggestions (opt-in)
+
+Enable **Settings → General → Suggest links copied to clipboard** if you want Fetchrail to recognize newly copied HTTP, HTTPS, FTP, SFTP or magnet links while the app is running. It is off by default. After enabling it, newly copied links appear in a small suggestion bar; select **Review links** to open the normal download confirmation window, or dismiss them. No transfer starts automatically. The existing clipboard contents are ignored when the setting is first enabled.
+
+Only local clipboard text is examined. Raw clipboard contents and link history are neither persisted nor sent to any server or analytics. Long clipboard contents are skipped. On Linux, the monitor requires an available `wl-paste` (Wayland) or `xclip` (X11) executable and ordinary desktop clipboard access.
+
 ### Replace an expired download link
 
 Pause a download, choose **More → Update download link**, and paste its replacement URL. By default, Fetchrail preserves the previous partial data separately and starts the new link from zero: a matching file size or ETag from another URL does **not** prove the bytes are the same.
