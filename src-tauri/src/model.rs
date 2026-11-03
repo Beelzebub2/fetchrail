@@ -223,6 +223,11 @@ pub struct DownloadSettings {
     /// Opt-in local clipboard inspection: sends URL candidates to the app only.
     #[serde(default)]
     pub clipboard_monitoring: bool,
+    /// Extract future completed ZIP downloads only when explicitly enabled.
+    #[serde(default)]
+    pub auto_extract_zip: bool,
+    #[serde(default)]
+    pub auto_extract_since: Option<DateTime<Utc>>,
     #[serde(default = "default_true")]
     pub minimize_to_tray: bool,
     #[serde(default)]
@@ -716,6 +721,8 @@ mod tests {
             windows_attachment_check: true,
             launch_on_start: false,
             clipboard_monitoring: false,
+            auto_extract_zip: false,
+            auto_extract_since: None,
             minimize_to_tray: true,
             theme: Theme::default(),
             accent: Accent::default(),
@@ -772,6 +779,8 @@ mod tests {
         legacy.remove("deleteFilesOnRemove");
         legacy.remove("windowsAttachmentCheck");
         legacy.remove("clipboardMonitoring");
+        legacy.remove("autoExtractZip");
+        legacy.remove("autoExtractSince");
         let restored: DownloadSettings =
             serde_json::from_value(serde_json::Value::Object(legacy)).unwrap();
         assert!(restored.sort_into_category_folders);
@@ -780,6 +789,11 @@ mod tests {
             !restored.clipboard_monitoring,
             "legacy profiles must never enable clipboard monitoring"
         );
+        assert!(
+            !restored.auto_extract_zip,
+            "legacy profiles must never auto-extract ZIPs"
+        );
+        assert!(restored.auto_extract_since.is_none());
         assert!(
             restored.windows_attachment_check,
             "existing profiles retain Windows checking"

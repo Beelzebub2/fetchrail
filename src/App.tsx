@@ -105,6 +105,7 @@ export type DownloadRecord = {
   finishedAt: string | null;
   queue: string;
   queuePriority?: number;
+  archiveExtraction?: { state: "extracting" | "complete" | "failed"; directory?: string; files?: number; bytes?: number; message?: string };
   scheduledFor: string | null;
   segments: SegmentProgress[];
   resumeSupported: boolean | null;
@@ -172,6 +173,8 @@ export type DownloadSettings = Appearance & {
   windowsAttachmentCheck: boolean;
   launchOnStart: boolean;
   clipboardMonitoring: boolean;
+  autoExtractZip: boolean;
+  autoExtractSince?: string | null;
   minimizeToTray: boolean;
 };
 
@@ -1912,6 +1915,13 @@ function DownloadRow({
           </button>
           <div className="menu" popover="auto" id={menuId} style={{ positionAnchor: anchor }}>
             {!provisional && ["paused", "failed"].includes(item.status) && <button popoverTarget={menuId} popoverTargetAction="hide" onClick={() => { setSourceDraft(""); setReuseVerifiedParts(false); setEditingSource(true); }}>Update download link…</button>}
+            {item.status === "completed" && !item.torrent && item.fileName.toLowerCase().endsWith(".zip") && (
+              <button popoverTarget={menuId} popoverTargetAction="hide"
+                disabled={["extracting", "complete"].includes(item.archiveExtraction?.state ?? "")}
+                onClick={() => void command("extract_archive", item.id)}>
+                <FolderOpen size={15} /> {item.archiveExtraction?.state === "failed" ? "Retry ZIP extraction" : item.archiveExtraction?.state === "complete" ? "ZIP extracted" : item.archiveExtraction?.state === "extracting" ? "Extracting ZIP…" : "Extract ZIP…"}
+              </button>
+            )}
             <button popoverTarget={menuId} popoverTargetAction="hide" onClick={() => void command("set_download_retry", item.id, { enabled: item.autoRetry === false })}>Automatic retry: {item.autoRetry === false ? "off" : "on"}</button>
             {item.nextRetryAt && <button popoverTarget={menuId} popoverTargetAction="hide" onClick={() => void command("resume_download", item.id)}>Retry now · planned {formatDateTime(item.nextRetryAt)}</button>}
             <button popoverTarget={menuId} popoverTargetAction="hide" onClick={() => { setLimitDraft(item.speedLimitBps / 1024); setEditingLimit(true); }}>
@@ -2023,6 +2033,13 @@ function DownloadRow({
           <button type="button" className="ghost-button" onClick={() => setEditingSchedule(false)}>
             Cancel
           </button>
+        </div>
+      )}
+      {item.archiveExtraction && (
+        <div className="archive-extraction-note" role="status">
+          {item.archiveExtraction.state === "extracting" && "Extracting ZIP safely into its own folder…"}
+          {item.archiveExtraction.state === "complete" && `Extracted ${item.archiveExtraction.files ?? 0} files beside the original ZIP: ${item.archiveExtraction.directory ?? ""}`}
+          {item.archiveExtraction.state === "failed" && `ZIP extraction failed: ${item.archiveExtraction.message ?? "Please try again."}`}
         </div>
       )}
       {/* Kept mounted so the lanes can fan out and fold back; inert keeps the folded panel out of the tab order. */}
@@ -2696,6 +2713,13 @@ function SettingsPage({
                       ))}
                     </div>
                   </fieldset>
+                  <label className="switch-label" style={{ marginTop: 12 }}>
+                    <span>
+                      <strong>Automatically extract new ZIP downloads</strong>
+                      <small>Off by default. Only future completed ZIP files; keeps each original archive and creates a separate folder. Files with unsafe paths or excessive expansion are rejected.</small>
+                    </span>
+                    <input className="switch" type="checkbox" checked={draft.autoExtractZip === true} onChange={event => onChange({ autoExtractZip: event.target.checked })} />
+                  </label>
                   {capabilities?.os === "windows" && (
                     <div className="windows-check">
                       <div className="windows-check-row">

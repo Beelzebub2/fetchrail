@@ -62,6 +62,14 @@ Schedules use local time in the interface. Fetchrail must be running to execute 
 
 ## File categories
 
+### Safe ZIP extraction
+
+For a completed single-file `.zip` download, choose **More → Extract ZIP** to extract into a uniquely named folder beside the archive. The original ZIP is never removed or overwritten. If an archive is invalid, encrypted, contains symlinks/special files, path traversal, duplicate paths, unsafe Windows names, or excessive decompression size/ratio, extraction stops without publishing a partial output folder. No programs from the ZIP are run.
+
+Enable **Settings → Downloads → Automatically extract new ZIP downloads** to do this for *future* completed ZIPs. It is off by default, never retroactively extracts existing history, and is limited to ordinary single-file downloads (not multi-file torrents). Each attempt is recorded to prevent duplicate output after a restart; failed attempts can be retried manually. Long-running extraction can leave a private staging folder after an unexpected process termination, but never replaces the original archive.
+
+The built-in extractor supports ZIP only. RAR, 7z, password-protected archives, and ZIPs using unsupported compression methods require an external extractor. Extraction is bounded to 10,000 entries, a 16 GiB ZIP source, 16 GiB per member, 64 GiB expanded total and a conservative decompression ratio, to reduce resource exhaustion from malicious archives.
+
 Files are sorted into **Compressed**, **Documents**, **Music**, **Programs**, and **Video** folders by default. Customize their extensions and destinations in **Settings → File categories**. Files without a matching category use the default download folder. When two categories list the same ending, the one higher in the list gets the file.
 
 Each category keeps to one line with a count of its endings. Select the endings to edit them: type or paste several at once separated by spaces, commas or new lines (a leading `.` or `*.` is dropped and duplicates are skipped), filter a long list, or remove single endings, with **Undo** for the last removal. **Ctrl+S** saves settings while they are open.
