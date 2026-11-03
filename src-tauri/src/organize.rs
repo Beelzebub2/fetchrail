@@ -328,6 +328,8 @@ mod tests {
             extra: Default::default(),
             torrent: Default::default(),
             speed_limit_bps: 0,
+            max_requests_per_origin: 32,
+            network_proxy: Default::default(),
             default_download_dir: root.to_string_lossy().to_string(),
             max_concurrent_downloads: 3,
             connections_per_download: 8,

@@ -66,7 +66,7 @@ macro_rules! transfer_span {
 use crate::model::{
     default_categories, default_queue_name, AddDownloadRequest, BatchDownloadError,
     BatchDownloadResult, BrowserRequestContext, DownloadRecord, DownloadSettings, DownloadStatus,
-    EngineOverview, QueueRecord, SegmentProgress, WeeklyWindow,
+    EngineOverview, NetworkProxy, QueueRecord, SegmentProgress, WeeklyWindow,
 };
 use crate::organize::{self, OrganizeMode, OrganizeReport};
 use crate::rate_limit::RateLimiter;
@@ -127,8 +127,39 @@ pub(crate) fn download_client_builder() -> reqwest::ClientBuilder {
     } else {
         builder
     };
-    builder
+    // All native HTTP clients (metadata, parallel range pools, retry clients
+    // and browser handoffs) must take the same effective proxy. A previously
+    // configured proxy never falls back to a direct client on failure.
+    if let Some(proxy) = active_http_proxy()
+        .read()
+        .expect("HTTP proxy configuration poisoned")
+        .clone()
+    {
+        // Clear environment/system bypass rules before attaching the explicit
+        // proxy, so NO_PROXY cannot silently route selected hosts directly.
+        builder.no_proxy().proxy(proxy)
+    } else {
+        builder
+    }
 }
+
+fn active_http_proxy() -> &'static std::sync::RwLock<Option<reqwest::Proxy>> {
+    static ACTIVE: std::sync::OnceLock<std::sync::RwLock<Option<reqwest::Proxy>>> =
+        std::sync::OnceLock::new();
+    ACTIVE.get_or_init(|| std::sync::RwLock::new(None))
+}
+
+fn validated_http_proxy(config: &NetworkProxy) -> Result<Option<reqwest::Proxy>, String> {
+    let endpoint = config.endpoint()?;
+    endpoint
+        .map(|endpoint| {
+            reqwest::Proxy::all(endpoint)
+                .map_err(|_| "HTTP proxy configuration is invalid.".to_string())
+        })
+        .transpose()
+}
+
+static REQUEST_CAP_PER_ORIGIN: AtomicUsize = AtomicUsize::new(32);
 
 fn global_budget() -> &'static tokio::sync::Semaphore {
     static BUDGET: std::sync::OnceLock<tokio::sync::Semaphore> = std::sync::OnceLock::new();
@@ -180,7 +211,12 @@ async fn send_admitted(
             health = health,
             trace,
             Origin,
-            origin.acquire(32, cancel).await
+            origin
+                .acquire(
+                    REQUEST_CAP_PER_ORIGIN.load(Ordering::Relaxed).clamp(1, 32),
+                    cancel
+                )
+                .await
         )
         .ok_or(EngineError::Cancelled)?;
         let global = transfer_span!(
@@ -1562,6 +1598,11 @@ impl DownloadManager {
                 },
             );
         }
+        let selected_proxy = validated_http_proxy(&settings.network_proxy)?;
+        *active_http_proxy()
+            .write()
+            .expect("HTTP proxy configuration poisoned") = selected_proxy;
+        REQUEST_CAP_PER_ORIGIN.store(settings.max_requests_per_origin, Ordering::Release);
         let client = download_client_builder()
             .build()
             .map_err(|error| format!("Could not initialize HTTP client: {error}"))?;
@@ -4657,6 +4698,14 @@ impl DownloadManager {
         settings.extra.remove("runtimeWarning");
         settings.preserve_analytics_consent(&*self.settings.read().await);
         let mut settings = settings.normalized();
+        if settings.network_proxy.mode == crate::model::NetworkProxyMode::None {
+            // Disabling proxy routing clears any leftover host/port values;
+            // these are never needed for the default network route.
+            settings.network_proxy = NetworkProxy::default();
+        }
+        // Validate before writing the settings file. Failed proxy setups must
+        // never degrade to direct connections or become silently accepted.
+        validated_http_proxy(&settings.network_proxy)?;
         // Turning on auto-extraction must never retroactively extract the
         // user's entire existing download history. The durable timestamp
         // only admits ZIPs completed after the user enabled this option.
@@ -4680,8 +4729,10 @@ impl DownloadManager {
                 .await
                 .map_err(|error| error.to_string())?;
         }
+        let previous_proxy = self.settings.read().await.network_proxy.clone();
         let prior_limit = self.settings.read().await.speed_limit_bps;
         *self.settings.write().await = settings.clone();
+        REQUEST_CAP_PER_ORIGIN.store(settings.max_requests_per_origin, Ordering::Release);
         if settings.speed_limit_bps > 0 {
             for task in self.tasks.read().await.values() {
                 if let Some(policy) = task
@@ -4711,6 +4762,9 @@ impl DownloadManager {
         // The durable desired settings are committed. Application failures are
         // warnings, not a rejected save that can cause stale clients to retry.
         let mut warnings = Vec::new();
+        if settings.network_proxy != previous_proxy {
+            warnings.push("HTTP/SOCKS proxy settings are saved, but require a full app restart. Until then, existing and new HTTP downloads still use the previously active network route.".into());
+        }
         if let Err(error) = sync_startup_registration(settings.launch_on_start) {
             warnings.push(error);
         }
@@ -7758,6 +7812,8 @@ fn default_settings(download_dir: &Path) -> DownloadSettings {
         extra: Default::default(),
         torrent: Default::default(),
         speed_limit_bps: 0,
+        max_requests_per_origin: 32,
+        network_proxy: Default::default(),
         default_download_dir: download_dir.to_string_lossy().to_string(),
         max_concurrent_downloads: 3,
         connections_per_download: 8,
@@ -8815,6 +8871,166 @@ mod tests {
         record_is_dispatch_ready, safe_file_name, split_ranges, suggested_connection_count,
     };
     use crate::model::{DownloadRecord, DownloadStatus};
+
+    #[tokio::test]
+    async fn explicit_proxy_routes_http_requests_without_resolving_target_locally() {
+        use crate::model::{NetworkProxy, NetworkProxyMode};
+        use tokio::{
+            io::{AsyncReadExt, AsyncWriteExt},
+            net::TcpListener,
+        };
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let proxy_server = tokio::spawn(async move {
+            let (mut socket, _) =
+                tokio::time::timeout(std::time::Duration::from_secs(4), listener.accept())
+                    .await
+                    .unwrap()
+                    .unwrap();
+            let mut request = vec![0u8; 2048];
+            let received = socket.read(&mut request).await.unwrap();
+            let request = String::from_utf8_lossy(&request[..received]);
+            assert!(
+                request.starts_with("GET http://not-a-real-host.invalid/file HTTP/1.1"),
+                "explicit proxy must receive absolute target URL"
+            );
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello",
+                )
+                .await
+                .unwrap();
+        });
+        let config = NetworkProxy {
+            mode: NetworkProxyMode::Http,
+            host: "127.0.0.1".into(),
+            port,
+        };
+        let selected = super::validated_http_proxy(&config).unwrap().unwrap();
+        let client = super::download_client_builder()
+            .no_proxy()
+            .proxy(selected)
+            .build()
+            .unwrap();
+        let body = tokio::time::timeout(
+            std::time::Duration::from_secs(4),
+            client.get("http://not-a-real-host.invalid/file").send(),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .bytes()
+        .await
+        .unwrap();
+        assert_eq!(body, b"hello"[..]);
+        proxy_server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn failed_explicit_proxy_does_not_fall_back_to_a_direct_origin() {
+        use crate::model::{NetworkProxy, NetworkProxyMode};
+        use tokio::net::TcpListener;
+
+        let origin = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin_port = origin.local_addr().unwrap().port();
+        let proxy_socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let unused_port = proxy_socket.local_addr().unwrap().port();
+        drop(proxy_socket);
+        let config = NetworkProxy {
+            mode: NetworkProxyMode::Http,
+            host: "127.0.0.1".into(),
+            port: unused_port,
+        };
+        let selected = super::validated_http_proxy(&config).unwrap().unwrap();
+        let client = super::download_client_builder()
+            .no_proxy()
+            .proxy(selected)
+            .connect_timeout(std::time::Duration::from_secs(1))
+            .build()
+            .unwrap();
+        let target = format!("http://127.0.0.1:{origin_port}/must-stay-unreached");
+        assert!(
+            client.get(&target).send().await.is_err(),
+            "an unavailable selected proxy must fail closed"
+        );
+        assert!(tokio::time::timeout(std::time::Duration::from_millis(150), origin.accept()).await.is_err(),
+            "NO_PROXY or system settings must not bypass the explicit proxy to a direct destination");
+    }
+
+    #[tokio::test]
+    async fn socks5_proxy_resolves_the_target_hostname_remotely() {
+        use crate::model::{NetworkProxy, NetworkProxyMode};
+        use tokio::{
+            io::{AsyncReadExt, AsyncWriteExt},
+            net::TcpListener,
+        };
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) =
+                tokio::time::timeout(std::time::Duration::from_secs(5), listener.accept())
+                    .await
+                    .unwrap()
+                    .unwrap();
+            let mut greeting = [0; 3];
+            stream.read_exact(&mut greeting).await.unwrap();
+            assert_eq!(greeting, [5, 1, 0]);
+            stream.write_all(&[5, 0]).await.unwrap();
+            let mut request = [0; 4];
+            stream.read_exact(&mut request).await.unwrap();
+            assert_eq!(
+                request,
+                [5, 1, 0, 3],
+                "SOCKS5 remote DNS must send a domain rather than a local IP address"
+            );
+            let mut length = [0; 1];
+            stream.read_exact(&mut length).await.unwrap();
+            let mut domain = vec![0; length[0] as usize];
+            stream.read_exact(&mut domain).await.unwrap();
+            assert_eq!(domain, b"unresolvable-proxy-test.invalid");
+            let mut target_port = [0; 2];
+            stream.read_exact(&mut target_port).await.unwrap();
+            assert_eq!(u16::from_be_bytes(target_port), 80);
+            stream
+                .write_all(&[5, 0, 0, 1, 127, 0, 0, 1, 0, 80])
+                .await
+                .unwrap();
+            let mut http = [0; 1024];
+            let received = stream.read(&mut http).await.unwrap();
+            assert!(String::from_utf8_lossy(&http[..received]).starts_with("GET /segment HTTP/1.1"));
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\nSOCK")
+                .await
+                .unwrap();
+        });
+        let config = NetworkProxy {
+            mode: NetworkProxyMode::Socks5,
+            host: "127.0.0.1".into(),
+            port,
+        };
+        let proxy = super::validated_http_proxy(&config).unwrap().unwrap();
+        let client = super::download_client_builder()
+            .no_proxy()
+            .proxy(proxy)
+            .build()
+            .unwrap();
+        let body = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            client
+                .get("http://unresolvable-proxy-test.invalid/segment")
+                .send(),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .bytes()
+        .await
+        .unwrap();
+        assert_eq!(body, b"SOCK"[..]);
+        server.await.unwrap();
+    }
 
     #[tokio::test]
     async fn settings_and_consent_migrate_both_generations_with_the_secret_policy() {

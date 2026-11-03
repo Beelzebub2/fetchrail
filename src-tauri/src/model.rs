@@ -192,6 +192,70 @@ impl<'de> Deserialize<'de> for Accent {
     }
 }
 
+fn default_origin_request_cap() -> usize {
+    32
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum NetworkProxyMode {
+    #[default]
+    None,
+    Http,
+    Socks5,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase", deny_unknown_fields)]
+pub struct NetworkProxy {
+    pub mode: NetworkProxyMode,
+    pub host: String,
+    pub port: u16,
+}
+
+impl NetworkProxy {
+    /// Returns a credential-free proxy URL; invalid input never falls back to
+    /// a direct connection when a proxy is explicitly selected.
+    pub fn endpoint(&self) -> Result<Option<String>, String> {
+        if self.mode == NetworkProxyMode::None {
+            return Ok(None);
+        }
+        let host = self.host.trim();
+        if host.is_empty() || host.len() > 253 || self.port == 0 {
+            return Err("HTTP proxy requires a hostname and a port from 1 to 65535.".into());
+        }
+        let host = if let Ok(ipv6) = host.parse::<std::net::Ipv6Addr>() {
+            format!("[{ipv6}]")
+        } else {
+            if host.starts_with('.')
+                || host.ends_with('.')
+                || !host.is_ascii()
+                || host.split('.').any(|label| {
+                    label.is_empty()
+                        || label.len() > 63
+                        || label.starts_with('-')
+                        || label.ends_with('-')
+                        || !label
+                            .bytes()
+                            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+                })
+            {
+                return Err(
+                    "Proxy host must be a DNS name or IP address, not a URL or credential.".into(),
+                );
+            }
+            host.to_ascii_lowercase()
+        };
+        let scheme = match self.mode {
+            NetworkProxyMode::Http => "http",
+            // Remote DNS resolution avoids leaking names to the local resolver.
+            NetworkProxyMode::Socks5 => "socks5h",
+            NetworkProxyMode::None => unreachable!(),
+        };
+        Ok(Some(format!("{scheme}://{host}:{}", self.port)))
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DownloadSettings {
@@ -208,6 +272,11 @@ pub struct DownloadSettings {
     /// Shared by all downloads and connections; zero is unlimited.
     #[serde(default)]
     pub speed_limit_bps: u64,
+    #[serde(default = "default_origin_request_cap")]
+    pub max_requests_per_origin: usize,
+    /// Explicit desktop HTTP/HTTPS proxy. No credentials are accepted or stored.
+    #[serde(default)]
+    pub network_proxy: NetworkProxy,
     pub default_download_dir: String,
     pub max_concurrent_downloads: usize,
     pub connections_per_download: usize,
@@ -311,6 +380,7 @@ impl DownloadSettings {
         }
         self.max_concurrent_downloads = self.max_concurrent_downloads.clamp(1, 12);
         self.connections_per_download = self.connections_per_download.clamp(1, 32);
+        self.max_requests_per_origin = self.max_requests_per_origin.clamp(1, 32);
         self.min_segment_size_mb = self.min_segment_size_mb.clamp(1, 128);
         self.torrent.max_seeds = self.torrent.max_seeds.clamp(1, 100);
         self.torrent.connections = self.torrent.connections.clamp(20, 2000);
@@ -713,6 +783,8 @@ mod tests {
             extra: Default::default(),
             torrent: Default::default(),
             speed_limit_bps: 0,
+            max_requests_per_origin: 32,
+            network_proxy: Default::default(),
             default_download_dir: download_root.into(),
             max_concurrent_downloads: 3,
             connections_per_download: 8,
@@ -781,6 +853,8 @@ mod tests {
         legacy.remove("clipboardMonitoring");
         legacy.remove("autoExtractZip");
         legacy.remove("autoExtractSince");
+        legacy.remove("maxRequestsPerOrigin");
+        legacy.remove("networkProxy");
         let restored: DownloadSettings =
             serde_json::from_value(serde_json::Value::Object(legacy)).unwrap();
         assert!(restored.sort_into_category_folders);
@@ -794,6 +868,14 @@ mod tests {
             "legacy profiles must never auto-extract ZIPs"
         );
         assert!(restored.auto_extract_since.is_none());
+        assert_eq!(restored.max_requests_per_origin, 32);
+        assert_eq!(restored.network_proxy.mode, NetworkProxyMode::None);
+        let mut low_cap = settings.clone();
+        low_cap.max_requests_per_origin = 0;
+        assert_eq!(low_cap.normalized().max_requests_per_origin, 1);
+        let mut high_cap = settings.clone();
+        high_cap.max_requests_per_origin = 1000;
+        assert_eq!(high_cap.normalized().max_requests_per_origin, 32);
         assert!(
             restored.windows_attachment_check,
             "existing profiles retain Windows checking"
@@ -807,5 +889,64 @@ mod tests {
             .iter()
             .any(|category| category.name == "Programs"
                 && category.extensions.contains(&"exe".to_string())));
+    }
+
+    #[test]
+    fn network_proxy_rejects_credentials_and_unsafe_host_syntax() {
+        let proxy = NetworkProxy {
+            mode: NetworkProxyMode::Socks5,
+            host: "proxy.example.com".into(),
+            port: 1080,
+        };
+        assert_eq!(
+            proxy.endpoint().unwrap().unwrap(),
+            "socks5h://proxy.example.com:1080"
+        );
+        assert_eq!(
+            NetworkProxy {
+                mode: NetworkProxyMode::Http,
+                host: "::1".into(),
+                port: 3128
+            }
+            .endpoint()
+            .unwrap()
+            .unwrap(),
+            "http://[::1]:3128"
+        );
+        for host in [
+            "user:password@proxy.example.com",
+            "https://proxy.example.com",
+            "host/path",
+            "host?secret=1",
+            "bad host",
+            "example..com",
+            "-name.com",
+        ] {
+            assert!(
+                NetworkProxy {
+                    host: host.into(),
+                    ..proxy.clone()
+                }
+                .endpoint()
+                .is_err(),
+                "unsafe host {host}"
+            );
+        }
+        assert!(NetworkProxy {
+            port: 0,
+            ..proxy.clone()
+        }
+        .endpoint()
+        .is_err());
+        assert_eq!(
+            NetworkProxy {
+                mode: NetworkProxyMode::None,
+                host: "anything".into(),
+                ..proxy
+            }
+            .endpoint()
+            .unwrap(),
+            None
+        );
     }
 }

@@ -50,6 +50,14 @@ Use **New downloads** to paste several file URLs, one per line. The batch shares
 
 **Settings → Downloads** sets the total speed limit. Each download's **More → Speed limit** changes its cap while running. Limits use KiB/s; zero means unlimited.
 
+### Desktop HTTP proxy and per-website request limits
+
+In **Settings → Downloads → Network routing**, set the maximum number of simultaneous HTTP requests to a single website (1–32, default 32). This applies across all downloads, including redirect destinations, and does not bypass server `Retry-After` cooldowns. Reducing the limit causes new requests to wait until the currently active ones finish; transfers are not restarted.
+
+Choose **HTTP proxy** or **SOCKS5 (remote DNS)** and enter a proxy host and port for the desktop's HTTP/HTTPS download engine. An explicit proxy applies to probes, each segmented connection, retries and browser download handoffs after the next full Fetchrail restart. If the proxy is unreachable, the request fails instead of falling back to a direct connection. Changes are **saved immediately but require restarting the application**; until then both new and active transfers continue using the previous route. **System/default routing** retains the app's existing environment/system proxy behavior. No proxy credentials or proxy URLs are stored in download history or logs.
+
+Authentication to HTTP/SOCKS proxies is not implemented in this setting; do not put usernames, passwords or URLs into the host field. The existing torrent proxy controls operate independently, while FTP/FTPS/SFTP use separate transports and do not use this HTTP proxy. This is not a network kill switch or a verified VPN leak prevention control.
+
 ## Queues and schedules
 
 In **Settings → Queues**, save a start time and optional stop time for a queue. At the stop time, active network transfers return to the queue with their partial bytes intact. Clear or extend the window to continue them.
