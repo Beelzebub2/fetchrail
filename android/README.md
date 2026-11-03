@@ -43,7 +43,7 @@ Install JDK 17+, Android SDK API 37, build tools 36.0.0, Android NDK
 Gradle 9.3.1. From the repository root:
 
 1. Run cargo test --manifest-path android/rust/Cargo.toml --locked.
-2. Run cargo ndk --platform 34 -t arm64-v8a -o android/app/src/main/jniLibs build --release --locked --manifest-path android/rust/Cargo.toml.
+2. Change into android/rust and run cargo ndk --platform 34 -t arm64-v8a -o ../app/src/main/jniLibs build --release --locked, then return to the repository root.
 3. Run gradle -p android :app:assembleDebug.
 4. Install android/app/build/outputs/apk/debug/app-debug.apk on an ARM64 device
    running Android 14+.
