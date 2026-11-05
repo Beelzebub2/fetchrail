@@ -27,10 +27,11 @@ const options = {
       testAlarm() { return this.ctx.storage.getAlarm(); }
       testRunAlarm() { return this.alarm(); }
     }
-  ` }, ...["worker.mjs", "policy.mjs", "bootstrap.mjs", "analytics.mjs", "quality-schema.mjs", "store-badges.mjs"].map(name => ({ type: "ESModule", path: fileURLToPath(new URL(name, import.meta.url)) }))],
+  ` }, ...["worker.mjs", "policy.mjs", "bootstrap.mjs", "analytics.mjs", "analytics-metrics.mjs", "quality-schema.mjs", "store-badges.mjs"].map(name => ({ type: "ESModule", path: fileURLToPath(new URL(name, import.meta.url)) }))],
   compatibilityDate: "2026-10-09",
   durableObjects: { RELEASE_FEED: { className: "ReleaseFeed", useSQLite: true }, ANALYTICS: { className: "AnalyticsStore", useSQLite: true } },
-  bindings: { QUALITY_ANALYTICS_ENABLED: "true", ANALYTICS_READ_TOKEN: "test-read-secret-with-at-least-32-characters" },
+  bindings: { QUALITY_ANALYTICS_ENABLED: "true", ANALYTICS_READ_TOKEN: "test-read-secret-with-at-least-32-characters",
+    ANALYTICS_EXPORT_TOKEN: "test-export-secret-with-at-least-32-characters" },
   ratelimits: { ANALYTICS_RATE_LIMITER: { namespace_id: "1", simple: { limit: 1000, period: 60 } } },
   serviceBindings: { ASSETS: "assets-test" },
   outboundService: async request => {
@@ -61,8 +62,11 @@ try {
   const reportFixture = { schema: 1, version: "0.6.1", os: "windows", arch: "x64", counters: { launch: 1, http_added: 3, http_completed: 2, size_under_10mb: 2 } };
   const collect = (data, headers = {}, path = "/api/analytics") => worker.dispatchFetch(`https://fetchrail.rrmtools.uk${path}`, { method: "POST", headers: { "Content-Type": "application/json", ...headers }, body: typeof data === "string" ? data : JSON.stringify(data) });
   const readAnalytics = () => worker.dispatchFetch("https://fetchrail.rrmtools.uk/api/analytics/report", { headers: { Authorization: `Bearer ${options.bindings.ANALYTICS_READ_TOKEN}` } });
+  const exportAnalytics = (token = options.bindings.ANALYTICS_EXPORT_TOKEN) => worker.dispatchFetch("https://fetchrail.rrmtools.uk/api/analytics/report", { headers: { Authorization: `Bearer ${token}` } });
   assert.equal((await get("/api/analytics/report")).status, 401);
   assert.equal((await worker.dispatchFetch("https://fetchrail.rrmtools.uk/api/analytics/report", { headers: { Authorization: "Bearer incorrect" } })).status, 401);
+  assert.equal((await exportAnalytics()).status, 200, "Independent private exporter token reads only the existing protected aggregate report");
+  assert.equal((await exportAnalytics("wrong-export-token")).status, 401);
   assert.equal((await get("/api/analytics")).status, 405);
   for (const data of [
     { ...reportFixture, url: "https://private.example" }, { ...reportFixture, id: "device" },
@@ -212,6 +216,7 @@ try {
     { name: "assets-test", modules: [{ type: "ESModule", path: fileURLToPath(new URL("test-assets.mjs", import.meta.url)) }] },
   ] }));
   assert.equal((await readAnalytics()).status, 401, "Missing read secret fails closed even with a supplied token");
+  assert.equal((await exportAnalytics()).status, 401, "Missing export secret fails closed even with a supplied token");
   assert.equal((await collect(qualityFixture)).status, 503, "Unconfigured v2 release gate rejects an otherwise valid report");
   await worker.dispose();
   worker = new Miniflare(convertV4MiniflareOptions({ https: true, resourcePersistencePath: directory, workers: [

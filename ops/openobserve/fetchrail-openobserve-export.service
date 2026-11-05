@@ -1,0 +1,24 @@
+[Unit]
+Description=Export finalized Fetchrail analytics aggregates to VPS OpenObserve
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+WorkingDirectory=/root/Projects/ricardo/fetchrail-analytics-exporter
+EnvironmentFile=/etc/rrm-fetchrail-analytics.env
+Environment=FETCHRAIL_EXPORT_STATE=/var/lib/fetchrail-openobserve/sent.json
+ExecStart=/usr/bin/node scripts/export-analytics-openobserve.mjs
+StateDirectory=fetchrail-openobserve
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/var/lib/fetchrail-openobserve
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+
+[Install]
+WantedBy=multi-user.target

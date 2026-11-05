@@ -1,14 +1,9 @@
 import { DurableObject } from "cloudflare:workers";
 import { FeedError, readJson } from "./policy.mjs";
 import { validQuality } from "./quality-schema.mjs";
+import { METRICS, DIAGNOSTIC_METRICS } from "./analytics-metrics.mjs";
+export { METRICS, DIAGNOSTIC_METRICS } from "./analytics-metrics.mjs";
 
-export const METRICS = Object.freeze([
-  "launch", "http_added", "torrent_added", "http_completed", "torrent_completed",
-  "http_failed", "torrent_failed", "http_cancelled", "torrent_cancelled",
-  "size_under_10mb", "size_10mb_1gb", "size_over_1gb",
-  "pause", "resume", "speed_limit", "queue", "schedule", "browser_handoff", "batch",
-]);
-export const DIAGNOSTIC_METRICS = Object.freeze(["cpu", "drive", "memory", "network"].flatMap(group => ["f", "d", "c", "b", "a", "s", "ss"].map(grade => `diagnostics_${group}_${grade}`)));
 const keys = (value, allowed) => value && typeof value === "object" && !Array.isArray(value)
   && Object.keys(value).every(key => allowed.includes(key));
 export function validateReport(report) {
@@ -118,7 +113,8 @@ export async function analyticsApi(request, env) {
     if (url.search || request.headers.has("cookie")) return fail(400, "Use a plain analytics request without cookies or query parameters.");
     if (url.pathname === "/api/analytics/report") {
       if (request.method !== "GET") return fail(405, "Use GET.");
-      if (!await authorized(request, env.ANALYTICS_READ_TOKEN)) return fail(401, "Analytics read authorization is required.");
+      if (!await authorized(request, env.ANALYTICS_READ_TOKEN)
+        && !await authorized(request, env.ANALYTICS_EXPORT_TOKEN)) return fail(401, "Analytics read authorization is required.");
       return Response.json(await env.ANALYTICS.getByName("daily-v1").report(), { headers });
     }
     if (request.method !== "POST") return fail(405, "Use POST.");
