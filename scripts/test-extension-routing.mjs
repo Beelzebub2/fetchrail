@@ -117,8 +117,24 @@ for (const family of ["chromium", "firefox"]) {
   for(let i=0;i<50;i++)await new Promise(setImmediate);
   assert.equal([...cold.items.values()].filter(item=>item.id>=200&&item.paused).length,8,"All browser transfers must be held during a slow companion startup");
   assert.equal(Object.keys(cold.saved.pendingHandoffs).length,8,"Every held transfer needs its own durable intent");
+  assert.equal(cold.calls.filter(call=>call.method==="ping").length,1,"Concurrent captures should wake the desktop app with one shared readiness probe");
   releaseStartup();await cold.settle();assert.equal(cold.stages.size,8);
   assert.ok([...cold.stages.values()].every(stage=>stage.committed));
+  cold.create({...cold.item,id:208,url:"https://files.test/cold-again.zip",finalUrl:"https://files.test/cold-again.zip"});
+  await cold.settle();
+  assert.equal(cold.calls.filter(call=>call.method==="ping").length,2,"The next download should recheck readiness after a prior launch");
+  let desktopAvailable = false;
+  const reboot = await browserFixture(family,{native:async request=>{
+    if(request.method==="ping"&&!desktopAvailable)throw Error("Desktop app unavailable");
+  }});
+  reboot.create();await reboot.settle();
+  assert.equal(reboot.item.paused,false,"A failed cold start must return ownership to the browser");
+  assert.equal(reboot.stages.size,0);
+  desktopAvailable = true;
+  reboot.create({...reboot.item,id:209,url:"https://files.test/after-restart.zip",finalUrl:"https://files.test/after-restart.zip"});
+  await reboot.settle();
+  assert.equal(reboot.calls.filter(call=>call.method==="ping").length,2,"A failed wakeup must not block a later attempt");
+  assert.equal([...reboot.stages.values()].filter(stage=>stage.committed).length,1);
   const partial=await browserFixture(family);
   for(let i=0;i<3;i++) {
     const url=`https://files.test/${i===1?"reject":i}.zip`;
