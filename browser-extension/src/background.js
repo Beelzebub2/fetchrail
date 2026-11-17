@@ -454,8 +454,15 @@ async function nativeRequest(method, params = {}, id = crypto.randomUUID()) {
   if (method === "getDownloads") await setBadge(result.overview.active ? String(result.overview.active) : "", "Fetchrail Download Companion");
   return result;
 }
+let readinessProbe = null;
 async function requireCapabilities(capabilities) {
-  const app = await nativeRequest("ping");
+  // Each native message starts a new host process. One shared probe lets a burst
+  // of intercepted downloads wake the closed desktop app just once, while every
+  // browser transfer stays independently paused until its handoff is resolved.
+  if (!readinessProbe) {
+    readinessProbe = nativeRequest("ping").finally(() => { readinessProbe = null; });
+  }
+  const app = await readinessProbe;
   const missing = capabilities.filter(capability => !app.capabilities.includes(capability));
   if (missing.length) throw nativeError("UPGRADE_REQUIRED", "Update Fetchrail before using browser capture (missing " + missing.join(", ") + "). The file will stay in the browser.");
   return app;

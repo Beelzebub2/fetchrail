@@ -147,7 +147,7 @@ npm run browser:install
 
 Then load the stable folder as described above. `npm run browser:build` creates `browser-extension/dist`; `npm run build` and `npm run tauri dev` also build the extensions. Build and restart Fetchrail to deploy changes to the stable folders. Direct Cargo builds embed the most recent `browser:build` output.
 
-If the companion cannot reach Fetchrail in a source installation, confirm that the release executable exists and rerun `npm run browser:install`. The native host uses the same executable as the desktop app and can launch Fetchrail in the background when it is closed.
+An eligible browser download starts Fetchrail in the background through its registered native host if the desktop app is closed; **Start with Windows/Linux** is not required. Downloads started together share the initial connection check, but keep separate handoffs. If the host cannot be started or verification fails, the browser keeps the download. In a source installation, confirm that the release executable exists and rerun `npm run browser:install` if the companion cannot connect.
 
 Run `npm run browser:check` for extension validation. Run `npm run engine:test` with Fetchrail closed after building the release executable for real transfer checks.
 
