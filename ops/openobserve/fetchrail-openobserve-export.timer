@@ -1,0 +1,11 @@
+[Unit]
+Description=Daily finalized Fetchrail analytics export
+
+[Timer]
+OnCalendar=*-*-* 00:20:00 UTC
+Persistent=true
+RandomizedDelaySec=5min
+Unit=fetchrail-openobserve-export.service
+
+[Install]
+WantedBy=timers.target

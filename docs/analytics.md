@@ -56,11 +56,21 @@ The quality readout merges receipt days only within the same release, broad OS a
 
 Opt-in bias, short runs under 30 minutes, exits, capped counters, drops and network failures underrepresent activity. Launch/report counts do not count unique people. With no identifiers or retry IDs, no cohorts, retention, user funnels or precise population failure rates can be derived. Already combined totals cannot identify a contribution for removal; withdrawal prevents future collection and clears unsent memory.
 
+## Optional OpenObserve mirror on the RRMTools VPS
+
+The operator can mirror **finalized daily aggregates**, not individual reports, to the existing RRMTools OpenObserve instance. `scripts/export-analytics-openobserve.mjs` is VPS-only code, never desktop, website or browser-extension code. It reads the existing protected aggregate report with a separate Cloudflare Worker secret `ANALYTICS_EXPORT_TOKEN`. The existing `ANALYTICS_READ_TOKEN` continues to work and must not be rotated by this integration. The exporter discards the current UTC day's partial groups, filters to the 30-day window and transmits only finalized version/OS/architecture totals: fixed v1 usage/explicit-share counters and already-suppressed v2 quality counters and histogram bins. No source IP, raw report, private download data, client identifiers or individual activity timestamps are exported. The Worker store remains authoritative, including its volume and retention caps.
+
+The target is localhost-only `http://127.0.0.1:5080/api/default/fetchrail_analytics/_json`. No public OpenObserve ingestion route or client credential is added. Use an ingestion-only OpenObserve credential, never its admin password, and store it with the separate Worker export token in a root-only VPS environment file. A private checkpoint stores only SHA-256 digests of exported dimension groups. After a successful per-record OpenObserve receipt, it is atomically updated; if the process crashes between ingestion and checkpoint, the next run can create a duplicate snapshot. No current-day group is exported, so normal reports do not create such replacements. The daily systemd timer performs backfill after downtime.
+
+Mirrored rows include an explicit **aggregate UTC day**; OpenObserve assigns a separate timestamp at ingestion, not a client event time. This permits importing historical aggregate days without changing OpenObserve's default five-hour age limit. Configure and verify OpenObserve's own 30-day retention **from ingestion**, including backfilled rows; its copies and backups are separate from Cloudflare's documented retention and recovery history. This is still the same product analytics purpose under the existing optional sender and separate v2 consent; no new on-device telemetry is enabled. Follow [OpenObserve bridge](openobserve-bridge.md) for operating instructions.
+
 ## Diagnostic summaries use separate per-run permission
 
 The usage grant does not authorize performance fields. [Diagnostics](diagnostics.md) keeps exact measurements local and only offers coarse fixed bands under an explicit preview/Share action for a completed run. `purpose: diagnostics-summary-v1` accepts one count per successful group band, with the same protected daily aggregation/retention and no remote run IDs or raw rows. Ordinary usage payloads cannot include those counters; no sharing happens from the usage toggle.
 
 ## Verification
+
+The VPS mirror additionally runs `node scripts/test-openobserve-export.mjs` for finalized-day-only export, private credentials, suppression, allowlists, checkpointing and error handling.
 
 Run `npm run build`, `node scripts/test-analytics-ui.mjs @playwright/test`, native `cargo test --manifest-path src-tauri/Cargo.toml --locked --lib`, and `npm test --prefix update-service`. Tests cover explicit/versioned consent, no preconsent collection, no backfill, revoke/cancellation/epoch exclusion, bounded payloads, idempotent outcomes, accessible equal choices, persisted refusal, grant/revoke, native save failure including settings events, scope renewal, strict runtime intake, protected reads, SQLite persistence, cleanup alarms, volume/cardinality caps and release-feed regressions. The public policy and settings disclosures must change together with any future scope change.
 
