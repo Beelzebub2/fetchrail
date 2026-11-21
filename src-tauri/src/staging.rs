@@ -2,7 +2,7 @@ use sha2::{Digest, Sha256};
 use std::{
     io::{self, Read, Seek},
     path::Path,
-    sync::OnceLock,
+    sync::{Arc, OnceLock},
 };
 use tokio_util::sync::CancellationToken;
 
@@ -93,14 +93,26 @@ pub async fn prefix_hasher(
     length: u64,
     cancel: &CancellationToken,
 ) -> io::Result<Sha256> {
-    static BUDGET: OnceLock<tokio::sync::Semaphore> = OnceLock::new();
+    // There is nothing to validate on a fresh range. In particular, do not queue a
+    // blocking reader or open the shared staging file for every empty prefix.
+    if cancel.is_cancelled() {
+        return Err(io::ErrorKind::Interrupted.into());
+    }
+    if length == 0 {
+        return Ok(Sha256::new());
+    }
+    static BUDGET: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
     let permit = tokio::select! {
-        permit = BUDGET.get_or_init(|| tokio::sync::Semaphore::new(4)).acquire() => permit.map_err(io::Error::other)?,
+        permit = BUDGET.get_or_init(|| Arc::new(tokio::sync::Semaphore::new(4))).clone().acquire_owned() => permit.map_err(io::Error::other)?,
         _ = cancel.cancelled() => return Err(io::ErrorKind::Interrupted.into()),
     };
     let path = path.to_owned();
     let cancel = cancel.clone();
     let result = tokio::task::spawn_blocking(move || {
+        // A dropped async caller does not stop spawn_blocking. Keep its budget
+        // owned by the actual disk reader, rather than releasing it prematurely.
+        let _permit = permit;
+        let _verification_lane = crate::integrity::verification_lane(&cancel)?;
         let mut file = std::fs::File::open(path)?;
         file.seek(io::SeekFrom::Start(start))?;
         let mut hash = Sha256::new();
@@ -125,6 +137,60 @@ pub async fn prefix_hasher(
     })
     .await
     .map_err(io::Error::other)?;
-    drop(permit);
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn empty_prefix_needs_no_disk_access_but_honors_cancellation() {
+        let missing = std::env::temp_dir().join(format!("missing-prefix-{}", uuid::Uuid::new_v4()));
+        let cancel = CancellationToken::new();
+        assert_eq!(
+            format!(
+                "{:x}",
+                prefix_hasher(&missing, u64::MAX, 0, &cancel)
+                    .await
+                    .unwrap()
+                    .finalize()
+            ),
+            format!("{:x}", Sha256::digest([]))
+        );
+        cancel.cancel();
+        assert_eq!(
+            prefix_hasher(&missing, 0, 0, &cancel)
+                .await
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::Interrupted
+        );
+    }
+
+    #[tokio::test]
+    async fn nonempty_prefix_revalidates_bytes_and_rejects_short_reads() {
+        let path = std::env::temp_dir().join(format!("prefix-proof-{}", uuid::Uuid::new_v4()));
+        std::fs::write(&path, b"0123456789").unwrap();
+        let cancel = CancellationToken::new();
+        let before = prefix_hasher(&path, 2, 4, &cancel).await.unwrap();
+        assert_eq!(
+            format!("{:x}", before.finalize()),
+            format!("{:x}", Sha256::digest(b"2345"))
+        );
+        std::fs::write(&path, b"01xxxx6789").unwrap();
+        let after = prefix_hasher(&path, 2, 4, &cancel).await.unwrap();
+        assert_eq!(
+            format!("{:x}", after.finalize()),
+            format!("{:x}", Sha256::digest(b"xxxx"))
+        );
+        assert_eq!(
+            prefix_hasher(&path, 8, 4, &cancel)
+                .await
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::UnexpectedEof
+        );
+        std::fs::remove_file(path).unwrap();
+    }
 }

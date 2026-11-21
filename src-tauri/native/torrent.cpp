@@ -36,6 +36,7 @@
 #include <deque>
 #include <thread>
 #include <random>
+#include <atomic>
 #ifndef _WIN32
 #include <fcntl.h>
 #include <unistd.h>
@@ -141,6 +142,34 @@ static json metadata(lt::torrent_info const& ti) {
         {"totalBytes", ti.total_size()}, {"files", files}, {"fileCount", ti.num_files()}, {"pieceLength", ti.piece_length()}, {"pieces", ti.num_pieces()}};
 }
 
+using CreationProgress = bool (*)(void*, std::uint64_t, std::uint64_t);
+static json create_metadata(json const& c, CreationProgress progress = nullptr, void* context = nullptr) {
+    auto report = [&](std::uint64_t done, std::uint64_t total) {
+        if (progress && !progress(context, done, total))
+            throw std::runtime_error("Torrent creation cancelled before metadata publication");
+    };
+    report(0, 0);
+    auto files = lt::list_files(c.at("path").get<std::string>(), [&](std::string const&) { report(0, 0); return true; });
+    auto flags = lt::create_flags_t{};
+    if (c.value("format", "hybrid") == "v1") flags |= lt::create_torrent::v1_only;
+    if (c.value("format", "hybrid") == "v2") flags |= lt::create_torrent::v2_only;
+    lt::create_torrent creator(files, c.value("pieceLength", 0), flags);
+    for (auto const& tracker : c.value("trackers", json::array())) creator.add_tracker(tracker.get<std::string>());
+    creator.set_priv(c.value("private", false));
+    auto total = std::uint64_t(std::max(0, creator.num_pieces()));
+    std::atomic<std::uint64_t> completed{0};
+    report(0, total);
+    lt::set_piece_hashes(creator, fs::u8path(c.at("path").get<std::string>()).parent_path().u8string(),
+        [&](lt::piece_index_t) { report(std::min(total, ++completed), total); });
+    report(total, total);
+    auto bytes = creator.generate_buf();
+    report(total, total);
+    // Preserve the existing durable atomic output replacement. Cancellation is
+    // checked before publication; an already in-flight filesystem call is not undone.
+    write_file(c.at("output"), bytes);
+    return {{"path", c.at("output")}};
+}
+
 static lt::settings_pack network_settings(json const& c) {
     lt::settings_pack p;
     p.set_bool(lt::settings_pack::enable_dht, c.value("dht", true));
@@ -188,6 +217,18 @@ struct Job {
     std::set<std::string> paths;
     std::set<std::string> moving_paths;
     std::deque<json> activity;
+    std::optional<std::chrono::steady_clock::time_point> checkpoint_at;
+    std::optional<std::chrono::steady_clock::time_point> payload_progress_at;
+    std::int64_t last_payload = 0;
+    void observe(lt::torrent_status const& status) {
+        auto now = std::chrono::steady_clock::now();
+        bool receiving = !(status.flags & lt::torrent_flags::paused) && status.has_metadata && !status.is_finished && !status.errc && !status.moving_storage
+            && status.state != lt::torrent_status::checking_files && status.state != lt::torrent_status::checking_resume_data;
+        if (!receiving) payload_progress_at.reset();
+        else if (!payload_progress_at || status.total_payload_download != last_payload) payload_progress_at = now;
+        last_payload = status.total_payload_download;
+        cached = status; cached_at = now;
+    }
 };
 
 struct Engine {
@@ -200,6 +241,10 @@ struct Engine {
     int listen_retries = 0;
     std::map<std::string, std::string> path_owners;
     std::deque<json> session_activity;
+    void (*yield_control)(void*) = nullptr;
+    void* yield_context = nullptr;
+    std::uint64_t alert_drops = 0; // Overflow notifications, not an unknowable count of lost alerts.
+    int session_download_limit = 0, session_upload_limit = 0, session_connection_limit = 500;
     bool available(std::string const& key, std::string const& id = "") const {
         auto owned = [&](std::string const& path) { auto it = path_owners.find(path); return it != path_owners.end() && it->second != id; };
         if (owned(key)) return false;
@@ -226,6 +271,11 @@ struct Engine {
         if (!session) {
             listen_request = config.value("listenInterfaces", "0.0.0.0:0,[::]:0");
             auto p = network_settings(config);
+            session_connection_limit = std::max(0, config.value("connections", 500));
+            session_download_limit = std::max(0, config.value("downloadLimit", 0));
+            session_upload_limit = std::max(0, config.value("uploadLimit", 0));
+            p.set_int(lt::settings_pack::download_rate_limit, session_download_limit);
+            p.set_int(lt::settings_pack::upload_rate_limit, session_upload_limit);
             p.set_str(lt::settings_pack::user_agent, "Fetchrail/" FETCHRAIL_APP_VERSION " libtorrent/" LIBTORRENT_VERSION);
             p.set_int(lt::settings_pack::alert_mask, lt::alert_category::error | lt::alert_category::storage | lt::alert_category::status | lt::alert_category::connect | lt::alert_category::tracker);
             p.set_int(lt::settings_pack::alert_queue_size, 4096);
@@ -270,6 +320,9 @@ struct Engine {
             if (std::chrono::steady_clock::now() >= deadline) throw std::runtime_error("Timed out waiting for torrent storage. Retry the operation.");
             session->wait_for_alert(std::chrono::milliseconds(100));
             drain();
+            // Only the owning Rust control thread can reenter here. It services
+            // bounded read/control requests; conflicting storage mutations stay queued.
+            if (yield_control) yield_control(yield_context);
         }
     }
     void drain() {
@@ -278,6 +331,7 @@ struct Engine {
         session->pop_alerts(&alerts);
         bool retry_listen = false;
         for (auto a : alerts) {
+            if (lt::alert_cast<lt::alerts_dropped_alert>(a)) ++alert_drops;
 #ifdef _WIN32
             // Windows reserves different TCP and UDP ranges. An automatic TCP
             // port can be forbidden to UDP; retry without changing interfaces.
@@ -291,7 +345,7 @@ struct Engine {
             if (auto updated = lt::alert_cast<lt::state_update_alert>(a)) {
                 for (auto const& s : updated->status) {
                     auto owner = owners.find(s.handle);
-                    if (owner != owners.end()) { auto& job = jobs.at(owner->second); job.cached = s; job.cached_at = std::chrono::steady_clock::now(); }
+                    if (owner != owners.end()) jobs.at(owner->second).observe(s);
                 }
                 continue;
             }
@@ -335,6 +389,7 @@ struct Engine {
                         continue;
                     }
                     j.saved_checkpoint = true; j.checkpoint_error.clear();
+                    j.checkpoint_at = std::chrono::steady_clock::now();
                 } else if (auto s = lt::alert_cast<lt::save_resume_data_failed_alert>(a)) {
                     j.pending_saves = std::max(0, j.pending_saves - 1);
                     if (s->error != lt::errors::resume_data_not_modified || !j.saved_checkpoint || !checkpoint_exists(j.resume_path)) {
@@ -392,18 +447,7 @@ struct Engine {
             return metadata(*p.ti);
         }
         if (op == "pathAvailable") return available(path_key(fs::u8path(c.at("path").get<std::string>())));
-        if (op == "create") {
-            auto files = lt::list_files(c.at("path").get<std::string>());
-            auto flags = lt::create_flags_t{};
-            if (c.value("format", "hybrid") == "v1") flags |= lt::create_torrent::v1_only;
-            if (c.value("format", "hybrid") == "v2") flags |= lt::create_torrent::v2_only;
-            lt::create_torrent creator(files, c.value("pieceLength", 0), flags);
-            for (auto const& tracker : c.value("trackers", json::array())) creator.add_tracker(tracker.get<std::string>());
-            creator.set_priv(c.value("private", false));
-            lt::set_piece_hashes(creator, fs::u8path(c.at("path").get<std::string>()).parent_path().u8string());
-            auto bytes = creator.generate_buf(); write_file(c.at("output"), bytes);
-            return {{"path", c.at("output")}};
-        }
+        if (op == "create") return create_metadata(c);
         if (op == "poll") {
             drain(); json states = json::array();
             if (session) session->post_torrent_updates(lt::torrent_handle::query_accurate_download_counters);
@@ -415,7 +459,12 @@ struct Engine {
                     pair.second.flushing = true; pair.second.handle.flush_cache();
                 }
                 bool ready = s.is_finished && pair.second.flushed;
-                auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() - pair.second.cached_at).count();
+                auto now = std::chrono::steady_clock::now();
+                auto age_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - pair.second.cached_at).count();
+                auto no_progress_ms = pair.second.payload_progress_at
+                    ? std::chrono::duration_cast<std::chrono::milliseconds>(now - *pair.second.payload_progress_at).count() : 0;
+                bool connected_without_payload = s.num_peers > 0 && s.download_payload_rate == 0 && no_progress_ms >= 10000;
+                auto elapsed = age_ms / 1000;
                 if (s.flags & lt::torrent_flags::paused) elapsed = 0;
                 std::string state = "downloading";
                 if (s.flags & lt::torrent_flags::paused) state = "paused";
@@ -423,7 +472,7 @@ struct Engine {
                 else if (!s.has_metadata) state = "metadata";
                 else if (ready) state = "seeding";
                 else if (s.is_finished) state = "checking";
-                else if (s.download_payload_rate == 0 && s.num_peers == 0) state = "stalled";
+                else if (s.download_payload_rate == 0 && (s.num_peers == 0 || connected_without_payload)) state = "stalled";
                 if (s.errc) state = "failed";
                 states.push_back({{"id", pair.first}, {"state", state}, {"wanted", s.total_wanted}, {"downloaded", s.total_wanted_done},
                     {"downloadSpeed", s.download_payload_rate}, {"uploadSpeed", s.upload_payload_rate}, {"uploaded", s.all_time_upload},
@@ -435,7 +484,18 @@ struct Engine {
                         {"hashFailures", pair.second.hash_failures}, {"fileErrors", pair.second.file_errors}, {"engineErrors", pair.second.engine_errors},
                         {"metadataFailures", pair.second.metadata_failures}, {"checkpointErrors", pair.second.checkpoint_errors},
                         {"peers", std::max(0, s.num_peers)}, {"seeds", std::max(0, s.num_seeds)}, {"selectedReady", ready},
-                        {"checking", state == "checking"}, {"metadata", !s.has_metadata}}},
+                        {"checking", state == "checking"}, {"metadata", !s.has_metadata},
+                        {"statusAgeMs", age_ms}, {"noPayloadProgressMs", no_progress_ms},
+                        {"checkpointAgeMs", pair.second.checkpoint_at ? json(std::chrono::duration_cast<std::chrono::milliseconds>(now - *pair.second.checkpoint_at).count()) : json(nullptr)},
+                        {"checkpointPending", pair.second.pending_saves > 0}, {"connectedWithoutPayload", connected_without_payload},
+                        {"distributedFullCopies", s.distributed_full_copies >= 0 ? json(s.distributed_full_copies) : json(nullptr)},
+                        {"distributedFraction", s.distributed_fraction >= 0 ? json(s.distributed_fraction) : json(nullptr)},
+                        {"incomingObserved", s.has_incoming}, {"downloadLimitBps", std::max(0, s.download_limit)},
+                        {"uploadLimitBps", std::max(0, s.upload_limit)}, {"sessionDownloadLimitBps", session_download_limit},
+                        {"sessionUploadLimitBps", session_upload_limit}, {"connectionLimit", std::max(0, s.connections_limit)},
+                        {"sessionConnectionLimit", session_connection_limit}, {"alertDrops", alert_drops},
+                        {"downBandwidthQueue", std::max(0, s.down_bandwidth_queue)}, {"upBandwidthQueue", std::max(0, s.up_bandwidth_queue)},
+                        {"connectCandidates", std::max(0, s.connect_candidates)}, {"announcingToDht", s.announcing_to_dht}}},
                     {"error", s.errc ? s.errc.message() : pair.second.error}});
             }
             json out = {{"states", states}, {"events", events}}; events.clear(); return out;
@@ -501,8 +561,11 @@ struct Engine {
             auto requested = c.value("listenInterfaces", "0.0.0.0:0,[::]:0");
             if (requested != listen_request) { listen_request = requested; listen_retries = 0; }
             auto p = network_settings(c);
-            p.set_int(lt::settings_pack::download_rate_limit, c.value("downloadLimit", 0));
-            p.set_int(lt::settings_pack::upload_rate_limit, c.value("uploadLimit", 0));
+            session_connection_limit = std::max(0, c.value("connections", 500));
+            session_download_limit = std::max(0, c.value("downloadLimit", 0));
+            session_upload_limit = std::max(0, c.value("uploadLimit", 0));
+            p.set_int(lt::settings_pack::download_rate_limit, session_download_limit);
+            p.set_int(lt::settings_pack::upload_rate_limit, session_upload_limit);
             session->apply_settings(p); return json::object();
         }
         if (op == "checkpoint") {
@@ -606,12 +669,33 @@ struct Engine {
 extern "C" void* fr_torrent_new() noexcept { try { return new Engine(); } catch (...) { return nullptr; } }
 extern "C" void fr_torrent_drop(void* ptr) noexcept { delete static_cast<Engine*>(ptr); }
 extern "C" void fr_torrent_free(char* ptr) noexcept { std::free(ptr); }
+template<class Work> static char* respond(Work work) noexcept {
+    try {
+        std::string output;
+        try { output = json({{"ok", work()}}).dump(); }
+        catch (std::exception const& e) { output = json({{"error", e.what()}}).dump(); }
+        catch (...) { output = "{\"error\":\"Native torrent engine failed\"}"; }
+        auto result = static_cast<char*>(std::malloc(output.size() + 1));
+        if (result) std::memcpy(result, output.c_str(), output.size() + 1);
+        return result;
+    } catch (...) { return nullptr; }
+}
 extern "C" char* fr_torrent_call(void* ptr, char const* input) noexcept {
-    std::string output;
-    try { output = json({{"ok", static_cast<Engine*>(ptr)->call(json::parse(input))}}).dump(); }
-    catch (std::exception const& e) { output = json({{"error", e.what()}}).dump(); }
-    catch (...) { output = "{\"error\":\"Native torrent engine failed\"}"; }
-    auto result = static_cast<char*>(std::malloc(output.size() + 1));
-    if (result) std::memcpy(result, output.c_str(), output.size() + 1);
-    return result;
+    return respond([&] { return static_cast<Engine*>(ptr)->call(json::parse(input)); });
+}
+extern "C" char* fr_torrent_call_cooperative(void* ptr, char const* input, void (*yield)(void*), void* context) noexcept {
+    return respond([&] {
+        auto& engine = *static_cast<Engine*>(ptr);
+        struct Restore {
+            Engine& engine;
+            void (*callback)(void*);
+            void* context;
+            ~Restore() { engine.yield_control = callback; engine.yield_context = context; }
+        } restore{engine, engine.yield_control, engine.yield_context};
+        engine.yield_control = yield; engine.yield_context = context;
+        return engine.call(json::parse(input));
+    });
+}
+extern "C" char* fr_torrent_create(char const* input, CreationProgress progress, void* context) noexcept {
+    return respond([&] { return create_metadata(json::parse(input), progress, context); });
 }

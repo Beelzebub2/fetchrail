@@ -272,6 +272,7 @@ pub struct DownloadSettings {
     /// Shared by all downloads and connections; zero is unlimited.
     #[serde(default)]
     pub speed_limit_bps: u64,
+    /// Shared admission ceiling across HTTP jobs targeting the same origin.
     #[serde(default = "default_origin_request_cap")]
     pub max_requests_per_origin: usize,
     /// Explicit desktop HTTP/HTTPS proxy. No credentials are accepted or stored.

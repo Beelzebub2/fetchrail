@@ -4,28 +4,79 @@ fn main() {
     {
         use std::hash::{Hash, Hasher};
         let mut build = std::collections::hash_map::DefaultHasher::new();
+        fn collect(
+            root: &std::path::Path,
+            directory: &std::path::Path,
+            sources: &mut Vec<std::path::PathBuf>,
+        ) {
+            let mut entries = std::fs::read_dir(directory)
+                .expect("Missing fingerprint source directory")
+                .map(|e| e.expect("Unreadable fingerprint source").path())
+                .collect::<Vec<_>>();
+            entries.sort();
+            for entry in entries {
+                if entry.is_dir() {
+                    collect(root, &entry, sources);
+                } else {
+                    sources.push(entry.strip_prefix(root).unwrap().to_owned());
+                }
+            }
+        }
+        let mut sources = Vec::new();
+        collect(&root, &root.join("src"), &mut sources);
+        for directory in ["native/ports", "native/triplets"] {
+            collect(&root, &root.join(directory), &mut sources);
+        }
         for name in [
-            "src/engine.rs",
-            "src/network.rs",
-            "src/performance.rs",
-            "src/performance_platform.rs",
-            "src/staging.rs",
-            "src/model.rs",
-            "src/integrity.rs",
-            "src/platform/mod.rs",
-            "src/platform/windows_attachment.rs",
-            "src/platform/windows_scan_watch.rs",
+            "build.rs",
             "Cargo.toml",
             "Cargo.lock",
+            "native/torrent.cpp",
+            "native/CMakeLists.txt",
+            "native/vcpkg.json",
+            "native/vcpkg-configuration.json",
         ] {
-            println!("cargo:rerun-if-changed={name}");
-            let text = std::fs::read_to_string(root.join(name))
-                .expect("Missing engine fingerprint source");
-            text.replace("\r\n", "\n").hash(&mut build);
+            if root.join(name).exists() {
+                sources.push(name.into());
+            }
         }
-        std::env::var("PROFILE")
-            .unwrap_or_default()
-            .hash(&mut build);
+        sources.sort();
+        for name in sources {
+            let relative = name.to_string_lossy().replace('\\', "/");
+            println!("cargo:rerun-if-changed={relative}");
+            relative.hash(&mut build);
+            let bytes = std::fs::read(root.join(&name)).expect("Missing engine fingerprint source");
+            // Cross-platform checkouts must agree despite CRLF conversion.
+            String::from_utf8_lossy(&bytes)
+                .replace("\r\n", "\n")
+                .hash(&mut build);
+        }
+        let mut flags = std::env::vars()
+            .filter(|(name, _)| {
+                name.starts_with("CARGO_FEATURE_")
+                    || [
+                        "PROFILE",
+                        "TARGET",
+                        "OPT_LEVEL",
+                        "DEBUG",
+                        "CARGO_CFG_TARGET_FEATURE",
+                        "CARGO_ENCODED_RUSTFLAGS",
+                    ]
+                    .contains(&name.as_str())
+            })
+            .collect::<Vec<_>>();
+        flags.sort();
+        for (name, value) in flags {
+            println!("cargo:rerun-if-env-changed={name}");
+            name.hash(&mut build);
+            value.hash(&mut build);
+        }
+        let compiler =
+            std::process::Command::new(std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into()))
+                .arg("-vV")
+                .output()
+                .expect("Cannot fingerprint Rust compiler");
+        compiler.stdout.hash(&mut build);
         println!(
             "cargo:rustc-env=FETCHRAIL_ENGINE_BUILD={:016x}",
             build.finish()

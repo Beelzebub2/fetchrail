@@ -1,0 +1,44 @@
+{
+  "schema": 3,
+  "purpose": "product-quality-v3",
+  "version": "0.8.2",
+  "os": "windows",
+  "arch": "x64",
+  "batchId": "00000000000000000000000000000000",
+  "provenance": "controlled",
+  "counters": {
+    "http_accepted": 1,
+    "http_verified_durable": 1,
+    "size_small": 1,
+    "throughput_unobserved": 1
+  },
+  "histograms": {
+    "catalog_worker_ms_v1": [
+      1,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    "http_e2e_under10m_ms_v2": [
+      1,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0
+    ]
+  }
+}

@@ -7,17 +7,17 @@ const blobUrl = "blob:https://chatgpt.com/3f57eaf6-38a6-4f74-9d3f-9aa32876ab01";
 
 function setBrowserBlob(f, overrides = {}) {
   Object.assign(f.item, {
-    url: blobUrl, finalUrl: blobUrl, referrer: "https://chatgpt.com/c/test-chat",
+    url: blobUrl, finalUrl: blobUrl, referrer: "https://chatgpt.com/attachment-fixture",
     tabId: 1, filename: "C:\\Downloads\\generated-report.zip", ...overrides,
   });
 }
 async function recordXHR(f, overrides = {}) {
-  const { url = fileUrl, requestId = "chatgpt-content", tabId = 1, statusCode = 200,
+  const { url = fileUrl, requestId = "generated-file-content", tabId = 1, statusCode = 200,
     method = "GET", type = "xmlhttprequest", filename = "generated-report.zip", disposition = true, ...extra } = overrides;
   const details = { url, requestId, tabId, incognito: !!f.item.incognito, method, type,
     cookieStoreId: f.item.cookieStoreId, ...extra };
   f.events.get("before")(details);
-  f.events.get("headers")({ ...details, requestHeaders: [{ name: "Cookie", value: "chatgpt-test-session" }] });
+  f.events.get("headers")({ ...details, requestHeaders: [{ name: "Cookie", value: "generated-file-test-session" }] });
   f.events.get("response")({ ...details, statusCode, responseHeaders: [
     ...(disposition ? [{ name: "Content-Disposition", value: `attachment; filename="${filename}"` }] : []),
     { name: "Content-Type", value: "application/zip" },
@@ -74,7 +74,7 @@ for (const family of ["chromium", "firefox"]) {
   setBrowserBlob(queryOnly);
   await recordXHR(queryOnly, { disposition: false });
   await beginBlob(queryOnly);
-  assert.equal(queryOnly.stages.size, 1, "The ChatGPT fn query parameter must identify the file without a Content-Disposition header");
+  assert.equal(queryOnly.stages.size, 1, "The content API fn query parameter must identify the file without a Content-Disposition header");
 
   const interpreter = await browserFixture(family);
   setBrowserBlob(interpreter);
@@ -88,14 +88,14 @@ for (const family of ["chromium", "firefox"]) {
   setBrowserBlob(signedIn);
   await recordXHR(signedIn);
   await beginBlob(signedIn);
-  assert.equal(signedIn.calls.find(call => call.method === "addDownloads").params.items[0].requestContext.cookie, "chatgpt-test-session");
-  assert.ok(!JSON.stringify(signedIn.saved).includes("chatgpt-test-session"), "Sensitive headers must not reach durable storage");
+  assert.equal(signedIn.calls.find(call => call.method === "addDownloads").params.items[0].requestContext.cookie, "generated-file-test-session");
+  assert.ok(!JSON.stringify(signedIn.saved).includes("generated-file-test-session"), "Sensitive headers must not reach durable storage");
 
   const redirect = await browserFixture(family);
   setBrowserBlob(redirect);
   const source = { url: fileUrl, requestId: "redirect", tabId: 1, incognito: false, method: "GET", type: "xmlhttprequest" };
   redirect.events.get("headers")({ ...source, requestHeaders: [{ name: "Authorization", value: "Bearer original-site-only" }] });
-  const finalUrl = "https://files.oaiusercontent.com/signed-file";
+  const finalUrl = "https://files.example.test/signed-file";
   redirect.events.get("headers")({ ...source, url: finalUrl, requestHeaders: [] });
   redirect.events.get("response")({ ...source, url: finalUrl, statusCode: 200,
     responseHeaders: [{ name: "Content-Disposition", value: 'attachment; filename="generated-report.zip"' }] });
@@ -160,9 +160,9 @@ for (const family of ["chromium", "firefox"]) {
     assert.equal(optedOut.saved.recentOutcomes?.length ?? 0, 0, reason + " must not produce a capture failure warning");
   }
 
-  console.log(`PASS ${family}: exact ChatGPT XHR-to-blob matching, session isolation, redirects, and browser fallback`);
+  console.log(`PASS ${family}: exact generated-file XHR-to-blob matching, session isolation, redirects, and browser fallback`);
 }
 for (const family of ["chromium", "firefox"]) {
   const manifest = JSON.parse(await readFile(`browser-extension/manifests/${family}.json`, "utf8"));
-  assert.deepEqual(manifest.host_permissions, ["https://chatgpt.com/*"], "Only the ChatGPT origin should gain automatic request observation");
+  assert.deepEqual(manifest.host_permissions, ["https://chatgpt.com/*"], "Only the supported content origin should gain automatic request observation");
 }

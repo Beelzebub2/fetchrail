@@ -13,7 +13,7 @@
     "browser:install": "node scripts/platform-command.mjs browser:install",
     "browser:uninstall": "node scripts/platform-command.mjs browser:uninstall",
     "browser:test": "node scripts/test-native-host.mjs",
-    "browser:check": "node browser-extension/build.mjs && node scripts/test-extension.mjs && node scripts/test-extension-routing.mjs && node scripts/test-chatgpt-capture.mjs && node scripts/test-browser-batch.mjs && node scripts/test-browser-handoff.mjs && node scripts/test-extension-reliability.mjs",
+    "browser:check": "node browser-extension/build.mjs && node scripts/test-extension.mjs && node scripts/test-extension-routing.mjs && node scripts/test-generated-file-capture.mjs && node scripts/test-browser-batch.mjs && node scripts/test-browser-handoff.mjs && node scripts/test-extension-reliability.mjs",
     "cws:test": "node scripts/test-chrome-web-store.mjs",
     "amo:test": "node scripts/test-firefox-add-ons.mjs",
     "amo:lint": "node browser-extension/publisher/node_modules/web-ext/bin/web-ext.js lint --source-dir browser-extension/dist/firefox",

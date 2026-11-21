@@ -164,6 +164,18 @@ jobs:
         run: node scripts/test-engine-repairs.mjs src-tauri/target/release/fetchrail.exe
       - name: Test bounded HTTP transfer slot reuse
         run: node scripts/test-http-slot-reuse.mjs src-tauri/target/release/fetchrail.exe
+      - name: Test durable transfer recovery and shutdown
+        run: |
+          node scripts/test-tail-sharing.mjs src-tauri/target/release/fetchrail.exe
+          if ($LASTEXITCODE -ne 0) { throw 'Tail recovery checks failed.' }
+          node scripts/test-attachment-worker.mjs src-tauri/target/release/fetchrail.exe
+          if ($LASTEXITCODE -ne 0) { throw 'Attachment worker checks failed.' }
+          node scripts/test-shutdown-finalization.mjs src-tauri/target/release/fetchrail.exe
+          if ($LASTEXITCODE -ne 0) { throw 'Durable shutdown checks failed.' }
+          node scripts/test-webview-shutdown.mjs src-tauri/target/release/fetchrail.exe
+          if ($LASTEXITCODE -ne 0) { throw 'Window shutdown checks failed.' }
+          node scripts/test-torrent-checkpoint.mjs src-tauri/target/release/fetchrail.exe
+          if ($LASTEXITCODE -ne 0) { throw 'Torrent checkpoint checks failed.' }
       - name: Test retained Firefox companion handoffs
         run: node scripts/test-local-companion.mjs src-tauri/target/release/fetchrail.exe --test-tools
       - name: Install isolated browser qualification runtimes

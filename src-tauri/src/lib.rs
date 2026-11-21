@@ -59,12 +59,123 @@ use tauri::{AppHandle, Emitter, Manager, State, WindowEvent};
 use uuid::Uuid;
 
 struct FrontendReady(AtomicBool, std::sync::Mutex<Option<String>>);
-struct ShuttingDown(AtomicBool);
+#[derive(Default)]
+struct ShutdownState {
+    started: bool,
+    ready: bool,
+    window_builders: usize,
+}
+#[derive(Default)]
+struct ShuttingDown(std::sync::Mutex<ShutdownState>);
 struct TrayReady(AtomicBool);
 struct BrowserIntegration(std::sync::Mutex<platform::Feature>);
 struct StartupRecovery(String);
 #[derive(Default)]
 struct PendingDownloadPrompts(std::sync::Mutex<Vec<Uuid>>, AtomicBool);
+
+fn shutdown_started(app: &AppHandle) -> bool {
+    app.try_state::<ShuttingDown>()
+        .is_some_and(|state| state.0.lock().expect("shutdown state poisoned").started)
+}
+
+struct WindowCreationGuard(AppHandle);
+
+fn begin_window_creation(app: &AppHandle) -> Option<WindowCreationGuard> {
+    let state = app.try_state::<ShuttingDown>()?;
+    let mut shutdown = state.0.lock().expect("shutdown state poisoned");
+    if shutdown.started {
+        return None;
+    }
+    // Admission and the shutdown gate share a lock: an admitted builder cannot
+    // be missed between its initial check and native-window registration.
+    shutdown.window_builders += 1;
+    Some(WindowCreationGuard(app.clone()))
+}
+
+impl Drop for WindowCreationGuard {
+    fn drop(&mut self) {
+        let state = self.0.state::<ShuttingDown>();
+        let mut shutdown = state.0.lock().expect("shutdown state poisoned");
+        shutdown.window_builders -= 1;
+    }
+}
+
+fn windows_drained(app: &AppHandle) -> bool {
+    let state = app.state::<ShuttingDown>();
+    let idle = state
+        .0
+        .lock()
+        .expect("shutdown state poisoned")
+        .window_builders
+        == 0;
+    // No window-map clone or mutex guard survives this synchronous check.
+    idle && app.webview_windows().is_empty()
+}
+
+#[cfg(feature = "test-tools")]
+fn isolated_shutdown_marker(name: &str, bytes: &[u8]) {
+    use std::io::Write;
+    if !std::env::var("FETCHRAIL_TEST_HOLD_FINALIZATION").is_ok_and(|value| value == "1")
+        || !std::env::var("FETCHRAIL_TEST_TRACE").is_ok_and(|value| value == "1")
+    {
+        return;
+    }
+    let Ok(Some(root)) = platform::test_root() else {
+        return;
+    };
+    let result = (|| {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(root.join(name))?;
+        file.write_all(bytes)
+    })();
+    if result.is_err_and(|error: std::io::Error| error.kind() != std::io::ErrorKind::AlreadyExists)
+    {
+        eprintln!("Could not record isolated window shutdown readiness.");
+    }
+}
+
+async fn destroy_webviews_before_exit(app: &AppHandle) -> Result<(), &'static str> {
+    use tokio::time::{sleep, timeout_at, Duration, Instant};
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let mut requested = std::collections::HashSet::new();
+    loop {
+        // Tauri removes a managed window on its native Destroyed event. Do not
+        // keep cloned window handles alive while waiting for that acknowledgement.
+        if windows_drained(app) {
+            let (send, received) = tokio::sync::oneshot::channel();
+            app.run_on_main_thread(move || {
+                let _ = send.send(());
+            })
+            .map_err(|_| "Could not schedule the final window teardown acknowledgement")?;
+            timeout_at(deadline, received)
+                .await
+                .map_err(|_| "Window teardown acknowledgement timed out")?
+                .map_err(|_| "Window teardown acknowledgement was interrupted")?;
+            // The barrier runs after the Destroyed callback, allowing the runtime
+            // to drop its WebView/controller before the event loop is asked to exit.
+            if windows_drained(app) {
+                #[cfg(feature = "test-tools")]
+                isolated_shutdown_marker("shutdown-window-drain-ready", b"destroyed");
+                return Ok(());
+            }
+        }
+        let mut request_failed = false;
+        for (label, window) in app.webview_windows() {
+            if requested.insert(label) && window.destroy().is_err() {
+                request_failed = true;
+            }
+        }
+        if request_failed {
+            return Err("Could not request native window teardown");
+        }
+        if Instant::now() >= deadline {
+            return Err("Native window teardown timed out");
+        }
+        sleep(Duration::from_millis(10)).await;
+    }
+}
 
 fn valid_backup(path: &std::path::Path, name: &str) -> bool {
     match name {
@@ -475,7 +586,9 @@ async fn performance_status(
     let settings = manager.settings().await;
     let hardware = manager
         .performance
-        .hardware(std::path::Path::new(&settings.default_download_dir));
+        .hardware_async(std::path::Path::new(&settings.default_download_dir))
+        .await;
+    status.repeatable_hosts = manager.performance.repeatable_hosts(&hardware);
     status.applied_active = manager.performance.profile(&hardware).is_some();
     status.latest_issue = status
         .latest
@@ -608,6 +721,10 @@ fn quality_release_status() -> serde_json::Value {
     })
 }
 #[tauri::command]
+fn quality_delivery_status(manager: State<'_, Arc<DownloadManager>>) -> quality::DeliveryStatus {
+    manager.quality_delivery_status()
+}
+#[tauri::command]
 fn quality_preview(manager: State<'_, Arc<DownloadManager>>) -> Option<quality::Report> {
     manager.quality_preview()
 }
@@ -647,6 +764,12 @@ async fn set_local_crash_history(
     enabled: bool,
 ) -> Result<DownloadSettings, String> {
     manager.set_local_crash_history(enabled).await
+}
+#[tauri::command]
+fn local_history_save_status(
+    manager: State<'_, Arc<DownloadManager>>,
+) -> health_history::SaveStatus {
+    manager.local_history_save_status()
 }
 #[tauri::command]
 async fn local_health_history(
@@ -862,6 +985,9 @@ pub(crate) fn prompt_for_download(app: &AppHandle, id: Uuid) {
 }
 
 fn show_pending_download_prompt(app: &AppHandle, id: Uuid) {
+    let Some(creation) = begin_window_creation(app) else {
+        return;
+    };
     let prompts = app.state::<PendingDownloadPrompts>();
     let mut pending = prompts.0.lock().unwrap();
     if !pending.contains(&id) {
@@ -888,6 +1014,9 @@ fn show_pending_download_prompt(app: &AppHandle, id: Uuid) {
     // held. Captures arriving during construction join the same pending list.
     let handle = app.clone();
     std::thread::spawn(move || {
+        // Keep admission visible until the off-thread builder has registered or
+        // retired its native window, including a shutdown that starts meanwhile.
+        let _creation = creation;
         let window = tauri::WebviewWindowBuilder::new(
             &handle,
             SHARED_PROMPT_WINDOW,
@@ -902,10 +1031,19 @@ fn show_pending_download_prompt(app: &AppHandle, id: Uuid) {
         .visible(false)
         .center()
         .build();
-        let created = window.is_ok();
-        if let Err(error) = window {
-            eprintln!("Fetchrail download prompt: {error}");
-        }
+        let created = match window {
+            Ok(window) if shutdown_started(&handle) => {
+                if window.destroy().is_err() {
+                    eprintln!("Could not retire a download prompt created during shutdown.");
+                }
+                false
+            }
+            Ok(_) => true,
+            Err(error) => {
+                eprintln!("Fetchrail download prompt: {error}");
+                false
+            }
+        };
         let next = handle.clone();
         let _ = handle.run_on_main_thread(move || {
             let state = next.state::<PendingDownloadPrompts>();
@@ -921,6 +1059,9 @@ fn show_pending_download_prompt(app: &AppHandle, id: Uuid) {
 }
 
 fn show_main_window(app: &AppHandle) {
+    if shutdown_started(app) {
+        return;
+    }
     if let Some(window) = app.get_webview_window("main") {
         let _ = window.show();
         let _ = window.unminimize();
@@ -1116,7 +1257,7 @@ pub fn run() {
             )
             .expect("browser request journal"),
         )
-        .manage(ShuttingDown(AtomicBool::new(false)))
+        .manage(ShuttingDown::default())
         .manage(PendingDownloadPrompts::default())
         .manage(TrayReady(AtomicBool::new(false)))
         .manage(BrowserIntegration(std::sync::Mutex::new(
@@ -1146,8 +1287,16 @@ pub fn run() {
             }
             #[cfg(target_os = "linux")]
             app.manage(linux_updates::Updates::new());
-            tauri::WebviewWindowBuilder::from_config(app.handle(), &app.config().app.windows[0])?
+            {
+                let Some(_creation) = begin_window_creation(app.handle()) else {
+                    return Ok(());
+                };
+                tauri::WebviewWindowBuilder::from_config(
+                    app.handle(),
+                    &app.config().app.windows[0],
+                )?
                 .build()?;
+            }
             if let Err(error) = repair_browser_integration(app.handle().clone()) {
                 eprintln!("Fetchrail browser extension: {error}");
             }
@@ -1444,11 +1593,13 @@ pub fn run() {
             set_quality_consent,
             quality_release_status,
             quality_preview,
+            quality_delivery_status,
             recent_operation_health,
             download_health,
             clear_download_health,
             export_health_report,
             set_local_crash_history,
+            local_history_save_status,
             local_health_history,
             clear_local_health_history,
             start_diagnostics,
@@ -1478,18 +1629,41 @@ pub fn run() {
                 windows_tray::remove();
             }
             if let tauri::RunEvent::ExitRequested { api, code, .. } = event {
-                let Some(manager) = app.try_state::<Arc<DownloadManager>>() else {
+                let state = app.state::<ShuttingDown>();
+                let mut shutdown = state.0.lock().expect("shutdown state poisoned");
+                if shutdown.ready {
                     return;
-                };
-                if !app.state::<ShuttingDown>().0.swap(true, Ordering::AcqRel) {
-                    api.prevent_exit();
-                    let app = app.clone();
-                    let manager = manager.inner().clone();
-                    tauri::async_runtime::spawn(async move {
-                        manager.shutdown().await;
-                        app.exit(code.unwrap_or(0));
-                    });
                 }
+                api.prevent_exit();
+                if shutdown.started {
+                    drop(shutdown);
+                    #[cfg(feature = "test-tools")]
+                    isolated_shutdown_marker("shutdown-repeat-quit-deferred", b"draining");
+                    return;
+                }
+                shutdown.started = true;
+                drop(shutdown);
+                let manager = app
+                    .try_state::<Arc<DownloadManager>>()
+                    .map(|manager| manager.inner().clone());
+                let app = app.clone();
+                tauri::async_runtime::spawn(async move {
+                    // Startup recovery has a WebView but no download manager.
+                    if let Some(manager) = manager {
+                        manager.shutdown().await;
+                    }
+                    if let Err(error) = destroy_webviews_before_exit(&app).await {
+                        // Engine state is already drained. Make a framework
+                        // cleanup failure visible without trapping shutdown.
+                        eprintln!("Fetchrail window shutdown: {error}; finishing process exit.");
+                    }
+                    app.state::<ShuttingDown>()
+                        .0
+                        .lock()
+                        .expect("shutdown state poisoned")
+                        .ready = true;
+                    app.exit(code.unwrap_or(0));
+                });
             }
         });
 }
