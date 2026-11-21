@@ -94,7 +94,6 @@ impl OriginGate {
             admission: Mutex::new(()),
         }
     }
-    #[cfg(test)]
     pub async fn acquire(
         self: &Arc<Self>,
         limit: usize,
