@@ -842,6 +842,7 @@ async fn benchmark_synthetic_windows_attachment_and_publish() {
         &source,
         &filename,
         true,
+        &CancellationToken::new(),
         None,
         Some(trace.clone()),
     )
@@ -892,6 +893,7 @@ async fn optional_attachment_check_still_marks_internet_origin() {
         "https://example.com/safe-test.bin",
         "safe-test.bin",
         false,
+        &CancellationToken::new(),
         None,
         #[cfg(feature = "test-tools")]
         None,

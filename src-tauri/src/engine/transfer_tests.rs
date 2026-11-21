@@ -11,10 +11,32 @@ const HTTP_FIXTURE: &str = r#"
 import { createServer } from 'node:http';
 const total = Number(process.argv[1]), mode = process.argv[2];
 const body = Buffer.alloc(mode === 'uneven-rates' ? 64 * 1024 : 16 * 1024, mode === 'corrupt' ? 0x4b : 0x5a);
-let failed = false, active = 0, peak = 0, firstRangeRequests = 0;
+let failed = false, active = 0, peak = 0, firstRangeRequests = 0, redirects = 0, routeRefreshed = false;
 const served = [];
 const handler = (request, response) => {
-  if (request.url === '/stats') { response.end(JSON.stringify({peak, served})); return; }
+  if (request.url === '/stats') { response.end(JSON.stringify({peak, served, redirects})); return; }
+  if (mode === 'redirect-anonymous' && request.url !== '/destination') {
+    redirects++; response.writeHead(302, {Location: '/destination'}).end(); return;
+  }
+  if (mode === 'redirect-expired') {
+    if (request.url !== '/destination') {
+      routeRefreshed = true; redirects++; response.writeHead(302, {Location: '/destination'}).end(); return;
+    }
+    if (!routeRefreshed) { response.writeHead(403).end(); return; }
+    if (request.headers['if-range'] !== '"fixture"') { response.writeHead(400).end(); return; }
+  }
+  if (mode.startsWith('probe-') && request.method === 'HEAD') {
+    const headers = {'Content-Type': 'application/octet-stream', 'Content-Length': total};
+    if (mode !== 'probe-head-changed') headers['Accept-Ranges'] = 'bytes';
+    if (!mode.startsWith('probe-get-validator')) headers.ETag = '"fixture"';
+    if (mode === 'probe-get-validator-head-name') headers['Content-Disposition'] = 'attachment; filename="head.bin"';
+    if (mode === 'probe-head-changed') {
+      headers['Content-Length'] = total + 1024;
+      headers['Content-Disposition'] = 'attachment; filename="old.bin"';
+      headers.ETag = '"old"';
+    }
+    response.writeHead(200, headers).end(); return;
+  }
   if (mode === 'redirect-secret' && request.url !== '/destination') {
     response.writeHead(302, {Location: `http://127.0.0.1:${target.address().port}/destination`}).end(); return;
   }
@@ -27,7 +49,7 @@ const handler = (request, response) => {
   let start = range ? Number(range[1]) : 0;
   let end = range?.[2] ? Number(range[2]) : total - 1;
   console.log(JSON.stringify([start, end]));
-  const visit = {start, end, at: performance.now()}; served.push(visit);
+  const visit = {start, end, at: performance.now(), url: request.url}; served.push(visit);
   const renewal = mode.startsWith('renewal-');
   const rangeAttempt = renewal && end === total/4-1 ? ++firstRangeRequests : 0;
   active++; peak = Math.max(peak, active);
@@ -42,14 +64,26 @@ const handler = (request, response) => {
     }, 40);
     return;
   }
-  if (mode === 'ignore') { start = 0; end = total - 1; }
-  const partial = range && mode !== 'ignore';
+  if ((mode === 'mirror-tail-fallback' && end < total/4-1)
+      || (mode === 'mirror-tail-unavailable' && start > 0 && start < total/4)) {
+    response.writeHead(503, {'Content-Length': 0, 'Retry-After': '0'}).end(); return;
+  }
+  if (mode === 'mirror-tail-forbidden' && end < total/4-1) {
+    response.writeHead(403, {'Content-Length': 0}).end(); return;
+  }
+  const ignoredRange = mode === 'ignore' || (mode === 'mirror-tail-ignore' && end < total/4-1);
+  if (ignoredRange) { start = 0; end = total - 1; }
+  const partial = range && !ignoredRange;
   const headers = {'Content-Type': 'application/octet-stream'};
   if (partial) headers['Content-Range'] = `bytes ${start + Number(mode === 'invalid')}-${end}/${total}`;
+  if (mode === 'mirror-tail-invalid' && end < total/4-1) headers['Content-Range'] = `bytes ${start+1}-${end}/${total}`;
   if (!['unknown', 'short'].includes(mode)) headers['Content-Length'] = end - start + 1;
   if (mode === 'drop' && fail) headers.Connection = 'close';
   if (mode === 'compressed') headers['Content-Encoding'] = 'gzip';
-  else headers.ETag = mode === 'changed' ? '\"v2\"' : ['trickle', 'validated-slow'].includes(mode) ? '\"v1\"' : '\"fixture\"';
+  else headers.ETag = mode === 'changed' ? '\"v2\"' : ['trickle', 'validated-slow'].includes(mode) || mode.startsWith('mirror-tail') ? '\"v1\"' : '\"fixture\"';
+  if (mode === 'mirror-tail-changed' && end < total/4-1) headers.ETag = '"changed-after-parent"';
+  if (mode === 'probe-filename-changed') { headers.ETag = '"changed"'; headers['Content-Disposition'] = 'attachment; filename="wrong.bin"'; }
+  if (mode === 'probe-filename-slow') { setTimeout(() => { if (!response.destroyed) response.writeHead(partial ? 206 : 200, headers).end(body.subarray(0, end-start+1)); }, 2500); return; }
   response.writeHead(partial ? 206 : 200, headers);
   response.flushHeaders();
   if (mode === 'weak' && fail) { response.write(body.subarray(0, 1024)); return; }
@@ -58,17 +92,21 @@ const handler = (request, response) => {
   let paused = false;
   const began = performance.now();
   const pacedRate = mode === 'slow-group' ? (start < total * 3 / 8 && start % (total / 8) === 0 ? 128 * 1024 : 512 * 1024)
-    : renewal ? (rangeAttempt === 1 ? 64*1024 : rangeAttempt === 2 ? 512*1024 : 2*1024*1024)
+    : renewal ? (rangeAttempt === 1 ? 64*1024 : rangeAttempt === 2 ? (['renewal-steady', 'renewal-final-slow'].includes(mode) ? 64*1024 : 512*1024) : mode === 'renewal-final-slow' && rangeAttempt === 3 ? 64*1024 : 2*1024*1024)
+    // Elapsed-time budgets catch up after coarse Windows timers. A fixed 2 ms
+    // delay per block can keep healthy peers occupied until ordinary recovery.
+    : mode.startsWith('mirror-tail') ? 8*1024*1024
     : ['queued-skew', 'queued-gated'].includes(mode) && start === 0 ? 2e6 : 0;
   function pump() {
     if (mode === 'host-pause' && !paused && remaining < count - 1024 * 1024) { paused = true; setTimeout(pump, 12000); return; }
     while (!response.destroyed && remaining > 0) {
       // Assert queue order without depending on disk/CPU timing under parallel CI load.
       if (mode === 'queued-gated' && start === 0 && remaining <= body.length && !served.some(visit => visit.start >= total / 2) && performance.now()-began < 20000) { setTimeout(pump, 5); return; }
-      const trickling = (mode === 'trickle' && fail && remaining < count - 1024 * 1024)
+      const trickling = ((mode === 'trickle' || mode.startsWith('mirror-tail')) && fail && remaining < count - 1024 * 1024)
         || (mode === 'renewal-regresses' && rangeAttempt === 2);
-      const budget = pacedRate ? Math.max(0, body.length + Math.floor((performance.now()-began)/1000*pacedRate) - (count-remaining)) : body.length;
-      if (!budget) { setTimeout(pump, Math.max(1,(count-remaining)/pacedRate*1000-(performance.now()-began))); return; }
+      const effectiveRate = mode === 'renewal-final-slow' && rangeAttempt === 3 && performance.now()-began >= 25000 ? 2*1024*1024 : pacedRate;
+      const budget = effectiveRate ? Math.max(0, body.length + Math.floor((performance.now()-began)/1000*effectiveRate) - (count-remaining)) : body.length;
+      if (!budget) { setTimeout(pump, Math.max(1,(count-remaining)/effectiveRate*1000-(performance.now()-began))); return; }
       const size = Math.min(remaining, budget, trickling ? 64 : mode === 'uneven-rates' && start > 0 ? 16 * 1024 : body.length);
       const blocked = !response.write(body.subarray(0, size));
       remaining -= size;
@@ -157,6 +195,117 @@ impl TestServer {
     }
 }
 
+#[tokio::test]
+async fn checkpoint_sync_overlaps_receiving_and_cancel_drains_before_resume() {
+    let total = 32 * 1024 * 1024;
+    let server = TestServer::new(total, "validated-slow");
+    let (dir, _, mut probe) = parts(total, 4).await;
+    probe.validator = Some("\"v1\"".into());
+    let ranges = split_ranges(total, 4);
+    prepare_parts(&dir, &probe, &ranges).await.unwrap();
+    let segments = segment_counters(&dir, &ranges).await.unwrap();
+    let cancel = CancellationToken::new();
+    let client = download_client_builder().no_proxy().build().unwrap();
+    let mut download_task = task();
+    Arc::get_mut(&mut download_task)
+        .unwrap()
+        .checkpoint_test_delay = Duration::from_millis(600);
+    let limiter = RateLimiter::new(0);
+    let (result, _) = tokio::join!(
+        DownloadManager::download_ranges(
+            &client,
+            &limiter,
+            &download_task,
+            &cancel,
+            &server.url,
+            &dir,
+            &segments,
+            &probe
+        ),
+        async {
+            tokio::time::timeout(Duration::from_secs(8), async {
+                while !download_task
+                    .health
+                    .snapshot(false)
+                    .stages
+                    .iter()
+                    .any(|s| s.phase == crate::health::Phase::Sync && s.active > 0)
+                {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("A deliberately delayed checkpoint must start");
+            let before: u64 = segments
+                .iter()
+                .map(|s| s.downloaded.load(Ordering::Relaxed))
+                .sum();
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            let after: u64 = segments
+                .iter()
+                .map(|s| s.downloaded.load(Ordering::Relaxed))
+                .sum();
+            assert!(
+                after > before,
+                "Receiving must continue while earlier prefix sync is pending"
+            );
+            cancel.cancel();
+        }
+    );
+    assert!(matches!(result, Err(EngineError::Cancelled)));
+    assert!(
+        download_task
+            .health
+            .snapshot(false)
+            .stages
+            .iter()
+            .all(|s| s.active == 0),
+        "Cancellation joins every checkpoint before returning"
+    );
+    for (index, segment) in segments.iter().enumerate() {
+        let saved = part_checkpoint(&dir, index, segment.range.len())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(saved.bytes, segment.downloaded.load(Ordering::Relaxed));
+        assert_eq!(saved.bytes, segment.durable.load(Ordering::Relaxed));
+    }
+    Arc::get_mut(&mut download_task)
+        .unwrap()
+        .checkpoint_test_delay = Duration::ZERO;
+    let resumed = segment_counters(&dir, &ranges).await.unwrap();
+    DownloadManager::download_ranges(
+        &client,
+        &limiter,
+        &download_task,
+        &CancellationToken::new(),
+        &server.url,
+        &dir,
+        &resumed,
+        &probe,
+    )
+    .await
+    .unwrap();
+    let bytes = fs::read(dir.join("0.part")).await.unwrap();
+    assert_eq!(bytes.len() as u64, total);
+    assert!(bytes.iter().all(|b| *b == 0x5a));
+    for (index, range) in ranges.iter().enumerate() {
+        let saved = part_checkpoint(&dir, index, range.len())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(saved.bytes, range.len());
+        assert_eq!(
+            saved.sha256,
+            format!(
+                "{:x}",
+                Sha256::digest(&bytes[range.start as usize..=range.end as usize])
+            )
+        );
+    }
+    fs::remove_dir_all(dir).await.unwrap();
+}
+
 impl Drop for TestServer {
     fn drop(&mut self) {
         // Only this fixture's child is terminated; wait and join release every pipe.
@@ -176,6 +325,101 @@ fn task() -> Arc<DownloadTask> {
     }))
     .unwrap();
     Arc::new(DownloadTask::new(record, None, None, None))
+}
+
+#[tokio::test]
+async fn remote_analytics_excludes_unsupported_transports_but_keeps_local_health() {
+    for (url, torrent, supported) in [
+        (
+            "http://telemetry-sentinel.invalid/private?token=source-sentinel",
+            false,
+            true,
+        ),
+        (
+            "https://telemetry-sentinel.invalid/private?token=source-sentinel",
+            false,
+            true,
+        ),
+        ("magnet:?xt=urn:btih:source-sentinel", true, true),
+        (
+            "ftp://telemetry-sentinel.invalid/private?token=source-sentinel",
+            false,
+            false,
+        ),
+        (
+            "ftps://telemetry-sentinel.invalid/private?token=source-sentinel",
+            false,
+            false,
+        ),
+        (
+            "sftp://telemetry-sentinel.invalid/private?token=source-sentinel",
+            false,
+            false,
+        ),
+        ("not-a-valid-url-source-sentinel", false, false),
+    ] {
+        let analytics = crate::analytics::Analytics::new(&crate::analytics::Consent::choice(true));
+        analytics
+            .quality
+            .configure(&crate::quality::Consent::choice(true));
+        let mut record = task().record.read().await.clone();
+        record.url = url.into();
+        record.torrent = torrent.then(Default::default);
+        let task = DownloadTask::new(
+            record,
+            None,
+            analytics.prepare(),
+            analytics.quality.prepare(),
+        );
+        assert_eq!(task.analytics_sample.lock().unwrap().is_some(), supported);
+        assert_eq!(task.quality_sample.lock().unwrap().is_some(), supported);
+
+        task.health.accepted();
+        task.health.completed(1024);
+        assert!(
+            task.health.snapshot(torrent).durable_completed_ms.is_some(),
+            "Transport eligibility must not remove local completion evidence"
+        );
+        if let Some(sample) = task.quality_sample.lock().unwrap().as_mut() {
+            analytics.quality.added(sample, torrent);
+            analytics.quality.outcome(
+                sample,
+                torrent,
+                if torrent {
+                    crate::quality::Outcome::TorrentSelectedReady
+                } else {
+                    crate::quality::Outcome::HttpDurable
+                },
+                Some(1024),
+                &task.health.snapshot(torrent),
+            );
+        }
+        let report = serde_json::to_value(analytics.quality.preview().unwrap()).unwrap();
+        if supported {
+            assert_eq!(
+                report["counters"][if torrent {
+                    "torrent_accepted"
+                } else {
+                    "http_accepted"
+                }],
+                1
+            );
+            assert_eq!(
+                report["counters"][if torrent {
+                    "torrent_selected_ready"
+                } else {
+                    "http_verified_durable"
+                }],
+                1
+            );
+        } else {
+            assert!(report["counters"].as_object().unwrap().is_empty());
+            assert!(report["histograms"].as_object().unwrap().is_empty());
+        }
+        let serialized = report.to_string();
+        assert!(!serialized.contains("source-sentinel"));
+        assert!(!serialized.contains("telemetry-sentinel.invalid"));
+    }
 }
 
 #[tokio::test]
@@ -394,6 +638,179 @@ async fn hash_authorized_mirrors_share_independent_ranges_without_overlapping_pa
 }
 
 #[tokio::test]
+async fn mirror_tail_helpers_and_ordinary_fallback_keep_the_selected_source_identity() {
+    for mode in ["mirror-tail", "mirror-tail-fallback"] {
+        let total = 96 * 1024 * 1024;
+        let primary = TestServer::new(total, "changed");
+        let alternate = TestServer::new(total, mode);
+        let (dir, _, mut probe) = parts(total, 4).await;
+        probe.validator = Some("\"v1\"".into());
+        probe.final_url = Some(primary.url.clone());
+        let ranges = split_ranges(total, 4);
+        prepare_parts(&dir, &probe, &ranges).await.unwrap();
+        let segments = segment_counters(&dir, &ranges).await.unwrap();
+        let task = task();
+        // Exactly one qualified source: the changed primary is a sentinel,
+        // not a failover target. A transient cohort gets one same-source fallback.
+        *task.qualified_mirrors.lock().unwrap() = vec![mirrors::QualifiedMirror::fixture(
+            alternate.url.clone(),
+            ProbeResult {
+                final_url: Some(alternate.url.clone()),
+                ..probe.clone()
+            },
+            2,
+        )];
+        let client = download_client_builder().no_proxy().build().unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(90),
+            DownloadManager::download_ranges(
+                &client,
+                &RateLimiter::new(0),
+                &task,
+                &CancellationToken::new(),
+                &primary.url,
+                &dir,
+                &segments,
+                &probe,
+            ),
+        )
+        .await
+        .expect("A slow mirror must recover within the bounded fixture")
+        .unwrap();
+        let health = task.health.snapshot(false);
+        assert!(
+            health.tail.redistributions > 0,
+            "The fixture must exercise tail sharing"
+        );
+        assert_eq!(
+            health.tail.ordinary_fallbacks,
+            u64::from(mode == "mirror-tail-fallback")
+        );
+        assert!(
+            primary.requests.lock().unwrap().is_empty(),
+            "Helpers and fallback must retain the selected mirror's URL and validator"
+        );
+        let bytes = fs::read(dir.join("0.part")).await.unwrap();
+        assert_eq!(bytes.len() as u64, total);
+        assert!(bytes.iter().all(|byte| *byte == 0x5a));
+        for (index, range) in ranges.iter().enumerate() {
+            let saved = part_checkpoint(&dir, index, range.len())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(saved.bytes, range.len());
+            assert_eq!(
+                saved.sha256,
+                format!(
+                    "{:x}",
+                    Sha256::digest(&bytes[range.start as usize..=range.end as usize])
+                )
+            );
+        }
+        fs::remove_dir_all(dir).await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn mirror_tail_source_failures_use_remaining_mirror_budget() {
+    for (mode, expected_cause) in [
+        ("mirror-tail-changed", crate::health::Cause::SourceChanged),
+        ("mirror-tail-invalid", crate::health::Cause::RangeInvalid),
+        ("mirror-tail-ignore", crate::health::Cause::RangeIgnored),
+        ("mirror-tail-forbidden", crate::health::Cause::Http4xx),
+        ("mirror-tail-unavailable", crate::health::Cause::Http503),
+    ] {
+        let total = 96 * 1024 * 1024;
+        let changing = TestServer::new(total, mode);
+        let healthy = TestServer::new(total, "mirror-tail-healthy");
+        let (dir, _, mut probe) = parts(total, 4).await;
+        probe.validator = Some("\"v1\"".into());
+        probe.final_url = Some(changing.url.clone());
+        let ranges = split_ranges(total, 4);
+        prepare_parts(&dir, &probe, &ranges).await.unwrap();
+        let segments = segment_counters(&dir, &ranges).await.unwrap();
+        let task = task();
+        *task.qualified_mirrors.lock().unwrap() = vec![
+            mirrors::QualifiedMirror::fixture(changing.url.clone(), probe.clone(), 1),
+            mirrors::QualifiedMirror::fixture(
+                healthy.url.clone(),
+                ProbeResult {
+                    final_url: Some(healthy.url.clone()),
+                    ..probe.clone()
+                },
+                2,
+            ),
+        ];
+        let client = download_client_builder().no_proxy().build().unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(90),
+            DownloadManager::download_ranges(
+                &client,
+                &RateLimiter::new(0),
+                &task,
+                &CancellationToken::new(),
+                &changing.url,
+                &dir,
+                &segments,
+                &probe,
+            ),
+        )
+        .await
+        .expect("A failed tail source must use the remaining ordinary mirror attempt")
+        .unwrap();
+        let health = task.health.snapshot(false);
+        assert_eq!(
+            health.tail.redistributions, 1,
+            "Failover must not reset the one-shot handoff"
+        );
+        assert_eq!(
+            health.tail.ordinary_fallbacks, 0,
+            "A failed source must move to the qualified mirror without a same-source fallback"
+        );
+        assert!(health
+            .causes
+            .iter()
+            .any(|(cause, count)| *cause == expected_cause && *count > 0));
+        let sources = task.qualified_mirrors.lock().unwrap().clone();
+        assert_eq!(sources[0].attempts.load(Ordering::Relaxed), 2);
+        assert_eq!(sources[0].failures.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            sources[1].attempts.load(Ordering::Relaxed),
+            3,
+            "Exactly one ordinary retry must be charged to the next qualified mirror"
+        );
+        assert_eq!(sources[1].failures.load(Ordering::Relaxed), 0);
+        assert!(
+            healthy
+                .requests
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|&(start, end)| start > 0 && start < ranges[0].len() && end == ranges[0].end),
+            "Failover must append the validated parent prefix, not restart it"
+        );
+        let bytes = fs::read(dir.join("0.part")).await.unwrap();
+        assert_eq!(bytes.len() as u64, total);
+        assert!(bytes.iter().all(|byte| *byte == 0x5a));
+        for (index, range) in ranges.iter().enumerate() {
+            let saved = part_checkpoint(&dir, index, range.len())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(saved.bytes, range.len());
+            assert_eq!(
+                saved.sha256,
+                format!(
+                    "{:x}",
+                    Sha256::digest(&bytes[range.start as usize..=range.end as usize])
+                )
+            );
+        }
+        fs::remove_dir_all(dir).await.unwrap();
+    }
+}
+
+#[tokio::test]
 async fn changed_alternative_validator_falls_back_without_using_invalid_response() {
     let total = 8 * 1024 * 1024;
     let primary = TestServer::new(total, "normal");
@@ -480,6 +897,108 @@ async fn identical_mirror_metadata_cannot_publish_mixed_bytes_without_matching_s
 }
 
 #[tokio::test]
+async fn a_get_validator_enables_ranges_with_or_without_a_head_filename() {
+    for mode in ["probe-get-validator", "probe-get-validator-head-name"] {
+        let total = 1024 * 1024;
+        let server = TestServer::new(total, mode);
+        let client = download_client_builder().no_proxy().build().unwrap();
+        let probe = DownloadManager::probe_with_client(&client, &server.url, None, None)
+            .await
+            .unwrap();
+        assert_eq!(probe.total_bytes, Some(total));
+        assert_eq!(probe.validator, Some("\"fixture\"".into()));
+        assert!(probe.accepts_ranges);
+        assert!(server.requests.lock().unwrap().contains(&(0, 0)));
+    }
+}
+
+#[tokio::test]
+async fn changed_get_metadata_does_not_inherit_the_heads_length_or_name() {
+    let total = 1024 * 1024;
+    let server = TestServer::new(total, "probe-head-changed");
+    let client = download_client_builder().no_proxy().build().unwrap();
+    let probe = DownloadManager::probe_with_client(&client, &server.url, None, None)
+        .await
+        .unwrap();
+    assert_eq!(probe.total_bytes, Some(total));
+    assert_eq!(probe.validator, Some("\"fixture\"".into()));
+    assert!(probe.accepts_ranges);
+    assert_eq!(probe.suggested_file_name, None);
+}
+
+#[tokio::test]
+async fn optional_filename_probe_is_bounded_and_cannot_mix_representations() {
+    for mode in ["probe-filename-slow", "probe-filename-changed"] {
+        let total = 1024 * 1024;
+        let server = TestServer::new(total, mode);
+        let client = download_client_builder().no_proxy().build().unwrap();
+        let probe = tokio::time::timeout(
+            Duration::from_secs(2),
+            DownloadManager::probe_with_client(&client, &server.url, None, None),
+        )
+        .await
+        .expect("An optional filename must not hold up the transfer")
+        .unwrap();
+        assert_eq!(probe.total_bytes, Some(total));
+        assert_eq!(probe.validator, Some("\"fixture\"".into()));
+        assert!(probe.accepts_ranges);
+        assert_eq!(probe.suggested_file_name, None);
+    }
+}
+
+#[tokio::test]
+async fn anonymous_ranges_reuse_the_probed_route_without_repeating_redirects() {
+    let total = 1024 * 1024;
+    let server = TestServer::new(total, "redirect-anonymous");
+    let client = download_client_builder().no_proxy().build().unwrap();
+    let probe = DownloadManager::probe_with_client(&client, &server.url, None, None)
+        .await
+        .unwrap();
+    let stats: serde_json::Value = client
+        .get(server.url.join("/stats").unwrap())
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let redirects = stats["redirects"].as_u64().unwrap();
+    assert!(redirects > 0);
+    let (dir, segments, _) = parts(total, 4).await;
+    DownloadManager::download_ranges(
+        &client,
+        &RateLimiter::new(0),
+        &task(),
+        &CancellationToken::new(),
+        &server.url,
+        &dir,
+        &segments,
+        &probe,
+    )
+    .await
+    .unwrap();
+    verify_parts(&dir, &segments).await;
+    let stats: serde_json::Value = client
+        .get(server.url.join("/stats").unwrap())
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(stats["redirects"].as_u64(), Some(redirects));
+    let context: BrowserRequestContext = serde_json::from_value(json!({
+        "cookie": "private-session",
+    }))
+    .unwrap();
+    assert_eq!(
+        transfer_request_url(&server.url, &probe, Some(&context)),
+        &server.url
+    );
+    fs::remove_dir_all(dir).await.unwrap();
+}
+
+#[tokio::test]
 #[ignore = "local throughput comparison; controlled loopback speed, not a CI pass/fail assertion"]
 async fn mirror_vs_single_source_throughput_baseline() {
     let total = 32 * 1024 * 1024;
@@ -525,6 +1044,39 @@ async fn mirror_vs_single_source_throughput_baseline() {
             started.elapsed().as_millis(), total as f64 / 1024.0 / 1024.0 / started.elapsed().as_secs_f64());
         fs::remove_dir_all(&dir).await.unwrap();
     }
+}
+
+#[tokio::test]
+async fn rejected_cached_route_replays_the_original_route_with_the_same_range_identity() {
+    let total = 1024 * 1024;
+    let server = TestServer::new(total, "redirect-expired");
+    let client = download_client_builder().no_proxy().build().unwrap();
+    let (dir, segments, mut probe) = parts(total, 4).await;
+    probe.final_url = Some(server.url.join("/destination").unwrap());
+    DownloadManager::download_ranges(
+        &client,
+        &RateLimiter::new(0),
+        &task(),
+        &CancellationToken::new(),
+        &server.url,
+        &dir,
+        &segments,
+        &probe,
+    )
+    .await
+    .unwrap();
+    verify_parts(&dir, &segments).await;
+    let stats: serde_json::Value = client
+        .get(server.url.join("/stats").unwrap())
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(stats["redirects"].as_u64().unwrap() > 0);
+    assert!(stats["redirects"].as_u64().unwrap() <= 4);
+    fs::remove_dir_all(dir).await.unwrap();
 }
 
 #[tokio::test]
@@ -1293,7 +1845,11 @@ async fn trickling_tail_resumes_only_its_flushed_suffix() {
 
 #[tokio::test]
 async fn degraded_renewal_uses_the_last_attempt_without_restarting_an_improved_source() {
-    for (mode, attempts) in [("renewal-regresses", 3), ("renewal-improves", 2)] {
+    for (mode, attempts) in [
+        ("renewal-regresses", 3),
+        ("renewal-improves", 2),
+        ("renewal-steady", 3),
+    ] {
         let total = 32 * 1024 * 1024;
         let server = TestServer::new(total, mode);
         let (dir, _, mut probe) = parts(total, 4).await;
@@ -1359,6 +1915,68 @@ async fn degraded_renewal_uses_the_last_attempt_without_restarting_an_improved_s
         }
         fs::remove_dir_all(dir).await.unwrap();
     }
+}
+
+#[tokio::test]
+async fn final_slow_attempt_keeps_progress_and_reports_degradation_without_a_fourth_request() {
+    let total = 32 * 1024 * 1024;
+    let server = TestServer::new(total, "renewal-final-slow");
+    let (dir, _, mut probe) = parts(total, 4).await;
+    probe.final_url = Some(server.url.clone());
+    let ranges = split_ranges(total, 4);
+    prepare_parts(&dir, &probe, &ranges).await.unwrap();
+    let segments = segment_counters(&dir, &ranges).await.unwrap();
+    let job = task();
+    tokio::time::timeout(
+        Duration::from_secs(70),
+        DownloadManager::download_ranges(
+            &download_client_builder().no_proxy().build().unwrap(),
+            &RateLimiter::new(0),
+            &job,
+            &CancellationToken::new(),
+            &server.url,
+            &dir,
+            &segments,
+            &probe,
+        ),
+    )
+    .await
+    .expect("The final progressing response must survive until the source improves")
+    .unwrap();
+    assert_eq!(
+        job.record.read().await.extra.get("slowSourceRetained"),
+        Some(&json!(true))
+    );
+    let visits = server.requests.lock().unwrap().clone();
+    assert_eq!(
+        visits
+            .iter()
+            .filter(|(_, end)| *end == segments[0].range.end)
+            .count(),
+        3
+    );
+    assert_eq!(visits.len(), 6, "Do not exceed the existing retry budget");
+    let data = fs::read(dir.join("0.part")).await.unwrap();
+    assert_eq!(data.len() as u64, total);
+    assert!(data.iter().all(|&byte| byte == 0x5a));
+    assert_eq!(
+        completed_shared_hashes(&dir, total)
+            .await
+            .unwrap()
+            .unwrap()
+            .len(),
+        4
+    );
+    let health = job.health.snapshot(false);
+    assert!(health
+        .retry_evidence
+        .iter()
+        .any(|evidence| evidence.attempt == 3 && evidence.after_bps.is_some()));
+    assert!(health
+        .retry_evidence
+        .iter()
+        .any(|evidence| evidence.rehashed_bytes > 0));
+    fs::remove_dir_all(dir).await.unwrap();
 }
 
 #[tokio::test]

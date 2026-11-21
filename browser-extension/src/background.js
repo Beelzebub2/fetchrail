@@ -32,14 +32,14 @@ api.storage.onChanged?.addListener((changes, area) => {
 function requestKey(details, url = details.url) {
   return JSON.stringify([!!details.incognito, details.cookieStoreId ?? "", details.requestId ?? `tab:${details.tabId}:${url}`]);
 }
-function isChatGPTFileEndpoint(value) {
+function isGeneratedFileEndpoint(value) {
   try {
     const url = new URL(value);
     return url.origin === "https://chatgpt.com" && (url.pathname === "/backend-api/estuary/content"
       || /^\/backend-api\/conversation\/[^/]+\/interpreter\/download$/.test(url.pathname));
   } catch { return false; }
 }
-function isChatGPTBlobDownload(item) {
+function isGeneratedFileBlobDownload(item) {
   const url = item?.finalUrl || item?.url;
   if (typeof url !== "string" || !/^blob:https:\/\/chatgpt\.com\//i.test(url)) return false;
   if (!item.referrer) return true;
@@ -55,30 +55,30 @@ function contentDispositionName(value) {
   if (encoded) { try { return decodeURIComponent(encoded); } catch { return ""; } }
   return /(?:^|;)\s*filename\s*=\s*(?:"([^"]*)"|([^;]*))/i.exec(value)?.slice(1).find(Boolean)?.trim() ?? "";
 }
-function chatGPTSourceMatchesItem(trace, item) {
+function generatedFileSourceMatchesItem(trace, item) {
   if (!trace || trace.method !== "GET" || trace.type !== "xmlhttprequest" || trace.statusCode !== 200
-    || !trace.completedAt || !isChatGPTBlobDownload(item) || !Number.isInteger(item.tabId) || item.tabId < 0
+    || !trace.completedAt || !isGeneratedFileBlobDownload(item) || !Number.isInteger(item.tabId) || item.tabId < 0
     || trace.tabId !== item.tabId || trace.incognito !== !!item.incognito || trace.cookieStoreId !== item.cookieStoreId) return false;
-  if (!isChatGPTFileEndpoint(trace.originalUrl) && !isChatGPTFileEndpoint(trace.url)) return false;
+  if (!isGeneratedFileEndpoint(trace.originalUrl) && !isGeneratedFileEndpoint(trace.url)) return false;
   const started = Date.parse(item.startTime);
   if (!Number.isFinite(started) || started - trace.completedAt < -5000 || started - trace.completedAt > 30000) return false;
   const names = [trace.responseFilename];
   for (const value of [trace.originalUrl, trace.url]) {
-    if (!isChatGPTFileEndpoint(value)) continue;
+    if (!isGeneratedFileEndpoint(value)) continue;
     try { names.push(new URL(value).searchParams.get("fn")); } catch { /* Ignore malformed download hints. */ }
   }
   const browserName = filenameOnly(item.filename);
   return !!browserName && names.some(name => name && filenameOnly(name) === browserName);
 }
-function matchingChatGPTRequest(item) {
-  const matches = [...recentRequests.values()].filter(trace => chatGPTSourceMatchesItem(trace, item)
+function matchingGeneratedFileRequest(item) {
+  const matches = [...recentRequests.values()].filter(trace => generatedFileSourceMatchesItem(trace, item)
     && (!useBrowserSession || trace.headersObserved));
-  if (matches.length > 1) throw nativeError("AMBIGUOUS_SOURCE", "Several ChatGPT file requests match this download. Leave the file in the browser and retry from one tab.");
-  if (matches[0]?.claimedBy != null && matches[0].claimedBy !== item.id) throw nativeError("CHATGPT_SOURCE_USED", "The ChatGPT response already belongs to another browser download.");
+  if (matches.length > 1) throw nativeError("AMBIGUOUS_SOURCE", "Several file requests match this generated download. Leave the file in the browser and retry from one tab.");
+  if (matches[0]?.claimedBy != null && matches[0].claimedBy !== item.id) throw nativeError("GENERATED_FILE_SOURCE_USED", "The file response already belongs to another browser download.");
   return matches[0];
 }
-async function observedChatGPTRequest(item) {
-  const observed = () => matchingChatGPTRequest(item);
+async function observedGeneratedFileRequest(item) {
+  const observed = () => matchingGeneratedFileRequest(item);
   if (observed()) return observed();
   // The blob download can be reported before the final webRequest completion.
   await new Promise((resolve, reject) => {
@@ -130,10 +130,10 @@ function saveRequests() {
   savingRequests = true;
   queueMicrotask(() => {
     savingRequests = false;
-    // A signed ChatGPT file URL is private. Do not persist it even in session
+    // A signed file URL is private. Do not persist it even in session
     // storage unless the user explicitly opted into browser-session capture.
     void api.storage.session?.set({ recentRequests: [...recentRequests].filter(([, trace]) => !trace.incognito
-      && (useBrowserSession || !isChatGPTFileEndpoint(trace.originalUrl))) }).catch(() => {});
+      && (useBrowserSession || !isGeneratedFileEndpoint(trace.originalUrl))) }).catch(() => {});
   });
 }
 async function ensureSessionPermission() {
@@ -169,7 +169,7 @@ function rememberRequest(details) {
     const headers = Object.fromEntries(details.responseHeaders.map(h => [h.name.toLowerCase(), h.value ?? ""]));
     trace.attachment = /attachment/i.test(headers["content-disposition"] ?? "");
     trace.mime = headers["content-type"]; trace.etag = headers.etag; trace.responseTime = details.timeStamp ?? now;
-    if (isChatGPTFileEndpoint(trace.originalUrl) || isChatGPTFileEndpoint(trace.url)) trace.responseFilename = contentDispositionName(headers["content-disposition"]);
+    if (isGeneratedFileEndpoint(trace.originalUrl) || isGeneratedFileEndpoint(trace.url)) trace.responseFilename = contentDispositionName(headers["content-disposition"]);
   }
   recentRequests.set(key, trace);
   // Evict background traffic before response attachments and active batch candidates.
@@ -195,14 +195,14 @@ async function observeRequest(details) {
     details = { ...details, incognito: tab?.incognito ?? previous.incognito, cookieStoreId: details.cookieStoreId ?? tab?.cookieStoreId ?? previous?.cookieStoreId };
   }
   const originalUrl = recentRequests.get(requestKey(details))?.originalUrl;
-  // ChatGPT access is narrowly granted for its download endpoint: don't
-  // observe unrelated conversation/API traffic without session opt-in.
-  if (!useBrowserSession && !isChatGPTFileEndpoint(details.url) && !isChatGPTFileEndpoint(originalUrl)) {
+  // Content access is narrowly granted for the supported file endpoints: don't
+  // observe unrelated page/API traffic without session opt-in.
+  if (!useBrowserSession && !isGeneratedFileEndpoint(details.url) && !isGeneratedFileEndpoint(originalUrl)) {
     try { if (new URL(details.url).origin === "https://chatgpt.com") return; } catch { /* Invalid URLs have no trusted origin. */ }
   }
   // The completed event only adds evidence needed for this one XHR-to-blob
   // bridge; normal HTTP captures still rely on response attachment metadata.
-  if (details.fetchrailCompleted && !isChatGPTFileEndpoint(details.url) && !isChatGPTFileEndpoint(originalUrl)) return;
+  if (details.fetchrailCompleted && !isGeneratedFileEndpoint(details.url) && !isGeneratedFileEndpoint(originalUrl)) return;
   rememberRequest(details);
 }
 if (api.webRequest) {
@@ -646,7 +646,7 @@ function safeBrowserDownload(item) {
     && item.paused && item.canResume && (!item.error || item.error === "USER_CANCELED"));
   return active && (!item.danger || item.danger === "safe")
     && (!item.byExtensionId || item.byExtensionId === api.runtime.id)
-    && (/^https?:\/\//i.test(item.finalUrl || item.url) || isChatGPTBlobDownload(item));
+    && (/^https?:\/\//i.test(item.finalUrl || item.url) || isGeneratedFileBlobDownload(item));
 }
 
 // Automatic capture exclusions never pause or cancel a browser-owned file.
@@ -678,7 +678,7 @@ function excludedFromAutomaticCapture(item, rules) {
 function browserDownloadReady(item) {
   // Byte progress has no onChanged event. Chromium's filename decision holds
   // completion even when the whole body arrives before pause() takes effect.
-  if (isChatGPTBlobDownload(item) && !isFirefox) return filenameDecisions.has(item.id);
+  if (isGeneratedFileBlobDownload(item) && !isFirefox) return filenameDecisions.has(item.id);
   return item.bytesReceived > 0 || filenameDecisions.has(item.id);
 }
 function cancelledBrowserDownload(item) {
@@ -724,11 +724,11 @@ async function routeBrowserDownload(item) {
     }
     if (directStart) await directStart;
     await ensureSessionPermission();
-    const chatGPTBlob = isChatGPTBlobDownload(item);
+    const generatedFileBlob = isGeneratedFileBlobDownload(item);
     // A generated blob is not automatically a file the user wants routed.
     // Check preferences before waiting for a signed response, which may never
     // be available; otherwise disabled capture would still show a warning.
-    if (chatGPTBlob) {
+    if (generatedFileBlob) {
       const activeBatch = await loadBatch(!!item.incognito);
       const selectedByBatch = activeBatch && ((activeBatch.direct && activeBatch.browserDownloadId === item.id)
         || (activeBatch.status === "waiting" && activeBatch.tabIds?.includes(item.tabId)));
@@ -737,10 +737,10 @@ async function routeBrowserDownload(item) {
         if (automaticDownloads === false || excludedFromAutomaticCapture(item, captureRules)) return;
       }
     }
-    const trace = chatGPTBlob ? await observedChatGPTRequest(item) : await observedDownloadRequest(item);
-    if (chatGPTBlob) {
-      if (!trace) throw nativeError("CHATGPT_SOURCE_UNAVAILABLE", "The original ChatGPT file request was not observed. The file stays in the browser.");
-      if (trace.claimedBy != null && trace.claimedBy !== item.id) throw nativeError("CHATGPT_SOURCE_USED", "This ChatGPT response already belongs to another download.");
+    const trace = generatedFileBlob ? await observedGeneratedFileRequest(item) : await observedDownloadRequest(item);
+    if (generatedFileBlob) {
+      if (!trace) throw nativeError("GENERATED_FILE_SOURCE_UNAVAILABLE", "The original file request was not observed. The file stays in the browser.");
+      if (trace.claimedBy != null && trace.claimedBy !== item.id) throw nativeError("GENERATED_FILE_SOURCE_USED", "This file response already belongs to another download.");
       trace.claimedBy = item.id;
       claimedTrace = trace;
     }
@@ -773,7 +773,7 @@ async function routeBrowserDownload(item) {
     // Chromium's pending filename decision keeps a blob from being published.
     // A blob cannot be reliably paused as an HTTP transfer, so hold its
     // filename until a verified native handoff can safely cancel it instead.
-    const heldBlob = chatGPTBlob && !isFirefox && filenameDecisions.has(item.id);
+    const heldBlob = generatedFileBlob && !isFirefox && filenameDecisions.has(item.id);
     if (!heldBlob) { await api.downloads.pause(item.id); paused = true; }
     const [current] = await api.downloads.search({ id: item.id });
     if (!safeBrowserDownload(current) || !(current.paused || (heldBlob && filenameDecisions.has(item.id)))
@@ -784,9 +784,9 @@ async function routeBrowserDownload(item) {
     await observingRequests;
     // Firefox can emit onErrorOccurred when pause stops the browser channel.
     // Retain the already matched final GET if that event removes its observation.
-    const requestTrace = chatGPTBlob ? matchingChatGPTRequest(current)
+    const requestTrace = generatedFileBlob ? matchingGeneratedFileRequest(current)
       : matchingRequest(current) ?? (trace?.url === (current.finalUrl || current.url) ? trace : null);
-    if (chatGPTBlob && requestTrace !== claimedTrace) throw nativeError("CHATGPT_SOURCE_CHANGED", "The ChatGPT file request no longer matches the browser download.");
+    if (generatedFileBlob && requestTrace !== claimedTrace) throw nativeError("GENERATED_FILE_SOURCE_CHANGED", "The file request no longer matches the browser download.");
     if (useBrowserSession && !requestTrace) throw nativeError("SESSION_UNAVAILABLE", "The browser request changed before session capture. Finish this file in the browser.");
     const context = useBrowserSession ? requestTrace?.context : null;
     const capturedItem = { url: requestTrace?.method === "GET" ? requestTrace.url : current.finalUrl || current.url,
@@ -810,7 +810,7 @@ async function routeBrowserDownload(item) {
     if (!safeBrowserDownload(latest) || !(latest.paused || (heldBlob && filenameDecisions.has(item.id)))
       || !!latest.incognito !== handoff.incognito || latest.cookieStoreId !== item.cookieStoreId
       || (latest.finalUrl || latest.url) !== (current.finalUrl || current.url)
-      || (chatGPTBlob && matchingChatGPTRequest(latest) !== claimedTrace)) throw nativeError("BROWSER_CHANGED", "The browser download changed during verification.");
+      || (generatedFileBlob && matchingGeneratedFileRequest(latest) !== claimedTrace)) throw nativeError("BROWSER_CHANGED", "The browser download changed during verification.");
     handoff.phase = "cancelling"; await saveHandoff(handoff);
     await api.downloads.cancel(item.id);
     const [cancelled] = await api.downloads.search({ id: item.id });

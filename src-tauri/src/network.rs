@@ -53,6 +53,21 @@ pub fn slow_tail(
     *windows >= 2
 }
 
+pub fn replacement_reference(
+    previous: u64,
+    live_peer: u64,
+    completed_peer: u64,
+    draining: bool,
+) -> u64 {
+    // A finished fast outlier must not influence the main transfer. Once most
+    // work has drained, completed peers are the remaining capacity evidence.
+    previous.max(if draining {
+        live_peer.max(completed_peer)
+    } else {
+        live_peer
+    })
+}
+
 pub struct OriginGate {
     active: AtomicUsize,
     waits: AtomicUsize,
@@ -79,9 +94,31 @@ impl OriginGate {
             admission: Mutex::new(()),
         }
     }
+    #[cfg(test)]
     pub async fn acquire(
         self: &Arc<Self>,
         limit: usize,
+        cancel: &CancellationToken,
+    ) -> Option<OriginPermit> {
+        self.acquire_with(|| limit, cancel).await
+    }
+
+    pub async fn acquire_current(
+        self: &Arc<Self>,
+        limit: &AtomicUsize,
+        cancel: &CancellationToken,
+    ) -> Option<OriginPermit> {
+        self.acquire_with(|| limit.load(Ordering::Acquire), cancel)
+            .await
+    }
+
+    pub fn admission_changed(&self) {
+        self.changed.notify_waiters();
+    }
+
+    async fn acquire_with(
+        self: &Arc<Self>,
+        limit: impl Fn() -> usize + Sync,
         cancel: &CancellationToken,
     ) -> Option<OriginPermit> {
         // Queue admission so a refilling download cannot overtake jobs already waiting.
@@ -103,7 +140,7 @@ impl OriginGate {
             tokio::pin!(notified);
             notified.as_mut().enable();
             let active = self.active.load(Ordering::Acquire);
-            if active < limit.max(1)
+            if active < limit().max(1)
                 && self
                     .active
                     .compare_exchange(active, active + 1, Ordering::AcqRel, Ordering::Acquire)
@@ -213,6 +250,45 @@ mod tests {
     }
 
     #[test]
+    fn replacement_uses_healthy_peers_and_only_uses_completed_rates_in_the_tail() {
+        assert_eq!(
+            replacement_reference(600_000, 4_000_000, 100_000_000, false),
+            4_000_000
+        );
+        assert_eq!(
+            replacement_reference(600_000, 0, 100_000_000, false),
+            600_000
+        );
+        assert_eq!(
+            replacement_reference(600_000, 0, 4_000_000, true),
+            4_000_000
+        );
+        let mut windows = 0;
+        let reference = replacement_reference(600_000, 0, 4_000_000, true);
+        assert!(!slow_tail(
+            3_000_000,
+            Duration::from_secs(5),
+            reference,
+            120_000_000,
+            &mut windows
+        ));
+        assert!(slow_tail(
+            3_000_000,
+            Duration::from_secs(5),
+            reference,
+            117_000_000,
+            &mut windows
+        ));
+        assert!(!slow_tail(
+            3_000_000,
+            Duration::from_secs(5),
+            reference,
+            3_000_000,
+            &mut windows
+        ));
+    }
+
+    #[test]
     fn slow_links_and_isolated_spikes_are_not_stalls() {
         let (mut best, mut previous) = (0.0, 0.0);
         for _ in 0..4 {
@@ -292,5 +368,30 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(!waiting.is_finished());
         assert!(waiting.await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn changed_origin_limit_wakes_waiters_and_drains_without_revoking_bodies() {
+        let gate = Arc::new(OriginGate::new());
+        let cancel = CancellationToken::new();
+        let limit = AtomicUsize::new(1);
+        let first = gate.acquire_current(&limit, &cancel).await.unwrap();
+        let second = gate.acquire_current(&limit, &cancel);
+        tokio::pin!(second);
+        assert!(second.as_mut().now_or_never().is_none());
+        limit.store(2, Ordering::Release);
+        gate.admission_changed();
+        let second = second.await.unwrap();
+        limit.store(1, Ordering::Release);
+        gate.admission_changed();
+        let third = gate.acquire_current(&limit, &cancel);
+        tokio::pin!(third);
+        assert!(third.as_mut().now_or_never().is_none());
+        drop(first);
+        assert!(third.as_mut().now_or_never().is_none());
+        drop(second);
+        let third = third.await.unwrap();
+        assert_eq!(gate.active.load(Ordering::Acquire), 1);
+        drop(third);
     }
 }
