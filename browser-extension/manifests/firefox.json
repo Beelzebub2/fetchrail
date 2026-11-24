@@ -20,7 +20,6 @@
     "webRequest",
     "cookies"
   ],
-  "host_permissions": ["https://chatgpt.com/*"],
   "optional_host_permissions": [
     "http://*/*",
     "https://*/*"
