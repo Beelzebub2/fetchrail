@@ -77,7 +77,17 @@ try {
   // Completion is emitted before the writer's final handle is dropped on Windows.
   await until(async () => { try { await rename(final, final + ".held"); return true; } catch (error) { if (error.code === "EBUSY" || error.code === "EPERM") return false; throw error; } }, "completed writer released");
   await mkdir(final);
-  await assert.rejects(invoke("remove_download", { id: completed.id, deleteFile: true }), /delete/);
+  // The writer closing does not release the task's terminal accounting guard.
+  await assert.rejects(() => until(async () => {
+    try {
+      await invoke("remove_download", { id: completed.id, deleteFile: true });
+      return true;
+    } catch (error) {
+      const message = error instanceof Error ? error.message.replace(/^page\.evaluate: /, "") : "";
+      if (message === "Pause or cancel the download before removing it.") return false;
+      throw error;
+    }
+  }, "completed task released removal guard"), /Could not delete/);
   assert.equal((await record(completed.id)).status, "completed");
   await rmdir(final); await rename(final + ".held", final); await invoke("remove_download", { id: completed.id, deleteFile: true }); assert.equal(await exists(final), false);
 

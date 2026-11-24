@@ -908,7 +908,22 @@ async fn a_get_validator_enables_ranges_with_or_without_a_head_filename() {
         assert_eq!(probe.total_bytes, Some(total));
         assert_eq!(probe.validator, Some("\"fixture\"".into()));
         assert!(probe.accepts_ranges);
-        assert!(server.requests.lock().unwrap().contains(&(0, 0)));
+        // The fixture records served ranges synchronously; its stdout reader is asynchronous.
+        let stats: serde_json::Value = client
+            .get(server.url.join("/stats").unwrap())
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let served = stats["served"].as_array().unwrap();
+        let served_probe = served
+            .iter()
+            .any(|visit| visit["start"].as_u64() == Some(0) && visit["end"].as_u64() == Some(0));
+        assert!(served_probe, "{mode} should serve the one-byte GET probe");
     }
 }
 
