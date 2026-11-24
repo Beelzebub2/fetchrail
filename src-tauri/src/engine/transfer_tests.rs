@@ -920,9 +920,9 @@ async fn a_get_validator_enables_ranges_with_or_without_a_head_filename() {
             .await
             .unwrap();
         let served = stats["served"].as_array().unwrap();
-        let served_probe = served.iter().any(|visit| {
-            visit["start"].as_u64() == Some(0) && visit["end"].as_u64() == Some(0)
-        });
+        let served_probe = served
+            .iter()
+            .any(|visit| visit["start"].as_u64() == Some(0) && visit["end"].as_u64() == Some(0));
         assert!(served_probe, "{mode} should serve the one-byte GET probe");
     }
 }
