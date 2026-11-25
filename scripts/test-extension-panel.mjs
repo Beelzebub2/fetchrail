@@ -18,10 +18,20 @@ try {
   await page.addInitScript(()=>{
     const saved={connections:0,queue:"Default"};let listener;
     window.calls=[];window.committed=false;window.failSave=false;
+    window.grantWebsiteAccess=true;window.permissionRequests=[];
+    let permissionGesture=false;
+    document.addEventListener("change", event=>{
+      if(event.target.id!=="browser-session")return;
+      permissionGesture=true;queueMicrotask(()=>{permissionGesture=false;});
+    },true);
     const tabs=[{id:1,title:"Fixture source",url:"https://fixture.test",incognito:false}];
     window.chrome={
       storage:{local:{async get(){return {...saved};},async set(values){if(window.failSave)throw Error("Save failed");Object.assign(saved,values);listener?.(Object.fromEntries(Object.entries(values).map(([k,newValue])=>[k,{newValue}])),"local");}},onChanged:{addListener(fn){listener=fn;}}},
-      permissions:{async request(){return true;}},
+      permissions:{async request(options){
+        window.permissionRequests.push({options,permissionGesture});
+        if(!permissionGesture)throw Error("Permission must be requested during the initiating gesture");
+        return window.grantWebsiteAccess;
+      }},
       tabs:{async query(){return tabs;},async get(){return tabs[0];},async getCurrent(){return {id:2};}},
       runtime:{getManifest:()=>({version:"0.8.2"}),getURL:p=>location.origin+"/"+p,async sendMessage(m){
         window.calls.push(m);let result={};
@@ -48,9 +58,23 @@ try {
   assert.equal(await page.locator("#urls").inputValue(),"https://fixture.test/new-edit","An accepted reply cannot erase newer edits");
   await page.evaluate(()=>window.committed=true);
   await page.locator('[data-action="resume"]').waitFor();
-  await page.locator("#options-open").click();await page.evaluate(()=>window.failSave=true);
-  await page.locator("#browser-session").click();
-  await page.waitForFunction(()=>!document.querySelector("#browser-session").checked);
+  await page.locator("#options-open").click();
+  const sessionSwitch=page.locator("#browser-session");
+  await page.evaluate(()=>window.grantWebsiteAccess=false);
+  await sessionSwitch.click();
+  await page.getByText("Website access was not granted. Fetchrail will not use your browser sign-in.").waitFor();
+  assert.equal(await sessionSwitch.isChecked(),false,"A denied grant keeps sign-in forwarding off");
+  await page.evaluate(()=>window.grantWebsiteAccess=true);
+  await sessionSwitch.click();
+  await page.waitForFunction(()=>document.querySelector("#browser-session").checked&&!document.querySelector("#browser-session").disabled);
+  await sessionSwitch.click();
+  await page.waitForFunction(()=>!document.querySelector("#browser-session").checked&&!document.querySelector("#browser-session").disabled);
+  await page.evaluate(()=>window.failSave=true);
+  await sessionSwitch.click();
+  await page.getByText("Save failed").waitFor();
+  assert.equal(await sessionSwitch.isChecked(),false,"A failed settings write keeps sign-in forwarding off");
+  const prompt=await page.evaluate(()=>window.permissionRequests);
+  assert.deepEqual(prompt,Array.from({length:3},()=>({options:{origins:["http://*/*","https://*/*"]},permissionGesture:true})));
   await page.locator("#sheet-done").click();
   await page.waitForTimeout(500);
   assert.ok((await page.locator(".capture-recovery").textContent()).includes("The app could not verify this file"));

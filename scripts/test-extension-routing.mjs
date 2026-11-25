@@ -42,6 +42,39 @@ for (const family of ["chromium", "firefox"]) {
     assert.equal(f.stages.size,1); assert.ok(!JSON.stringify(f.saved).includes("synthetic-session"));
     if(incognito) assert.ok(!JSON.stringify(f.session).includes("files.test"));
   }
+  // The before-redirect hop and the final GET may share one webRequest ID.
+  // Replay only the final request's own credentials, even when it changes site.
+  for (const mode of ["finalHeaders", "finalUnobserved"]) {
+    const f = await browserFixture(family);
+    f.saved.useBrowserSession = true; await f.boot();
+    const original = f.item.url, destination = "https://cdn.other.test/final.zip";
+    const start = { requestId: "redirecting", url: original, tabId: 1, incognito: false, method: "GET" };
+    f.events.get("headers")({ ...start, requestHeaders: [{ name: "Cookie", value: "source-session" }, { name: "Authorization", value: "source-authorization" }] });
+    f.events.get("redirect")({ ...start, redirectUrl: destination, statusCode: 302 });
+    if (mode === "finalHeaders") {
+      f.item.finalUrl = destination;
+      const final = { ...start, url: destination };
+      f.events.get("before")(final);
+      f.events.get("headers")({ ...final, requestHeaders: [{ name: "Cookie", value: "cdn-session" }] });
+    }
+    await new Promise(setImmediate);
+    f.create();
+    if (mode === "finalHeaders") {
+      await f.settle();
+      assert.deepEqual(f.actions, ["pause", "cancel", "erase"]);
+      const request = f.calls.find(call => call.method === "addDownloads").params.items[0];
+      assert.equal(request.url, destination);
+      assert.deepEqual(request.requestContext, { cookie: "cdn-session" });
+    } else {
+      // DownloadItem can still display the original URL if the redirect's last
+      // request did not yield an observable final URL.
+      for (let i = 0; i < 20; i++) await new Promise(setImmediate);
+      await f.tick();
+      assert.deepEqual(f.actions, []);
+      assert.equal(f.stages.size, 0);
+      assert.equal(f.saved.recentOutcomes[0].code, "SESSION_UNAVAILABLE");
+    }
+  }
   // Real Firefox can deliver the download before its private/container headers.
   for (const cookieStoreId of ["firefox-private", "firefox-container-1"]) {
     const late = await browserFixture(family);

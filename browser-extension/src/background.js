@@ -41,7 +41,7 @@ function matchingRequest(item) {
   const url = item.finalUrl || item.url;
   const matches = [...recentRequests.values()].filter(trace => Date.now() - trace.time < (trace.attachment ? 30 : 5) * 60 * 1000
     && trace.incognito === !!item.incognito && trace.cookieStoreId === item.cookieStoreId
-    && (trace.url === url || trace.originalUrl === url)
+    && trace.url === url
     && (item.tabId == null || item.tabId < 0 || trace.tabId === item.tabId)
     && (!item.startTime || !trace.responseTime || Math.abs(Date.parse(item.startTime) - trace.responseTime) < 5 * 60 * 1000));
   // A response attachment is stronger evidence than unrelated XHR traffic.
@@ -104,6 +104,13 @@ api.permissions?.onRemoved?.addListener(() => {
 function rememberRequest(details) {
   if (details.tabId < 0) return;
   const now = Date.now(), key = requestKey(details), previous = recentRequests.get(key);
+  const sameUrl = previous?.url === details.url;
+  if (details.redirectUrl) {
+    // A redirect cannot authorize replay with the prior hop's credentials.
+    if (previous) recentRequests.delete(key);
+    saveRequests();
+    return;
+  }
   const context = useBrowserSession && previous?.url === details.url && !details.requestHeaders ? { ...previous.context } : {};
   if (useBrowserSession && details.requestHeaders) {
     for (const header of details.requestHeaders) {
@@ -113,9 +120,9 @@ function rememberRequest(details) {
   }
   for (const [id, trace] of recentRequests) if (now - trace.time > (trace.attachment ? 30 : 5) * 60 * 1000) recentRequests.delete(id);
   recentRequests.delete(key);
-  const trace = { ...previous, incognito: !!details.incognito, cookieStoreId: details.cookieStoreId, tabId: details.tabId,
+  const trace = { ...(sameUrl ? previous : {}), incognito: !!details.incognito, cookieStoreId: details.cookieStoreId, tabId: details.tabId,
     frameId: details.frameId, documentId: details.documentId, type: details.type, requestId: details.requestId,
-    originalUrl: previous?.originalUrl ?? details.url, url: details.url, method: details.method ?? previous?.method, context, time: now,
+    url: details.url, method: details.method, context, time: now,
     headersObserved: useBrowserSession && (!!details.requestHeaders || (previous?.url === details.url && previous.headersObserved === true)) };
   if (details.responseHeaders) {
     const headers = Object.fromEntries(details.responseHeaders.map(h => [h.name.toLowerCase(), h.value ?? ""]));
@@ -152,6 +159,7 @@ if (api.webRequest) {
   const headersEvent = api.webRequest.onSendHeaders ?? api.webRequest.onBeforeSendHeaders;
   headersEvent?.addListener(queueRequest, filter, isFirefox ? ["requestHeaders"] : ["requestHeaders", "extraHeaders"]);
   api.webRequest.onBeforeRequest?.addListener(queueRequest, filter);
+  api.webRequest.onBeforeRedirect?.addListener(queueRequest, filter);
   api.webRequest.onResponseStarted?.addListener(queueRequest, filter, ["responseHeaders"]);
   api.webRequest.onErrorOccurred?.addListener(details => {
     const trace = recentRequests.get(requestKey(details));
@@ -711,7 +719,7 @@ async function routeBrowserDownload(item) {
     // Firefox can emit onErrorOccurred when pause stops the browser channel.
     // Retain the already matched final GET if that event removes its observation.
     const requestTrace = matchingRequest(current) ?? (trace?.url === browserHttpUrl(current) ? trace : null);
-    if (useBrowserSession && !requestTrace) throw nativeError("SESSION_UNAVAILABLE", "The browser request changed before session capture. Finish this file in the browser.");
+    if (useBrowserSession && (!requestTrace?.headersObserved || requestTrace.method !== "GET")) throw nativeError("SESSION_UNAVAILABLE", "The browser request changed before session capture. Finish this file in the browser.");
     const context = useBrowserSession ? requestTrace?.context : null;
     const capturedItem = { url: requestTrace?.method === "GET" ? requestTrace.url : browserHttpUrl(current),
       suggestedFileName: current.filename?.split(/[\\/]/).pop(),

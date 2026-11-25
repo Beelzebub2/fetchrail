@@ -121,7 +121,7 @@
           </div>
           <div id="browser-help" class="reveal" inert>
             <div>
-              <p class="hint">Each page opens in a tab. Fetchrail catches the final file and moves to the next page. Logins and CAPTCHAs stay with you.</p>
+              <p class="hint">Each page opens in a tab. Optional access to HTTP and HTTPS websites lets Fetchrail follow redirects and find the final file, including files on other sites. Logins and CAPTCHAs stay with you. This does not turn on browser sign-in forwarding.</p>
               <label class="option-switch"><span>Press a single clear download button for me</span><input id="follow-buttons" class="switch" type="checkbox" checked /></label>
             </div>
           </div>
@@ -162,7 +162,7 @@
         </div>
         <div class="option-group tight">
           <label class="option-switch"><span>Use my browser session</span><input id="browser-session" class="switch" type="checkbox" /></label>
-          <p class="hint">Uses your sign-in for captured files, including private repositories. For private windows, also allow this extension in incognito/private browsing in your browser's extension settings. Accepted files appear in Fetchrail's history.</p>
+          <p class="hint">Optional: grants access to HTTP and HTTPS websites so Fetchrail can match the download to the final site, even after redirects. Only the matching final request's sign-in details are used for that download. For private windows, also allow this extension in the browser's private browsing settings.</p>
         </div>
         <details class="capture-rule-group">
           <summary>Automatic capture rules</summary>

@@ -29,7 +29,7 @@ export async function browserFixture(family = "chromium", faults = {}) {
       async get(key) { return { [key]: structuredClone(session[key]) }; },
       async set(value) { Object.assign(session, structuredClone(value)); }, async remove(key) { delete session[key]; },
     }, onChanged: event("storage") },
-    webRequest: { onBeforeRequest: event("before"), onSendHeaders: event("headers"), onResponseStarted: event("response"), onCompleted: event("completed"), onErrorOccurred: event("requestError") },
+    webRequest: { onBeforeRequest: event("before"), onBeforeRedirect: event("redirect"), onSendHeaders: event("headers"), onResponseStarted: event("response"), onCompleted: event("completed"), onErrorOccurred: event("requestError") },
     tabs: { onCreated: event("tabCreated"), onRemoved: event("tabRemoved"), onUpdated: event("tabUpdated"),
       async get(id) { if (!tabs.has(id)) throw Error("No tab"); return { ...tabs.get(id) }; },
       async query() { return [...tabs.values()]; },

@@ -1,5 +1,5 @@
 Fetchrail Browser Integration Privacy Policy
-Last updated: 20 October 2026.
+Last updated: 25 November 2026.
 
 Project maintainer: RRMTools, Portugal. Privacy contact: support.fetchrail@rrmtools.uk.
 
@@ -32,7 +32,7 @@ The desktop app offers user-started hardware and connection tests with explicit 
 
 Storage and retention
 
-Preferences and regular page-batch state are stored locally in browser extension storage. Regular request observations use browser session storage, bounded to 500 entries/512 KiB: background traffic expires after five minutes and attachment evidence after thirty minutes. Turning off session support or revoking website access clears captured observations.
+Preferences and regular page-batch state are stored locally in browser extension storage. Matching ignores ordinary observations older than five minutes and file-attachment evidence older than thirty minutes. Expired records are pruned on later request activity rather than on an exact timer. The cache is bounded to 500 entries/512 KiB. With session support enabled, regular observations may be held in browser session storage; otherwise they stay in extension memory. Private-window observations always stay in memory. Turning off session support or revoking optional website access clears captured observations.
 
 Private-window observations and raw private batch links/options stay in extension memory, never shared browser storage. They have the same bounded observation lifetime and are discarded if the extension restarts. Closing a popup can retain bounded evidence for an in-flight download. Opaque ownership and item IDs, phases and counts persist locally for recovery, without private URLs or headers. Recent outcomes contain IDs, fixed reason codes and times; private outcomes stay in memory. Diagnostics export occurs only on request and excludes source links, credentials and paths. Accepted private downloads appear in the desktop application's local history and follow the desktop retention rules below.
 
@@ -42,7 +42,7 @@ Fetchrail stores download history and unfinished transfer details locally. When 
 
 Your choices
 
-You may turn off automatic routing, keep browser session support disabled, revoke optional website access, stop a batch, remove downloads or uninstall the extension. Page scanning uses temporary active-tab access when requested. Broader website access is optional, requested when starting page batches or session support. Private/incognito downloads can be captured only after you allow this extension in private windows through your browser's extension settings. Session forwarding still requires enabling Use my browser session.
+You may turn off automatic routing, keep browser session support disabled, revoke optional website access, stop a batch, remove downloads or uninstall the extension. Page scanning uses temporary active-tab access when requested. Broader access to HTTP and HTTPS websites is optional and requested only when you choose Browse pages, enable Use my browser session, or choose Use this window for a desktop sign-in request. This lets Fetchrail match the initiating page and final download even when they use different websites. Browse pages does not by itself enable sign-in forwarding. Use this window also enables the browser-session setting; you can switch it off afterward. If you decline, you can still save the file with your browser. Private/incognito downloads can be captured only after you allow this extension in private windows through your browser's extension settings. Session forwarding still requires enabling Use my browser session.
 
 Optional desktop improvement analytics
 
