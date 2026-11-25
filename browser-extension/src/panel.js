@@ -11,6 +11,7 @@ let links = [];
 let selected = new Set();
 let tabId = Number(query.get("tab")) || null;
 let sourceIncognito;
+let sessionEnabled = false;
 let busy = false;
 const draftItems = new Map();
 let lastCapabilitiesAt = 0;
@@ -56,6 +57,14 @@ function notice(message, error = false) {
 function hideNotice() {
   clearTimeout(noticeTimer);
   $("#notice").classList.remove("open");
+}
+
+function requestDownloadSiteAccess(denial) {
+  // Browser permission prompts require the initiating user gesture. Never put
+  // a storage read or native call before this request.
+  return api.permissions.request({ origins: ["http://*/*", "https://*/*"] }).then(granted => {
+    if (!granted) throw new Error(denial);
+  });
 }
 
 function clearError() {
@@ -391,15 +400,16 @@ function renderDesktopRequests(requests) {
     const card = document.createElement("section");
     card.className = "batch-card";
     const text = document.createElement("p");
-    text.textContent = `${pending.count} download${pending.count === 1 ? "" : "s"} from the desktop app waiting for browser sign-in.`;
+    text.textContent = `${pending.count} download${pending.count === 1 ? "" : "s"} from the desktop app waiting for browser sign-in. Website access lets Fetchrail follow the download through a sign-in page or redirect in this window. This also turns on Use my browser session.`;
     const button = document.createElement("button");
     button.className = "text-button";
     button.textContent = "Use this window";
     button.addEventListener("click", async () => {
       button.disabled = true;
       try {
-        if (!await api.permissions.request({ origins: ["http://*/*", "https://*/*"] })) throw new Error("Browser access is required to capture the signed-in download.");
+        await requestDownloadSiteAccess("Website access was not granted. The desktop request is still waiting; you can also save the file in your browser.");
         await api.storage.local.set({ useBrowserSession: true });
+        sessionEnabled = true;
         $("#browser-session").checked = true;
         const batch = await request("takeBrowserRequest", { id: pending.id });
         renderBrowserBatch(batch);
@@ -585,7 +595,7 @@ async function browsePages(items, fromSelection = false) {
   clearError();
   try {
     const options = transferOptions();
-    if (!await api.permissions.request({ origins: ["http://*/*", "https://*/*"] })) throw new Error("Browser access is required to associate the final file with its download page.");
+    await requestDownloadSiteAccess("Website access was not granted. Browse pages did not start. You can open the links yourself and save the files in your browser.");
     const batch = await request("startBrowserBatch", { items, ...options, followButtons: $("#follow-buttons").checked });
     renderBrowserBatch(batch);
     if (fromSelection) { selected.clear(); renderLinks(); setView("downloads"); }
@@ -699,11 +709,14 @@ for (const action of ["retry", "skip", "stop"]) $("#batch-" + action).addEventLi
 });
 $("#browser-session").addEventListener("change", async () => {
   const input = $("#browser-session");
-  const previous = (await api.storage.local.get("useBrowserSession")).useBrowserSession === true;
+  const next = input.checked;
+  input.disabled = true;
   try {
-    if (input.checked && !await api.permissions.request({ origins: ["http://*/*", "https://*/*"] })) throw new Error("Browser access was not granted.");
-    await api.storage.local.set({ useBrowserSession: input.checked });
-  } catch (error) { input.checked = previous; notice(error.message, true); }
+    if (next) await requestDownloadSiteAccess("Website access was not granted. Fetchrail will not use your browser sign-in.");
+    await api.storage.local.set({ useBrowserSession: next });
+    sessionEnabled = next;
+  } catch (error) { input.checked = sessionEnabled; notice(error.message, true); }
+  finally { input.disabled = false; }
 });
 $("#download-selected").addEventListener("click", () => void add(links.filter((item) => selected.has(item.url)).map(({ url, suggestedFileName }) => ({ url, suggestedFileName })), true));
 $("#connection").addEventListener("click", () => void connect());
@@ -811,7 +824,8 @@ async function initialize() {
     const saved = await api.storage.local.get(["connections", "queue", "automaticDownloads", "useBrowserSession", "captureRules"]);
     $("#automatic-downloads").checked = saved.automaticDownloads !== false;
     renderCaptureRules(saved.captureRules);
-    $("#browser-session").checked = saved.useBrowserSession === true;
+    sessionEnabled = saved.useBrowserSession === true;
+    $("#browser-session").checked = sessionEnabled;
     if ([0, 1, 2, 4, 8, 16, 32].includes(saved.connections)) choose($("#connections"), String(saved.connections));
     preferredQueue = saved.queue ?? "Default";
     optionsSummary();
@@ -875,7 +889,10 @@ function renderRecovery(state) {
 }
 api.storage.onChanged?.addListener((changes, area) => {
   if (area !== "local") return;
-  if (changes.useBrowserSession) $("#browser-session").checked = changes.useBrowserSession.newValue === true;
+  if (changes.useBrowserSession) {
+    sessionEnabled = changes.useBrowserSession.newValue === true;
+    $("#browser-session").checked = sessionEnabled;
+  }
   if (changes.automaticDownloads) $("#automatic-downloads").checked = changes.automaticDownloads.newValue !== false;
   if (changes.captureRules && !document.querySelector(".capture-rule-input:focus, #capture-min-size:focus")) renderCaptureRules(changes.captureRules.newValue);
   if (changes.connections) choose($("#connections"), String(changes.connections.newValue ?? 0));
