@@ -432,6 +432,15 @@ impl DownloadSettings {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct StreamSelection {
+    pub kind: String,
+    pub variant_id: Option<String>,
+    pub audio_id: Option<String>,
+    pub container: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct AddDownloadRequest {
     #[serde(skip)]
     pub handoff_id: Option<String>,
@@ -455,6 +464,7 @@ pub struct AddDownloadRequest {
     pub expected_bytes: Option<u64>,
     pub speed_limit_bps: Option<u64>,
     pub request_context: Option<BrowserRequestContext>,
+    pub stream_selection: Option<StreamSelection>,
 }
 
 /// Only headers needed to replay the final browser GET. Never included in UI events.
